@@ -246,10 +246,12 @@ NATURAL_PERSON_ID = 6484810
 # org's own stage progression (see chadgracia/daily-brief's
 # TO_CLOSE_ALL_STAGES / TO_CLOSE_AGED_STAGE ordering), so they're included
 # too. Deliberately NOT excluding is_archived here (unlike the Sellers
-# column) — Active Intros' status pipeline ends in "Closed", derived when
-# the Intro Status field (below) has no value set for a deal, so an
-# archived deal must stay in this set to ever reach and display that
-# terminal status instead of silently disappearing.
+# column) — an archived deal can still carry a real Intro Status value
+# (including an explicit "Closed", id 7207587) and needs to stay visible
+# to show it. An archived deal with no Intro Status value set derives
+# "Matched" like any other empty one (see _default_intro_status) and
+# lands in Pending introductions, not "Closed" — is_archived is never
+# treated as a status signal.
 MATCHED_OR_LATER_STAGE_IDS = {
     STAGE_MATCHED, STAGE_FIRM, STAGE_CONFIRM,
     STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
@@ -921,13 +923,21 @@ def get_intro_details(tenant_email):
 def _default_intro_status(deal):
     """Derived status when the Intro Status field is empty/absent for a
     deal (including when the deals.json snapshot hasn't picked up the
-    brand-new field yet): "Closed" if the deal reads as won/closed, else
-    "Matched". No repo this org's code lives in ever names an explicit
-    "won" stage or field — is_archived is the one signal already
-    established elsewhere on this page (Sellers column, Matched Buyers,
-    Deal Card) as meaning a deal is closed/dead, so it's reused here as
-    the closest verified proxy."""
-    return "Closed" if deal.get("is_archived") else "Matched"
+    brand-new field yet): always "Matched" — per instruction, empty/
+    derived-Matched is the ONLY default and belongs in Pending
+    introductions regardless of any other deal attribute.
+
+    Previously this returned "Closed" when deal.get("is_archived") was
+    true, on the theory that is_archived was the closest available proxy
+    for "won" before this field existed. That was the actual bug behind
+    rows with a genuinely empty Intro Status showing up under
+    "Introduced": is_archived also covers deals that are archived because
+    they're dead/lost/inactive, not just won ones, so any archived deal
+    that was never actually introduced was mislabeled "Closed" and
+    misclassified as disclosed. "Closed" is now only ever reached through
+    a real Pipeline value (id 7207587) via _deal_intro_status_id — never
+    guessed."""
+    return "Matched"
 
 
 def _deal_intro_status_id(deal):
@@ -953,15 +963,18 @@ def _resolve_intro_status(deal, override_entry=None):
 
     "disclosed" is the hard privacy gate: True for every status except an
     explicit or derived Matched. That covers the six named
-    Introduced-through-Closed ids, a derived Closed (won deal), and the
-    three exit ids (Stalled/Passed/Withdrawn) — none of those are
-    "Matched" either. The instruction enumerated the six Introduced-
-    through-Closed ids explicitly and didn't say either way for the exit
-    ids; "not Matched" is what makes "Stalled stays, flagged" (a NAMED
-    row) consistent with a pending row's fixed "status: Matched" without
-    the two contradicting each other. Flag for confirmation if a deal
-    marked Stalled/Passed/Withdrawn before ever being Introduced should
-    actually still be anonymized."""
+    Introduced-through-Closed ids and the three exit ids (Stalled/Passed/
+    Withdrawn) — none of those are "Matched" either. An empty/absent
+    field always derives "Matched" (see _default_intro_status) — there is
+    no other derived value, so disclosed is False whenever the field is
+    genuinely unset, regardless of any other deal attribute (is_archived
+    included). The instruction enumerated the six Introduced-through-
+    Closed ids explicitly and didn't say either way for the exit ids;
+    "not Matched" is what makes "Stalled stays, flagged" (a NAMED row)
+    consistent with a pending row's fixed "status: Matched" without the
+    two contradicting each other. Flag for confirmation if a deal marked
+    Stalled/Passed/Withdrawn before ever being Introduced should actually
+    still be anonymized."""
     status_id = _deal_intro_status_id(deal)
 
     if override_entry:
@@ -1502,6 +1515,18 @@ NAV_CSS = """
     font-size: 13px;
     white-space: nowrap;
   }
+  .gg-admin-badge {
+    background: #7a1f1f;
+    color: #ffffff;
+    font-weight: 800;
+    font-size: 12px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 6px 12px;
+    border-radius: 5px;
+    border: 1px solid #ff6b6b;
+    white-space: nowrap;
+  }
 """
 
 
@@ -1517,7 +1542,7 @@ def _tab_qs_suffix(key=None, view_as=None):
     return suffix
 
 
-def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True):
+def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True, edit_flag=False):
     suffix = _tab_qs_suffix(key, view_as)
     mydeals_href = f"?tab=mydeals{suffix}"
     intros_href = f"?tab=intros{suffix}"
@@ -1530,6 +1555,21 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True)
     # unqualified except for section (a)'s deal names, so even the
     # viewer's own identity stays off it. Every other page keeps showing it.
     viewer_html = _esc(viewer_name) if show_viewer else ""
+
+    # key is only ever non-None for a valid ADMIN_KEY session (see
+    # lambda_handler's nav_key) — never for a real tenant, cookie or not —
+    # so it's the exact same signal used to gate edit_mode and is safe to
+    # reuse here as "is admin" without threading a separate flag through
+    # every render_* call.
+    admin_badge_html = ""
+    if key is not None:
+        badge_text = "ADMIN"
+        if edit_flag:
+            badge_text += " · editing"
+        if view_as:
+            badge_text += f" · viewing as {view_as}"
+        admin_badge_html = f'<div class="gg-admin-badge">{_esc(badge_text)}</div>'
+
     return f"""<header class="gg-nav">
   <div class="gg-nav-inner">
     <div class="gg-brand">Gracia Group</div>
@@ -1538,6 +1578,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True)
       <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
     </nav>
+    {admin_badge_html}
     <div class="gg-viewer">{viewer_html}</div>
   </div>
 </header>"""
@@ -1643,7 +1684,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
     — never for a real tenant."""
-    nav = _nav_html("intros", viewer_name, key=key, view_as=view_as)
+    nav = _nav_html("intros", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode)
 
     if tenant is None:
         body_html = (
@@ -2127,7 +2168,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
     — never for a real tenant — and switches the Buyers table to editable
     rows with no pending/disclosed split (see _matched_buyer_row_edit_html)."""
-    nav = _nav_html(None, viewer_name, key=key, view_as=view_as, show_viewer=False)
+    nav = _nav_html(None, viewer_name, key=key, view_as=view_as, show_viewer=False, edit_flag=edit_mode)
     suffix = _tab_qs_suffix(key, view_as)
     back_href = f"?tab={ref}{suffix}"
     back_label = REF_LABELS.get(ref, "My Deals")
