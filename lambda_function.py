@@ -150,11 +150,24 @@ STAGE_LABELS = {
 TICKET_MIN_FIELD = "custom_label_3065488"
 TICKET_MAX_FIELD = "custom_label_3064645"
 GROSS_FIELD = "custom_label_3064339"
+NET_FIELD = "custom_label_3064369"  # verified verbatim as CF_NET in chadgracia/daily-brief
 STRUCTURE_FIELD = "custom_label_3064360"
 LAYERS_FIELD = "custom_label_3938743"
 
 STRUCTURE_LABELS = {6250090: "Direct", 5077906: "Fund"}
 LAYERS_MAP = {7000228: "1-Layer", 7000229: "2-Layer", 7000230: "3-Layer"}
+
+# Fund Exemption: no repo this org's code lives in reads
+# custom_label_4006089, but the field id and all three option labels were
+# given directly (same trust basis as the earlier bare "In Process" option
+# ids) — implemented as instructed since a missing/differently-shaped
+# field just omits the line rather than showing anything wrong.
+EXEMPTION_FIELD = "custom_label_4006089"
+EXEMPTION_LABELS = {
+    7200027: "3(c)(1) — accredited investors",
+    7200028: "3(c)(7) — qualified purchasers only",
+    7201486: "Other",
+}
 
 # Person-level Ticket Size multi-select, for the company page's Buyer Demand
 # tiles. Field id and every entry id -> (min, max) dollar tier verified
@@ -729,6 +742,42 @@ def _person_display_name(rec):
     return " ".join(p for p in parts if p).strip()
 
 
+def _person_email_text(rec):
+    """Ported verbatim from chadgracia/daily-brief's _person_email: a
+    scalar "email", falling back to the first entry of an "emails" list
+    (which may itself be plain strings or {"address": ...} dicts)."""
+    if not isinstance(rec, dict):
+        return ""
+    email = rec.get("email")
+    if not email:
+        emails = rec.get("emails") or []
+        if isinstance(emails, list) and emails:
+            first = emails[0]
+            email = first.get("address") if isinstance(first, dict) else first
+    if not isinstance(email, str):
+        return ""
+    return email.strip()
+
+
+def _person_phone_text(rec):
+    """Best-effort phone extraction, mirroring _person_email_text's own
+    scalar/list fallback shape ("phone" / "phones" list) — no repo this
+    org's code lives in ever reads a phone field off a person record, so
+    this is implemented on trust and degrades to blank if the real shape
+    differs."""
+    if not isinstance(rec, dict):
+        return ""
+    phone = rec.get("phone")
+    if not phone:
+        phones = rec.get("phones") or []
+        if isinstance(phones, list) and phones:
+            first = phones[0]
+            phone = first.get("number") if isinstance(first, dict) else first
+    if not isinstance(phone, str):
+        return ""
+    return phone.strip()
+
+
 def get_my_sell_deals(person_id, company):
     """The tenant's SELL deals for one company, for the Deal Card
     section."""
@@ -781,12 +830,16 @@ STATUS_INDEX = {name: i for i, name in enumerate(STATUS_STEPS)}
 
 
 def get_intro_statuses(tenant_email):
-    """{deal_id_str: status_name} for every intro item under this tenant,
-    via a single Query on the syndicate-dash table (never one GetItem per
-    deal). Never raises: any failure (missing table, network, permissions)
+    """{deal_id_str: {"status", "next_steps", "notes"}} for every intro
+    item under this tenant, via a single Query on the syndicate-dash table
+    (never one GetItem per deal). "status" is the raw attribute when it's
+    one of the seven step names, else None (the derived default applies at
+    the call site); "next_steps"/"notes" pass through as-is (absent ->
+    None). Never raises: any failure (missing table, network, permissions)
     returns ({}, True) so the caller can fall back to derived defaults and
     show a small "live statuses unavailable" note instead of a broken
-    page. Returns (statuses, dynamo_failed)."""
+    page. Returns (entries, dynamo_failed). Reused as-is everywhere an
+    intro's Dynamo item is needed — one Query, never a second."""
     try:
         table = boto3.resource("dynamodb", region_name=INTRO_REGION).Table(INTRO_TABLE)
         resp = table.query(
@@ -798,9 +851,14 @@ def get_intro_statuses(tenant_email):
             if not sk.startswith("intro#"):
                 continue
             deal_id = sk[len("intro#"):]
+            if not deal_id:
+                continue
             status = item.get("status")
-            if deal_id and status in STATUS_INDEX:
-                out[deal_id] = status
+            out[deal_id] = {
+                "status": status if status in STATUS_INDEX else None,
+                "next_steps": item.get("next_steps"),
+                "notes": item.get("notes"),
+            }
         return out, False
     except Exception:
         return {}, True
@@ -816,8 +874,14 @@ def _default_intro_status(deal):
     return "Closed" if deal.get("is_archived") else "Matched"
 
 
-def _intro_status_for(deal, dynamo_statuses):
-    return dynamo_statuses.get(str(deal.get("id"))) or _default_intro_status(deal)
+def _intro_status_for(deal, dynamo_entries):
+    entry = dynamo_entries.get(str(deal.get("id")))
+    status = entry.get("status") if entry else None
+    return status or _default_intro_status(deal)
+
+
+def _intro_entry_for(deal, dynamo_entries):
+    return dynamo_entries.get(str(deal.get("id"))) or {}
 
 
 def _status_strip_html(status):
@@ -905,7 +969,7 @@ def _deal_card_html(deal, company):
     sid = _deal_stage_id(deal)
     stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
     size_text = _esc(_deal_size_text(deal))
-    gross_text = _esc(_fmt_money(_deal_cf_number(deal, GROSS_FIELD)))
+    net_text = _esc(_fmt_money(_deal_cf_number(deal, NET_FIELD)))
 
     struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
     layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
@@ -915,6 +979,11 @@ def _deal_card_html(deal, company):
     deadline = _deal_deadline_text(deal)
     deadline_html = (f'<div class="dc-line">Deadline: {_esc(deadline)}</div>'
                       if deadline else "")
+
+    exemption_id = next(iter(_deal_cf_option_ids(deal, EXEMPTION_FIELD)), None)
+    exemption_label = EXEMPTION_LABELS.get(exemption_id)
+    exemption_html = (f'<div class="dc-line">Exemption: {_esc(exemption_label)}</div>'
+                       if exemption_label else "")
 
     fees = _fmt_fees(deal)
     fees_html = f'<div class="dc-line">{_esc(fees)}</div>' if fees else ""
@@ -928,39 +997,81 @@ def _deal_card_html(deal, company):
       </div>
       <div class="deal-card-metrics">
         <div><span class="dc-label">Size</span><span class="dc-value">{size_text}</span></div>
-        <div><span class="dc-label">Gross</span><span class="dc-value">{gross_text}</span></div>
+        <div><span class="dc-label">Net</span><span class="dc-value">{net_text}</span></div>
         <div><span class="dc-label">Structure</span><span class="dc-value">{structure_text}</span></div>
       </div>
       {deadline_html}
+      {exemption_html}
       {fees_html}
       {badge_html}
     </div>"""
 
 
-def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, dynamo_statuses):
+def _buyer_name_cell_html(buyer_recs, show_contact):
+    """Buyer name(s), plus a contact second line (email/phone) when
+    show_contact is True. When False, no contact info is emitted anywhere
+    in the HTML — not hidden via CSS, simply never written. Shared by the
+    Matched Buyers table and Active Intros rows so the gating rule can't
+    drift between them.
+
+    won_deals_total (for the green "has closed with Rainmaker" dot) does
+    not appear anywhere in portfolio-deploy, deal-notifier, loi-sign,
+    web-bid, trades, or daily-brief — no code anywhere reads such a field
+    off a person record — so the dot is never rendered here."""
+    if not buyer_recs:
+        return "—"
+    names = ", ".join(_esc(_person_display_name(r) or "—") for r in buyer_recs)
+    if not show_contact:
+        return f'<div>{names}</div>'
+    contact_lines = []
+    for r in buyer_recs:
+        bits = [b for b in (_person_email_text(r), _person_phone_text(r)) if b]
+        if bits:
+            contact_lines.append(" · ".join(bits))
+    contact_html = (f'<div class="buyer-contact">{_esc(", ".join(contact_lines))}</div>'
+                     if contact_lines else "")
+    return f'<div>{names}</div>{contact_html}'
+
+
+def _investor_type_and_company(buyer_recs):
+    """(investor_type_text, company_text) for the first linked buyer —
+    the same "first buyer" convention already used for the Entity/Natural
+    Person determination. Company is "—" for a confirmed Natural Person,
+    else that person's own company_name (blank -> "—")."""
+    if not buyer_recs:
+        return "", "—"
+    first_cf = buyer_recs[0].get("custom_fields") or {}
+    transactor_ids = cf_list(first_cf, TRANSACTOR_TYPE_FIELD)
+    is_natural = NATURAL_PERSON_ID in transactor_ids
+    investor_type = "Natural Person" if is_natural else ""
+    company = "—" if is_natural else (buyer_recs[0].get("company_name") or "—")
+    return investor_type, company
+
+
+def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, dynamo_entries):
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
 
-    if buyer_recs:
-        names = ", ".join(_esc(_person_display_name(r) or "—") for r in buyer_recs)
-        first_cf = buyer_recs[0].get("custom_fields") or {}
-        transactor_ids = cf_list(first_cf, TRANSACTOR_TYPE_FIELD)
-        entity_text = "Natural Person" if NATURAL_PERSON_ID in transactor_ids else ""
-    else:
-        names = "—"
-        entity_text = ""
+    status = _intro_status_for(deal, dynamo_entries)
+    show_contact = STATUS_INDEX.get(status, 0) >= STATUS_INDEX["Introduced"]
 
-    sid = _deal_stage_id(deal)
-    stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
+    name_cell = _buyer_name_cell_html(buyer_recs, show_contact)
+    investor_type, company_text = _investor_type_and_company(buyer_recs)
     size_text = _esc(_deal_size_text(deal))
-    status = _intro_status_for(deal, dynamo_statuses)
     status_html = _status_pill_html(status)
 
+    entry = _intro_entry_for(deal, dynamo_entries)
+    next_steps_html = _esc(entry.get("next_steps") or "")
+    notes_html = _esc(entry.get("notes") or "")
+
     return (
-        f'<tr><td>{names}</td>'
-        f'<td>{_esc(entity_text)}</td>'
+        f'<tr><td>{name_cell}</td>'
+        f'<td>{_esc(company_text)}</td>'
+        f'<td>{_esc(investor_type)}</td>'
         f'<td class="num">{size_text}</td>'
-        f'<td>{stage} {status_html}</td></tr>'
+        f'<td>{status_html}</td>'
+        f'<td>{next_steps_html}</td>'
+        f'<td>{notes_html}</td></tr>'
     )
 
 
@@ -1068,8 +1179,10 @@ def _intro_row_html(deal, status, people_by_id, tenant_person_id, key=None, view
 
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-    buyers = (", ".join(_esc(_person_display_name(r) or "—") for r in buyer_recs)
-              if buyer_recs else "—")
+
+    show_contact = STATUS_INDEX.get(status, 0) >= STATUS_INDEX["Introduced"]
+    name_cell = _buyer_name_cell_html(buyer_recs, show_contact)
+    investor_type, _company_text = _investor_type_and_company(buyer_recs)
 
     size_text = _esc(_deal_size_text(deal))
     strip = _status_strip_html(status)
@@ -1077,7 +1190,8 @@ def _intro_row_html(deal, status, people_by_id, tenant_person_id, key=None, view
     return (
         f'<tr><td class="company">{company_cell}</td>'
         f'<td>{name}</td>'
-        f'<td>{buyers}</td>'
+        f'<td>{name_cell}</td>'
+        f'<td>{_esc(investor_type)}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{strip}</td></tr>'
     )
@@ -1122,7 +1236,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
       <table>
         <thead>
           <tr>
-            <th>Company</th><th>Deal</th><th>Buyer name(s)</th>
+            <th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>
             <th class="num">Size</th><th>Status</th>
           </tr>
         </thead>
@@ -1489,7 +1603,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         else:
             deals_body = '<div class="gg-placeholder small">No deals with this company yet.</div>'
         your_deals_html = f"""<section class="cd-section">
-    <h2>Your Deals</h2>
+    <h2>Deal Details</h2>
     {deals_body}
   </section>"""
 
@@ -1499,17 +1613,18 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             for d in matched_deals:
                 wanted_ids |= _deal_linked_person_ids(d) - {person_id}
             people_by_id = get_people_by_ids(wanted_ids)
-            dynamo_statuses, _ = get_intro_statuses(anon_key_email)
+            dynamo_entries, _ = get_intro_statuses(anon_key_email)
             matched_rows_html = "".join(
-                _matched_buyer_row_html(d, person_id, people_by_id, dynamo_statuses)
+                _matched_buyer_row_html(d, person_id, people_by_id, dynamo_entries)
                 for d in matched_deals
             )
             matched_body = f"""<div class="card">
       <table>
         <thead>
           <tr>
-            <th>Buyer name</th><th>Entity/Natural person</th>
-            <th class="num">Size</th><th>Stage</th>
+            <th>Buyer name</th><th>Company</th><th>Investor Type</th>
+            <th class="num">Size</th><th>Status</th>
+            <th>Next Steps</th><th>Buyer Notes</th>
           </tr>
         </thead>
         <tbody>{matched_rows_html}</tbody>
@@ -1660,9 +1775,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .deal-card {{
     background: var(--card);
     border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 16px 18px;
-    margin-bottom: 12px;
+    border-radius: 12px;
+    padding: 22px 24px;
+    margin-bottom: 16px;
   }}
   .deal-card:last-child {{ margin-bottom: 0; }}
   .deal-card-head {{
@@ -1670,9 +1785,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     align-items: baseline;
     justify-content: space-between;
     gap: 12px;
-    margin-bottom: 10px;
+    margin-bottom: 16px;
   }}
-  .deal-card-title {{ font-size: 15px; font-weight: 600; }}
+  .deal-card-title {{ font-size: 20px; font-weight: 700; }}
   .deal-card-stage {{
     font-size: 11px;
     font-weight: 600;
@@ -1684,19 +1799,20 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .deal-card-metrics {{
     display: flex;
     flex-wrap: wrap;
-    gap: 20px;
-    margin-bottom: 8px;
+    gap: 32px;
+    margin-bottom: 14px;
   }}
   .dc-label {{
     display: block;
     font-size: 11px;
     text-transform: uppercase;
-    letter-spacing: 0.03em;
+    letter-spacing: 0.04em;
     color: var(--muted);
-    margin-bottom: 2px;
+    margin-bottom: 4px;
   }}
-  .dc-value {{ font-size: 14px; font-weight: 500; }}
+  .dc-value {{ font-size: 16px; font-weight: 600; }}
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
+  .buyer-contact {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
   .engagement-badge {{
     display: inline-block;
     font-size: 12px;
@@ -1710,6 +1826,15 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .engagement-badge.in-process {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
   .engagement-badge.not-engaged {{ background: rgba(220,80,80,0.15); color: #e06666; }}
   .engagement-badge.not-engaged:hover {{ text-decoration: underline; }}
+  .status-pill {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    background: rgba(255,255,255,0.06);
+    border-radius: 999px;
+    padding: 2px 8px;
+  }}
 </style>
 </head>
 <body>
