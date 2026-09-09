@@ -65,8 +65,11 @@ Access / identity: two doors, either grants access —
     must be in TENANTS (below) or the tenant sees a "not enabled yet" page
     instead of the board. Neither door open -> access-denied page, no data
     rendered/fetched.
-GET only. Read-only: no S3 writes, no CRM writes, no email, no calls beyond
-the S3 reads below.
+GET only, except one route: POST ?action=update_intro, admin-only (ADMIN_KEY
+in the POST body — the session cookie alone never authorizes a write), lets
+an admin edit a deal's Intro Status / Next Steps / Buyer Notes. See
+_handle_update_intro. No other route ever writes anything — no other S3
+writes, no other CRM writes, no email.
 """
 
 import base64
@@ -75,7 +78,9 @@ import hmac
 import json
 import os
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 import boto3
 from boto3.dynamodb.conditions import Key
@@ -280,6 +285,21 @@ INTRO_STATUS_STALLED_ID = 7207584
 INTRO_STATUS_PASSED_ID = 7207585
 INTRO_STATUS_WITHDRAWN_ID = 7207586
 EXIT_STATUS_IDS = {INTRO_STATUS_STALLED_ID, INTRO_STATUS_PASSED_ID, INTRO_STATUS_WITHDRAWN_ID}
+
+# Pipeline API v3 write (Intro Status only — see _pipeline_update_deal_status).
+# Every other write this org's Lambdas make to Pipeline (pricing-updater,
+# valuation-scanner) goes through a per-session JWT Bearer token instead
+# (fetched fresh from s3://pipeline-token — see those repos' get_jwt), never
+# through a standing api_key/app_key pair; this env-var pair was specified
+# directly rather than discovered, so the HTTP Basic auth built from them
+# below is an unverified best guess at how Pipeline's API accepts it —
+# confirm against a real write once the console values are set. Endpoint and
+# payload shape (PUT deals/<id>.json, {"deal": {"custom_fields": {...}}})
+# mirror the verified companies/<id>.json write in both of those repos
+# exactly, swapping company for deal — never write, never read from a repo.
+PIPELINE_API_KEY = os.environ.get("PIPELINE_API_KEY", "")
+PIPELINE_APP_KEY = os.environ.get("PIPELINE_APP_KEY", "")
+PIPELINE_API_BASE = "https://api.pipelinecrm.com/api/v3"
 
 # Shared with chadgracia/trades and chadgracia/portfolio-deploy: signs both
 # the trades gg_id identity cookie and the ?sso= handoff token. Never in
@@ -862,15 +882,20 @@ STATUS_STEPS = [
 STATUS_INDEX = {name: i for i, name in enumerate(STATUS_STEPS)}
 
 
+def _dynamo_table():
+    return boto3.resource("dynamodb", region_name=INTRO_REGION).Table(INTRO_TABLE)
+
+
 def get_intro_details(tenant_email):
-    """{deal_id_str: {"next_steps", "notes"}} for every intro item under
-    this tenant, via a single Query on the syndicate-dash table (never one
-    GetItem per deal). Never raises: any failure (missing table, network,
-    permissions) returns ({}, True) so the caller can blank those two
-    columns and show a small note instead of a broken page. Returns
-    (entries, dynamo_failed)."""
+    """{deal_id_str: {"next_steps", "notes", "status_override",
+    "override_at"}} for every intro item under this tenant, via a single
+    Query on the syndicate-dash table (never one GetItem per deal). Never
+    raises: any failure (missing table, network, permissions) returns
+    ({}, True) so the caller can fall back to Pipeline-only data and show
+    a small note instead of a broken page. Returns (entries,
+    dynamo_failed)."""
     try:
-        table = boto3.resource("dynamodb", region_name=INTRO_REGION).Table(INTRO_TABLE)
+        table = _dynamo_table()
         resp = table.query(
             KeyConditionExpression=Key("tenant").eq(tenant_email) & Key("sk").begins_with("intro#"),
         )
@@ -885,6 +910,8 @@ def get_intro_details(tenant_email):
             out[deal_id] = {
                 "next_steps": item.get("next_steps"),
                 "notes": item.get("notes"),
+                "status_override": item.get("status_override"),
+                "override_at": item.get("override_at"),
             }
         return out, False
     except Exception:
@@ -912,9 +939,17 @@ def _deal_intro_status_id(deal):
     return status_id if status_id in INTRO_STATUS_LABELS else None
 
 
-def _resolve_intro_status(deal):
+def _resolve_intro_status(deal, override_entry=None):
     """The single place every page reads a deal's intro status from.
     Returns {"id", "name", "is_exit", "disclosed"}.
+
+    override_entry is this deal's Dynamo intro item (from
+    get_intro_details), or None. When it carries a valid status_override
+    and an override_at strictly newer than the deal's own updated_at in
+    deals.json, the override wins outright — including for the disclosure
+    gate below. An older or missing override, or one on a deal with no
+    updated_at to compare against unless the override itself is present,
+    never shadows the Pipeline field.
 
     "disclosed" is the hard privacy gate: True for every status except an
     explicit or derived Matched. That covers the six named
@@ -928,6 +963,19 @@ def _resolve_intro_status(deal):
     marked Stalled/Passed/Withdrawn before ever being Introduced should
     actually still be anonymized."""
     status_id = _deal_intro_status_id(deal)
+
+    if override_entry:
+        override_id = override_entry.get("status_override")
+        override_at = override_entry.get("override_at")
+        if override_id in INTRO_STATUS_LABELS and override_at:
+            pipeline_dt = _parse_dt(deal.get("updated_at"))
+            try:
+                override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                override_dt = None
+            if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
+                status_id = override_id
+
     name = INTRO_STATUS_LABELS[status_id] if status_id is not None else _default_intro_status(deal)
     return {
         "id": status_id,
@@ -935,6 +983,98 @@ def _resolve_intro_status(deal):
         "is_exit": status_id in EXIT_STATUS_IDS,
         "disclosed": name != "Matched",
     }
+
+
+# ── Admin write path: Intro Status / Next Steps / Buyer Notes ───────────────
+
+def _pipeline_update_deal_status(deal_id, status_id):
+    """PUT the Intro Status field to Pipeline. Returns (ok, error_message).
+    See the PIPELINE_API_KEY/PIPELINE_APP_KEY comment above: the Basic
+    auth built here is unverified against a real Pipeline write. On any
+    non-2xx response (or any other failure) this returns False and writes
+    nothing — the caller must not touch Dynamo when this fails."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    body = json.dumps({"deal": {"custom_fields": {INTRO_STATUS_FIELD: status_id}}}).encode("utf-8")
+    auth = base64.b64encode(f"{PIPELINE_API_KEY}:{PIPELINE_APP_KEY}".encode()).decode()
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/deals/{deal_id}.json",
+        data=body, method="PUT",
+        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _tenant_email_for_deal(deal):
+    """The TENANTS email whose person_id is linked to this deal, or None
+    if no tenant maps to it — writes are rejected outright in that case."""
+    linked = _deal_linked_person_ids(deal)
+    for email, info in TENANTS.items():
+        if info.get("person_id") in linked:
+            return email
+    return None
+
+
+def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, old_values):
+    """Update the intro item's Dynamo-owned attributes (status_override/
+    override_at when status_id is not None, next_steps/notes when they are
+    not None) and append an audit item (sk=audit#<deal_id>#<epoch_ms>,
+    actor "admin", old and new values). Returns (ok, error_message). Never
+    called when a requested Pipeline write failed — see
+    _handle_update_intro."""
+    update_parts = []
+    expr_names = {}
+    expr_values = {}
+    new_values = {}
+    now = time.time()
+
+    if status_id is not None:
+        update_parts.append("#so = :so")
+        expr_names["#so"] = "status_override"
+        expr_values[":so"] = status_id
+        update_parts.append("override_at = :oa")
+        expr_values[":oa"] = int(now)
+        new_values["status_override"] = status_id
+    if next_steps is not None:
+        update_parts.append("next_steps = :ns")
+        expr_values[":ns"] = next_steps
+        new_values["next_steps"] = next_steps
+    if notes is not None:
+        update_parts.append("notes = :no")
+        expr_values[":no"] = notes
+        new_values["notes"] = notes
+
+    if not update_parts:
+        return True, None
+
+    try:
+        table = _dynamo_table()
+        kwargs = {
+            "Key": {"tenant": tenant_email, "sk": f"intro#{deal_id}"},
+            "UpdateExpression": "SET " + ", ".join(update_parts),
+            "ExpressionAttributeValues": expr_values,
+        }
+        if expr_names:
+            kwargs["ExpressionAttributeNames"] = expr_names
+        table.update_item(**kwargs)
+        table.put_item(Item={
+            "tenant": tenant_email,
+            "sk": f"audit#{deal_id}#{int(now * 1000)}",
+            "actor": "admin",
+            "old": old_values,
+            "new": new_values,
+        })
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
 
 
 def _status_strip_html(status):
@@ -1163,9 +1303,11 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
 
 
 def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details, anon_key_email):
+    deal_id = str(deal.get("id"))
+    entry = intro_details.get(deal_id) or {}
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-    resolved = _resolve_intro_status(deal)
+    resolved = _resolve_intro_status(deal, entry)
     size_text = _esc(_deal_size_text(deal))
 
     if not resolved["disclosed"]:
@@ -1183,7 +1325,6 @@ def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details,
     investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
     status_html = _status_display_html(resolved, compact=True)
 
-    entry = intro_details.get(str(deal.get("id"))) or {}
     next_steps_html = _esc(entry.get("next_steps") or "")
     notes_html = _esc(entry.get("notes") or "")
 
@@ -1195,6 +1336,87 @@ def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details,
         f'<td>{status_html}</td>'
         f'<td>{next_steps_html}</td>'
         f'<td>{notes_html}</td></tr>'
+    )
+
+
+def _intro_status_select_html(deal_id, current_id):
+    options = []
+    for oid, label in INTRO_STATUS_LABELS.items():
+        selected = " selected" if oid == current_id else ""
+        options.append(f'<option value="{oid}"{selected}>{_esc(label)}</option>')
+    return (f'<select class="ei-status" data-deal-id="{_esc(deal_id)}">'
+            f'{"".join(options)}</select>')
+
+
+def _edit_script_html(key):
+    """Plain HTML+fetch(), no frameworks. One shared script, included on
+    both Active Intros and the Buyers table when edit_mode is on."""
+    admin_key_json = json.dumps(key or "")
+    return f"""<script>
+(function() {{
+  var ADMIN_KEY = {admin_key_json};
+  document.querySelectorAll('.ei-save').forEach(function(btn) {{
+    btn.addEventListener('click', function() {{
+      var tr = btn.closest('tr');
+      var dealId = btn.getAttribute('data-deal-id');
+      var statusEl = tr.querySelector('.ei-status');
+      var nextStepsEl = tr.querySelector('.ei-next-steps');
+      var notesEl = tr.querySelector('.ei-notes');
+      var msgEl = tr.querySelector('.ei-status-msg');
+      var payload = {{ key: ADMIN_KEY, deal_id: dealId }};
+      if (statusEl) payload.status = statusEl.value;
+      if (nextStepsEl) payload.next_steps = nextStepsEl.value;
+      if (notesEl) payload.notes = notesEl.value;
+      btn.disabled = true;
+      if (msgEl) msgEl.textContent = 'Saving…';
+      fetch('?action=update_intro', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify(payload)
+      }}).then(function(r) {{
+        return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }});
+      }}).then(function(res) {{
+        btn.disabled = false;
+        if (msgEl) msgEl.textContent = res.ok ? 'Saved' : ('Error: ' + (res.data.error || 'unknown'));
+      }}).catch(function(err) {{
+        btn.disabled = false;
+        if (msgEl) msgEl.textContent = 'Error: ' + err;
+      }});
+    }});
+  }});
+}})();
+</script>"""
+
+
+def _matched_buyer_row_edit_html(deal, tenant_person_id, people_by_id, intro_details):
+    """Admin edit-mode row: always the real buyer(s), regardless of
+    disclosure — the disclosure gate is a tenant-facing privacy rule, not
+    something that should blind the admin managing the pipeline. Status
+    always reflects the TRUE current resolved status (Matched included),
+    editable via a dropdown of all ten options."""
+    deal_id = str(deal.get("id"))
+    entry = intro_details.get(deal_id) or {}
+    resolved = _resolve_intro_status(deal, entry)
+
+    linked = _deal_linked_person_ids(deal) - {tenant_person_id}
+    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True)
+    investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
+    size_text = _esc(_deal_size_text(deal))
+    select_html = _intro_status_select_html(deal_id, resolved["id"])
+    next_steps_val = _esc(entry.get("next_steps") or "")
+    notes_val = _esc(entry.get("notes") or "")
+
+    return (
+        f'<tr data-deal-id="{_esc(deal_id)}"><td>{name_cell}</td>'
+        f'<td>{_esc(company_text)}</td>'
+        f'<td>{_esc(investor_type)}</td>'
+        f'<td class="num">{size_text}</td>'
+        f'<td>{select_html}</td>'
+        f'<td><input type="text" class="ei-next-steps" maxlength="2000" value="{next_steps_val}"></td>'
+        f'<td><input type="text" class="ei-notes" maxlength="2000" value="{notes_val}"></td>'
+        f'<td><button type="button" class="ei-save" data-deal-id="{_esc(deal_id)}">Save</button>'
+        f'<span class="ei-status-msg"></span></td></tr>'
     )
 
 
@@ -1338,12 +1560,53 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, key=None, view_as=
     )
 
 
-def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None):
+def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, key=None, view_as=None):
+    """Admin edit-mode row for Active Intros: always the real buyer(s),
+    always the true current status (Matched included) via a dropdown of
+    all ten options, plus Next Steps / Buyer Notes inputs and a Save
+    button — mirrors _matched_buyer_row_edit_html's rationale exactly."""
+    deal_id = str(deal.get("id"))
+    entry = intro_details.get(deal_id) or {}
+    resolved = _resolve_intro_status(deal, entry)
+
+    company_name = _deal_company_name(deal)
+    company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
+                    f'{_esc(company_name)}</a>') if company_name else "—"
+    name = _esc(_deal_title(deal))
+
+    linked = _deal_linked_person_ids(deal) - {tenant_person_id}
+    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True)
+    investor_type, _company_text = _investor_type_and_company(buyer_recs, disclosed=True)
+
+    size_text = _esc(_deal_size_text(deal))
+    select_html = _intro_status_select_html(deal_id, resolved["id"])
+    next_steps_val = _esc(entry.get("next_steps") or "")
+    notes_val = _esc(entry.get("notes") or "")
+
+    return (
+        f'<tr data-deal-id="{_esc(deal_id)}"><td class="company">{company_cell}</td>'
+        f'<td>{name}</td>'
+        f'<td>{name_cell}</td>'
+        f'<td>{_esc(investor_type)}</td>'
+        f'<td class="num">{size_text}</td>'
+        f'<td>{select_html}</td>'
+        f'<td><input type="text" class="ei-next-steps" maxlength="2000" value="{next_steps_val}"></td>'
+        f'<td><input type="text" class="ei-notes" maxlength="2000" value="{notes_val}"></td>'
+        f'<td><button type="button" class="ei-save" data-deal-id="{_esc(deal_id)}">Save</button>'
+        f'<span class="ei-status-msg"></span></td></tr>'
+    )
+
+
+def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None, edit_mode=False):
     """tenant is None only for admin-without-view_as — the same
     tenant-picker signal render_my_deals_page uses. tenant_email is always
     a real email otherwise (the logged-in tenant's own, or the previewed
-    tenant's under &view_as), used only for the pending rows' anon buyer
-    codes now — status no longer touches Dynamo at all."""
+    tenant's under &view_as), used for the pending rows' anon buyer codes
+    and as the Dynamo partition key for status overrides / edit data.
+
+    edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
+    — never for a real tenant."""
     nav = _nav_html("intros", viewer_name, key=key, view_as=view_as)
 
     if tenant is None:
@@ -1355,10 +1618,12 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         person_id = tenant.get("person_id")
         deals = get_my_matched_buy_deals(person_id) if person_id is not None else []
 
+        intro_details, dynamo_failed = get_intro_details(tenant_email) if deals else ({}, False)
+
         resolved_by_deal_id = {}
         kept_deals = []
         for d in deals:
-            resolved = _resolve_intro_status(d)
+            resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
             if resolved["name"] in ("Passed", "Withdrawn"):
                 continue
             resolved_by_deal_id[str(d.get("id"))] = resolved
@@ -1369,15 +1634,29 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             wanted_ids |= _deal_linked_person_ids(d) - {person_id}
         people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
 
-        main_rows, pending_rows = [], []
-        for d in kept_deals:
-            resolved = resolved_by_deal_id[str(d.get("id"))]
-            (main_rows if resolved["disclosed"] else pending_rows).append((d, resolved))
+        note_html = ('<p class="gg-note">Status overrides unavailable — showing Pipeline values.</p>'
+                     if dynamo_failed else "")
 
-        main_rows.sort(key=lambda dr: (-_intro_sort_rank(dr[1]), (_deal_company_name(dr[0]) or "").lower()))
-        pending_rows.sort(key=lambda dr: (_deal_company_name(dr[0]) or "").lower())
+        if edit_mode:
+            sorted_deals = sorted(kept_deals,
+                                   key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
+                                                   (_deal_company_name(d) or "").lower()))
+            rows_html = "".join(
+                _intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key, view_as=view_as)
+                for d in sorted_deals
+            )
+            head_row = ('<th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>'
+                        '<th class="num">Size</th><th>Status</th>'
+                        '<th>Next Steps</th><th>Buyer Notes</th><th></th>')
+        else:
+            main_rows, pending_rows = [], []
+            for d in kept_deals:
+                resolved = resolved_by_deal_id[str(d.get("id"))]
+                (main_rows if resolved["disclosed"] else pending_rows).append((d, resolved))
 
-        if main_rows or pending_rows:
+            main_rows.sort(key=lambda dr: (-_intro_sort_rank(dr[1]), (_deal_company_name(dr[0]) or "").lower()))
+            pending_rows.sort(key=lambda dr: (_deal_company_name(dr[0]) or "").lower())
+
             parts = [_intro_row_html(d, resolved, people_by_id, person_id, key=key, view_as=view_as)
                      for d, resolved in main_rows]
             if main_rows and pending_rows:
@@ -1387,12 +1666,15 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                 buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
                 parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, key=key, view_as=view_as))
             rows_html = "".join(parts)
+            head_row = ('<th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>'
+                        '<th class="num">Size</th><th>Status</th>')
+
+        if kept_deals:
             table_html = f"""<div class="card">
       <table>
         <thead>
           <tr>
-            <th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>
-            <th class="num">Size</th><th>Status</th>
+            {head_row}
           </tr>
         </thead>
         <tbody>{rows_html}</tbody>
@@ -1401,7 +1683,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         else:
             table_html = '<div class="gg-placeholder">No active introductions yet.</div>'
 
-        body_html = table_html
+        edit_script = _edit_script_html(key) if edit_mode else ""
+        body_html = f"{note_html}{table_html}{edit_script}"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1521,6 +1804,32 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     background: rgba(255,255,255,0.02);
     border-bottom: 1px solid var(--line);
   }}
+  .gg-note {{
+    color: var(--accredited, #c9a227);
+    font-size: 13px;
+    margin: 0 0 16px;
+  }}
+  .ei-status, .ei-next-steps, .ei-notes {{
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 13px;
+  }}
+  .ei-next-steps, .ei-notes {{ width: 140px; }}
+  .ei-save {{
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }}
+  .ei-save:disabled {{ opacity: 0.6; cursor: default; }}
+  .ei-status-msg {{ font-size: 11px; color: var(--muted); margin-left: 6px; }}
 </style>
 </head>
 <body>
@@ -1760,14 +2069,18 @@ def _buyer_tile_html(buyer, anon_key_email, now):
     </div>"""
 
 
-def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=None, view_as=None):
+def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=None, view_as=None, edit_mode=False):
     """No tab is highlighted (active_tab=None never matches mydeals/intros/
     demand in _nav_html). Section (a) is included only when tenant is not
     None — the same "admin with no view_as" signal render_my_deals_page's
     tenant_picker branch uses, since there is no tenant to scope deals to.
     Section (b) never receives — and so can never render — a buyer's name,
     email, or raw person id; the tile only ever sees the anonymized code,
-    tier, ticket range, and a boolean recency flag from _buyer_tile_html."""
+    tier, ticket range, and a boolean recency flag from _buyer_tile_html.
+
+    edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
+    — never for a real tenant — and switches the Buyers table to editable
+    rows with no pending/disclosed split (see _matched_buyer_row_edit_html)."""
     nav = _nav_html(None, viewer_name, key=key, view_as=view_as, show_viewer=False)
     suffix = _tab_qs_suffix(key, view_as)
     back_href = f"?tab={ref}{suffix}"
@@ -1790,38 +2103,53 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 
         matched_deals = get_my_matched_buy_deals(person_id, company) if person_id is not None else []
         if matched_deals:
-            resolved_by_deal_id = {str(d.get("id")): _resolve_intro_status(d) for d in matched_deals}
             wanted_ids = set()
             for d in matched_deals:
                 wanted_ids |= _deal_linked_person_ids(d) - {person_id}
             people_by_id = get_people_by_ids(wanted_ids)
             intro_details, dynamo_failed = get_intro_details(anon_key_email)
-
-            main_deals, pending_deals = [], []
-            for d in matched_deals:
-                resolved = resolved_by_deal_id[str(d.get("id"))]
-                (main_deals if resolved["disclosed"] else pending_deals).append(d)
-            main_deals.sort(key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
-                                            (_deal_title(d) or "").lower()))
-            pending_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
-
-            rows_parts = [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
-                          for d in main_deals]
-            if main_deals and pending_deals:
-                rows_parts.append('<tr class="pending-divider"><td colspan="7">Pending introductions</td></tr>')
-            rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
-                           for d in pending_deals]
-            matched_rows_html = "".join(rows_parts)
+            resolved_by_deal_id = {str(d.get("id")): _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
+                                    for d in matched_deals}
 
             note_html = ('<p class="gg-note">Next steps and notes unavailable right now.</p>'
                          if dynamo_failed else "")
+
+            if edit_mode:
+                sorted_deals = sorted(matched_deals,
+                                       key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
+                                                       (_deal_title(d) or "").lower()))
+                matched_rows_html = "".join(
+                    _matched_buyer_row_edit_html(d, person_id, people_by_id, intro_details)
+                    for d in sorted_deals
+                )
+                head_row = ('<th>Buyer name</th><th>Company</th><th>Investor Type</th>'
+                            '<th class="num">Size</th><th>Status</th>'
+                            '<th>Next Steps</th><th>Buyer Notes</th><th></th>')
+            else:
+                main_deals, pending_deals = [], []
+                for d in matched_deals:
+                    resolved = resolved_by_deal_id[str(d.get("id"))]
+                    (main_deals if resolved["disclosed"] else pending_deals).append(d)
+                main_deals.sort(key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
+                                                (_deal_title(d) or "").lower()))
+                pending_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
+
+                rows_parts = [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
+                              for d in main_deals]
+                if main_deals and pending_deals:
+                    rows_parts.append('<tr class="pending-divider"><td colspan="7">Pending introductions</td></tr>')
+                rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
+                               for d in pending_deals]
+                matched_rows_html = "".join(rows_parts)
+                head_row = ('<th>Buyer name</th><th>Company</th><th>Investor Type</th>'
+                            '<th class="num">Size</th><th>Status</th>'
+                            '<th>Next Steps</th><th>Buyer Notes</th>')
+
             matched_body = f"""{note_html}<div class="card">
       <table>
         <thead>
           <tr>
-            <th>Buyer name</th><th>Company</th><th>Investor Type</th>
-            <th class="num">Size</th><th>Status</th>
-            <th>Next Steps</th><th>Buyer Notes</th>
+            {head_row}
           </tr>
         </thead>
         <tbody>{matched_rows_html}</tbody>
@@ -1829,9 +2157,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     </div>"""
         else:
             matched_body = '<div class="gg-placeholder small">No buyers yet.</div>'
+        edit_script = _edit_script_html(key) if edit_mode else ""
         matched_buyers_html = f"""<section class="cd-section">
     <h2>Buyers</h2>
     {matched_body}
+    {edit_script}
   </section>"""
 
     buyers = get_company_buyer_details(company)
@@ -2056,6 +2386,27 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     background: rgba(255,255,255,0.02);
     border-bottom: 1px solid var(--line);
   }}
+  .ei-status, .ei-next-steps, .ei-notes {{
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 13px;
+  }}
+  .ei-next-steps, .ei-notes {{ width: 140px; }}
+  .ei-save {{
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }}
+  .ei-save:disabled {{ opacity: 0.6; cursor: default; }}
+  .ei-status-msg {{ font-size: 11px; color: var(--muted); margin-left: 6px; }}
 </style>
 </head>
 <body>
@@ -2363,6 +2714,105 @@ def _html_response(body, status=200):
     }
 
 
+def _json_response(data, status=200):
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(data),
+    }
+
+
+def _parse_json_body(event):
+    body = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        try:
+            body = base64.b64decode(body).decode("utf-8", errors="replace")
+        except Exception:
+            return {}
+    try:
+        data = json.loads(body)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+MAX_INTRO_TEXT_LEN = 2000
+
+
+def _handle_update_intro(event):
+    """POST ?action=update_intro — the only write path in this Lambda.
+    Admin-only: ADMIN_KEY must be present IN THE BODY (the session cookie
+    alone never authorizes a write, even an admin's own). Order: validate
+    -> look up the deal and its owning tenant -> if status is part of the
+    write, PUT it to Pipeline first and abort the whole request (writing
+    nothing to Dynamo) on any non-2xx -> write the Dynamo intro-item
+    update (status_override/override_at, next_steps, notes) -> append an
+    audit item. Never raises past this function; every failure mode
+    returns a JSON error the UI can show."""
+    body = _parse_json_body(event)
+
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not admin_key or body.get("key") != admin_key:
+        return _json_response({"error": "forbidden"}, 403)
+
+    deal_id = str(body.get("deal_id") or "").strip()
+    if not deal_id:
+        return _json_response({"error": "deal_id is required"}, 400)
+
+    status_id = None
+    if body.get("status") not in (None, ""):
+        try:
+            status_id = int(body.get("status"))
+        except (TypeError, ValueError):
+            return _json_response({"error": "invalid status"}, 400)
+        if status_id not in INTRO_STATUS_LABELS:
+            return _json_response({"error": "invalid status"}, 400)
+
+    next_steps = body.get("next_steps")
+    if next_steps is not None:
+        next_steps = str(next_steps)
+        if len(next_steps) > MAX_INTRO_TEXT_LEN:
+            return _json_response({"error": "next_steps too long"}, 400)
+
+    notes = body.get("notes")
+    if notes is not None:
+        notes = str(notes)
+        if len(notes) > MAX_INTRO_TEXT_LEN:
+            return _json_response({"error": "notes too long"}, 400)
+
+    if status_id is None and next_steps is None and notes is None:
+        return _json_response({"error": "nothing to update"}, 400)
+
+    deals = get_deals_list()
+    deal = next((d for d in deals if str(d.get("id")) == deal_id), None)
+    if deal is None:
+        return _json_response({"error": "deal not found"}, 404)
+
+    tenant_email = _tenant_email_for_deal(deal)
+    if tenant_email is None:
+        return _json_response({"error": "deal has no linked tenant"}, 400)
+
+    intro_details, _ = get_intro_details(tenant_email)
+    old_entry = intro_details.get(deal_id) or {}
+    old_resolved = _resolve_intro_status(deal, old_entry)
+    old_values = {
+        "status": old_resolved["id"] if old_resolved["id"] is not None else old_resolved["name"],
+        "next_steps": old_entry.get("next_steps"),
+        "notes": old_entry.get("notes"),
+    }
+
+    if status_id is not None:
+        ok, err = _pipeline_update_deal_status(deal_id, status_id)
+        if not ok:
+            return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
+
+    ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, old_values)
+    if not ok:
+        return _json_response({"error": f"Save failed: {err}"}, 502)
+
+    return _json_response({"ok": True})
+
+
 NOT_ENABLED_MESSAGE = (
     "This dashboard isn't enabled for your account yet — "
     "contact cgracia@rainmakersecurities.com."
@@ -2372,10 +2822,18 @@ NOT_ENABLED_MESSAGE = (
 def lambda_handler(event, context):
     method = (event.get("requestContext", {}).get("http", {}).get("method")
               or event.get("httpMethod") or "GET")
+    query = event.get("queryStringParameters") or {}
+
+    # The one write route: POST only. A GET here renders nothing and
+    # changes nothing.
+    if query.get("action") == "update_intro":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_update_intro(event)
+
     if method != "GET":
         return _forbidden()
 
-    query = event.get("queryStringParameters") or {}
     admin_key = os.environ.get("ADMIN_KEY")
     is_admin_key = bool(admin_key) and query.get("key") == admin_key
 
@@ -2437,6 +2895,12 @@ def lambda_handler(event, context):
     nav_key = query.get("key") if is_admin_key else None
     nav_view_as = view_as or None
 
+    # Edit UI (Intro Status / Next Steps / Buyer Notes) is admin-only and,
+    # when previewing a tenant via &view_as, opt-in via &edit=1 — without
+    # it, &view_as previews exactly the tenant's read-only page. Never
+    # True for a real tenant: is_admin_key is never True on their session.
+    edit_mode = is_admin_key and (not view_as or query.get("edit") == "1")
+
     # Company detail page: same auth resolution as the tabs above, just a
     # different route param.
     company = query.get("company")
@@ -2445,7 +2909,7 @@ def lambda_handler(event, context):
         if ref not in REF_LABELS:
             ref = "mydeals"
         body = render_company_page(company, viewer_name, tenant, anon_key_email, ref,
-                                    key=nav_key, view_as=nav_view_as)
+                                    key=nav_key, view_as=nav_view_as, edit_mode=edit_mode)
         return _html_response(body)
 
     if tab == "demand":
@@ -2462,5 +2926,5 @@ def lambda_handler(event, context):
                                          key=nav_key, view_as=nav_view_as)
     else:
         body = render_intros_page(viewer_name, tenant=tenant, tenant_email=anon_key_email,
-                                   key=nav_key, view_as=nav_view_as)
+                                   key=nav_key, view_as=nav_view_as, edit_mode=edit_mode)
     return _html_response(body)
