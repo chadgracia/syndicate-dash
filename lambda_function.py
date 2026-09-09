@@ -26,6 +26,13 @@ is one of LIVE_SELL_STAGE_IDS (verbatim from chadgracia/daily-brief's stage
 constants: Firm, Matched, Inquiry, Hold, Confirm, LOI Signed, Transfer
 Notice, SPA Signed), and the deal is not archived.
 
+My Deals tab: one row per deals.json deal linked to the viewing tenant's
+person_id (TENANTS[email]["person_id"]). Linkage is read the same way
+chadgracia/daily-brief's _deal_people does — a deal's "people" list of
+dicts (each carrying "id"), falling back to the flat "person_ids" list when
+"people" isn't present. No stage/archived filtering here (unlike Sellers):
+every deal the person is linked to shows, whatever its stage.
+
 portfolio-deploy/build_people_index.py's people_index.json only carries
 email/first_name/name (no custom_fields), so it can't be used for tiering —
 this Lambda parses the full people.json instead.
@@ -99,6 +106,7 @@ _EXCLUDED_COMPANIES_LOWER = {c.lower() for c in EXCLUDED_COMPANIES}
 # being counted as a live seller.
 DEAL_SIDE_FIELD = "custom_label_1958"
 DEAL_SIDE_SELL_ID = 5011675
+DEAL_SIDE_BUY_ID = 5077819
 
 STAGE_FIRM = 111800
 STAGE_MATCHED = 2381534
@@ -114,6 +122,38 @@ LIVE_SELL_STAGE_IDS = {
     STAGE_CONFIRM, STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
 }
 
+# Labels for every stage id this org's code has ever named (verbatim from
+# chadgracia/daily-brief's STAGE_LABELS). An id outside this map (e.g. a
+# closed-won/closed-lost stage no Lambda has needed to name) falls back to
+# its raw id string rather than guessing a label.
+STAGE_LABELS = {
+    STAGE_FIRM: "FIRM",
+    STAGE_MATCHED: "MATCHED",
+    STAGE_INQUIRY: "INQUIRY",
+    STAGE_HOLD: "HOLD",
+    STAGE_CONFIRM: "CONFIRM",
+    STAGE_LOI_SIGNED: "LOI SIGNED",
+    STAGE_TRANSFER_NOTICE: "TRANSFER NOTICE",
+    STAGE_SPA_SIGNED: "SPA SIGNED",
+}
+
+# My Deals tab columns — every field id verified present on deal records in
+# chadgracia/daily-brief/lambda_function.py (CF_TICKET_MIN/MAX, CF_GROSS,
+# CF_STRUCTURE) and chadgracia/deal-notifier/lambda_function.py
+# (LAYERS_FIELD/LAYERS_MAP). "Size" has no field id given, so it's mapped to
+# the Ticket Size min/max fields — the only deal-level "size" fields any
+# Lambda in this org reads. Deadline (custom_label_4006402) does not appear
+# anywhere in portfolio-deploy, deal-notifier, loi-sign, web-bid, trades, or
+# daily-brief, so it's omitted rather than guessing its shape.
+TICKET_MIN_FIELD = "custom_label_3065488"
+TICKET_MAX_FIELD = "custom_label_3064645"
+GROSS_FIELD = "custom_label_3064339"
+STRUCTURE_FIELD = "custom_label_3064360"
+LAYERS_FIELD = "custom_label_3938743"
+
+STRUCTURE_LABELS = {6250090: "Direct", 5077906: "Fund"}
+LAYERS_MAP = {7000228: "1-Layer", 7000229: "2-Layer", 7000230: "3-Layer"}
+
 # Shared with chadgracia/trades and chadgracia/portfolio-deploy: signs both
 # the trades gg_id identity cookie and the ?sso= handoff token. Never in
 # repo code.
@@ -122,9 +162,11 @@ IDENTITY_SECRET = os.environ.get("IDENTITY_SECRET", "")
 SIGNIN_URL = "https://trades.graciagroup.com"
 
 # Tenants enabled for this dashboard, keyed by lowercase email. Edited by
-# hand — no other code changes required.
+# hand — no other code changes required. person_id is that tenant's
+# Pipeline CRM person id, used to match them against deals.json's people
+# linkage for the My Deals tab — carry it for every entry going forward.
 TENANTS = {
-    # "someone@example.com": {"name": "Someone Co."},
+    "michael@nonpublic.io": {"name": "Michael Ferkol (NonPublic)", "person_id": 1307955474},
 }
 
 # Module-level cache: survives warm Lambda invocations, reset on cold start.
@@ -212,6 +254,69 @@ def _is_live_sell_deal(deal):
     if _deal_stage_id(deal) not in LIVE_SELL_STAGE_IDS:
         return False
     return DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+
+
+def _deal_linked_person_ids(deal):
+    """IDs of every person attached to a deal. Mirrors the exact fallback
+    chadgracia/daily-brief's _deal_people uses to read deals.json's person
+    linkage: a "people" list of dicts (each carrying at least "id") when
+    present, else the flat "person_ids" list of raw ids. daily-brief never
+    merges the two — one or the other is populated — so neither do we."""
+    out = set()
+    raw = deal.get("people") or []
+    if isinstance(raw, list) and raw:
+        for p in raw:
+            pid = p.get("id") if isinstance(p, dict) else p
+            if pid is None:
+                continue
+            try:
+                out.add(int(pid))
+            except (TypeError, ValueError):
+                continue
+        return out
+    for pid in (deal.get("person_ids") or []):
+        if pid is None:
+            continue
+        try:
+            out.add(int(pid))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _deal_cf_number(deal, key):
+    """A deal custom_field's numeric value. Mirrors daily-brief's
+    _cf_number: the value may be a scalar, a one-item list, or a dict
+    carrying it under "value"/"amount"/"number"."""
+    v = (deal.get("custom_fields") or {}).get(key)
+    if isinstance(v, list):
+        v = v[0] if v else None
+    if isinstance(v, dict):
+        v = v.get("value") or v.get("amount") or v.get("number")
+    if v in (None, ""):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _fmt_money(v):
+    """$1.5M / $500K / $2,500 style formatting, matching
+    chadgracia/deal-notifier's fmt_size."""
+    if v is None:
+        return "—"
+    if v >= 1_000_000:
+        n = v / 1_000_000
+        return f"${n:.0f}M" if n == int(n) else f"${n:.1f}M"
+    if v >= 1_000:
+        n = v / 1_000
+        return f"${n:.0f}K" if n == int(n) else f"${n:.1f}K"
+    return f"${v:,.0f}"
+
+
+def _deal_title(deal):
+    return deal.get("name") or deal.get("title") or f"Deal {deal.get('id', '')}"
 
 
 # ── Identity: SSO handoff + durable cookie ───────────────────────────────
@@ -368,6 +473,38 @@ def get_company_table():
     return table
 
 
+# Separate module-level cache for the raw deals.json list, used by My Deals.
+# Kept independent of _cache/get_company_table above (which caches the
+# Demand Board's precomputed per-company table, not a per-tenant view) so
+# neither one touches the other's cache-invalidation behavior.
+_deals_cache = {"version": None, "deals": None}
+
+
+def get_deals_list():
+    """Raw deals.json deals, fresh-checked via the same cheap
+    head_object-version pattern as get_company_table, cached independently
+    since My Deals needs the full per-deal records (for per-tenant
+    filtering) rather than a precomputed aggregate."""
+    s3 = boto3.client("s3")
+    version = _object_version(s3, DEALS_KEY)
+    if _deals_cache["version"] == version and _deals_cache["deals"] is not None:
+        return _deals_cache["deals"]
+    deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
+    deals_data = json.loads(deals_obj["Body"].read())
+    deals = deals_data.get("deals", []) if isinstance(deals_data, dict) else (deals_data or [])
+    _deals_cache["version"] = version
+    _deals_cache["deals"] = deals
+    return deals
+
+
+def get_my_deals(person_id):
+    """Deals linked to person_id, newest-updated first."""
+    deals = get_deals_list()
+    mine = [d for d in deals if person_id in _deal_linked_person_ids(d)]
+    mine.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
+    return mine
+
+
 # ── Nav shell: header bar + tabs, shared by every authenticated page ────────
 # Palette lifted verbatim from the shared trades/portfolio-deploy design
 # (portfolio-deploy/lambda_function.py :root — --ink #16181d, --bg #f4f2ee,
@@ -437,14 +574,17 @@ def _tab_qs_suffix(key=None, view_as=None):
 
 def _nav_html(active_tab, viewer_name, key=None, view_as=None):
     suffix = _tab_qs_suffix(key, view_as)
+    mydeals_href = f"?tab=mydeals{suffix}"
     intros_href = f"?tab=intros{suffix}"
     demand_href = f"?tab=demand{suffix}"
+    mydeals_cls = "gg-tab active" if active_tab == "mydeals" else "gg-tab"
     intros_cls = "gg-tab active" if active_tab == "intros" else "gg-tab"
     demand_cls = "gg-tab active" if active_tab == "demand" else "gg-tab"
     return f"""<header class="gg-nav">
   <div class="gg-nav-inner">
     <div class="gg-brand">Gracia Group</div>
     <nav class="gg-tabs">
+      <a class="{mydeals_cls}" href="{mydeals_href}">My Deals</a>
       <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
     </nav>
@@ -483,6 +623,200 @@ def render_intros_page(viewer_name, key=None, view_as=None):
 <body>
 {nav}
 <div class="gg-placeholder">Your active introductions will appear here soon</div>
+</body>
+</html>"""
+
+
+def _my_deal_row_html(deal):
+    company = _esc(_deal_company_name(deal) or "—")
+    name = _esc(_deal_title(deal))
+
+    side_ids = _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+    if DEAL_SIDE_SELL_ID in side_ids:
+        side = "Sell"
+    elif DEAL_SIDE_BUY_ID in side_ids:
+        side = "Buy"
+    else:
+        side = "—"
+
+    sid = _deal_stage_id(deal)
+    stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
+
+    ticket_max = _deal_cf_number(deal, TICKET_MAX_FIELD)
+    ticket_min = _deal_cf_number(deal, TICKET_MIN_FIELD)
+    size_val = ticket_max if ticket_max is not None else ticket_min
+    size_text = _fmt_money(size_val)
+
+    gross_val = _deal_cf_number(deal, GROSS_FIELD)
+    gross_text = _fmt_money(gross_val)
+
+    struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
+    layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
+    parts = [p for p in (struct_label, layer_label) if p]
+    structure = _esc(" · ".join(parts)) if parts else "—"
+
+    updated = _esc((deal.get("updated_at") or "")[:10] or "—")
+
+    return (
+        f'<tr><td class="company">{company}</td>'
+        f'<td>{name}</td>'
+        f'<td>{side}</td>'
+        f'<td>{stage}</td>'
+        f'<td class="num" data-sort="{size_val if size_val is not None else -1}">{size_text}</td>'
+        f'<td class="num" data-sort="{gross_val if gross_val is not None else -1}">{gross_text}</td>'
+        f'<td>{structure}</td>'
+        f'<td>{updated}</td></tr>'
+    )
+
+
+def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None):
+    nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as)
+
+    if tenant_picker:
+        body_html = (
+            '<div class="gg-placeholder">Pick a tenant to preview — '
+            'add &amp;view_as=&lt;email&gt; to the URL.</div>'
+        )
+    elif not deals:
+        body_html = '<div class="gg-placeholder">You have no active deals yet.</div>'
+    else:
+        rows_html = "".join(_my_deal_row_html(d) for d in deals)
+        body_html = f"""<div class="card">
+    <table id="board">
+      <thead>
+        <tr>
+          <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
+          <th data-key="name" data-type="string">Deal<span class="arrow"></span></th>
+          <th data-key="side" data-type="string">Buy/Sell<span class="arrow"></span></th>
+          <th data-key="stage" data-type="string">Stage<span class="arrow"></span></th>
+          <th class="num" data-key="size" data-type="number">Size<span class="arrow"></span></th>
+          <th class="num" data-key="gross" data-type="number">Gross price<span class="arrow"></span></th>
+          <th data-key="structure" data-type="string">Structure/Layers<span class="arrow"></span></th>
+          <th data-key="updated" data-type="string">Last updated<span class="arrow"></span></th>
+        </tr>
+      </thead>
+      <tbody id="board-body">
+        {rows_html}
+      </tbody>
+    </table>
+  </div>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Deals</title>
+<style>
+{NAV_CSS}
+  :root {{
+    --bg: #14161a;
+    --card: #1c1f26;
+    --line: #2a2e37;
+    --ink: #e8eaed;
+    --muted: #9aa0ac;
+    --accent: #4f8cff;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    padding: 32px 24px 64px;
+  }}
+  .wrap {{ max-width: 1000px; margin: 0 auto; }}
+  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 24px; }}
+  .card {{
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  thead th {{
+    text-align: left;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+  }}
+  thead th:hover {{ color: var(--ink); }}
+  thead th.num, td.num {{ text-align: right; }}
+  thead th .arrow {{ font-size: 10px; margin-left: 4px; color: var(--accent); }}
+  tbody td {{
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+  }}
+  tbody tr:last-child td {{ border-bottom: none; }}
+  tbody tr:hover {{ background: rgba(255,255,255,0.03); }}
+  td.company {{ font-weight: 500; }}
+  .gg-placeholder {{
+    max-width: 1000px;
+    margin: 96px auto;
+    padding: 0 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 15px;
+  }}
+</style>
+</head>
+<body>
+{nav}
+<div class="wrap">
+  <h1>My Deals</h1>
+  {body_html}
+</div>
+<script>
+(function() {{
+  var tbody = document.getElementById('board-body');
+  if (!tbody) return;
+  var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+  var headers = document.querySelectorAll('#board thead th');
+  var sortState = {{ key: null, dir: 1 }};
+
+  function cellSortValue(row, colIndex) {{
+    var cell = row.children[colIndex];
+    var raw = cell.getAttribute('data-sort');
+    return raw !== null ? raw : cell.textContent.trim();
+  }}
+
+  function applySort(colIndex, key, type) {{
+    var dir = (sortState.key === key) ? -sortState.dir : 1;
+    sortState = {{ key: key, dir: dir }};
+    headers.forEach(function(h) {{
+      var arrow = h.querySelector('.arrow');
+      if (!arrow) return;
+      arrow.textContent = '';
+    }});
+    var activeHeader = headers[colIndex];
+    var arrow = activeHeader.querySelector('.arrow');
+    if (arrow) arrow.textContent = dir === 1 ? '\\u25B2' : '\\u25BC';
+
+    rows.sort(function(a, b) {{
+      var av = cellSortValue(a, colIndex);
+      var bv = cellSortValue(b, colIndex);
+      if (type === 'number') {{
+        return (parseFloat(av) - parseFloat(bv)) * dir;
+      }}
+      return av.localeCompare(bv) * dir;
+    }});
+    rows.forEach(function(row) {{ tbody.appendChild(row); }});
+  }}
+
+  headers.forEach(function(h, idx) {{
+    h.addEventListener('click', function() {{
+      applySort(idx, h.getAttribute('data-key'), h.getAttribute('data-type'));
+    }});
+  }});
+}})();
+</script>
 </body>
 </html>"""
 
@@ -803,14 +1137,15 @@ def lambda_handler(event, context):
                 "body": "",
             }
 
-    tab = query.get("tab") or "intros"
-    if tab not in ("intros", "demand"):
-        tab = "intros"
+    tab = query.get("tab") or "mydeals"
+    if tab not in ("mydeals", "intros", "demand"):
+        tab = "mydeals"
 
     # view_as is admin-only: never let a non-admin request steer whose view
     # they get.
     view_as = (query.get("view_as") or "").strip() if is_admin_key else ""
 
+    tenant = None  # stays None for admin-without-view_as: the tenant-picker case
     if is_admin_key:
         if view_as:
             tenant = TENANTS.get(view_as.lower())
@@ -838,6 +1173,15 @@ def lambda_handler(event, context):
     if tab == "demand":
         table = get_company_table()
         body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as)
+    elif tab == "mydeals":
+        if tenant is None:
+            body = render_my_deals_page(viewer_name, tenant_picker=True,
+                                         key=nav_key, view_as=nav_view_as)
+        else:
+            person_id = tenant.get("person_id")
+            deals = get_my_deals(person_id) if person_id is not None else []
+            body = render_my_deals_page(viewer_name, deals=deals,
+                                         key=nav_key, view_as=nav_view_as)
     else:
         body = render_intros_page(viewer_name, key=nav_key, view_as=nav_view_as)
     return _html_response(body)
