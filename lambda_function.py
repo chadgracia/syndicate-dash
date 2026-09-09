@@ -287,16 +287,16 @@ INTRO_STATUS_WITHDRAWN_ID = 7207586
 EXIT_STATUS_IDS = {INTRO_STATUS_STALLED_ID, INTRO_STATUS_PASSED_ID, INTRO_STATUS_WITHDRAWN_ID}
 
 # Pipeline API v3 write (Intro Status only — see _pipeline_update_deal_status).
-# Every other write this org's Lambdas make to Pipeline (pricing-updater,
-# valuation-scanner) goes through a per-session JWT Bearer token instead
-# (fetched fresh from s3://pipeline-token — see those repos' get_jwt), never
-# through a standing api_key/app_key pair; this env-var pair was specified
-# directly rather than discovered, so the HTTP Basic auth built from them
-# below is an unverified best guess at how Pipeline's API accepts it —
-# confirm against a real write once the console values are set. Endpoint and
-# payload shape (PUT deals/<id>.json, {"deal": {"custom_fields": {...}}})
-# mirror the verified companies/<id>.json write in both of those repos
-# exactly, swapping company for deal — never write, never read from a repo.
+# Auth is Pipeline's query-string scheme — ?api_key=...&app_key=..., no
+# Authorization header — confirmed working for reads against this account.
+# Endpoint and payload shape (PUT deals/<id>.json,
+# {"deal": {"custom_fields": {...}}}) mirror the verified
+# companies/<id>.json write in pricing-updater and valuation-scanner
+# exactly, swapping company for deal — those two repos authenticate with a
+# per-session JWT Bearer token instead, fetched fresh from
+# s3://pipeline-token, since that's the scheme their user-facing writes
+# need; this admin write uses the query-string key pair instead, per
+# instruction.
 PIPELINE_API_KEY = os.environ.get("PIPELINE_API_KEY", "")
 PIPELINE_APP_KEY = os.environ.get("PIPELINE_APP_KEY", "")
 PIPELINE_API_BASE = "https://api.pipelinecrm.com/api/v3"
@@ -989,18 +989,21 @@ def _resolve_intro_status(deal, override_entry=None):
 
 def _pipeline_update_deal_status(deal_id, status_id):
     """PUT the Intro Status field to Pipeline. Returns (ok, error_message).
-    See the PIPELINE_API_KEY/PIPELINE_APP_KEY comment above: the Basic
-    auth built here is unverified against a real Pipeline write. On any
-    non-2xx response (or any other failure) this returns False and writes
-    nothing — the caller must not touch Dynamo when this fails."""
+    Auth is Pipeline's query-string scheme (?api_key=...&app_key=...,
+    both URL-encoded, no Authorization header) — verified working for
+    reads against this account; no Authorization-header alternative was
+    ever confirmed, so this replaces the earlier unverified Basic-auth
+    guess outright. On any non-2xx response (or any other failure) this
+    returns False and writes nothing — the caller must not touch Dynamo
+    when this fails."""
     if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
         return False, "Pipeline API credentials not configured"
     body = json.dumps({"deal": {"custom_fields": {INTRO_STATUS_FIELD: status_id}}}).encode("utf-8")
-    auth = base64.b64encode(f"{PIPELINE_API_KEY}:{PIPELINE_APP_KEY}".encode()).decode()
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
     req = urllib.request.Request(
-        f"{PIPELINE_API_BASE}/deals/{deal_id}.json",
+        f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
         data=body, method="PUT",
-        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/json"},
+        headers={"Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
