@@ -76,6 +76,7 @@ import json
 import os
 import time
 import urllib.parse
+from datetime import datetime, timezone
 import boto3
 
 BUCKET = "full-pipeline-cache"
@@ -153,6 +154,29 @@ LAYERS_FIELD = "custom_label_3938743"
 
 STRUCTURE_LABELS = {6250090: "Direct", 5077906: "Fund"}
 LAYERS_MAP = {7000228: "1-Layer", 7000229: "2-Layer", 7000230: "3-Layer"}
+
+# Person-level Ticket Size multi-select, for the company page's Buyer Demand
+# tiles. Field id and every entry id -> (min, max) dollar tier verified
+# verbatim in chadgracia/deal-notifier's TICKET_SIZE_MAP and
+# chadgracia/portfolio-deploy's WL_TICKET_SIZE_MAP (identical maps in both).
+TICKET_SIZE_FIELD = "custom_label_3052210"
+TICKET_SIZE_MAP = {
+    6870210: (100_000, 250_000),
+    6631962: (100_000, 250_000),
+    5014552: (251_000, 999_000),
+    5014555: (1_000_000, 5_000_000),
+    5014558: (5_000_000, 10_000_000),
+    5014561: (10_000_000, 25_000_000),
+    5014564: (25_000_000, 50_000_000),
+    5014567: (50_000_000, 100_000_000),
+    5014570: (100_000_000, None),
+}
+
+# Company page buyer tile anonymization: 32 chars, no I/L/O/0/1 (ambiguous
+# on screen).
+ANON_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+REF_LABELS = {"mydeals": "My Deals", "intros": "Active Intros", "demand": "Demand Board"}
 
 # Shared with chadgracia/trades and chadgracia/portfolio-deploy: signs both
 # the trades gg_id identity cookie and the ?sso= handoff token. Never in
@@ -317,6 +341,74 @@ def _fmt_money(v):
 
 def _deal_title(deal):
     return deal.get("name") or deal.get("title") or f"Deal {deal.get('id', '')}"
+
+
+def get_person_ticket_range(cf):
+    """(min, max) dollar ticket size for a person: min of all their tier
+    lower-bounds, max of all upper-bounds (None if any selected tier is
+    unbounded). Ported verbatim from chadgracia/deal-notifier's
+    get_person_ticket_range. (None, None) if no ticket size is set."""
+    entry_ids = cf_list(cf, TICKET_SIZE_FIELD)
+    if not entry_ids:
+        return None, None
+    mins, maxs = [], []
+    for eid in entry_ids:
+        tier = TICKET_SIZE_MAP.get(eid)
+        if tier:
+            mins.append(tier[0])
+            maxs.append(tier[1])
+    if not mins:
+        return None, None
+    person_min = min(mins)
+    person_max = None if any(m is None for m in maxs) else max(maxs)
+    return person_min, person_max
+
+
+def _fmt_ticket_range(min_v, max_v):
+    if min_v is None:
+        return None
+    if max_v is None:
+        return f"{_fmt_money(min_v)}+"
+    return f"{_fmt_money(min_v)} – {_fmt_money(max_v)}"
+
+
+def _parse_dt(s):
+    """Best-effort parse of a Pipeline timestamp into an aware datetime, or
+    None. Mirrors chadgracia/daily-brief's _parse_dt (ISO 8601, with a
+    couple of common non-ISO fallbacks), plus a slash-date fallback for the
+    "2026/08/21" Pipeline format noted elsewhere in this org's exports."""
+    if not s:
+        return None
+    s = str(s)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _anon_buyer_code(key_email, person_id):
+    """Stable 4-char anonymous code for a Buyer Demand tile:
+    HMAC-SHA256(IDENTITY_SECRET, f"{key_email}|{person_id}"), first 4
+    digest bytes mapped onto ANON_ALPHABET. Same viewer + same person always
+    produces the same code; a different viewer gets a different one. The
+    code is a one-way function of the person id — it never appears in the
+    output on its own."""
+    digest = hmac.new(IDENTITY_SECRET.encode(), f"{key_email}|{person_id}".encode(),
+                      hashlib.sha256).digest()
+    return "".join(ANON_ALPHABET[b % len(ANON_ALPHABET)] for b in digest[:4])
+
+
+def _company_href(company, ref, key=None, view_as=None):
+    suffix = _tab_qs_suffix(key, view_as)
+    return f"?company={urllib.parse.quote(company, safe='')}&ref={ref}{suffix}"
 
 
 # ── Identity: SSO handoff + durable cookie ───────────────────────────────
@@ -505,6 +597,47 @@ def get_my_deals(person_id):
     return mine
 
 
+def get_company_buyer_details(company):
+    """Tier/ticket-range/updated_at for every person with Buy Interest in
+    one company, per interest_people.json + people.json. Fresh S3 fetch on
+    every call, same as _build_table's own fetch of these two files — the
+    parsed people list is a local variable here and is dropped when this
+    function returns; per the module docstring, it is never added to any
+    module-level cache."""
+    s3 = boto3.client("s3")
+    interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
+    interest_data = json.loads(interest_obj["Body"].read())
+    buy = interest_data.get("buy") or {}
+
+    target = company.strip().lower()
+    person_ids = []
+    for name, ids in buy.items():
+        if isinstance(ids, list) and name.strip().lower() == target:
+            person_ids = ids
+            break
+    if not person_ids:
+        return []
+    wanted = {str(pid) for pid in person_ids}
+
+    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+    people_data = json.loads(people_obj["Body"].read())
+    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+
+    out = []
+    for rec in people_list:
+        pid = rec.get("id")
+        if pid is None or str(pid) not in wanted:
+            continue
+        cf = rec.get("custom_fields") or {}
+        out.append({
+            "person_id": pid,
+            "tier": classify_person(cf),
+            "ticket_range": get_person_ticket_range(cf),
+            "updated_at": rec.get("updated_at"),
+        })
+    return out
+
+
 # ── Nav shell: header bar + tabs, shared by every authenticated page ────────
 # Palette lifted verbatim from the shared trades/portfolio-deploy design
 # (portfolio-deploy/lambda_function.py :root — --ink #16181d, --bg #f4f2ee,
@@ -572,7 +705,7 @@ def _tab_qs_suffix(key=None, view_as=None):
     return suffix
 
 
-def _nav_html(active_tab, viewer_name, key=None, view_as=None):
+def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True):
     suffix = _tab_qs_suffix(key, view_as)
     mydeals_href = f"?tab=mydeals{suffix}"
     intros_href = f"?tab=intros{suffix}"
@@ -580,6 +713,11 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None):
     mydeals_cls = "gg-tab active" if active_tab == "mydeals" else "gg-tab"
     intros_cls = "gg-tab active" if active_tab == "intros" else "gg-tab"
     demand_cls = "gg-tab active" if active_tab == "demand" else "gg-tab"
+    # show_viewer=False (the company detail page) omits the viewer's own
+    # name from the nav — that page's "no identities anywhere" rule is
+    # unqualified except for section (a)'s deal names, so even the
+    # viewer's own identity stays off it. Every other page keeps showing it.
+    viewer_html = _esc(viewer_name) if show_viewer else ""
     return f"""<header class="gg-nav">
   <div class="gg-nav-inner">
     <div class="gg-brand">Gracia Group</div>
@@ -588,7 +726,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None):
       <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
     </nav>
-    <div class="gg-viewer">{_esc(viewer_name)}</div>
+    <div class="gg-viewer">{viewer_html}</div>
   </div>
 </header>"""
 
@@ -627,8 +765,13 @@ def render_intros_page(viewer_name, key=None, view_as=None):
 </html>"""
 
 
-def _my_deal_row_html(deal):
-    company = _esc(_deal_company_name(deal) or "—")
+def _my_deal_row_html(deal, key=None, view_as=None):
+    company_name = _deal_company_name(deal)
+    if company_name:
+        company = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
+                   f'{_esc(company_name)}</a>')
+    else:
+        company = "—"
     name = _esc(_deal_title(deal))
 
     side_ids = _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
@@ -669,6 +812,50 @@ def _my_deal_row_html(deal):
     )
 
 
+def _your_deal_row_html(deal):
+    """Same fields as _my_deal_row_html, minus the Company column — used on
+    the company detail page, where the section is already scoped to one
+    company. A standalone copy rather than a shared helper, so editing it
+    can never change the My Deals tab's own output."""
+    name = _esc(_deal_title(deal))
+
+    side_ids = _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+    if DEAL_SIDE_SELL_ID in side_ids:
+        side = "Sell"
+    elif DEAL_SIDE_BUY_ID in side_ids:
+        side = "Buy"
+    else:
+        side = "—"
+
+    sid = _deal_stage_id(deal)
+    stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
+
+    ticket_max = _deal_cf_number(deal, TICKET_MAX_FIELD)
+    ticket_min = _deal_cf_number(deal, TICKET_MIN_FIELD)
+    size_val = ticket_max if ticket_max is not None else ticket_min
+    size_text = _fmt_money(size_val)
+
+    gross_val = _deal_cf_number(deal, GROSS_FIELD)
+    gross_text = _fmt_money(gross_val)
+
+    struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
+    layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
+    parts = [p for p in (struct_label, layer_label) if p]
+    structure = _esc(" · ".join(parts)) if parts else "—"
+
+    updated = _esc((deal.get("updated_at") or "")[:10] or "—")
+
+    return (
+        f'<tr><td>{name}</td>'
+        f'<td>{side}</td>'
+        f'<td>{stage}</td>'
+        f'<td class="num">{size_text}</td>'
+        f'<td class="num">{gross_text}</td>'
+        f'<td>{structure}</td>'
+        f'<td>{updated}</td></tr>'
+    )
+
+
 def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None):
     nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as)
 
@@ -680,7 +867,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     elif not deals:
         body_html = '<div class="gg-placeholder">You have no active deals yet.</div>'
     else:
-        rows_html = "".join(_my_deal_row_html(d) for d in deals)
+        rows_html = "".join(_my_deal_row_html(d, key=key, view_as=view_as) for d in deals)
         body_html = f"""<div class="card">
     <table id="board">
       <thead>
@@ -757,6 +944,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   tbody tr:last-child td {{ border-bottom: none; }}
   tbody tr:hover {{ background: rgba(255,255,255,0.03); }}
   td.company {{ font-weight: 500; }}
+  td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
+  td.company a:hover {{ border-bottom-color: var(--muted); }}
   .gg-placeholder {{
     max-width: 1000px;
     margin: 96px auto;
@@ -821,6 +1010,230 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 </html>"""
 
 
+TIER_LABELS = {"qp": "QP", "accredited": "Accredited", "unknown": "Unknown"}
+TIER_ORDER = {"qp": 0, "accredited": 1, "unknown": 2}
+
+
+def _buyer_tile_html(buyer, anon_key_email, now):
+    code = _anon_buyer_code(anon_key_email, buyer["person_id"])
+    tier = buyer["tier"]
+    tier_label = TIER_LABELS.get(tier, "Unknown")
+
+    min_v, max_v = buyer["ticket_range"]
+    range_text = _fmt_ticket_range(min_v, max_v)
+    range_html = f'<div class="buyer-range">{_esc(range_text)}</div>' if range_text else ""
+
+    dt = _parse_dt(buyer["updated_at"])
+    recent = bool(dt and (now - dt).days <= 365)
+    dot_cls = "buyer-dot filled" if recent else "buyer-dot"
+    dot_title = "Active within 12 months" if recent else "No recent activity"
+
+    return f"""<div class="buyer-tile">
+      <span class="{dot_cls}" title="{dot_title}"></span>
+      <div class="buyer-code">Buyer {_esc(code)}</div>
+      <span class="tier-badge tier-{tier}">{_esc(tier_label)}</span>
+      {range_html}
+    </div>"""
+
+
+def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=None, view_as=None):
+    """No tab is highlighted (active_tab=None never matches mydeals/intros/
+    demand in _nav_html). Section (a) is included only when tenant is not
+    None — the same "admin with no view_as" signal render_my_deals_page's
+    tenant_picker branch uses, since there is no tenant to scope deals to.
+    Section (b) never receives — and so can never render — a buyer's name,
+    email, or raw person id; the tile only ever sees the anonymized code,
+    tier, ticket range, and a boolean recency flag from _buyer_tile_html."""
+    nav = _nav_html(None, viewer_name, key=key, view_as=view_as, show_viewer=False)
+    suffix = _tab_qs_suffix(key, view_as)
+    back_href = f"?tab={ref}{suffix}"
+    back_label = REF_LABELS.get(ref, "My Deals")
+
+    your_deals_html = ""
+    if tenant is not None:
+        person_id = tenant.get("person_id")
+        target = company.strip().lower()
+        rows = []
+        if person_id is not None:
+            rows = [d for d in get_my_deals(person_id)
+                    if (_deal_company_name(d) or "").strip().lower() == target]
+        if rows:
+            deals_rows_html = "".join(_your_deal_row_html(d) for d in rows)
+            deals_body = f"""<div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Deal</th><th>Buy/Sell</th><th>Stage</th>
+            <th class="num">Size</th><th class="num">Gross price</th>
+            <th>Structure/Layers</th><th>Last updated</th>
+          </tr>
+        </thead>
+        <tbody>{deals_rows_html}</tbody>
+      </table>
+    </div>"""
+        else:
+            deals_body = '<div class="gg-placeholder small">No deals with this company yet.</div>'
+        your_deals_html = f"""<section class="cd-section">
+    <h2>Your Deals</h2>
+    {deals_body}
+  </section>"""
+
+    buyers = get_company_buyer_details(company)
+    buyers.sort(key=lambda b: b["updated_at"] or "", reverse=True)
+    buyers.sort(key=lambda b: TIER_ORDER.get(b["tier"], 3))
+    now = datetime.now(timezone.utc)
+    if buyers:
+        tiles_html = "".join(_buyer_tile_html(b, anon_key_email, now) for b in buyers)
+        buyer_demand_body = f'<div class="buyer-grid">{tiles_html}</div>'
+    else:
+        buyer_demand_body = '<div class="gg-placeholder small">No buy interest recorded yet.</div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(company)}</title>
+<style>
+{NAV_CSS}
+  :root {{
+    --bg: #14161a;
+    --card: #1c1f26;
+    --line: #2a2e37;
+    --ink: #e8eaed;
+    --muted: #9aa0ac;
+    --accent: #4f8cff;
+    --qp: #2e9d6a;
+    --accredited: #c9a227;
+    --unknown: #6b7280;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    padding: 32px 24px 64px;
+  }}
+  .wrap {{ max-width: 1000px; margin: 0 auto; }}
+  .cd-back {{
+    display: inline-block;
+    color: var(--muted);
+    text-decoration: none;
+    font-size: 13px;
+    margin-bottom: 12px;
+  }}
+  .cd-back:hover {{ color: var(--ink); }}
+  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 28px; }}
+  .cd-section {{ margin-bottom: 32px; }}
+  .cd-section h2 {{
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    font-weight: 600;
+    margin: 0 0 12px;
+  }}
+  .card {{
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  thead th {{
+    text-align: left;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }}
+  thead th.num, td.num {{ text-align: right; }}
+  tbody td {{
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+  }}
+  tbody tr:last-child td {{ border-bottom: none; }}
+  .gg-placeholder {{
+    padding: 40px 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 15px;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+  }}
+  .gg-placeholder.small {{ padding: 24px; font-size: 14px; }}
+  .buyer-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+    gap: 12px;
+  }}
+  .buyer-tile {{
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 14px;
+    position: relative;
+  }}
+  .buyer-dot {{
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1px solid var(--muted);
+    background: transparent;
+  }}
+  .buyer-dot.filled {{ background: var(--qp); border-color: var(--qp); }}
+  .buyer-code {{
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    margin-bottom: 8px;
+    letter-spacing: 0.02em;
+  }}
+  .tier-badge {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 3px 8px;
+    border-radius: 999px;
+    color: #14161a;
+    margin-bottom: 8px;
+  }}
+  .tier-badge.tier-qp {{ background: var(--qp); }}
+  .tier-badge.tier-accredited {{ background: var(--accredited); }}
+  .tier-badge.tier-unknown {{ background: var(--unknown); color: var(--ink); }}
+  .buyer-range {{ font-size: 12px; color: var(--muted); }}
+</style>
+</head>
+<body>
+{nav}
+<div class="wrap">
+  <a class="cd-back" href="{back_href}">&larr; Back to {_esc(back_label)}</a>
+  <h1>{_esc(company)}</h1>
+  {your_deals_html}
+  <section class="cd-section">
+    <h2>Buyer Demand</h2>
+    {buyer_demand_body}
+  </section>
+  <section class="cd-section">
+    <h2>Introduced</h2>
+    <div class="gg-placeholder small">Introductions for this company will appear here soon.</div>
+  </section>
+</div>
+</body>
+</html>"""
+
+
 def _message_page(title, message, show_signin=False):
     """Standalone pre-auth / not-enabled page. Reuses the board's own dark
     palette (not the nav's) since there's no tab shell to sit under here."""
@@ -873,7 +1286,8 @@ def _message_page(title, message, show_signin=False):
 
 def render_page(table, viewer_name, key=None, view_as=None):
     rows_html = "".join(
-        f'<tr><td class="company">{_esc(r["company"])}</td>'
+        f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
+        f'{_esc(r["company"])}</a></td>'
         f'<td class="num">{r["total"]}</td>'
         f'<td class="num">{r["qp"]}</td>'
         f'<td class="num">{r["accredited"]}</td>'
@@ -972,6 +1386,8 @@ def render_page(table, viewer_name, key=None, view_as=None):
   tbody tr:last-child td {{ border-bottom: none; }}
   tbody tr:hover {{ background: rgba(255,255,255,0.03); }}
   td.company {{ font-weight: 500; }}
+  td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
+  td.company a:hover {{ border-bottom-color: var(--muted); }}
   .legend {{ display: flex; gap: 16px; margin-top: 14px; font-size: 12px; color: var(--muted); }}
   .legend span {{ display: inline-flex; align-items: center; gap: 6px; }}
   .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
@@ -1146,12 +1562,18 @@ def lambda_handler(event, context):
     view_as = (query.get("view_as") or "").strip() if is_admin_key else ""
 
     tenant = None  # stays None for admin-without-view_as: the tenant-picker case
+    # Company page Buyer Demand anonymization key: the viewing tenant's own
+    # email (or the previewed tenant's, under &view_as — same identity
+    # view_as already renders everything else as), falling back to the
+    # literal "admin" only when there is no tenant context at all.
+    anon_key_email = "admin"
     if is_admin_key:
         if view_as:
             tenant = TENANTS.get(view_as.lower())
             if not tenant:
                 return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE))
             viewer_name = tenant["name"]
+            anon_key_email = view_as.strip().lower()
         else:
             viewer_name = "Admin"
     else:
@@ -1166,9 +1588,21 @@ def lambda_handler(event, context):
         if not tenant:
             return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE))
         viewer_name = tenant["name"]
+        anon_key_email = identity_email.strip().lower()
 
     nav_key = query.get("key") if is_admin_key else None
     nav_view_as = view_as or None
+
+    # Company detail page: same auth resolution as the tabs above, just a
+    # different route param.
+    company = query.get("company")
+    if company:
+        ref = query.get("ref") or "mydeals"
+        if ref not in REF_LABELS:
+            ref = "mydeals"
+        body = render_company_page(company, viewer_name, tenant, anon_key_email, ref,
+                                    key=nav_key, view_as=nav_view_as)
+        return _html_response(body)
 
     if tab == "demand":
         table = get_company_table()
