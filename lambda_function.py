@@ -43,13 +43,32 @@ any file's LastModified changes; only the small computed per-company table is
 kept in the module-level cache between invocations, never the parsed people
 list.
 
-Access gate: query param `key` must equal os.environ["ADMIN_KEY"]. GET only.
-Read-only: no S3 writes, no CRM writes, no email, no calls beyond the two S3
-reads below.
+Access / identity: two doors, either grants access —
+  - Admin: query param `key` equals os.environ["ADMIN_KEY"]. Full access;
+    optional &view_as=<email> renders exactly what that tenant sees
+    (including the not-enabled page) without needing their cookie.
+  - Tenant SSO: same signed-handoff scheme as chadgracia/trades ->
+    chadgracia/portfolio-deploy. A `?sso=<token>` verifies against
+    IDENTITY_SECRET (see _verify_sso_handoff, ported from
+    portfolio-deploy's _verify_sso_handoff) and, if valid, sets the same
+    durable `gg_id` identity cookie trades itself mints (see
+    _make_identity_cookie / _read_identity_email, ported from
+    chadgracia/trades/lambda_function.py) before redirecting to a clean
+    URL. Later requests read identity from that cookie. The verified email
+    must be in TENANTS (below) or the tenant sees a "not enabled yet" page
+    instead of the board. Neither door open -> access-denied page, no data
+    rendered/fetched.
+GET only. Read-only: no S3 writes, no CRM writes, no email, no calls beyond
+the S3 reads below.
 """
 
+import base64
+import hashlib
+import hmac
 import json
 import os
+import time
+import urllib.parse
 import boto3
 
 BUCKET = "full-pipeline-cache"
@@ -93,6 +112,19 @@ STAGE_SPA_SIGNED = 2381535
 LIVE_SELL_STAGE_IDS = {
     STAGE_FIRM, STAGE_MATCHED, STAGE_INQUIRY, STAGE_HOLD,
     STAGE_CONFIRM, STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
+}
+
+# Shared with chadgracia/trades and chadgracia/portfolio-deploy: signs both
+# the trades gg_id identity cookie and the ?sso= handoff token. Never in
+# repo code.
+IDENTITY_SECRET = os.environ.get("IDENTITY_SECRET", "")
+
+SIGNIN_URL = "https://trades.graciagroup.com"
+
+# Tenants enabled for this dashboard, keyed by lowercase email. Edited by
+# hand — no other code changes required.
+TENANTS = {
+    # "someone@example.com": {"name": "Someone Co."},
 }
 
 # Module-level cache: survives warm Lambda invocations, reset on cold start.
@@ -182,6 +214,86 @@ def _is_live_sell_deal(deal):
     return DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
 
 
+# ── Identity: SSO handoff + durable cookie ───────────────────────────────
+# Ported verbatim (formats and algorithms, not code layout) from the two
+# sibling Lambdas that originate this scheme:
+#   - chadgracia/trades/lambda_function.py: _make_identity_cookie,
+#     _read_identity_email, _get_cookie (the gg_id cookie trades mints on
+#     Cognito login and every other Gracia Group app reads).
+#   - chadgracia/portfolio-deploy/lambda_function.py: _b64u, _b64u_decode,
+#     _verify_sso_handoff (how the ?sso= handoff token is verified —
+#     expiry check, hmac.compare_digest, base64 padding handling).
+
+def _b64u(b):                       # bytes -> unpadded base64url str
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _b64u_decode(s):                # unpadded base64url str -> bytes
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def _get_cookie(event, name):
+    """Read a cookie value from a payload-v2 request, else None."""
+    for c in (event.get("cookies") or []):
+        if c.startswith(name + "="):
+            return c.split("=", 1)[1]
+    hdr = (event.get("headers") or {}).get("cookie", "")
+    for c in hdr.split(";"):
+        c = c.strip()
+        if c.startswith(name + "="):
+            return c.split("=", 1)[1]
+    return None
+
+
+def _make_identity_cookie(email):
+    sig = hmac.new(IDENTITY_SECRET.encode(), email.encode(), hashlib.sha256).hexdigest()
+    val = _b64u(f"{email}|{sig}".encode())
+    return f"gg_id={val}; Max-Age=31536000; Path=/; Secure; SameSite=Lax"
+
+
+def _read_identity_email(event):
+    """Verified email from the gg_id cookie, or None. Reverses
+    _make_identity_cookie. Never raises."""
+    if not IDENTITY_SECRET:
+        return None
+    raw = _get_cookie(event, "gg_id")
+    if not raw:
+        return None
+    try:
+        decoded = _b64u_decode(raw).decode()
+        email, sig = decoded.rsplit("|", 1)
+        expected = hmac.new(IDENTITY_SECRET.encode(), email.encode(),
+                            hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            return None
+        return email
+    except Exception:
+        return None
+
+
+def _verify_sso_handoff(token):
+    """Email if the trading site's signed, unexpired handoff verifies, else
+    None. Token is base64url(f"{email}|{exp}|{sig}"), sig =
+    HMAC-SHA256(IDENTITY_SECRET, f"{email}|{exp}").hexdigest(). Never
+    raises."""
+    if not (IDENTITY_SECRET and token):
+        return None
+    try:
+        parts = _b64u_decode(token).decode().split("|")
+        if len(parts) != 3:
+            return None
+        email, exp, sig = parts
+        expected = hmac.new(IDENTITY_SECRET.encode(), f"{email}|{exp}".encode(),
+                            hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig):
+            return None
+        if int(exp) < int(time.time()):
+            return None
+        return email
+    except Exception:
+        return None
+
+
 def _object_version(s3, key):
     head = s3.head_object(Bucket=BUCKET, Key=key)
     return head["LastModified"].isoformat()
@@ -256,7 +368,176 @@ def get_company_table():
     return table
 
 
-def render_page(table):
+# ── Nav shell: header bar + tabs, shared by every authenticated page ────────
+# Palette lifted verbatim from the shared trades/portfolio-deploy design
+# (portfolio-deploy/lambda_function.py :root — --ink #16181d, --bg #f4f2ee,
+# --muted #6b7280, --pos #1f7a4d) so the bar reads as part of the same
+# family, but repurposed as a dark bar (--ink as background, --bg as text)
+# rather than that palette's own light page/card backgrounds — the
+# "distinct background tint" the nav needs to read as its own band above
+# the (unchanged, separately dark-themed) Demand Board.
+NAV_CSS = """
+  .gg-nav {
+    background: #16181d;
+    border-bottom: 1px solid rgba(244,242,238,0.12);
+  }
+  .gg-nav-inner {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 14px 24px;
+    display: flex;
+    align-items: center;
+    gap: 24px;
+  }
+  .gg-brand {
+    color: #f4f2ee;
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+  }
+  .gg-tabs {
+    display: flex;
+    gap: 4px;
+    flex: 1;
+  }
+  .gg-tab {
+    color: #9aa0ac;
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: 600;
+    padding: 8px 14px;
+    border-radius: 6px;
+  }
+  .gg-tab:hover { color: #f4f2ee; }
+  .gg-tab.active {
+    color: #f4f2ee;
+    background: rgba(244,242,238,0.08);
+    box-shadow: inset 0 -2px 0 #1f7a4d;
+  }
+  .gg-viewer {
+    color: #9aa0ac;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+"""
+
+
+def _tab_qs_suffix(key=None, view_as=None):
+    """&key=...&view_as=... to append to tab links, so admin key / preview
+    access carries through tab clicks. Empty for cookie-authenticated
+    tenants, since the cookie already carries automatically."""
+    suffix = ""
+    if key:
+        suffix += f"&key={urllib.parse.quote(key, safe='')}"
+    if view_as:
+        suffix += f"&view_as={urllib.parse.quote(view_as, safe='')}"
+    return suffix
+
+
+def _nav_html(active_tab, viewer_name, key=None, view_as=None):
+    suffix = _tab_qs_suffix(key, view_as)
+    intros_href = f"?tab=intros{suffix}"
+    demand_href = f"?tab=demand{suffix}"
+    intros_cls = "gg-tab active" if active_tab == "intros" else "gg-tab"
+    demand_cls = "gg-tab active" if active_tab == "demand" else "gg-tab"
+    return f"""<header class="gg-nav">
+  <div class="gg-nav-inner">
+    <div class="gg-brand">Gracia Group</div>
+    <nav class="gg-tabs">
+      <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
+      <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
+    </nav>
+    <div class="gg-viewer">{_esc(viewer_name)}</div>
+  </div>
+</header>"""
+
+
+def render_intros_page(viewer_name, key=None, view_as=None):
+    nav = _nav_html("intros", viewer_name, key=key, view_as=view_as)
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Active Intros</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0;
+    background: #14161a;
+    color: #e8eaed;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  }}
+{NAV_CSS}
+  .gg-placeholder {{
+    max-width: 1000px;
+    margin: 96px auto;
+    padding: 0 24px;
+    text-align: center;
+    color: #9aa0ac;
+    font-size: 15px;
+  }}
+</style>
+</head>
+<body>
+{nav}
+<div class="gg-placeholder">Your active introductions will appear here soon</div>
+</body>
+</html>"""
+
+
+def _message_page(title, message, show_signin=False):
+    """Standalone pre-auth / not-enabled page. Reuses the board's own dark
+    palette (not the nav's) since there's no tab shell to sit under here."""
+    signin_html = ""
+    if show_signin:
+        signin_html = (
+            f'<p><a class="gg-link" href="{SIGNIN_URL}">'
+            "Sign in via trades.graciagroup.com</a></p>"
+        )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(title)}</title>
+<style>
+  body {{
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #14161a;
+    color: #e8eaed;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    padding: 24px;
+  }}
+  .gg-card {{
+    max-width: 420px;
+    text-align: center;
+    background: #1c1f26;
+    border: 1px solid #2a2e37;
+    border-radius: 10px;
+    padding: 32px 28px;
+  }}
+  .gg-card h1 {{ font-size: 18px; margin: 0 0 12px; }}
+  .gg-card p {{ color: #9aa0ac; font-size: 14px; line-height: 1.5; margin: 0 0 8px; }}
+  .gg-link {{ color: #4f8cff; text-decoration: none; font-weight: 600; }}
+</style>
+</head>
+<body>
+  <div class="gg-card">
+    <h1>{_esc(title)}</h1>
+    <p>{_esc(message)}</p>
+    {signin_html}
+  </div>
+</body>
+</html>"""
+
+
+def render_page(table, viewer_name, key=None, view_as=None):
     rows_html = "".join(
         f'<tr><td class="company">{_esc(r["company"])}</td>'
         f'<td class="num">{r["total"]}</td>'
@@ -266,6 +547,7 @@ def render_page(table):
         f'<td class="num">{r["sellers"]}</td></tr>'
         for r in table
     )
+    nav = _nav_html("demand", viewer_name, key=key, view_as=view_as)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -273,6 +555,7 @@ def render_page(table):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Demand Board</title>
 <style>
+{NAV_CSS}
   :root {{
     --bg: #14161a;
     --card: #1c1f26;
@@ -365,6 +648,7 @@ def render_page(table):
 </style>
 </head>
 <body>
+{nav}
 <div class="wrap">
   <div class="header-row">
     <div>
@@ -372,7 +656,7 @@ def render_page(table):
       <p class="sub">{len(table)} companies with interested buyers</p>
     </div>
     <a class="feature-btn"
-       href="mailto:cgracia@graciagroup.com?subject=Syndicator%20Dashboard%20feature%20request">Request a feature</a>
+       href="mailto:cgracia@rainmakersecurities.com?subject=Syndicator%20Dashboard%20feature%20request">Request a feature</a>
   </div>
   <div class="toolbar">
     <input id="search" type="text" placeholder="Search companies...">
@@ -477,20 +761,83 @@ def _forbidden():
     }
 
 
+def _html_response(body, status=200):
+    return {
+        "statusCode": status,
+        "headers": {"Content-Type": "text/html; charset=utf-8"},
+        "body": body,
+    }
+
+
+NOT_ENABLED_MESSAGE = (
+    "This dashboard isn't enabled for your account yet — "
+    "contact cgracia@rainmakersecurities.com."
+)
+
+
 def lambda_handler(event, context):
     method = (event.get("requestContext", {}).get("http", {}).get("method")
               or event.get("httpMethod") or "GET")
     if method != "GET":
         return _forbidden()
 
-    admin_key = os.environ.get("ADMIN_KEY")
     query = event.get("queryStringParameters") or {}
-    if not admin_key or query.get("key") != admin_key:
-        return _forbidden()
+    admin_key = os.environ.get("ADMIN_KEY")
+    is_admin_key = bool(admin_key) and query.get("key") == admin_key
 
-    table = get_company_table()
-    return {
-        "statusCode": 200,
-        "headers": {"Content-Type": "text/html; charset=utf-8"},
-        "body": render_page(table),
-    }
+    # SSO handoff: verify, set the durable identity cookie, redirect to a
+    # clean URL. An invalid/expired token just falls through to normal
+    # identity resolution (e.g. an existing cookie) rather than erroring.
+    sso_token = query.get("sso")
+    if sso_token:
+        email = _verify_sso_handoff(sso_token)
+        if email:
+            location = event.get("rawPath") or "/"
+            tab = query.get("tab")
+            if tab:
+                location += f"?tab={urllib.parse.quote(tab, safe='')}"
+            return {
+                "statusCode": 302,
+                "headers": {"Location": location},
+                "cookies": [_make_identity_cookie(email)],
+                "body": "",
+            }
+
+    tab = query.get("tab") or "intros"
+    if tab not in ("intros", "demand"):
+        tab = "intros"
+
+    # view_as is admin-only: never let a non-admin request steer whose view
+    # they get.
+    view_as = (query.get("view_as") or "").strip() if is_admin_key else ""
+
+    if is_admin_key:
+        if view_as:
+            tenant = TENANTS.get(view_as.lower())
+            if not tenant:
+                return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE))
+            viewer_name = tenant["name"]
+        else:
+            viewer_name = "Admin"
+    else:
+        identity_email = _read_identity_email(event)
+        if not identity_email:
+            return _html_response(_message_page(
+                "Access denied",
+                "Sign in to view the Demand Board.",
+                show_signin=True,
+            ), 403)
+        tenant = TENANTS.get(identity_email.strip().lower())
+        if not tenant:
+            return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE))
+        viewer_name = tenant["name"]
+
+    nav_key = query.get("key") if is_admin_key else None
+    nav_view_as = view_as or None
+
+    if tab == "demand":
+        table = get_company_table()
+        body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as)
+    else:
+        body = render_intros_page(viewer_name, key=nav_key, view_as=nav_view_as)
+    return _html_response(body)
