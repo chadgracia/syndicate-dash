@@ -241,14 +241,45 @@ NATURAL_PERSON_ID = 6484810
 # org's own stage progression (see chadgracia/daily-brief's
 # TO_CLOSE_ALL_STAGES / TO_CLOSE_AGED_STAGE ordering), so they're included
 # too. Deliberately NOT excluding is_archived here (unlike the Sellers
-# column) — Active Intros' status pipeline ends in "Closed", derived from
-# is_archived when Dynamo has no item for a deal, so an archived deal must
-# stay in this set to ever reach and display that terminal status instead
-# of silently disappearing.
+# column) — Active Intros' status pipeline ends in "Closed", derived when
+# the Intro Status field (below) has no value set for a deal, so an
+# archived deal must stay in this set to ever reach and display that
+# terminal status instead of silently disappearing.
 MATCHED_OR_LATER_STAGE_IDS = {
     STAGE_MATCHED, STAGE_FIRM, STAGE_CONFIRM,
     STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
 }
+
+# Intro Status: a brand-new deal dropdown (custom_label_4008329), created
+# the same day this was written, so no repo's code can possibly reference
+# it yet — this is the first and only place it's read. Option ids given
+# directly (same trust basis as every other bare option id in this file).
+# If the deals.json snapshot hasn't picked up the field yet, or a given
+# deal simply has no value set, _deal_intro_status_id returns None for it
+# and the derived default applies — never raises, never crashes.
+INTRO_STATUS_FIELD = "custom_label_4008329"
+
+# The seven linear pipeline states share their names 1:1 with STATUS_STEPS
+# (unchanged) so the existing strip/pill widgets need no changes beyond
+# their data source. The three exit ids are rendered as chips instead —
+# never as strip/pill segments — and never appear in STATUS_STEPS/
+# STATUS_INDEX.
+INTRO_STATUS_LABELS = {
+    7207578: "Matched",
+    7207579: "Introduced",
+    7207580: "NDA Signed",
+    7207581: "VDR Link Provided",
+    7207582: "Signed Sub Docs",
+    7207583: "Wired",
+    7207587: "Closed",
+    7207584: "Stalled",
+    7207585: "Passed",
+    7207586: "Withdrawn",
+}
+INTRO_STATUS_STALLED_ID = 7207584
+INTRO_STATUS_PASSED_ID = 7207585
+INTRO_STATUS_WITHDRAWN_ID = 7207586
+EXIT_STATUS_IDS = {INTRO_STATUS_STALLED_ID, INTRO_STATUS_PASSED_ID, INTRO_STATUS_WITHDRAWN_ID}
 
 # Shared with chadgracia/trades and chadgracia/portfolio-deploy: signs both
 # the trades gg_id identity cookie and the ?sso= handoff token. Never in
@@ -815,10 +846,12 @@ def get_my_matched_buy_deals(person_id, company=None):
     return out
 
 
-# ── Intro status pipeline (DynamoDB-backed, read-only) ───────────────────
-# Table "syndicate-dash" (us-east-1): partition key "tenant" (lowercase
-# tenant email), sort key "sk" = "intro#<deal_id>", attribute "status" one
-# of the seven step names below. Read-only this step — no write path yet.
+# ── Intro status pipeline ─────────────────────────────────────────────────
+# Status source of truth is the Pipeline Intro Status deal field
+# (custom_label_4008329, above) — see _resolve_intro_status. DynamoDB
+# table "syndicate-dash" (us-east-1) is consulted only for the free-text
+# next_steps/notes attributes now, via get_intro_details; it is never
+# asked for "status" at all. Read-only this step — no write path yet.
 INTRO_TABLE = "syndicate-dash"
 INTRO_REGION = "us-east-1"
 
@@ -829,17 +862,13 @@ STATUS_STEPS = [
 STATUS_INDEX = {name: i for i, name in enumerate(STATUS_STEPS)}
 
 
-def get_intro_statuses(tenant_email):
-    """{deal_id_str: {"status", "next_steps", "notes"}} for every intro
-    item under this tenant, via a single Query on the syndicate-dash table
-    (never one GetItem per deal). "status" is the raw attribute when it's
-    one of the seven step names, else None (the derived default applies at
-    the call site); "next_steps"/"notes" pass through as-is (absent ->
-    None). Never raises: any failure (missing table, network, permissions)
-    returns ({}, True) so the caller can fall back to derived defaults and
-    show a small "live statuses unavailable" note instead of a broken
-    page. Returns (entries, dynamo_failed). Reused as-is everywhere an
-    intro's Dynamo item is needed — one Query, never a second."""
+def get_intro_details(tenant_email):
+    """{deal_id_str: {"next_steps", "notes"}} for every intro item under
+    this tenant, via a single Query on the syndicate-dash table (never one
+    GetItem per deal). Never raises: any failure (missing table, network,
+    permissions) returns ({}, True) so the caller can blank those two
+    columns and show a small note instead of a broken page. Returns
+    (entries, dynamo_failed)."""
     try:
         table = boto3.resource("dynamodb", region_name=INTRO_REGION).Table(INTRO_TABLE)
         resp = table.query(
@@ -853,9 +882,7 @@ def get_intro_statuses(tenant_email):
             deal_id = sk[len("intro#"):]
             if not deal_id:
                 continue
-            status = item.get("status")
             out[deal_id] = {
-                "status": status if status in STATUS_INDEX else None,
                 "next_steps": item.get("next_steps"),
                 "notes": item.get("notes"),
             }
@@ -865,23 +892,49 @@ def get_intro_statuses(tenant_email):
 
 
 def _default_intro_status(deal):
-    """Derived status when no Dynamo item exists for a deal: "Closed" if
-    the deal reads as won/closed in deals.json, else "Matched". No repo
-    this org's code lives in ever names an explicit "won" stage or field —
-    is_archived is the one signal already established elsewhere on this
-    page (Sellers column, Matched Buyers, Deal Card) as meaning a deal is
-    closed/dead, so it's reused here as the closest verified proxy."""
+    """Derived status when the Intro Status field is empty/absent for a
+    deal (including when the deals.json snapshot hasn't picked up the
+    brand-new field yet): "Closed" if the deal reads as won/closed, else
+    "Matched". No repo this org's code lives in ever names an explicit
+    "won" stage or field — is_archived is the one signal already
+    established elsewhere on this page (Sellers column, Matched Buyers,
+    Deal Card) as meaning a deal is closed/dead, so it's reused here as
+    the closest verified proxy."""
     return "Closed" if deal.get("is_archived") else "Matched"
 
 
-def _intro_status_for(deal, dynamo_entries):
-    entry = dynamo_entries.get(str(deal.get("id")))
-    status = entry.get("status") if entry else None
-    return status or _default_intro_status(deal)
+def _deal_intro_status_id(deal):
+    """The raw Intro Status option id from custom_label_4008329, or None
+    if empty/absent/unrecognized — including every deal, always, until the
+    field has actually been backfilled into a deals.json snapshot. Never
+    raises."""
+    status_id = next(iter(_deal_cf_option_ids(deal, INTRO_STATUS_FIELD)), None)
+    return status_id if status_id in INTRO_STATUS_LABELS else None
 
 
-def _intro_entry_for(deal, dynamo_entries):
-    return dynamo_entries.get(str(deal.get("id"))) or {}
+def _resolve_intro_status(deal):
+    """The single place every page reads a deal's intro status from.
+    Returns {"id", "name", "is_exit", "disclosed"}.
+
+    "disclosed" is the hard privacy gate: True for every status except an
+    explicit or derived Matched. That covers the six named
+    Introduced-through-Closed ids, a derived Closed (won deal), and the
+    three exit ids (Stalled/Passed/Withdrawn) — none of those are
+    "Matched" either. The instruction enumerated the six Introduced-
+    through-Closed ids explicitly and didn't say either way for the exit
+    ids; "not Matched" is what makes "Stalled stays, flagged" (a NAMED
+    row) consistent with a pending row's fixed "status: Matched" without
+    the two contradicting each other. Flag for confirmation if a deal
+    marked Stalled/Passed/Withdrawn before ever being Introduced should
+    actually still be anonymized."""
+    status_id = _deal_intro_status_id(deal)
+    name = INTRO_STATUS_LABELS[status_id] if status_id is not None else _default_intro_status(deal)
+    return {
+        "id": status_id,
+        "name": name,
+        "is_exit": status_id in EXIT_STATUS_IDS,
+        "disclosed": name != "Matched",
+    }
 
 
 def _status_strip_html(status):
@@ -900,6 +953,33 @@ def _status_strip_html(status):
 
 def _status_pill_html(status):
     return f'<span class="status-pill">{_esc(status)}</span>'
+
+
+def _status_chip_html(status_id, name):
+    """Stalled/Passed/Withdrawn — never a strip/pill segment."""
+    if status_id == INTRO_STATUS_STALLED_ID:
+        return '<span class="status-chip stalled">Stalled — needs a nudge</span>'
+    return f'<span class="status-chip exit">{_esc(name)}</span>'
+
+
+def _status_display_html(resolved, compact):
+    """compact=True -> pill (Matched Buyers/Buyers table); False -> the
+    7-segment strip (Active Intros). Exit states always render as a chip
+    regardless of compact."""
+    if resolved["is_exit"]:
+        return _status_chip_html(resolved["id"], resolved["name"])
+    if compact:
+        return _status_pill_html(resolved["name"])
+    return _status_strip_html(resolved["name"])
+
+
+def _intro_sort_rank(resolved):
+    """Furthest-along-first sort key. Stalled has no real notion of "how
+    far" a deal got before stalling, so it's ranked alongside Introduced —
+    a documented judgment call, not a verified fact."""
+    if resolved["is_exit"]:
+        return STATUS_INDEX.get("Introduced", 0)
+    return STATUS_INDEX.get(resolved["name"], 0)
 
 
 def _fmt_pct(v):
@@ -1033,34 +1113,77 @@ def _buyer_name_cell_html(buyer_recs, show_contact):
     return f'<div>{names}</div>{contact_html}'
 
 
-def _investor_type_and_company(buyer_recs):
-    """(investor_type_text, company_text) for the first linked buyer —
-    the same "first buyer" convention already used for the Entity/Natural
-    Person determination. Company is "—" for a confirmed Natural Person,
-    else that person's own company_name (blank -> "—")."""
+def _investor_type_and_company(buyer_recs, disclosed):
+    """(investor_type_text, company_text) for the first linked buyer — the
+    same "first buyer" convention already used for the Entity/Natural
+    Person determination. Investor Type isn't identity-revealing on its
+    own (entity vs. natural person, not who), so it's shown regardless of
+    disclosure. company_name IS one of the four disclosure-gated fields,
+    so it's forced to "—" whenever disclosed is False — never the real
+    value, gated or not."""
     if not buyer_recs:
         return "", "—"
     first_cf = buyer_recs[0].get("custom_fields") or {}
     transactor_ids = cf_list(first_cf, TRANSACTOR_TYPE_FIELD)
     is_natural = NATURAL_PERSON_ID in transactor_ids
     investor_type = "Natural Person" if is_natural else ""
+    if not disclosed:
+        return investor_type, "—"
     company = "—" if is_natural else (buyer_recs[0].get("company_name") or "—")
     return investor_type, company
 
 
-def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, dynamo_entries):
+def _pending_buyer_cell_html(buyer_recs, anon_key_email):
+    """The anonymized "Pending introduction" replacement for the buyer
+    name cell: each linked buyer's existing 4-char anon code, tier badge,
+    and ticket range — reusing the exact same helpers and CSS classes
+    (_anon_buyer_code, classify_person/TIER_LABELS, get_person_ticket_range/
+    _fmt_ticket_range, .buyer-code/.tier-badge/.buyer-range) as the Buyer
+    Demand tiles. No name, company, email, or phone is ever looked up or
+    written here."""
+    if not buyer_recs:
+        return "—"
+    blocks = []
+    for rec in buyer_recs:
+        pid = rec.get("id")
+        cf = rec.get("custom_fields") or {}
+        code = _anon_buyer_code(anon_key_email, pid)
+        tier = classify_person(cf)
+        tier_label = TIER_LABELS.get(tier, "Unknown")
+        min_v, max_v = get_person_ticket_range(cf)
+        range_text = _fmt_ticket_range(min_v, max_v)
+        range_html = f'<div class="buyer-range">{_esc(range_text)}</div>' if range_text else ""
+        blocks.append(
+            f'<div class="pending-buyer">'
+            f'<span class="buyer-code">Buyer {_esc(code)}</span> '
+            f'<span class="tier-badge tier-{tier}">{_esc(tier_label)}</span>'
+            f'{range_html}</div>'
+        )
+    return "".join(blocks)
+
+
+def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details, anon_key_email):
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-
-    status = _intro_status_for(deal, dynamo_entries)
-    show_contact = STATUS_INDEX.get(status, 0) >= STATUS_INDEX["Introduced"]
-
-    name_cell = _buyer_name_cell_html(buyer_recs, show_contact)
-    investor_type, company_text = _investor_type_and_company(buyer_recs)
+    resolved = _resolve_intro_status(deal)
     size_text = _esc(_deal_size_text(deal))
-    status_html = _status_pill_html(status)
 
-    entry = _intro_entry_for(deal, dynamo_entries)
+    if not resolved["disclosed"]:
+        buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
+        status_html = _status_pill_html("Matched")
+        return (
+            f'<tr class="pending-row"><td>{buyer_cell}</td>'
+            f'<td>—</td><td></td>'
+            f'<td class="num">{size_text}</td>'
+            f'<td>{status_html}</td>'
+            f'<td></td><td></td></tr>'
+        )
+
+    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True)
+    investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
+    status_html = _status_display_html(resolved, compact=True)
+
+    entry = intro_details.get(str(deal.get("id"))) or {}
     next_steps_html = _esc(entry.get("next_steps") or "")
     notes_html = _esc(entry.get("notes") or "")
 
@@ -1168,7 +1291,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True)
 </header>"""
 
 
-def _intro_row_html(deal, status, people_by_id, tenant_person_id, key=None, view_as=None):
+def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, key=None, view_as=None):
     company_name = _deal_company_name(deal)
     if company_name:
         company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
@@ -1180,12 +1303,11 @@ def _intro_row_html(deal, status, people_by_id, tenant_person_id, key=None, view
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
 
-    show_contact = STATUS_INDEX.get(status, 0) >= STATUS_INDEX["Introduced"]
-    name_cell = _buyer_name_cell_html(buyer_recs, show_contact)
-    investor_type, _company_text = _investor_type_and_company(buyer_recs)
+    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True)
+    investor_type, _company_text = _investor_type_and_company(buyer_recs, disclosed=True)
 
     size_text = _esc(_deal_size_text(deal))
-    strip = _status_strip_html(status)
+    status_html = _status_display_html(resolved, compact=False)
 
     return (
         f'<tr><td class="company">{company_cell}</td>'
@@ -1193,15 +1315,35 @@ def _intro_row_html(deal, status, people_by_id, tenant_person_id, key=None, view
         f'<td>{name_cell}</td>'
         f'<td>{_esc(investor_type)}</td>'
         f'<td class="num">{size_text}</td>'
-        f'<td>{strip}</td></tr>'
+        f'<td>{status_html}</td></tr>'
+    )
+
+
+def _pending_intro_row_html(deal, buyer_recs, anon_key_email, key=None, view_as=None):
+    company_name = _deal_company_name(deal)
+    company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
+                    f'{_esc(company_name)}</a>') if company_name else "—"
+    name = _esc(_deal_title(deal))
+    buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
+    size_text = _esc(_deal_size_text(deal))
+    status_html = _status_pill_html("Matched")
+
+    return (
+        f'<tr class="pending-row"><td class="company">{company_cell}</td>'
+        f'<td>{name}</td>'
+        f'<td>{buyer_cell}</td>'
+        f'<td></td>'
+        f'<td class="num">{size_text}</td>'
+        f'<td>{status_html}</td></tr>'
     )
 
 
 def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None):
     """tenant is None only for admin-without-view_as — the same
-    tenant-picker signal render_my_deals_page uses. Otherwise tenant_email
-    is always a real email (the logged-in tenant's own, or the previewed
-    tenant's under &view_as), used as-is as the Dynamo partition key."""
+    tenant-picker signal render_my_deals_page uses. tenant_email is always
+    a real email otherwise (the logged-in tenant's own, or the previewed
+    tenant's under &view_as), used only for the pending rows' anon buyer
+    codes now — status no longer touches Dynamo at all."""
     nav = _nav_html("intros", viewer_name, key=key, view_as=view_as)
 
     if tenant is None:
@@ -1213,25 +1355,38 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         person_id = tenant.get("person_id")
         deals = get_my_matched_buy_deals(person_id) if person_id is not None else []
 
-        dynamo_failed = False
-        if deals:
-            dynamo_statuses, dynamo_failed = get_intro_statuses(tenant_email)
-        else:
-            dynamo_statuses = {}
+        resolved_by_deal_id = {}
+        kept_deals = []
+        for d in deals:
+            resolved = _resolve_intro_status(d)
+            if resolved["name"] in ("Passed", "Withdrawn"):
+                continue
+            resolved_by_deal_id[str(d.get("id"))] = resolved
+            kept_deals.append(d)
 
         wanted_ids = set()
-        for d in deals:
+        for d in kept_deals:
             wanted_ids |= _deal_linked_person_ids(d) - {person_id}
         people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
 
-        rows = [(d, _intro_status_for(d, dynamo_statuses)) for d in deals]
-        rows.sort(key=lambda r: (-STATUS_INDEX.get(r[1], 0), (_deal_company_name(r[0]) or "").lower()))
+        main_rows, pending_rows = [], []
+        for d in kept_deals:
+            resolved = resolved_by_deal_id[str(d.get("id"))]
+            (main_rows if resolved["disclosed"] else pending_rows).append((d, resolved))
 
-        if rows:
-            rows_html = "".join(
-                _intro_row_html(d, status, people_by_id, person_id, key=key, view_as=view_as)
-                for d, status in rows
-            )
+        main_rows.sort(key=lambda dr: (-_intro_sort_rank(dr[1]), (_deal_company_name(dr[0]) or "").lower()))
+        pending_rows.sort(key=lambda dr: (_deal_company_name(dr[0]) or "").lower())
+
+        if main_rows or pending_rows:
+            parts = [_intro_row_html(d, resolved, people_by_id, person_id, key=key, view_as=view_as)
+                     for d, resolved in main_rows]
+            if main_rows and pending_rows:
+                parts.append('<tr class="pending-divider"><td colspan="6">Pending introductions</td></tr>')
+            for d, resolved in pending_rows:
+                linked = _deal_linked_person_ids(d) - {person_id}
+                buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+                parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, key=key, view_as=view_as))
+            rows_html = "".join(parts)
             table_html = f"""<div class="card">
       <table>
         <thead>
@@ -1246,9 +1401,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         else:
             table_html = '<div class="gg-placeholder">No active introductions yet.</div>'
 
-        note_html = ('<p class="gg-note">Live statuses unavailable — showing defaults.</p>'
-                     if dynamo_failed else "")
-        body_html = f"{note_html}{table_html}"
+        body_html = table_html
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1313,12 +1466,6 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     color: var(--muted);
     font-size: 15px;
   }}
-  .gg-note {{
-    max-width: 1000px;
-    margin: 0 0 16px;
-    color: var(--accredited, #c9a227);
-    font-size: 13px;
-  }}
   .status-strip {{ display: flex; align-items: center; gap: 3px; white-space: nowrap; }}
   .status-step {{
     width: 14px;
@@ -1339,6 +1486,40 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     border-radius: 999px;
     padding: 2px 8px;
     margin-left: 6px;
+  }}
+  .status-chip {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 999px;
+    padding: 3px 9px;
+  }}
+  .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #c9a227; }}
+  .status-chip.exit {{ background: rgba(255,255,255,0.06); color: var(--muted); }}
+  .buyer-code {{ font-size: 12px; font-weight: 600; color: var(--ink); }}
+  .buyer-range {{ font-size: 11px; color: var(--muted); margin-top: 2px; }}
+  .tier-badge {{
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 2px 7px;
+    border-radius: 999px;
+    color: #14161a;
+  }}
+  .tier-badge.tier-qp {{ background: var(--qp); }}
+  .tier-badge.tier-accredited {{ background: #c9a227; }}
+  .tier-badge.tier-unknown {{ background: var(--muted); }}
+  tr.pending-row {{ opacity: 0.85; }}
+  tr.pending-divider td {{
+    padding: 8px 16px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    background: rgba(255,255,255,0.02);
+    border-bottom: 1px solid var(--line);
   }}
 </style>
 </head>
@@ -1609,16 +1790,32 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 
         matched_deals = get_my_matched_buy_deals(person_id, company) if person_id is not None else []
         if matched_deals:
+            resolved_by_deal_id = {str(d.get("id")): _resolve_intro_status(d) for d in matched_deals}
             wanted_ids = set()
             for d in matched_deals:
                 wanted_ids |= _deal_linked_person_ids(d) - {person_id}
             people_by_id = get_people_by_ids(wanted_ids)
-            dynamo_entries, _ = get_intro_statuses(anon_key_email)
-            matched_rows_html = "".join(
-                _matched_buyer_row_html(d, person_id, people_by_id, dynamo_entries)
-                for d in matched_deals
-            )
-            matched_body = f"""<div class="card">
+            intro_details, dynamo_failed = get_intro_details(anon_key_email)
+
+            main_deals, pending_deals = [], []
+            for d in matched_deals:
+                resolved = resolved_by_deal_id[str(d.get("id"))]
+                (main_deals if resolved["disclosed"] else pending_deals).append(d)
+            main_deals.sort(key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
+                                            (_deal_title(d) or "").lower()))
+            pending_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
+
+            rows_parts = [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
+                          for d in main_deals]
+            if main_deals and pending_deals:
+                rows_parts.append('<tr class="pending-divider"><td colspan="7">Pending introductions</td></tr>')
+            rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
+                           for d in pending_deals]
+            matched_rows_html = "".join(rows_parts)
+
+            note_html = ('<p class="gg-note">Next steps and notes unavailable right now.</p>'
+                         if dynamo_failed else "")
+            matched_body = f"""{note_html}<div class="card">
       <table>
         <thead>
           <tr>
@@ -1631,9 +1828,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
       </table>
     </div>"""
         else:
-            matched_body = '<div class="gg-placeholder small">No matched buyers yet.</div>'
+            matched_body = '<div class="gg-placeholder small">No buyers yet.</div>'
         matched_buyers_html = f"""<section class="cd-section">
-    <h2>Matched Buyers</h2>
+    <h2>Buyers</h2>
     {matched_body}
   </section>"""
 
@@ -1834,6 +2031,30 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     background: rgba(255,255,255,0.06);
     border-radius: 999px;
     padding: 2px 8px;
+  }}
+  .status-chip {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 999px;
+    padding: 3px 9px;
+  }}
+  .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .status-chip.exit {{ background: rgba(255,255,255,0.06); color: var(--muted); }}
+  .gg-note {{
+    color: var(--accredited);
+    font-size: 13px;
+    margin: 0 0 10px;
+  }}
+  tr.pending-row {{ opacity: 0.85; }}
+  tr.pending-divider td {{
+    padding: 8px 16px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    background: rgba(255,255,255,0.02);
+    border-bottom: 1px solid var(--line);
   }}
 </style>
 </head>
