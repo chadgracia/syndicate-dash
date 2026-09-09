@@ -78,6 +78,7 @@ import time
 import urllib.parse
 from datetime import datetime, timezone
 import boto3
+from boto3.dynamodb.conditions import Key
 
 BUCKET = "full-pipeline-cache"
 PEOPLE_KEY = "people.json"
@@ -219,14 +220,18 @@ DEADLINE_FIELD = "custom_label_4006402"
 TRANSACTOR_TYPE_FIELD = "custom_label_3759163"
 NATURAL_PERSON_ID = 6484810
 
-# "Matched or later" live buy-side stages for the Matched Buyers section:
-# every known stage id (STAGE_LABELS, above) except Inquiry and Hold, per
-# instruction to include matched/firm/transfer-notice/SPA-style stages and
-# exclude inquiry/hold/lost/dead. Confirm/LOI Signed sit later than Matched
-# in this org's own stage progression (see chadgracia/daily-brief's
+# "Matched or later" buy-side stages, shared verbatim by the Matched Buyers
+# section and the Active Intros tab: every known stage id (STAGE_LABELS,
+# above) except Inquiry and Hold, per instruction to include
+# matched/firm/transfer-notice/SPA-style stages and exclude
+# inquiry/hold/lost/dead. Confirm/LOI Signed sit later than Matched in this
+# org's own stage progression (see chadgracia/daily-brief's
 # TO_CLOSE_ALL_STAGES / TO_CLOSE_AGED_STAGE ordering), so they're included
-# too. Not archived is required in addition, same as the Sellers column's
-# "live" definition.
+# too. Deliberately NOT excluding is_archived here (unlike the Sellers
+# column) — Active Intros' status pipeline ends in "Closed", derived from
+# is_archived when Dynamo has no item for a deal, so an archived deal must
+# stay in this set to ever reach and display that terminal status instead
+# of silently disappearing.
 MATCHED_OR_LATER_STAGE_IDS = {
     STAGE_MATCHED, STAGE_FIRM, STAGE_CONFIRM,
     STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
@@ -737,21 +742,100 @@ def get_my_sell_deals(person_id, company):
     return out
 
 
-def get_my_matched_buy_deals(person_id, company):
-    """The tenant's BUY deals for one company at Matched-or-later stage,
-    for the Matched Buyers section."""
-    target = company.strip().lower()
+def _is_matched_or_later_buy_deal(deal):
+    """The one shared predicate for "matched-or-later buy deal": used by
+    both the company page's Matched Buyers section and the Active Intros
+    tab, so the stage/side rules can never drift between them. is_archived
+    is intentionally not checked — see MATCHED_OR_LATER_STAGE_IDS."""
+    if _deal_stage_id(deal) not in MATCHED_OR_LATER_STAGE_IDS:
+        return False
+    return DEAL_SIDE_BUY_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+
+
+def get_my_matched_buy_deals(person_id, company=None):
+    """The tenant's BUY deals at Matched-or-later stage — every company
+    (Active Intros) when company is None, else just that one (the company
+    page's Matched Buyers section)."""
+    target = company.strip().lower() if company else None
     out = []
     for d in get_my_deals(person_id):
-        if (_deal_company_name(d) or "").strip().lower() != target:
+        if target is not None and (_deal_company_name(d) or "").strip().lower() != target:
             continue
-        if d.get("is_archived"):
-            continue
-        if _deal_stage_id(d) not in MATCHED_OR_LATER_STAGE_IDS:
-            continue
-        if DEAL_SIDE_BUY_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+        if _is_matched_or_later_buy_deal(d):
             out.append(d)
     return out
+
+
+# ── Intro status pipeline (DynamoDB-backed, read-only) ───────────────────
+# Table "syndicate-dash" (us-east-1): partition key "tenant" (lowercase
+# tenant email), sort key "sk" = "intro#<deal_id>", attribute "status" one
+# of the seven step names below. Read-only this step — no write path yet.
+INTRO_TABLE = "syndicate-dash"
+INTRO_REGION = "us-east-1"
+
+STATUS_STEPS = [
+    "Matched", "Introduced", "NDA Signed", "VDR Link Provided",
+    "Signed Sub Docs", "Wired", "Closed",
+]
+STATUS_INDEX = {name: i for i, name in enumerate(STATUS_STEPS)}
+
+
+def get_intro_statuses(tenant_email):
+    """{deal_id_str: status_name} for every intro item under this tenant,
+    via a single Query on the syndicate-dash table (never one GetItem per
+    deal). Never raises: any failure (missing table, network, permissions)
+    returns ({}, True) so the caller can fall back to derived defaults and
+    show a small "live statuses unavailable" note instead of a broken
+    page. Returns (statuses, dynamo_failed)."""
+    try:
+        table = boto3.resource("dynamodb", region_name=INTRO_REGION).Table(INTRO_TABLE)
+        resp = table.query(
+            KeyConditionExpression=Key("tenant").eq(tenant_email) & Key("sk").begins_with("intro#"),
+        )
+        out = {}
+        for item in resp.get("Items", []):
+            sk = item.get("sk") or ""
+            if not sk.startswith("intro#"):
+                continue
+            deal_id = sk[len("intro#"):]
+            status = item.get("status")
+            if deal_id and status in STATUS_INDEX:
+                out[deal_id] = status
+        return out, False
+    except Exception:
+        return {}, True
+
+
+def _default_intro_status(deal):
+    """Derived status when no Dynamo item exists for a deal: "Closed" if
+    the deal reads as won/closed in deals.json, else "Matched". No repo
+    this org's code lives in ever names an explicit "won" stage or field —
+    is_archived is the one signal already established elsewhere on this
+    page (Sellers column, Matched Buyers, Deal Card) as meaning a deal is
+    closed/dead, so it's reused here as the closest verified proxy."""
+    return "Closed" if deal.get("is_archived") else "Matched"
+
+
+def _intro_status_for(deal, dynamo_statuses):
+    return dynamo_statuses.get(str(deal.get("id"))) or _default_intro_status(deal)
+
+
+def _status_strip_html(status):
+    idx = STATUS_INDEX.get(status, 0)
+    segments = []
+    for i, step_name in enumerate(STATUS_STEPS):
+        cls = "status-step"
+        if i < idx:
+            cls += " done"
+        elif i == idx:
+            cls += " current"
+        segments.append(f'<span class="{cls}" title="{_esc(step_name)}"></span>')
+    return (f'<div class="status-strip">{"".join(segments)}'
+            f'<span class="status-label">{_esc(status)}</span></div>')
+
+
+def _status_pill_html(status):
+    return f'<span class="status-pill">{_esc(status)}</span>'
 
 
 def _fmt_pct(v):
@@ -853,7 +937,7 @@ def _deal_card_html(deal, company):
     </div>"""
 
 
-def _matched_buyer_row_html(deal, tenant_person_id, people_by_id):
+def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, dynamo_statuses):
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
 
@@ -869,12 +953,14 @@ def _matched_buyer_row_html(deal, tenant_person_id, people_by_id):
     sid = _deal_stage_id(deal)
     stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
     size_text = _esc(_deal_size_text(deal))
+    status = _intro_status_for(deal, dynamo_statuses)
+    status_html = _status_pill_html(status)
 
     return (
         f'<tr><td>{names}</td>'
         f'<td>{_esc(entity_text)}</td>'
         f'<td class="num">{size_text}</td>'
-        f'<td>{stage}</td></tr>'
+        f'<td>{stage} {status_html}</td></tr>'
     )
 
 
@@ -971,8 +1057,85 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True)
 </header>"""
 
 
-def render_intros_page(viewer_name, key=None, view_as=None):
+def _intro_row_html(deal, status, people_by_id, tenant_person_id, key=None, view_as=None):
+    company_name = _deal_company_name(deal)
+    if company_name:
+        company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
+                        f'{_esc(company_name)}</a>')
+    else:
+        company_cell = "—"
+    name = _esc(_deal_title(deal))
+
+    linked = _deal_linked_person_ids(deal) - {tenant_person_id}
+    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+    buyers = (", ".join(_esc(_person_display_name(r) or "—") for r in buyer_recs)
+              if buyer_recs else "—")
+
+    size_text = _esc(_deal_size_text(deal))
+    strip = _status_strip_html(status)
+
+    return (
+        f'<tr><td class="company">{company_cell}</td>'
+        f'<td>{name}</td>'
+        f'<td>{buyers}</td>'
+        f'<td class="num">{size_text}</td>'
+        f'<td>{strip}</td></tr>'
+    )
+
+
+def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None):
+    """tenant is None only for admin-without-view_as — the same
+    tenant-picker signal render_my_deals_page uses. Otherwise tenant_email
+    is always a real email (the logged-in tenant's own, or the previewed
+    tenant's under &view_as), used as-is as the Dynamo partition key."""
     nav = _nav_html("intros", viewer_name, key=key, view_as=view_as)
+
+    if tenant is None:
+        body_html = (
+            '<div class="gg-placeholder">Pick a tenant to preview — '
+            'add &amp;view_as=&lt;email&gt; to the URL.</div>'
+        )
+    else:
+        person_id = tenant.get("person_id")
+        deals = get_my_matched_buy_deals(person_id) if person_id is not None else []
+
+        dynamo_failed = False
+        if deals:
+            dynamo_statuses, dynamo_failed = get_intro_statuses(tenant_email)
+        else:
+            dynamo_statuses = {}
+
+        wanted_ids = set()
+        for d in deals:
+            wanted_ids |= _deal_linked_person_ids(d) - {person_id}
+        people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
+
+        rows = [(d, _intro_status_for(d, dynamo_statuses)) for d in deals]
+        rows.sort(key=lambda r: (-STATUS_INDEX.get(r[1], 0), (_deal_company_name(r[0]) or "").lower()))
+
+        if rows:
+            rows_html = "".join(
+                _intro_row_html(d, status, people_by_id, person_id, key=key, view_as=view_as)
+                for d, status in rows
+            )
+            table_html = f"""<div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Company</th><th>Deal</th><th>Buyer name(s)</th>
+            <th class="num">Size</th><th>Status</th>
+          </tr>
+        </thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </div>"""
+        else:
+            table_html = '<div class="gg-placeholder">No active introductions yet.</div>'
+
+        note_html = ('<p class="gg-note">Live statuses unavailable — showing defaults.</p>'
+                     if dynamo_failed else "")
+        body_html = f"{note_html}{table_html}"
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -981,26 +1144,96 @@ def render_intros_page(viewer_name, key=None, view_as=None):
 <title>Active Intros</title>
 <style>
   * {{ box-sizing: border-box; }}
+  :root {{
+    --bg: #14161a;
+    --card: #1c1f26;
+    --line: #2a2e37;
+    --ink: #e8eaed;
+    --muted: #9aa0ac;
+    --accent: #4f8cff;
+    --qp: #2e9d6a;
+  }}
   body {{
     margin: 0;
-    background: #14161a;
-    color: #e8eaed;
+    background: var(--bg);
+    color: var(--ink);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+    padding: 32px 24px 64px;
   }}
 {NAV_CSS}
+  .wrap {{ max-width: 1000px; margin: 0 auto; }}
+  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 24px; }}
+  .card {{
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+  }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  thead th {{
+    text-align: left;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }}
+  thead th.num, td.num {{ text-align: right; }}
+  tbody td {{
+    padding: 11px 16px;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+    vertical-align: middle;
+  }}
+  tbody tr:last-child td {{ border-bottom: none; }}
+  td.company {{ font-weight: 500; }}
+  td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
+  td.company a:hover {{ border-bottom-color: var(--muted); }}
   .gg-placeholder {{
     max-width: 1000px;
     margin: 96px auto;
     padding: 0 24px;
     text-align: center;
-    color: #9aa0ac;
+    color: var(--muted);
     font-size: 15px;
+  }}
+  .gg-note {{
+    max-width: 1000px;
+    margin: 0 0 16px;
+    color: var(--accredited, #c9a227);
+    font-size: 13px;
+  }}
+  .status-strip {{ display: flex; align-items: center; gap: 3px; white-space: nowrap; }}
+  .status-step {{
+    width: 14px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--line);
+    flex: 0 0 auto;
+  }}
+  .status-step.done {{ background: var(--qp); }}
+  .status-step.current {{ background: var(--accent); }}
+  .status-label {{ font-size: 12px; color: var(--muted); margin-left: 6px; }}
+  .status-pill {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    background: rgba(255,255,255,0.06);
+    border-radius: 999px;
+    padding: 2px 8px;
+    margin-left: 6px;
   }}
 </style>
 </head>
 <body>
 {nav}
-<div class="gg-placeholder">Your active introductions will appear here soon</div>
+<div class="wrap">
+  <h1>Active Intros</h1>
+  {body_html}
+</div>
 </body>
 </html>"""
 
@@ -1266,8 +1499,10 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             for d in matched_deals:
                 wanted_ids |= _deal_linked_person_ids(d) - {person_id}
             people_by_id = get_people_by_ids(wanted_ids)
+            dynamo_statuses, _ = get_intro_statuses(anon_key_email)
             matched_rows_html = "".join(
-                _matched_buyer_row_html(d, person_id, people_by_id) for d in matched_deals
+                _matched_buyer_row_html(d, person_id, people_by_id, dynamo_statuses)
+                for d in matched_deals
             )
             matched_body = f"""<div class="card">
       <table>
@@ -1880,5 +2115,6 @@ def lambda_handler(event, context):
             body = render_my_deals_page(viewer_name, deals=deals,
                                          key=nav_key, view_as=nav_view_as)
     else:
-        body = render_intros_page(viewer_name, key=nav_key, view_as=nav_view_as)
+        body = render_intros_page(viewer_name, tenant=tenant, tenant_email=anon_key_email,
+                                   key=nav_key, view_as=nav_view_as)
     return _html_response(body)
