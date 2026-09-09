@@ -178,6 +178,60 @@ ANON_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 REF_LABELS = {"mydeals": "My Deals", "intros": "Active Intros", "demand": "Demand Board"}
 
+FEATURE_REQUEST_EMAIL = "cgracia@rainmakersecurities.com"
+
+# Deal Card section. Agent Agreement field id, and the "Yes" option ids,
+# verified verbatim in chadgracia/daily-brief (CF_AGENT_AGREEMENT,
+# AGENT_YES_OPTS); storage shape (scalar OR list) confirmed in
+# chadgracia/deal-notifier, which explicitly branches on isinstance(...,
+# list) before comparing. The "In Process" option ids (6354283, 6354280)
+# were given directly and don't appear in any repo's code, so they're taken
+# on trust the way every other bare option id supplied this way has been.
+AGENT_AGREEMENT_FIELD = "custom_label_3714334"
+AGENT_ENGAGED_OPTS = {6354274, 6354277}       # Yes - Buyside, Yes - Sellside
+AGENT_IN_PROCESS_OPTS = {6354283, 6354280}
+
+# Fee fields verified verbatim in chadgracia/loi-sign and
+# chadgracia/deal-notifier (both define the same three field ids under the
+# same names). Partner Fee (custom_label_3940561) is deliberately never
+# read — it's excluded from the card by omission, not filtered out.
+MGMT_FEE_FIELD = "custom_label_3940558"
+CARRY_FIELD = "custom_label_3940559"
+SELLER_FEE_FIELD = "custom_label_3940560"
+
+# Deadline: no code in any repo this org has read (portfolio-deploy,
+# deal-notifier, loi-sign, web-bid, trades, daily-brief) ever touches
+# custom_label_4006402 — unlike every other field id on this page, this one
+# has no independent verification. Implemented per explicit instruction
+# (date field, slash-format dates); it degrades safely (line omitted) if
+# the field turns out to be absent or differently shaped.
+DEADLINE_FIELD = "custom_label_4006402"
+
+# Transactor Type: field id and the Natural Person option id verified
+# verbatim in both chadgracia/loi-sign and chadgracia/portfolio-deploy.
+# Neither repo (nor any other) has a label for any OTHER option on this
+# field — loi-sign's INDIVIDUAL_TYPE_IDS additionally names 6716196
+# (Employee Holder), 6892622 (Employee Holder - VIP), and 6484809
+# (Ex-Employee Holder) as individual-type ids, but without confirming
+# they should read as "Natural Person" on this page, so per instruction
+# only 6484810 is labeled and everything else — including those three —
+# is left blank.
+TRANSACTOR_TYPE_FIELD = "custom_label_3759163"
+NATURAL_PERSON_ID = 6484810
+
+# "Matched or later" live buy-side stages for the Matched Buyers section:
+# every known stage id (STAGE_LABELS, above) except Inquiry and Hold, per
+# instruction to include matched/firm/transfer-notice/SPA-style stages and
+# exclude inquiry/hold/lost/dead. Confirm/LOI Signed sit later than Matched
+# in this org's own stage progression (see chadgracia/daily-brief's
+# TO_CLOSE_ALL_STAGES / TO_CLOSE_AGED_STAGE ordering), so they're included
+# too. Not archived is required in addition, same as the Sellers column's
+# "live" definition.
+MATCHED_OR_LATER_STAGE_IDS = {
+    STAGE_MATCHED, STAGE_FIRM, STAGE_CONFIRM,
+    STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
+}
+
 # Shared with chadgracia/trades and chadgracia/portfolio-deploy: signs both
 # the trades gg_id identity cookie and the ?sso= handoff token. Never in
 # repo code.
@@ -638,6 +692,192 @@ def get_company_buyer_details(company):
     return out
 
 
+def get_people_by_ids(person_ids):
+    """{id: person record} for exactly the wanted ids, via a fresh
+    people.json fetch. Same fetch-and-discard pattern as
+    get_company_buyer_details — never cached."""
+    wanted = {str(pid) for pid in person_ids if pid is not None}
+    if not wanted:
+        return {}
+    s3 = boto3.client("s3")
+    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+    people_data = json.loads(people_obj["Body"].read())
+    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+    out = {}
+    for rec in people_list:
+        pid = rec.get("id")
+        if pid is None or str(pid) not in wanted:
+            continue
+        out[pid] = rec
+    return out
+
+
+def _person_display_name(rec):
+    """Full "First Last" name. Mirrors chadgracia/daily-brief's
+    _person_full_name (full_name/name, else first_name+last_name)."""
+    if not isinstance(rec, dict):
+        return ""
+    full = (rec.get("full_name") or rec.get("name") or "").strip()
+    if full:
+        return full
+    parts = [rec.get("first_name"), rec.get("last_name")]
+    return " ".join(p for p in parts if p).strip()
+
+
+def get_my_sell_deals(person_id, company):
+    """The tenant's SELL deals for one company, for the Deal Card
+    section."""
+    target = company.strip().lower()
+    out = []
+    for d in get_my_deals(person_id):
+        if (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            out.append(d)
+    return out
+
+
+def get_my_matched_buy_deals(person_id, company):
+    """The tenant's BUY deals for one company at Matched-or-later stage,
+    for the Matched Buyers section."""
+    target = company.strip().lower()
+    out = []
+    for d in get_my_deals(person_id):
+        if (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        if d.get("is_archived"):
+            continue
+        if _deal_stage_id(d) not in MATCHED_OR_LATER_STAGE_IDS:
+            continue
+        if DEAL_SIDE_BUY_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            out.append(d)
+    return out
+
+
+def _fmt_pct(v):
+    if v is None:
+        return None
+    return f"{v:.0f}%" if v == int(v) else f"{v:.1f}%"
+
+
+def _fmt_fees(deal):
+    """'2% mgmt · 20% carry · 4% seller fee', omitting empty parts; None if
+    all three are empty (the line is omitted entirely). Partner Fee
+    (custom_label_3940561) is never read here."""
+    mgmt = _fmt_pct(_deal_cf_number(deal, MGMT_FEE_FIELD))
+    carry = _fmt_pct(_deal_cf_number(deal, CARRY_FIELD))
+    seller = _fmt_pct(_deal_cf_number(deal, SELLER_FEE_FIELD))
+    parts = []
+    if mgmt:
+        parts.append(f"{mgmt} mgmt")
+    if carry:
+        parts.append(f"{carry} carry")
+    if seller:
+        parts.append(f"{seller} seller fee")
+    return " · ".join(parts) if parts else None
+
+
+def _deal_deadline_text(deal):
+    """Normalized deadline date, or None (line omitted) if empty/unparsable.
+    _parse_dt already handles the "YYYY/MM/DD" slash format."""
+    raw = (deal.get("custom_fields") or {}).get(DEADLINE_FIELD)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if not raw:
+        return None
+    dt = _parse_dt(raw)
+    return dt.strftime("%Y-%m-%d") if dt else str(raw)
+
+
+def _deal_size_text(deal):
+    """Ticket min/max, falling back to the deal's own 'value' field (a
+    built-in Pipeline deal attribute, not a custom_field) when both are
+    empty."""
+    ticket_max = _deal_cf_number(deal, TICKET_MAX_FIELD)
+    ticket_min = _deal_cf_number(deal, TICKET_MIN_FIELD)
+    size_val = ticket_max if ticket_max is not None else ticket_min
+    if size_val is None:
+        try:
+            size_val = float(deal.get("value"))
+        except (TypeError, ValueError):
+            size_val = None
+    return _fmt_money(size_val)
+
+
+def _engagement_badge_html(deal, company):
+    opts = _deal_cf_option_ids(deal, AGENT_AGREEMENT_FIELD)
+    if opts & AGENT_ENGAGED_OPTS:
+        return '<span class="engagement-badge engaged">&#10003; Engaged with RMS</span>'
+    if opts & AGENT_IN_PROCESS_OPTS:
+        return '<span class="engagement-badge in-process">&#8226; Engagement in process</span>'
+    subject = urllib.parse.quote(f"Engage RMS re {company}", safe="")
+    href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
+    return (f'<a class="engagement-badge not-engaged" href="{href}">'
+            '&#10007; Not engaged — contact us to activate this deal</a>')
+
+
+def _deal_card_html(deal, company):
+    name = _esc(_deal_title(deal))
+    sid = _deal_stage_id(deal)
+    stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
+    size_text = _esc(_deal_size_text(deal))
+    gross_text = _esc(_fmt_money(_deal_cf_number(deal, GROSS_FIELD)))
+
+    struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
+    layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
+    struct_parts = [p for p in (struct_label, layer_label) if p]
+    structure_text = _esc(" · ".join(struct_parts)) if struct_parts else "—"
+
+    deadline = _deal_deadline_text(deal)
+    deadline_html = (f'<div class="dc-line">Deadline: {_esc(deadline)}</div>'
+                      if deadline else "")
+
+    fees = _fmt_fees(deal)
+    fees_html = f'<div class="dc-line">{_esc(fees)}</div>' if fees else ""
+
+    badge_html = _engagement_badge_html(deal, company)
+
+    return f"""<div class="deal-card">
+      <div class="deal-card-head">
+        <div class="deal-card-title">{name}</div>
+        <div class="deal-card-stage">{stage}</div>
+      </div>
+      <div class="deal-card-metrics">
+        <div><span class="dc-label">Size</span><span class="dc-value">{size_text}</span></div>
+        <div><span class="dc-label">Gross</span><span class="dc-value">{gross_text}</span></div>
+        <div><span class="dc-label">Structure</span><span class="dc-value">{structure_text}</span></div>
+      </div>
+      {deadline_html}
+      {fees_html}
+      {badge_html}
+    </div>"""
+
+
+def _matched_buyer_row_html(deal, tenant_person_id, people_by_id):
+    linked = _deal_linked_person_ids(deal) - {tenant_person_id}
+    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+
+    if buyer_recs:
+        names = ", ".join(_esc(_person_display_name(r) or "—") for r in buyer_recs)
+        first_cf = buyer_recs[0].get("custom_fields") or {}
+        transactor_ids = cf_list(first_cf, TRANSACTOR_TYPE_FIELD)
+        entity_text = "Natural Person" if NATURAL_PERSON_ID in transactor_ids else ""
+    else:
+        names = "—"
+        entity_text = ""
+
+    sid = _deal_stage_id(deal)
+    stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
+    size_text = _esc(_deal_size_text(deal))
+
+    return (
+        f'<tr><td>{names}</td>'
+        f'<td>{_esc(entity_text)}</td>'
+        f'<td class="num">{size_text}</td>'
+        f'<td>{stage}</td></tr>'
+    )
+
+
 # ── Nav shell: header bar + tabs, shared by every authenticated page ────────
 # Palette lifted verbatim from the shared trades/portfolio-deploy design
 # (portfolio-deploy/lambda_function.py :root — --ink #16181d, --bg #f4f2ee,
@@ -807,50 +1047,6 @@ def _my_deal_row_html(deal, key=None, view_as=None):
         f'<td>{stage}</td>'
         f'<td class="num" data-sort="{size_val if size_val is not None else -1}">{size_text}</td>'
         f'<td class="num" data-sort="{gross_val if gross_val is not None else -1}">{gross_text}</td>'
-        f'<td>{structure}</td>'
-        f'<td>{updated}</td></tr>'
-    )
-
-
-def _your_deal_row_html(deal):
-    """Same fields as _my_deal_row_html, minus the Company column — used on
-    the company detail page, where the section is already scoped to one
-    company. A standalone copy rather than a shared helper, so editing it
-    can never change the My Deals tab's own output."""
-    name = _esc(_deal_title(deal))
-
-    side_ids = _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
-    if DEAL_SIDE_SELL_ID in side_ids:
-        side = "Sell"
-    elif DEAL_SIDE_BUY_ID in side_ids:
-        side = "Buy"
-    else:
-        side = "—"
-
-    sid = _deal_stage_id(deal)
-    stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
-
-    ticket_max = _deal_cf_number(deal, TICKET_MAX_FIELD)
-    ticket_min = _deal_cf_number(deal, TICKET_MIN_FIELD)
-    size_val = ticket_max if ticket_max is not None else ticket_min
-    size_text = _fmt_money(size_val)
-
-    gross_val = _deal_cf_number(deal, GROSS_FIELD)
-    gross_text = _fmt_money(gross_val)
-
-    struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
-    layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
-    parts = [p for p in (struct_label, layer_label) if p]
-    structure = _esc(" · ".join(parts)) if parts else "—"
-
-    updated = _esc((deal.get("updated_at") or "")[:10] or "—")
-
-    return (
-        f'<tr><td>{name}</td>'
-        f'<td>{side}</td>'
-        f'<td>{stage}</td>'
-        f'<td class="num">{size_text}</td>'
-        f'<td class="num">{gross_text}</td>'
         f'<td>{structure}</td>'
         f'<td>{updated}</td></tr>'
     )
@@ -1050,32 +1246,45 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     back_label = REF_LABELS.get(ref, "My Deals")
 
     your_deals_html = ""
+    matched_buyers_html = ""
     if tenant is not None:
         person_id = tenant.get("person_id")
-        target = company.strip().lower()
-        rows = []
-        if person_id is not None:
-            rows = [d for d in get_my_deals(person_id)
-                    if (_deal_company_name(d) or "").strip().lower() == target]
-        if rows:
-            deals_rows_html = "".join(_your_deal_row_html(d) for d in rows)
-            deals_body = f"""<div class="card">
-      <table>
-        <thead>
-          <tr>
-            <th>Deal</th><th>Buy/Sell</th><th>Stage</th>
-            <th class="num">Size</th><th class="num">Gross price</th>
-            <th>Structure/Layers</th><th>Last updated</th>
-          </tr>
-        </thead>
-        <tbody>{deals_rows_html}</tbody>
-      </table>
-    </div>"""
+
+        sell_deals = get_my_sell_deals(person_id, company) if person_id is not None else []
+        if sell_deals:
+            deals_body = "".join(_deal_card_html(d, company) for d in sell_deals)
         else:
             deals_body = '<div class="gg-placeholder small">No deals with this company yet.</div>'
         your_deals_html = f"""<section class="cd-section">
     <h2>Your Deals</h2>
     {deals_body}
+  </section>"""
+
+        matched_deals = get_my_matched_buy_deals(person_id, company) if person_id is not None else []
+        if matched_deals:
+            wanted_ids = set()
+            for d in matched_deals:
+                wanted_ids |= _deal_linked_person_ids(d) - {person_id}
+            people_by_id = get_people_by_ids(wanted_ids)
+            matched_rows_html = "".join(
+                _matched_buyer_row_html(d, person_id, people_by_id) for d in matched_deals
+            )
+            matched_body = f"""<div class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>Buyer name</th><th>Entity/Natural person</th>
+            <th class="num">Size</th><th>Stage</th>
+          </tr>
+        </thead>
+        <tbody>{matched_rows_html}</tbody>
+      </table>
+    </div>"""
+        else:
+            matched_body = '<div class="gg-placeholder small">No matched buyers yet.</div>'
+        matched_buyers_html = f"""<section class="cd-section">
+    <h2>Matched Buyers</h2>
+    {matched_body}
   </section>"""
 
     buyers = get_company_buyer_details(company)
@@ -1213,6 +1422,59 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .tier-badge.tier-accredited {{ background: var(--accredited); }}
   .tier-badge.tier-unknown {{ background: var(--unknown); color: var(--ink); }}
   .buyer-range {{ font-size: 12px; color: var(--muted); }}
+  .deal-card {{
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px 18px;
+    margin-bottom: 12px;
+  }}
+  .deal-card:last-child {{ margin-bottom: 0; }}
+  .deal-card-head {{
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+  }}
+  .deal-card-title {{ font-size: 15px; font-weight: 600; }}
+  .deal-card-stage {{
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--muted);
+    white-space: nowrap;
+  }}
+  .deal-card-metrics {{
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+    margin-bottom: 8px;
+  }}
+  .dc-label {{
+    display: block;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--muted);
+    margin-bottom: 2px;
+  }}
+  .dc-value {{ font-size: 14px; font-weight: 500; }}
+  .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
+  .engagement-badge {{
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 999px;
+    margin-top: 6px;
+    text-decoration: none;
+  }}
+  .engagement-badge.engaged {{ background: rgba(46,157,106,0.15); color: var(--qp); }}
+  .engagement-badge.in-process {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .engagement-badge.not-engaged {{ background: rgba(220,80,80,0.15); color: #e06666; }}
+  .engagement-badge.not-engaged:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
@@ -1221,6 +1483,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   <a class="cd-back" href="{back_href}">&larr; Back to {_esc(back_label)}</a>
   <h1>{_esc(company)}</h1>
   {your_deals_html}
+  {matched_buyers_html}
   <section class="cd-section">
     <h2>Buyer Demand</h2>
     {buyer_demand_body}
