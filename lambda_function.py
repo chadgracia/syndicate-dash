@@ -1348,43 +1348,72 @@ def _intro_status_select_html(deal_id, current_id):
         selected = " selected" if oid == current_id else ""
         options.append(f'<option value="{oid}"{selected}>{_esc(label)}</option>')
     return (f'<select class="ei-status" data-deal-id="{_esc(deal_id)}">'
-            f'{"".join(options)}</select>')
+            f'{"".join(options)}</select><span class="ei-msg"></span>')
+
+
+def _ei_field_html(css_class, deal_id, field, value):
+    """An auto-saving text input: saved on blur or Enter (see
+    _edit_script_html), with its own inline .ei-msg indicator right
+    beside it — no Save button anywhere."""
+    return (f'<input type="text" class="{css_class}" data-deal-id="{_esc(deal_id)}" '
+            f'data-field="{field}" maxlength="2000" value="{value}">'
+            f'<span class="ei-msg"></span>')
 
 
 def _edit_script_html(key):
-    """Plain HTML+fetch(), no frameworks. One shared script, included on
-    both Active Intros and the Buyers table when edit_mode is on."""
+    """Plain HTML+fetch(), no frameworks, no Save button: the Status
+    dropdown posts on change; Next Steps / Buyer Notes post on blur or
+    Enter (Enter just blurs, so there's one save path, not two). Each
+    control's own .ei-msg (its very next sibling) shows "Saving…", then
+    either "Saved ✓" (fades after 2s) or the returned error text in red
+    (stays). One shared script, included on both Active Intros and the
+    Buyers table when edit_mode is on."""
     admin_key_json = json.dumps(key or "")
     return f"""<script>
 (function() {{
   var ADMIN_KEY = {admin_key_json};
-  document.querySelectorAll('.ei-save').forEach(function(btn) {{
-    btn.addEventListener('click', function() {{
-      var tr = btn.closest('tr');
-      var dealId = btn.getAttribute('data-deal-id');
-      var statusEl = tr.querySelector('.ei-status');
-      var nextStepsEl = tr.querySelector('.ei-next-steps');
-      var notesEl = tr.querySelector('.ei-notes');
-      var msgEl = tr.querySelector('.ei-status-msg');
-      var payload = {{ key: ADMIN_KEY, deal_id: dealId }};
-      if (statusEl) payload.status = statusEl.value;
-      if (nextStepsEl) payload.next_steps = nextStepsEl.value;
-      if (notesEl) payload.notes = notesEl.value;
-      btn.disabled = true;
-      if (msgEl) msgEl.textContent = 'Saving…';
-      fetch('?action=update_intro', {{
-        method: 'POST',
-        headers: {{ 'Content-Type': 'application/json' }},
-        body: JSON.stringify(payload)
-      }}).then(function(r) {{
-        return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }});
-      }}).then(function(res) {{
-        btn.disabled = false;
-        if (msgEl) msgEl.textContent = res.ok ? 'Saved' : ('Error: ' + (res.data.error || 'unknown'));
-      }}).catch(function(err) {{
-        btn.disabled = false;
-        if (msgEl) msgEl.textContent = 'Error: ' + err;
-      }});
+
+  function saveField(el, field) {{
+    var dealId = el.getAttribute('data-deal-id');
+    var msgEl = el.nextElementSibling;
+    var payload = {{ key: ADMIN_KEY, deal_id: dealId }};
+    payload[field] = el.value;
+    if (msgEl) {{ msgEl.className = 'ei-msg saving'; msgEl.textContent = 'Saving…'; }}
+    fetch('?action=update_intro', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(payload)
+    }}).then(function(r) {{
+      return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }});
+    }}).then(function(res) {{
+      if (!msgEl) return;
+      if (res.ok) {{
+        msgEl.className = 'ei-msg saved';
+        msgEl.textContent = 'Saved ✓';
+        setTimeout(function() {{
+          msgEl.className = 'ei-msg';
+          msgEl.textContent = '';
+        }}, 2000);
+      }} else {{
+        msgEl.className = 'ei-msg error';
+        msgEl.textContent = (res.data && res.data.error) || 'Error';
+      }}
+    }}).catch(function(err) {{
+      if (msgEl) {{
+        msgEl.className = 'ei-msg error';
+        msgEl.textContent = 'Error: ' + err;
+      }}
+    }});
+  }}
+
+  document.querySelectorAll('.ei-status').forEach(function(el) {{
+    el.addEventListener('change', function() {{ saveField(el, 'status'); }});
+  }});
+  document.querySelectorAll('.ei-next-steps, .ei-notes').forEach(function(el) {{
+    var field = el.getAttribute('data-field');
+    el.addEventListener('blur', function() {{ saveField(el, field); }});
+    el.addEventListener('keydown', function(e) {{
+      if (e.key === 'Enter') {{ e.preventDefault(); el.blur(); }}
     }});
   }});
 }})();
@@ -1407,19 +1436,17 @@ def _matched_buyer_row_edit_html(deal, tenant_person_id, people_by_id, intro_det
     investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
     size_text = _esc(_deal_size_text(deal))
     select_html = _intro_status_select_html(deal_id, resolved["id"])
-    next_steps_val = _esc(entry.get("next_steps") or "")
-    notes_val = _esc(entry.get("notes") or "")
+    next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""))
+    notes_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(entry.get("notes") or ""))
 
     return (
-        f'<tr data-deal-id="{_esc(deal_id)}"><td>{name_cell}</td>'
+        f'<tr><td>{name_cell}</td>'
         f'<td>{_esc(company_text)}</td>'
         f'<td>{_esc(investor_type)}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{select_html}</td>'
-        f'<td><input type="text" class="ei-next-steps" maxlength="2000" value="{next_steps_val}"></td>'
-        f'<td><input type="text" class="ei-notes" maxlength="2000" value="{notes_val}"></td>'
-        f'<td><button type="button" class="ei-save" data-deal-id="{_esc(deal_id)}">Save</button>'
-        f'<span class="ei-status-msg"></span></td></tr>'
+        f'<td>{next_steps_html}</td>'
+        f'<td>{notes_html}</td></tr>'
     )
 
 
@@ -1516,6 +1543,14 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True)
 </header>"""
 
 
+def _group_header_row_html(label, colspan):
+    return f'<tr class="group-divider"><td colspan="{colspan}">{_esc(label)}</td></tr>'
+
+
+def _group_empty_row_html(message, colspan):
+    return f'<tr><td colspan="{colspan}" class="group-empty">{_esc(message)}</td></tr>'
+
+
 def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, key=None, view_as=None):
     company_name = _deal_company_name(deal)
     if company_name:
@@ -1566,8 +1601,8 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, key=None, view_as=
 def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, key=None, view_as=None):
     """Admin edit-mode row for Active Intros: always the real buyer(s),
     always the true current status (Matched included) via a dropdown of
-    all ten options, plus Next Steps / Buyer Notes inputs and a Save
-    button — mirrors _matched_buyer_row_edit_html's rationale exactly."""
+    all ten options, plus auto-saving Next Steps / Buyer Notes inputs —
+    mirrors _matched_buyer_row_edit_html's rationale exactly."""
     deal_id = str(deal.get("id"))
     entry = intro_details.get(deal_id) or {}
     resolved = _resolve_intro_status(deal, entry)
@@ -1584,20 +1619,18 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
 
     size_text = _esc(_deal_size_text(deal))
     select_html = _intro_status_select_html(deal_id, resolved["id"])
-    next_steps_val = _esc(entry.get("next_steps") or "")
-    notes_val = _esc(entry.get("notes") or "")
+    next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""))
+    notes_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(entry.get("notes") or ""))
 
     return (
-        f'<tr data-deal-id="{_esc(deal_id)}"><td class="company">{company_cell}</td>'
+        f'<tr><td class="company">{company_cell}</td>'
         f'<td>{name}</td>'
         f'<td>{name_cell}</td>'
         f'<td>{_esc(investor_type)}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{select_html}</td>'
-        f'<td><input type="text" class="ei-next-steps" maxlength="2000" value="{next_steps_val}"></td>'
-        f'<td><input type="text" class="ei-notes" maxlength="2000" value="{notes_val}"></td>'
-        f'<td><button type="button" class="ei-save" data-deal-id="{_esc(deal_id)}">Save</button>'
-        f'<span class="ei-status-msg"></span></td></tr>'
+        f'<td>{next_steps_html}</td>'
+        f'<td>{notes_html}</td></tr>'
     )
 
 
@@ -1640,40 +1673,52 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         note_html = ('<p class="gg-note">Status overrides unavailable — showing Pipeline values.</p>'
                      if dynamo_failed else "")
 
+        main_rows, pending_rows = [], []
+        for d in kept_deals:
+            resolved = resolved_by_deal_id[str(d.get("id"))]
+            (main_rows if resolved["disclosed"] else pending_rows).append((d, resolved))
+        main_rows.sort(key=lambda dr: (-_intro_sort_rank(dr[1]), (_deal_company_name(dr[0]) or "").lower()))
+        pending_rows.sort(key=lambda dr: (_deal_company_name(dr[0]) or "").lower())
+
         if edit_mode:
-            sorted_deals = sorted(kept_deals,
-                                   key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
-                                                   (_deal_company_name(d) or "").lower()))
-            rows_html = "".join(
-                _intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key, view_as=view_as)
-                for d in sorted_deals
-            )
+            colspan = 8
             head_row = ('<th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>'
                         '<th class="num">Size</th><th>Status</th>'
-                        '<th>Next Steps</th><th>Buyer Notes</th><th></th>')
+                        '<th>Next Steps</th><th>Buyer Notes</th>')
         else:
-            main_rows, pending_rows = [], []
-            for d in kept_deals:
-                resolved = resolved_by_deal_id[str(d.get("id"))]
-                (main_rows if resolved["disclosed"] else pending_rows).append((d, resolved))
-
-            main_rows.sort(key=lambda dr: (-_intro_sort_rank(dr[1]), (_deal_company_name(dr[0]) or "").lower()))
-            pending_rows.sort(key=lambda dr: (_deal_company_name(dr[0]) or "").lower())
-
-            parts = [_intro_row_html(d, resolved, people_by_id, person_id, key=key, view_as=view_as)
-                     for d, resolved in main_rows]
-            if main_rows and pending_rows:
-                parts.append('<tr class="pending-divider"><td colspan="6">Pending introductions</td></tr>')
-            for d, resolved in pending_rows:
-                linked = _deal_linked_person_ids(d) - {person_id}
-                buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-                parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, key=key, view_as=view_as))
-            rows_html = "".join(parts)
+            colspan = 6
             head_row = ('<th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>'
                         '<th class="num">Size</th><th>Status</th>')
 
-        if kept_deals:
-            table_html = f"""<div class="card">
+        # "Introduced" always renders — even with zero rows — per instruction;
+        # "Pending introductions" only when there's something pending.
+        parts = [_group_header_row_html("Introduced", colspan)]
+        if main_rows:
+            if edit_mode:
+                parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key, view_as=view_as)
+                          for d, _ in main_rows]
+            else:
+                parts += [_intro_row_html(d, resolved, people_by_id, person_id, key=key, view_as=view_as)
+                          for d, resolved in main_rows]
+        else:
+            parts.append(_group_empty_row_html("No introductions yet on this deal.", colspan))
+
+        if pending_rows:
+            parts.append(_group_header_row_html("Pending introductions", colspan))
+            if edit_mode:
+                # Edit mode never anonymizes — the admin sees and edits the
+                # real buyer regardless of pending/disclosed.
+                parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key, view_as=view_as)
+                          for d, _ in pending_rows]
+            else:
+                for d, resolved in pending_rows:
+                    linked = _deal_linked_person_ids(d) - {person_id}
+                    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+                    parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, key=key, view_as=view_as))
+
+        rows_html = "".join(parts)
+        table_html = f"""<div class="card">
+      <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -1682,9 +1727,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         </thead>
         <tbody>{rows_html}</tbody>
       </table>
+      </div>
     </div>"""
-        else:
-            table_html = '<div class="gg-placeholder">No active introductions yet.</div>'
 
         edit_script = _edit_script_html(key) if edit_mode else ""
         body_html = f"{note_html}{table_html}{edit_script}"
@@ -1798,7 +1842,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--muted); }}
   tr.pending-row {{ opacity: 0.85; }}
-  tr.pending-divider td {{
+  tr.group-divider td {{
     padding: 8px 16px;
     font-size: 11px;
     text-transform: uppercase;
@@ -1807,6 +1851,13 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     background: rgba(255,255,255,0.02);
     border-bottom: 1px solid var(--line);
   }}
+  td.group-empty {{
+    padding: 16px;
+    color: var(--muted);
+    font-size: 13px;
+    font-style: italic;
+  }}
+  .table-scroll {{ overflow-x: auto; }}
   .gg-note {{
     color: var(--accredited, #c9a227);
     font-size: 13px;
@@ -1821,18 +1872,10 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     font-size: 13px;
   }}
   .ei-next-steps, .ei-notes {{ width: 140px; }}
-  .ei-save {{
-    background: var(--accent);
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-  }}
-  .ei-save:disabled {{ opacity: 0.6; cursor: default; }}
-  .ei-status-msg {{ font-size: 11px; color: var(--muted); margin-left: 6px; }}
+  .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
+  .ei-msg.saving {{ color: var(--muted); }}
+  .ei-msg.saved {{ color: var(--qp); }}
+  .ei-msg.error {{ color: #e06666; }}
 </style>
 </head>
 <body>
@@ -2105,50 +2148,57 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   </section>"""
 
         matched_deals = get_my_matched_buy_deals(person_id, company) if person_id is not None else []
-        if matched_deals:
-            wanted_ids = set()
-            for d in matched_deals:
-                wanted_ids |= _deal_linked_person_ids(d) - {person_id}
-            people_by_id = get_people_by_ids(wanted_ids)
-            intro_details, dynamo_failed = get_intro_details(anon_key_email)
-            resolved_by_deal_id = {str(d.get("id")): _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
-                                    for d in matched_deals}
+        wanted_ids = set()
+        for d in matched_deals:
+            wanted_ids |= _deal_linked_person_ids(d) - {person_id}
+        people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
+        intro_details, dynamo_failed = get_intro_details(anon_key_email) if matched_deals else ({}, False)
+        resolved_by_deal_id = {str(d.get("id")): _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
+                                for d in matched_deals}
 
-            note_html = ('<p class="gg-note">Next steps and notes unavailable right now.</p>'
-                         if dynamo_failed else "")
+        note_html = ('<p class="gg-note">Next steps and notes unavailable right now.</p>'
+                     if dynamo_failed else "")
 
+        main_deals, pending_deals = [], []
+        for d in matched_deals:
+            resolved = resolved_by_deal_id[str(d.get("id"))]
+            (main_deals if resolved["disclosed"] else pending_deals).append(d)
+        main_deals.sort(key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
+                                        (_deal_title(d) or "").lower()))
+        pending_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
+
+        colspan = 7
+        head_row = ('<th>Buyer name</th><th>Company</th><th>Investor Type</th>'
+                    '<th class="num">Size</th><th>Status</th>'
+                    '<th>Next Steps</th><th>Buyer Notes</th>')
+
+        # "Introduced" always renders — even with zero rows — per instruction;
+        # "Pending introductions" only when there's something pending.
+        rows_parts = [_group_header_row_html("Introduced", colspan)]
+        if main_deals:
             if edit_mode:
-                sorted_deals = sorted(matched_deals,
-                                       key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
-                                                       (_deal_title(d) or "").lower()))
-                matched_rows_html = "".join(
-                    _matched_buyer_row_edit_html(d, person_id, people_by_id, intro_details)
-                    for d in sorted_deals
-                )
-                head_row = ('<th>Buyer name</th><th>Company</th><th>Investor Type</th>'
-                            '<th class="num">Size</th><th>Status</th>'
-                            '<th>Next Steps</th><th>Buyer Notes</th><th></th>')
+                rows_parts += [_matched_buyer_row_edit_html(d, person_id, people_by_id, intro_details)
+                               for d in main_deals]
             else:
-                main_deals, pending_deals = [], []
-                for d in matched_deals:
-                    resolved = resolved_by_deal_id[str(d.get("id"))]
-                    (main_deals if resolved["disclosed"] else pending_deals).append(d)
-                main_deals.sort(key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
-                                                (_deal_title(d) or "").lower()))
-                pending_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
+                rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
+                               for d in main_deals]
+        else:
+            rows_parts.append(_group_empty_row_html("No introductions yet on this deal.", colspan))
 
-                rows_parts = [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
-                              for d in main_deals]
-                if main_deals and pending_deals:
-                    rows_parts.append('<tr class="pending-divider"><td colspan="7">Pending introductions</td></tr>')
+        if pending_deals:
+            rows_parts.append(_group_header_row_html("Pending introductions", colspan))
+            if edit_mode:
+                # Edit mode never anonymizes — the admin sees and edits the
+                # real buyer regardless of pending/disclosed.
+                rows_parts += [_matched_buyer_row_edit_html(d, person_id, people_by_id, intro_details)
+                               for d in pending_deals]
+            else:
                 rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
                                for d in pending_deals]
-                matched_rows_html = "".join(rows_parts)
-                head_row = ('<th>Buyer name</th><th>Company</th><th>Investor Type</th>'
-                            '<th class="num">Size</th><th>Status</th>'
-                            '<th>Next Steps</th><th>Buyer Notes</th>')
 
-            matched_body = f"""{note_html}<div class="card">
+        matched_rows_html = "".join(rows_parts)
+        matched_body = f"""{note_html}<div class="card">
+      <div class="table-scroll">
       <table>
         <thead>
           <tr>
@@ -2157,9 +2207,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         </thead>
         <tbody>{matched_rows_html}</tbody>
       </table>
+      </div>
     </div>"""
-        else:
-            matched_body = '<div class="gg-placeholder small">No buyers yet.</div>'
         edit_script = _edit_script_html(key) if edit_mode else ""
         matched_buyers_html = f"""<section class="cd-section">
     <h2>Buyers</h2>
@@ -2380,7 +2429,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     margin: 0 0 10px;
   }}
   tr.pending-row {{ opacity: 0.85; }}
-  tr.pending-divider td {{
+  tr.group-divider td {{
     padding: 8px 16px;
     font-size: 11px;
     text-transform: uppercase;
@@ -2389,6 +2438,13 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     background: rgba(255,255,255,0.02);
     border-bottom: 1px solid var(--line);
   }}
+  td.group-empty {{
+    padding: 16px;
+    color: var(--muted);
+    font-size: 13px;
+    font-style: italic;
+  }}
+  .table-scroll {{ overflow-x: auto; }}
   .ei-status, .ei-next-steps, .ei-notes {{
     background: var(--bg);
     border: 1px solid var(--line);
@@ -2398,18 +2454,10 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     font-size: 13px;
   }}
   .ei-next-steps, .ei-notes {{ width: 140px; }}
-  .ei-save {{
-    background: var(--accent);
-    color: #fff;
-    border: none;
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 12px;
-    font-weight: 600;
-    cursor: pointer;
-  }}
-  .ei-save:disabled {{ opacity: 0.6; cursor: default; }}
-  .ei-status-msg {{ font-size: 11px; color: var(--muted); margin-left: 6px; }}
+  .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
+  .ei-msg.saving {{ color: var(--muted); }}
+  .ei-msg.saved {{ color: var(--qp); }}
+  .ei-msg.error {{ color: #e06666; }}
 </style>
 </head>
 <body>
