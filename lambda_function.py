@@ -11,6 +11,20 @@ Data sources (S3 full-pipeline-cache), read fresh on every request:
   - interest_people.json  -> {"buy": {company_name: [person_id, ...]}, "last_updated": ...}
                               (see chadgracia/portfolio-deploy and chadgracia/web-bid
                               lambda_function.py, both read this exact shape)
+  - deals.json             -> {"deals": [ {..., "custom_fields": {...}, "deal_stage": {...},
+                              "company": {...}, "is_archived": ...}, ... ]}
+                              (see chadgracia/daily-brief/lambda_function.py, which reads
+                              this exact shape and enumerates the stage id/label constants
+                              used below)
+
+Excluded companies: EXCLUDED_COMPANIES (below) is filtered out of the board,
+case-insensitive. Edited manually.
+
+Sellers column: count of each company's live sell-side deals in deals.json —
+custom_label_1958 (deal side) contains option 5011675 (Sell), and deal_stage
+is one of LIVE_SELL_STAGE_IDS (verbatim from chadgracia/daily-brief's stage
+constants: Firm, Matched, Inquiry, Hold, Confirm, LOI Signed, Transfer
+Notice, SPA Signed), and the deal is not archived.
 
 portfolio-deploy/build_people_index.py's people_index.json only carries
 email/first_name/name (no custom_fields), so it can't be used for tiering —
@@ -23,9 +37,9 @@ chadgracia/loi-sign (QP) and chadgracia/portfolio-deploy (IQF):
                 6496840 (Yes) or 6596073 (Unnecessary)
   - Unknown:    everyone else (including buyer IDs missing from people.json)
 
-Caching: S3 is checked fresh on every request via a cheap head_object on both
-files. The (expensive) 113MB people.json parse only happens again when either
-file's LastModified changes; only the small computed per-company table is
+Caching: S3 is checked fresh on every request via a cheap head_object on all
+three files. The (expensive) 113MB people.json parse only happens again when
+any file's LastModified changes; only the small computed per-company table is
 kept in the module-level cache between invocations, never the parsed people
 list.
 
@@ -41,11 +55,45 @@ import boto3
 BUCKET = "full-pipeline-cache"
 PEOPLE_KEY = "people.json"
 INTEREST_KEY = "interest_people.json"
+DEALS_KEY = "deals.json"
 
 INVESTOR_LEVEL_FIELD = "custom_label_3923758"
 QP_ID = 6950564
 IQF_FIELD = "custom_label_3763008"
 IQF_OK_IDS = {6496840, 6596073}
+
+# Companies filtered out of the board entirely, case-insensitive. Edit this
+# set by hand as needed — no other code changes required.
+EXCLUDED_COMPANIES = {
+    "Flexport", "Zipline", "Kraken", "Eat Just", "Thrasio", "Indigo", "Oyo", "Headspace",
+}
+_EXCLUDED_COMPANIES_LOWER = {c.lower() for c in EXCLUDED_COMPANIES}
+
+# Deal side (custom_label_1958) option id for "Sell", and the deal_stage ids
+# that represent live (pre-close) sell-side pipeline activity. Field id, the
+# Sell option id, and every stage id/label below are verbatim from
+# chadgracia/daily-brief/lambda_function.py, which reads deals.json in
+# production. There may be additional stage ids present in deals.json (e.g.
+# closed-won/closed-lost) that no Lambda in this org has needed to name yet;
+# this list is a whitelist of only the known live stages, so an unrecognized
+# stage is excluded by default rather than risking a won/lost/dead stage
+# being counted as a live seller.
+DEAL_SIDE_FIELD = "custom_label_1958"
+DEAL_SIDE_SELL_ID = 5011675
+
+STAGE_FIRM = 111800
+STAGE_MATCHED = 2381534
+STAGE_INQUIRY = 2109142
+STAGE_HOLD = 2094373
+STAGE_CONFIRM = 2388323
+STAGE_LOI_SIGNED = 2517909
+STAGE_TRANSFER_NOTICE = 2533998
+STAGE_SPA_SIGNED = 2381535
+
+LIVE_SELL_STAGE_IDS = {
+    STAGE_FIRM, STAGE_MATCHED, STAGE_INQUIRY, STAGE_HOLD,
+    STAGE_CONFIRM, STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
+}
 
 # Module-level cache: survives warm Lambda invocations, reset on cold start.
 _cache = {"version": None, "table": None}
@@ -80,6 +128,60 @@ def classify_person(cf):
     return "unknown"
 
 
+def _deal_cf_option_ids(deal, key):
+    """Normalize a deals.json custom_field value to a set of option ids.
+    Ported verbatim (algorithm only) from chadgracia/daily-brief's
+    _cf_option_ids: deal custom_fields may hold a scalar, a dict
+    ({"option_id"/"id"/"value": ...}), or a list mixing either — unlike
+    people.json's custom_fields, which cf_list() above already handles as
+    plain ints/lists of ints."""
+    v = (deal.get("custom_fields") or {}).get(key)
+    if v is None:
+        return set()
+    items = v if isinstance(v, list) else [v]
+    out = set()
+    for item in items:
+        if isinstance(item, dict):
+            raw = item.get("option_id") or item.get("id") or item.get("value")
+        else:
+            raw = item
+        if raw is None:
+            continue
+        try:
+            out.add(int(raw))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _deal_stage_id(deal):
+    stage = deal.get("deal_stage") or {}
+    sid = stage.get("id") if isinstance(stage, dict) else None
+    if sid is None:
+        sid = deal.get("deal_stage_id")
+    try:
+        return int(sid) if sid is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _deal_company_name(deal):
+    company = deal.get("company") or {}
+    if isinstance(company, dict):
+        name = company.get("name")
+        if name:
+            return name
+    return deal.get("company_name") or ""
+
+
+def _is_live_sell_deal(deal):
+    if deal.get("is_archived"):
+        return False
+    if _deal_stage_id(deal) not in LIVE_SELL_STAGE_IDS:
+        return False
+    return DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+
+
 def _object_version(s3, key):
     head = s3.head_object(Bucket=BUCKET, Key=key)
     return head["LastModified"].isoformat()
@@ -105,9 +207,24 @@ def _build_table(s3):
     interest_data = json.loads(interest_obj["Body"].read())
     buy = interest_data.get("buy") or {}
 
+    deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
+    deals_data = json.loads(deals_obj["Body"].read())
+    deals_list = deals_data.get("deals", []) if isinstance(deals_data, dict) else (deals_data or [])
+
+    sellers_by_company = {}
+    for deal in deals_list:
+        if not _is_live_sell_deal(deal):
+            continue
+        company = _deal_company_name(deal).strip()
+        if not company:
+            continue
+        sellers_by_company[company] = sellers_by_company.get(company, 0) + 1
+
     table = []
     for company, ids in buy.items():
         if not isinstance(ids, list) or not ids:
+            continue
+        if company.strip().lower() in _EXCLUDED_COMPANIES_LOWER:
             continue
         counts = {"qp": 0, "accredited": 0, "unknown": 0}
         for pid in ids:
@@ -118,6 +235,7 @@ def _build_table(s3):
             "qp": counts["qp"],
             "accredited": counts["accredited"],
             "unknown": counts["unknown"],
+            "sellers": sellers_by_company.get(company, 0),
         })
     table.sort(key=lambda r: (-r["total"], r["company"].lower()))
     return table
@@ -125,7 +243,11 @@ def _build_table(s3):
 
 def get_company_table():
     s3 = boto3.client("s3")
-    version = (_object_version(s3, PEOPLE_KEY), _object_version(s3, INTEREST_KEY))
+    version = (
+        _object_version(s3, PEOPLE_KEY),
+        _object_version(s3, INTEREST_KEY),
+        _object_version(s3, DEALS_KEY),
+    )
     if _cache["version"] == version and _cache["table"] is not None:
         return _cache["table"]
     table = _build_table(s3)
@@ -140,7 +262,8 @@ def render_page(table):
         f'<td class="num">{r["total"]}</td>'
         f'<td class="num">{r["qp"]}</td>'
         f'<td class="num">{r["accredited"]}</td>'
-        f'<td class="num">{r["unknown"]}</td></tr>'
+        f'<td class="num">{r["unknown"]}</td>'
+        f'<td class="num">{r["sellers"]}</td></tr>'
         for r in table
     )
     return f"""<!DOCTYPE html>
@@ -170,8 +293,26 @@ def render_page(table):
     padding: 32px 24px 64px;
   }}
   .wrap {{ max-width: 1000px; margin: 0 auto; }}
+  .header-row {{
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+  }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
   .sub {{ color: var(--muted); font-size: 13px; margin: 0 0 24px; }}
+  .feature-btn {{
+    flex: 0 0 auto;
+    background: var(--accent);
+    color: #fff;
+    font-size: 13px;
+    font-weight: 600;
+    text-decoration: none;
+    padding: 10px 16px;
+    border-radius: 8px;
+    white-space: nowrap;
+  }}
+  .feature-btn:hover {{ opacity: 0.9; }}
   .toolbar {{ display: flex; gap: 12px; margin-bottom: 16px; }}
   #search {{
     flex: 1;
@@ -225,8 +366,14 @@ def render_page(table):
 </head>
 <body>
 <div class="wrap">
-  <h1>Demand Board</h1>
-  <p class="sub">{len(table)} companies with interested buyers</p>
+  <div class="header-row">
+    <div>
+      <h1>Demand Board</h1>
+      <p class="sub">{len(table)} companies with interested buyers</p>
+    </div>
+    <a class="feature-btn"
+       href="mailto:cgracia@graciagroup.com?subject=Syndicator%20Dashboard%20feature%20request">Request a feature</a>
+  </div>
   <div class="toolbar">
     <input id="search" type="text" placeholder="Search companies...">
   </div>
@@ -239,6 +386,7 @@ def render_page(table):
           <th class="num" data-key="qp" data-type="number">QP<span class="arrow"></span></th>
           <th class="num" data-key="accredited" data-type="number">Accredited<span class="arrow"></span></th>
           <th class="num" data-key="unknown" data-type="number">Unknown<span class="arrow"></span></th>
+          <th class="num" data-key="sellers" data-type="number">Sellers<span class="arrow"></span></th>
         </tr>
       </thead>
       <tbody id="board-body">
