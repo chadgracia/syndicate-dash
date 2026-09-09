@@ -267,15 +267,19 @@ TRANSACTOR_TYPE_LABELS = {
 }
 
 # Client Engagement Form (CEF - ID)? — person-level field, verified via the
-# same one-time fetch. The badge only cares whether the field is set at
-# all (any of these four), not which option, so the label text isn't read
-# anywhere except here for completeness/documentation.
+# same one-time fetch. Each of the four options drives a distinct badge
+# state (see _cef_badge_html): Yes -> on file, Pending -> pending,
+# No/unset -> missing, N/A -> no badge at all.
 CEF_FIELD = "custom_label_3796440"
+CEF_NO_ID = 6600513
+CEF_PENDING_ID = 6600514
+CEF_YES_ID = 6600515
+CEF_NA_ID = 6600516
 CEF_LABELS = {
-    6600513: "No",
-    6600514: "Pending",
-    6600515: "Yes",
-    6600516: "N/A",
+    CEF_NO_ID: "No",
+    CEF_PENDING_ID: "Pending",
+    CEF_YES_ID: "Yes",
+    CEF_NA_ID: "N/A",
 }
 
 # "Matched or later" buy-side stages, shared verbatim by the Matched Buyers
@@ -830,12 +834,13 @@ def get_people_by_ids(person_ids):
 
 
 def _tenant_cef_state(person_id):
-    """Whether the tenant's own Client Engagement Form field (CEF_FIELD,
-    verified via the one-time person_custom_field_labels fetch — any of
-    its four options No/Pending/Yes/N/A) is set at all. True/False once
-    the tenant's own person record is found; None when there's no
-    person_id to look up (admin-without-view_as, which never gets a CEF
-    badge in the first place)."""
+    """The tenant's own Client Engagement Form option id (CEF_FIELD,
+    verified via the one-time person_custom_field_labels fetch — one of
+    CEF_NO_ID/CEF_PENDING_ID/CEF_YES_ID/CEF_NA_ID), or None when the
+    field is unset, the tenant's own person record can't be found, or
+    there's no person_id to look up at all (admin-without-view_as, which
+    never gets a CEF badge in the first place — see the tenant is not
+    None guard at the call site)."""
     if person_id is None:
         return None
     people = get_people_by_ids({person_id})
@@ -843,19 +848,25 @@ def _tenant_cef_state(person_id):
     if rec is None:
         return None
     cf = rec.get("custom_fields") or {}
-    return bool(cf_list(cf, CEF_FIELD))
+    ids = cf_list(cf, CEF_FIELD)
+    return ids[0] if ids else None
 
 
-def _cef_badge_html(cef_on_file, tenant_name):
-    """Nav-bar badge for the tenant view (and admin &view_as preview):
-    green "CEF on file" when any option is set, red "CEF missing —
-    contact us" (mailto, subject "CEF for <tenant name>") when the field
-    is truly empty. Empty string when there's no tenant context at all
-    (cef_on_file is None) — admin-without-view_as never sees this."""
-    if cef_on_file is None:
+def _cef_badge_html(cef_option_id, tenant_name):
+    """Nav-bar badge for the tenant view (and admin &view_as preview),
+    one state per CEF option: Yes -> green "CEF on file"; Pending ->
+    amber "CEF pending"; No or unset (cef_option_id is None or any id
+    outside the verified map) -> red "CEF missing — contact us" (mailto,
+    subject "CEF for <tenant name>"); N/A -> no badge at all. Only ever
+    called when there IS a tenant to report on (see the call site's
+    tenant is not None guard) — there's no separate "no tenant" case to
+    handle here."""
+    if cef_option_id == CEF_NA_ID:
         return ""
-    if cef_on_file:
+    if cef_option_id == CEF_YES_ID:
         return '<div class="gg-cef-badge cef-ok">&#10003; CEF on file</div>'
+    if cef_option_id == CEF_PENDING_ID:
+        return '<div class="gg-cef-badge cef-pending">&#8226; CEF pending</div>'
     subject = urllib.parse.quote(f"CEF for {tenant_name}", safe="")
     href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
     return f'<a class="gg-cef-badge cef-missing" href="{href}">&#10007; CEF missing — contact us</a>'
@@ -1697,6 +1708,7 @@ NAV_CSS = """
     text-decoration: none;
   }
   .gg-cef-badge.cef-ok { background: rgba(46,157,106,0.15); color: #2e9d6a; }
+  .gg-cef-badge.cef-pending { background: rgba(201,162,39,0.15); color: #c9a227; }
   .gg-cef-badge.cef-missing { background: rgba(220,80,80,0.15); color: #e06666; }
   .gg-cef-badge.cef-missing:hover { text-decoration: underline; }
 """
