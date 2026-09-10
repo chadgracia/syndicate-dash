@@ -137,6 +137,22 @@ LIVE_SELL_STAGE_IDS = {
     STAGE_CONFIRM, STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
 }
 
+# Hold/Cancel + closed-stage detection (My Deals). Given directly as
+# "verified from live deal_stages API" — taken on trust the way every
+# other bare id supplied this way in this file has been, since this
+# session has no live Pipeline access of its own to re-confirm them.
+# HOLD_STAGE_ID is exactly STAGE_HOLD above (same id, same already-live
+# stage — Hold was already in LIVE_SELL_STAGE_IDS, so a Held deal
+# correctly stays in "Total in pipeline"). OBSOLETE_STAGE_ID is verified
+# verbatim in chadgracia/deal-update-form (OBSOLETE_STAGE_ID = 2348038).
+# Neither WON_STAGE_IDS nor LOST_STAGE_IDS was ever in LIVE_SELL_STAGE_IDS
+# to begin with, so excluding them from "live" needs no separate check —
+# they were simply never in the live whitelist.
+HOLD_STAGE_ID = STAGE_HOLD
+OBSOLETE_STAGE_ID = 2348038
+WON_STAGE_IDS = {111802, 2379321}
+LOST_STAGE_IDS = {111801, 2379322}
+
 # Labels for every stage id this org's code has ever named (verbatim from
 # chadgracia/daily-brief's STAGE_LABELS). An id outside this map (e.g. a
 # closed-won/closed-lost stage no Lambda has needed to name) falls back to
@@ -1072,6 +1088,8 @@ def get_intro_details(tenant_email):
                 "override_at": item.get("override_at"),
                 "deadline_override": item.get("deadline_override"),
                 "deadline_override_at": item.get("deadline_override_at"),
+                "stage_override": item.get("stage_override"),
+                "stage_override_at": item.get("stage_override_at"),
             }
         return out, False
     except Exception:
@@ -1379,101 +1397,149 @@ def _feature_requests_list_html(open_items, done_items, show_tenant=False, tenan
     return "".join(rows)
 
 
-# ── Hold / Cancel requests (My Deals) ────────────────────────────────────
-# Never a direct Pipeline write — these only record the ask for admin to
-# act on manually. One item per deal (sk is NOT epoch-suffixed, unlike
-# feature requests), stored under the deal's own linked tenant partition
-# (_tenant_email_for_deal — the same helper _handle_update_intro already
-# uses), so the write endpoint never needs a client-supplied partition:
-# ownership is always derived from the deal record itself.
+# ── Hold / Cancel: direct Pipeline stage writes (My Deals) ───────────────
+# Replaces the old action=deal_request "ask admin" flow outright — Hold
+# and Cancel are now one-click, PUT the deal's stage to Pipeline for
+# real, notify Chad by email, and overlay the new stage in Dynamo for
+# instant feedback. The old sk="request#<deal_id>" items are simply
+# ignored from here on (never read, never migrated, never cleaned up).
+#
+# Dynamo storage: stage_override/stage_override_at on the SAME
+# sk="intro#<deal_id>" item deadline_override already lives on (see
+# _resolve_deal_deadline) — not a new sk. That item is already this
+# deal's one-per-deal metadata record with the exact newer-wins-overlay
+# machinery this needs, so reusing it avoids inventing a fourth sk
+# pattern; stage_override_at is its own field (not the existing
+# status_override's override_at) so the two overlays — Intro Status on
+# buy deals, stage on sell deals — can never shadow each other.
+def _resolve_deal_stage(deal, override_entry=None):
+    """Newer-wins overlay for a deal's stage id, mirroring
+    _resolve_deal_deadline's logic exactly. override_entry is this
+    deal's Dynamo intro item (from get_intro_details), or None."""
+    stage_id = _deal_stage_id(deal)
+    if override_entry:
+        override_val = override_entry.get("stage_override")
+        override_at = override_entry.get("stage_override_at")
+        if override_val and override_at:
+            pipeline_dt = _parse_dt(deal.get("updated_at"))
+            try:
+                override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                override_dt = None
+            if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
+                stage_id = override_val
+    return stage_id
 
-def get_deal_requests(tenant_partition):
-    """{deal_id_str: {"request", "by", "at", "resolved"}} for every
-    request item under this tenant partition, via one Query. Never
-    raises: any failure returns ({}, True)."""
+
+def _pipeline_update_deal_stage(deal_id, stage_id):
+    """PUT the deal's stage to Pipeline. Field name (deal_stage_id, flat —
+    not the nested deal_stage.id shape deals.json reads back) verified
+    verbatim in chadgracia/deal-update-form's own deal-create payload
+    ("deal_stage_id": INQUIRY_STAGE_ID). Auth is the same query-string
+    scheme _pipeline_update_deal_status uses. Success requires BOTH a
+    2xx AND the response body echoing the new stage id back (checked via
+    _deal_stage_id against the raw response, and again against a
+    response["deal"] wrapper in case the API nests it there — no live
+    sample response to confirm which shape it actually returns) — on
+    anything else this returns False and the caller must not touch
+    Dynamo."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    body = json.dumps({"deal": {"deal_stage_id": stage_id}}).encode("utf-8")
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
+        data=body, method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
     try:
-        table = _dynamo_table()
-        resp = table.query(
-            KeyConditionExpression=Key("tenant").eq(tenant_partition) & Key("sk").begins_with("request#"),
-        )
-        out = {}
-        for item in resp.get("Items", []):
-            sk = item.get("sk") or ""
-            if not sk.startswith("request#"):
-                continue
-            deal_id = sk[len("request#"):]
-            if not deal_id:
-                continue
-            out[deal_id] = {
-                "request": item.get("request"),
-                "by": item.get("by"),
-                "at": item.get("at"),
-                "resolved": bool(item.get("resolved")),
-            }
-        return out, False
-    except Exception:
-        return {}, True
-
-
-def _dynamo_write_deal_request(tenant_partition, deal_id, request_type, actor):
-    now = time.time()
-    try:
-        table = _dynamo_table()
-        table.put_item(Item={
-            "tenant": tenant_partition,
-            "sk": f"request#{deal_id}",
-            "request": request_type,
-            "by": actor,
-            "at": datetime.now(timezone.utc).isoformat(),
-            "resolved": False,
-        })
-        table.put_item(Item={
-            "tenant": tenant_partition,
-            "sk": f"audit#request#{deal_id}#{int(now * 1000)}",
-            "actor": actor,
-            "old": {},
-            "new": {"request": request_type},
-        })
-        return True, None
+        with urllib.request.urlopen(req, timeout=15) as r:
+            if not (200 <= r.status < 300):
+                return False, f"HTTP {r.status}"
+            try:
+                data = json.loads(r.read().decode("utf-8"))
+            except Exception:
+                return False, "Pipeline response was not valid JSON"
+            echoed = _deal_stage_id(data) if isinstance(data, dict) else None
+            if echoed != stage_id and isinstance(data, dict) and isinstance(data.get("deal"), dict):
+                echoed = _deal_stage_id(data["deal"])
+            if echoed != stage_id:
+                return False, f"Pipeline did not confirm the new stage (got {echoed})"
+            return True, None
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
 
-def _dynamo_resolve_deal_request(tenant_partition, deal_id, actor):
-    """ConditionExpression=attribute_exists(sk) for the same reason as
-    _dynamo_toggle_feature_request's: without it, update_item would
-    silently upsert a phantom "resolved" item for a deal_id that never
-    had a request at all."""
+DEAL_STAGE_EMAIL_TO = "cgracia@rainmakersecurities.com"
+DEAL_STAGE_EMAIL_FROM = "agent@agent.graciagroup.com"
+
+
+def _send_deal_stage_email(deal, deal_id, tenant_name, target):
+    """Best-effort SES notification — failure here must never roll back
+    the Pipeline write or the Dynamo overlay (see _handle_deal_stage),
+    only get flagged in the audit item. Returns True/False, never
+    raises."""
+    action_label = "Hold" if target == "hold" else "Cancel"
+    deal_name = _deal_title(deal)
+    company = _deal_company_name(deal) or "—"
+    subject = f"[Dashboard] {action_label}: {deal_name} — {tenant_name}"
+    body = (
+        f"Action: {action_label}\n"
+        f"Deal: {deal_name} (ID {deal_id})\n"
+        f"Company: {company}\n"
+        f"Tenant: {tenant_name}\n"
+        f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n"
+    )
+    try:
+        ses = boto3.client("ses", region_name="us-east-1")
+        ses.send_email(
+            Source=DEAL_STAGE_EMAIL_FROM,
+            Destination={"ToAddresses": [DEAL_STAGE_EMAIL_TO]},
+            Message={"Subject": {"Data": subject}, "Body": {"Text": {"Data": body}}},
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _dynamo_write_deal_stage_override(tenant_email, deal_id, stage_id, actor, old_stage_id, email_failed):
     now = time.time()
     try:
         table = _dynamo_table()
         table.update_item(
-            Key={"tenant": tenant_partition, "sk": f"request#{deal_id}"},
-            UpdateExpression="SET resolved = :r",
-            ConditionExpression="attribute_exists(sk)",
-            ExpressionAttributeValues={":r": True},
+            Key={"tenant": tenant_email, "sk": f"intro#{deal_id}"},
+            UpdateExpression="SET stage_override = :s, stage_override_at = :sa",
+            ExpressionAttributeValues={":s": stage_id, ":sa": now},
         )
         table.put_item(Item={
-            "tenant": tenant_partition,
-            "sk": f"audit#request#{deal_id}#{int(now * 1000)}",
+            "tenant": tenant_email,
+            "sk": f"audit#{deal_id}#{int(now * 1000)}",
             "actor": actor,
-            "old": {"resolved": False},
-            "new": {"resolved": True},
+            "old": {"stage": old_stage_id},
+            "new": {"stage": stage_id},
+            "email_failed": email_failed,
         })
         return True, None
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
 
 
-def _handle_deal_request(event):
-    """POST ?action=deal_request — a tenant's one-click "Hold" or "Cancel"
-    ask, or an admin's "Mark resolved". Auth mirrors _handle_update_intro
-    exactly: the deal's owning partition is always derived server-side via
-    _tenant_email_for_deal, never taken from the client, so a tenant post
-    can only ever land in their own partition — the ownership check is
-    "does this deal's linked tenant match the authenticated identity",
-    not anything the client can steer. ADMIN_KEY may act on any deal.
-    Never raises past this function."""
+def _handle_deal_stage(event):
+    """POST ?action=deal_stage — Hold or Cancel a deal via a DIRECT
+    Pipeline stage write (never a request/ask — see the replacement note
+    above). Auth mirrors _handle_update_intro exactly: the deal's owning
+    partition is always derived server-side via _tenant_email_for_deal,
+    never taken from the client, so a tenant post can only ever land on
+    their own deal; ADMIN_KEY may act on any deal.
+
+    Order, per instruction: (a) PUT the new stage to Pipeline and abort
+    everything — nothing written to Dynamo, no email sent — on any
+    failure, including a mismatched echoed stage id; (b) send the
+    Chad-facing SES notification, whose failure does NOT roll back
+    anything, just gets flagged in the audit item; (c) write the
+    stage_override + audit item. Never raises past this function."""
     body = _parse_json_body(event)
 
     admin_key = os.environ.get("ADMIN_KEY")
@@ -1482,6 +1548,11 @@ def _handle_deal_request(event):
     deal_id = str(body.get("deal_id") or "").strip()
     if not deal_id:
         return _json_response({"error": "deal_id is required"}, 400)
+
+    target = body.get("target")
+    if target not in ("hold", "cancel"):
+        return _json_response({"error": "invalid target"}, 400)
+    target_stage_id = HOLD_STAGE_ID if target == "hold" else OBSOLETE_STAGE_ID
 
     deals = get_deals_list()
     deal = next((d for d in deals if str(d.get("id")) == deal_id), None)
@@ -1503,99 +1574,83 @@ def _handle_deal_request(event):
             return _json_response({"error": "forbidden"}, 403)
         actor = tenant_identity_email
 
-    if body.get("resolved"):
-        if not is_admin:
-            return _json_response({"error": "forbidden"}, 403)
-        ok, err = _dynamo_resolve_deal_request(tenant_email, deal_id, actor)
-        if not ok:
-            return _json_response({"error": f"Save failed: {err}"}, 502)
-        return _json_response({"ok": True})
+    old_stage_id = _deal_stage_id(deal)
 
-    request_type = body.get("request")
-    if request_type not in ("hold", "cancel"):
-        return _json_response({"error": "invalid request"}, 400)
-
-    ok, err = _dynamo_write_deal_request(tenant_email, deal_id, request_type, actor)
+    ok, err = _pipeline_update_deal_stage(deal_id, target_stage_id)
     if not ok:
-        return _json_response({"error": f"Save failed: {err}"}, 502)
+        return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
+
+    tenant_name = (TENANTS.get(tenant_email) or {}).get("name", tenant_email)
+    email_ok = _send_deal_stage_email(deal, deal_id, tenant_name, target)
+
+    ok, err = _dynamo_write_deal_stage_override(tenant_email, deal_id, target_stage_id, actor, old_stage_id,
+                                                 not email_ok)
+    if not ok:
+        return _json_response({"error": f"Pipeline updated but save failed: {err}"}, 502)
+
     return _json_response({"ok": True})
 
 
-def _deal_request_script_html():
+def _deal_stage_script_html():
     return """<script>
 (function() {
-  function post(payload, onDone) {
-    fetch('?action=deal_request', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
-    }).then(function(r) {
-      return r.json().then(function(data) { return { ok: r.ok, data: data }; });
-    }).then(onDone).catch(function(err) { onDone({ ok: false, data: { error: String(err) } }); });
-  }
-  document.querySelectorAll('.deal-request-btn').forEach(function(btn) {
+  var CONFIRM_TEXT = {
+    hold: function(name) {
+      return 'Put ' + name + ' on hold? Buyers will no longer be shown this deal until you reactivate.';
+    },
+    cancel: function(name) {
+      return 'Cancel ' + name + '? This marks the deal obsolete and removes it from circulation.';
+    }
+  };
+  document.querySelectorAll('.deal-stage-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
-      post({ key: btn.getAttribute('data-key'), deal_id: btn.getAttribute('data-deal-id'),
-             request: btn.getAttribute('data-request') }, function(res) {
+      var target = btn.getAttribute('data-target');
+      if (!window.confirm(CONFIRM_TEXT[target](btn.getAttribute('data-deal-name')))) return;
+      fetch('?action=deal_stage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key: btn.getAttribute('data-key'),
+          deal_id: btn.getAttribute('data-deal-id'),
+          target: target
+        })
+      }).then(function(r) {
+        return r.json().then(function(data) { return { ok: r.ok, data: data }; });
+      }).then(function(res) {
         if (res.ok) { window.location.reload(); }
         else { alert((res.data && res.data.error) || 'Error'); }
-      });
-    });
-  });
-  document.querySelectorAll('.request-resolve-btn').forEach(function(btn) {
-    btn.addEventListener('click', function() {
-      post({ key: btn.getAttribute('data-key'), deal_id: btn.getAttribute('data-deal-id'), resolved: true },
-        function(res) {
-          if (res.ok) { window.location.reload(); }
-          else { alert((res.data && res.data.error) || 'Error'); }
-        });
+      }).catch(function(err) { alert('Error: ' + err); });
     });
   });
 })();
 </script>"""
 
 
-def _deal_request_actions_html(deal_id, update_btn, request_entry, key):
-    """update_btn is the existing minted Update link, passed in unchanged.
-    show_resolve (key truthy, i.e. an admin session) also renders "Mark
-    resolved" next to the chip — never for a plain tenant view, which only
-    ever sees the chip itself."""
+def _deal_stage_chip_html(resolved_stage_id):
+    if resolved_stage_id == HOLD_STAGE_ID:
+        return '<span class="stage-chip hold">On hold</span>'
+    if resolved_stage_id == OBSOLETE_STAGE_ID:
+        return '<span class="stage-chip cancelled">Cancelled</span>'
+    return ""
+
+
+def _deal_actions_html(deal_id, deal_name, update_btn, resolved_stage_id, key=None):
+    """update_btn is the existing minted Update link, unchanged. Hold and
+    Cancel disappear in favor of the stage chip the moment either fires
+    (On hold amber, Cancelled gray) — same actions-column real estate the
+    old request-chip used, now driven by the resolved Pipeline stage
+    instead of an unresolved Dynamo request."""
+    chip = _deal_stage_chip_html(resolved_stage_id)
+    if chip:
+        return f'{update_btn} {chip}'
     key_attr = _esc(key or "")
-    if request_entry and not request_entry.get("resolved"):
-        label = "Hold requested" if request_entry.get("request") == "hold" else "Cancel requested"
-        chip = f'<span class="request-chip">{_esc(label)}</span>'
-        resolve_btn = ""
-        if key:
-            resolve_btn = (f'<button type="button" class="request-resolve-btn" data-key="{key_attr}" '
-                            f'data-deal-id="{_esc(deal_id)}">Mark resolved</button>')
-        return f'{update_btn} {chip} {resolve_btn}'
-    hold_btn = (f'<button type="button" class="deal-request-btn" data-key="{key_attr}" '
-                f'data-deal-id="{_esc(deal_id)}" data-request="hold">Hold</button>')
-    cancel_btn = (f'<button type="button" class="deal-request-btn" data-key="{key_attr}" '
-                  f'data-deal-id="{_esc(deal_id)}" data-request="cancel">Cancel</button>')
+    id_attr = _esc(deal_id)
+    name_attr = _esc(deal_name)
+    hold_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
+                f'data-deal-name="{name_attr}" data-target="hold">Hold</button>')
+    cancel_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
+                  f'data-deal-name="{name_attr}" data-target="cancel">Cancel</button>')
     return f'{update_btn} {hold_btn} {cancel_btn}'
-
-
-def _unresolved_request_row_html(deal_id, company_name, entry, show_tenant=False, tenant_name=None, key=None):
-    label = "Hold requested" if entry.get("request") == "hold" else "Cancel requested"
-    tag = f'<span class="feature-tenant-tag">{_esc(tenant_name)}</span> ' if show_tenant and tenant_name else ""
-    key_attr = _esc(key or "")
-    resolve_btn = (f'<button type="button" class="request-resolve-btn" data-key="{key_attr}" '
-                   f'data-deal-id="{_esc(deal_id)}">Mark resolved</button>')
-    return (f'<div class="feature-row">'
-            f'<div class="feature-row-text">{tag}<strong>{_esc(company_name or "—")}</strong> — '
-            f'{_esc(label)} by {_esc(entry.get("by") or "—")}</div>'
-            f'<div class="feature-row-meta">{resolve_btn}</div>'
-            f'</div>')
-
-
-def _unresolved_requests_block_html(rows_html):
-    if not rows_html:
-        return ""
-    return f"""<h2 class="feature-section-heading">Open Hold / Cancel requests</h2>
-  <div class="card">
-    {rows_html}
-  </div>"""
 
 
 def _default_intro_status(deal):
@@ -1979,42 +2034,25 @@ def _deal_pipeline_size(deal):
         return None
 
 
-# "Won"/"Lost"/"Dead" markers: UNVERIFIED against a live deals.json
-# snapshot (same caveat as DEADLINE_FIELD above — no repo this org's code
-# lives in ever reads them). The only trace found anywhere is a
-# dead/unused lookup table in chadgracia/CRMDealDetails
-# (map_option_value's 'Status' dict: {'1': 'Open', '2': 'Won',
-# '3': 'Inquiry', '4': 'Lost', '5': 'Dead'}), which is never actually
-# invoked in that file either — so this is a best-effort guess at
-# Pipeline's built-in numeric "status" deal attribute, not the
-# custom_label deal_stage field LIVE_SELL_STAGE_IDS is built from.
-# Degrades safely: if deals.json doesn't carry a "status" key, or uses a
-# different shape, no deal ever matches either predicate below and the
-# "Total closed" summary segment is simply omitted rather than showing a
-# wrong number. LIVE_SELL_STAGE_IDS (e.g. STAGE_SPA_SIGNED) alone doesn't
-# distinguish a deal that has actually closed from one still working
-# toward it — a Won deal can still carry a "live" stage id — so "Total in
-# pipeline" excludes DEAL_STATUS_CLOSED_IDS explicitly on top of the
-# existing _is_live_sell_deal check, per instruction ("live = not
-# won/lost/dead per stage").
-DEAL_STATUS_WON_ID = 2
-DEAL_STATUS_LOST_ID = 4
-DEAL_STATUS_DEAD_ID = 5
-DEAL_STATUS_CLOSED_IDS = {DEAL_STATUS_WON_ID, DEAL_STATUS_LOST_ID, DEAL_STATUS_DEAD_ID}
+# Stage-based won/live predicates for the My Deals summary strip totals.
+# Superseded the earlier deal.get("status")-based guess entirely — stage
+# id is the shape deals.json actually carries (see _deal_stage_id) and
+# WON_STAGE_IDS/LOST_STAGE_IDS/OBSOLETE_STAGE_ID above are given as
+# verified. Callers pass the deal's *resolved* stage (_resolve_deal_stage,
+# override-aware) rather than calling _deal_stage_id directly, so a
+# same-session Hold/Cancel is reflected in the totals immediately without
+# waiting for deals.json to resync.
+def _is_won_stage(stage_id):
+    return stage_id in WON_STAGE_IDS
 
 
-def _is_won_deal(deal):
-    try:
-        return int(deal.get("status")) == DEAL_STATUS_WON_ID
-    except (TypeError, ValueError):
-        return False
-
-
-def _is_closed_deal(deal):
-    try:
-        return int(deal.get("status")) in DEAL_STATUS_CLOSED_IDS
-    except (TypeError, ValueError):
-        return False
+def _is_live_pipeline_stage(stage_id):
+    """"Live" for the pipeline-total: in the known live-stage whitelist.
+    WON_STAGE_IDS/LOST_STAGE_IDS/OBSOLETE_STAGE_ID were never part of
+    LIVE_SELL_STAGE_IDS to begin with, so excluding them needs no extra
+    check beyond the whitelist membership test itself — a Held deal
+    (HOLD_STAGE_ID, already in the whitelist) correctly stays live."""
+    return stage_id in LIVE_SELL_STAGE_IDS
 
 
 def _my_deal_visibility_state(deal, cef_state):
@@ -3077,7 +3115,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 </html>"""
 
 
-def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, request_entry, key=None,
+def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, resolved_stage_id, key=None,
                        view_as=None, edit_mode=False):
     deal_id = str(deal.get("id"))
     if company_name:
@@ -3125,7 +3163,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         attention_html = f'<span class="attention-chip" title="{tooltip}">Needs attention</span>'
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
-    actions_html = _deal_request_actions_html(deal_id, update_btn, request_entry, key)
+    actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, resolved_stage_id, key=key)
 
     return (
         f'<tr><td class="company">{company_cell}</td>'
@@ -3172,40 +3210,6 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         feature_items, _ = get_feature_requests(anon_key_email)
         feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
 
-    # Unresolved Hold/Cancel requests block (admin only — key truthy).
-    # tenant_picker (aggregate) loops every TENANTS partition, since a
-    # request always lives under its deal's own owning tenant (never
-    # "admin" — a deal always belongs to exactly one real tenant, unlike
-    # feature requests which can be filed under the literal "admin"
-    # partition too). Single-tenant admin view (&view_as) only looks at
-    # anon_key_email's own partition.
-    unresolved_requests_html = ""
-    if key:
-        deals_by_id = None
-        if tenant_picker:
-            deals_by_id = {str(d.get("id")): d for d in get_deals_list()}
-            rows = []
-            for partition in TENANTS:
-                reqs, _ = get_deal_requests(partition)
-                for deal_id, entry in reqs.items():
-                    if entry.get("resolved"):
-                        continue
-                    d = deals_by_id.get(deal_id)
-                    rows.append(_unresolved_request_row_html(
-                        deal_id, _deal_company_name(d) if d else None, entry,
-                        show_tenant=True, tenant_name=TENANTS[partition]["name"], key=key))
-            unresolved_requests_html = _unresolved_requests_block_html("".join(rows))
-        elif anon_key_email:
-            reqs, _ = get_deal_requests(anon_key_email)
-            unresolved = {k: v for k, v in reqs.items() if not v.get("resolved")}
-            if unresolved:
-                deals_by_id = {str(d.get("id")): d for d in (deals or [])}
-                rows = [_unresolved_request_row_html(
-                            deal_id, _deal_company_name(deals_by_id[deal_id]) if deal_id in deals_by_id else None,
-                            entry, key=key)
-                        for deal_id, entry in unresolved.items()]
-                unresolved_requests_html = _unresolved_requests_block_html("".join(rows))
-
     summary_html = ""
     subtle_html = ""
     edit_script = ""
@@ -3221,7 +3225,6 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         buyer_counts = {row["company"].strip().lower(): row["total"] for row in company_table}
 
         intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
-        deal_requests, _ = get_deal_requests(anon_key_email) if anon_key_email else ({}, True)
         cef_state = _tenant_cef_state(person_id)
 
         # Per-company buy-side aggregation (Intros count, Stalled/follow-up
@@ -3262,6 +3265,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 "deadline": deadline,
                 "stats": _company_stats(company_name),
                 "buyer_count": buyer_counts.get((company_name or "").strip().lower(), 0),
+                "resolved_stage": _resolve_deal_stage(d, override_entry),
             })
 
         # Deadline ascending (ISO yyyy-mm-dd sorts correctly as a string),
@@ -3296,16 +3300,22 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 not_engaged_count += 1
 
             row_htmls.append(_my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
-                                                deal_requests.get(str(d.get("id"))),
+                                                r["resolved_stage"],
                                                 key=key, view_as=view_as, edit_mode=edit_mode))
 
         today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         future_deadlines = [dl for dl in deadlines if dl >= today_iso]
 
-        pipeline_total = sum(v for v in (_deal_pipeline_size(d) for d in deals
-                                          if _is_live_sell_deal(d) and not _is_closed_deal(d))
+        # Resolved (override-aware) stage, not the deal's own raw
+        # deal_stage — so a same-session Hold/Cancel drops the deal from
+        # "Total in pipeline" (Cancel) or leaves it counted (Hold stays
+        # live) immediately, without waiting for deals.json to resync.
+        pipeline_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in rows
+                                          if not r["deal"].get("is_archived")
+                                          and _is_live_pipeline_stage(r["resolved_stage"]))
                               if v is not None)
-        closed_total = sum(v for v in (_deal_pipeline_size(d) for d in deals if _is_won_deal(d))
+        closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in rows
+                                        if _is_won_stage(r["resolved_stage"]))
                             if v is not None)
 
         summary_parts = []
@@ -3451,7 +3461,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   }}
   .copy-id:hover {{ border-color: var(--accent); color: var(--accent); }}
   td.actions {{ white-space: nowrap; }}
-  .update-cancel-btn, .deal-request-btn, .request-resolve-btn {{
+  .update-cancel-btn, .deal-stage-btn {{
     display: inline-block;
     font-size: 12px;
     font-weight: 600;
@@ -3465,10 +3475,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     margin: 0 4px 4px 0;
     font-family: inherit;
   }}
-  .update-cancel-btn:hover, .deal-request-btn:hover, .request-resolve-btn:hover {{
+  .update-cancel-btn:hover, .deal-stage-btn:hover {{
     text-decoration: underline;
   }}
-  .request-chip {{
+  .stage-chip {{
     display: inline-block;
     font-size: 11px;
     font-weight: 700;
@@ -3476,11 +3486,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     letter-spacing: 0.03em;
     padding: 3px 9px;
     border-radius: 999px;
-    background: rgba(201,162,39,0.15);
-    color: var(--accredited);
     white-space: nowrap;
     margin-right: 4px;
   }}
+  .stage-chip.hold {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .stage-chip.cancelled {{ background: rgba(255,255,255,0.08); color: var(--muted); }}
   .cef-complete-link {{
     font-size: 11px;
     font-weight: 600;
@@ -3547,7 +3557,6 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   {feature_box_html}
   {summary_html}
   {subtle_html}
-  {unresolved_requests_html}
   {body_html}
   <h2 class="feature-section-heading">Feature requests</h2>
   <div class="card">
@@ -3556,7 +3565,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 </div>
 {edit_script}
 {_feature_toggle_script_html(key)}
-{_deal_request_script_html()}
+{_deal_stage_script_html()}
 <script>
 (function() {{
   function copyTextToClipboard(text) {{
@@ -4537,10 +4546,10 @@ def lambda_handler(event, context):
             return _json_response({"error": "POST only"}, 405)
         return _handle_feature_request(event)
 
-    if query.get("action") == "deal_request":
+    if query.get("action") == "deal_stage":
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
-        return _handle_deal_request(event)
+        return _handle_deal_stage(event)
 
     if method != "GET":
         return _forbidden()
