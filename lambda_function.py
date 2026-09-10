@@ -2866,7 +2866,13 @@ def _flag_select_html(deal_id, resolved, admin_controls, disabled=False):
     it's not a value this viewer could have set" convention
     _intro_status_select_html already uses (e.g. a tenant viewing a
     Withdrawn row, which they can't set but also can't be lied to
-    about)."""
+    about).
+
+    Dedup fix (turn 19): the select itself carries an amber (Stalled) or
+    gray (Passed/Withdrawn) border+tint so the state stays glanceable
+    without a separate chip repeating it — see
+    _status_milestones_column_html, which drops the chip entirely
+    whenever this select is actually editable."""
     current = _current_flag_value(resolved)
     values = ["none", "stalled", "passed"]
     if admin_controls:
@@ -2878,29 +2884,43 @@ def _flag_select_html(deal_id, resolved, admin_controls, disabled=False):
         for v in values
     )
     disabled_attr = " disabled" if disabled else ""
-    return f'<select class="ei-flag" data-deal-id="{_esc(deal_id)}"{disabled_attr}>{options}</select>'
+    flag_cls = ""
+    if current == "stalled":
+        flag_cls = " flag-stalled"
+    elif current in ("passed", "withdrawn"):
+        flag_cls = " flag-exit"
+    return (f'<select class="ei-flag{flag_cls}" data-deal-id="{_esc(deal_id)}"{disabled_attr}>'
+            f'{options}</select>')
 
 
 def _status_milestones_column_html(resolved, deal_id, milestones, admin_controls, disabled=False):
     """Turn 17: the full Active Intros status cell -- the four milestone
-    checkboxes (item 1), the flag chip when the row is actually flagged
-    (unchanged visual continuity from the previous pass — Stalled amber,
-    Passed/Withdrawn gray, plus a new Closed chip), a muted
-    "Awaiting our confirmation" note on a Wired-not-yet-Closed row, and
-    the flag select (item 2) — one shared .ei-msg at the end covers
-    every control in the cell (see _edit_script_html's saveMilestone).
-    disabled=True renders every control non-interactive: a tenant
-    viewing a Closed row, which is locked read-only for tenants (item
-    2) — admin_controls=True (admin edit mode) is never disabled, since
-    admin has full rights everywhere, Closed rows included."""
+    checkboxes (item 1), the flag chip (Stalled amber, Passed/Withdrawn
+    gray, Closed its own color), a muted "Awaiting our confirmation"
+    note on a Wired-not-yet-Closed row, and the flag select (item 2) —
+    one shared .ei-msg at the end covers every control in the cell (see
+    _edit_script_html's saveMilestone).
+
+    Dedup fix (turn 19): the chip and the select never both show the
+    same state. disabled=False means the select is actually editable
+    (a tenant on an Introduced-or-later, non-Closed row; admin in edit
+    mode, always) — the select alone carries the state (styled
+    amber/gray by _flag_select_html), so the chip is dropped entirely.
+    disabled=True is a read-only context (a tenant viewing a Closed-
+    locked row today — the only case that currently reaches this
+    function disabled, since admin_controls=True is never disabled) —
+    there the chip renders alongside the (disabled) select. Pending
+    rows keep their own separate "Matched" pill, untouched by any of
+    this."""
     checkboxes_html = _milestone_checkboxes_html(deal_id, milestones, disabled=disabled)
 
     flag_html = ""
-    if resolved["is_exit"]:
-        flag_cls = "stalled" if resolved["id"] == INTRO_STATUS_STALLED_ID else "exit"
-        flag_html = f'<span class="status-chip {flag_cls}">{_esc(resolved["name"])}</span>'
-    elif resolved["name"] == "Closed":
-        flag_html = '<span class="status-chip closed">Closed</span>'
+    if disabled:
+        if resolved["is_exit"]:
+            flag_cls = "stalled" if resolved["id"] == INTRO_STATUS_STALLED_ID else "exit"
+            flag_html = f'<span class="status-chip {flag_cls}">{_esc(resolved["name"])}</span>'
+        elif resolved["name"] == "Closed":
+            flag_html = '<span class="status-chip closed">Closed</span>'
 
     awaiting_html = ('<div class="status-awaiting">Awaiting our confirmation</div>'
                       if resolved["name"] == "Wired" else "")
@@ -3909,6 +3929,11 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     width: 100%;
     box-sizing: border-box;
   }}
+  /* Dedup fix (turn 19): the flag select carries the Stalled/Passed/
+     Withdrawn state itself (glanceable border+tint) whenever it's the
+     only place that state shows — see _status_milestones_column_html. */
+  select.ei-flag.flag-stalled {{ border-color: #c9a227; background: rgba(201,162,39,0.15); color: #8a6d1f; }}
+  select.ei-flag.flag-exit {{ border-color: var(--muted); background: rgba(22,24,29,0.06); }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
