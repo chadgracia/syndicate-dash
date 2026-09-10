@@ -207,6 +207,34 @@ REF_LABELS = {"mydeals": "My Deals", "intros": "Active Intros", "demand": "Deman
 
 FEATURE_REQUEST_EMAIL = "cgracia@rainmakersecurities.com"
 
+# Deal-update-form ("Update / Cancel" button): chadgracia/deal-update-form,
+# routed at this CloudFront URL. Token format (HMAC-SHA256 of str(deal_id),
+# urlsafe base64, no padding) and query shape (?deal_id=<id>&token=<token>)
+# copied verbatim from that repo's own make_token/verify_token, matching
+# exactly how chadgracia/deal-nudge's form_url() already mints the same
+# link. HMAC_SECRET must be the same secret value configured on
+# deal-update-form's own Lambda — when it's unset here, _deal_update_form_url
+# returns None and callers render without the button rather than a broken
+# link.
+DEAL_UPDATE_FORM_URL = "https://desk.graciagroup.com/update/"
+
+
+def _deal_update_form_url(deal_id):
+    secret = os.environ.get("HMAC_SECRET")
+    if not secret:
+        return None
+    sig = hmac.new(secret.encode(), f"{deal_id}".encode(), hashlib.sha256).digest()
+    token = base64.urlsafe_b64encode(sig).decode().rstrip("=")
+    return f"{DEAL_UPDATE_FORM_URL}?deal_id={deal_id}&token={token}"
+
+
+def _update_cancel_button_html(deal_id):
+    url = _deal_update_form_url(deal_id)
+    if not url:
+        return ""
+    return (f'<a class="update-cancel-btn" href="{url}" target="_blank" rel="noopener noreferrer">'
+            'Update / Cancel</a>')
+
 # Deal Card section. Agent Agreement field id, and the "Yes" option ids,
 # verified verbatim in chadgracia/daily-brief (CF_AGENT_AGREEMENT,
 # AGENT_YES_OPTS); storage shape (scalar OR list) confirmed in
@@ -1398,9 +1426,16 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
         if edit_mode:
             overdue_html = '<div class="overdue-chip">Deadline passed — update or cancel this deal</div>'
         else:
-            subject = urllib.parse.quote(f"Deadline passed: {_deal_title(deal)}", safe="")
-            href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
-            overdue_html = (f'<a class="overdue-chip" href="{href}">'
+            # The update-form link replaces the mailto for tenants (see
+            # _deal_update_form_url) — falls back to the mailto only when
+            # HMAC_SECRET isn't configured, so this chip is never dead.
+            update_url = _deal_update_form_url(deal_id)
+            if update_url:
+                href = update_url
+            else:
+                subject = urllib.parse.quote(f"Deadline passed: {_deal_title(deal)}", safe="")
+                href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
+            overdue_html = (f'<a class="overdue-chip" href="{href}" target="_blank" rel="noopener noreferrer">'
                              'Deadline passed — update or cancel this deal</a>')
 
     exemption_id = next(iter(_deal_cf_option_ids(deal, EXEMPTION_FIELD)), None)
@@ -1411,7 +1446,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
     fees = _fmt_fees(deal)
     fees_html = f'<div class="dc-line">{_esc(fees)}</div>' if fees else ""
 
-    badge_html = _engagement_badge_html(deal, company)
+    badge_html = _engagement_badge_html(deal, company) + _update_cancel_button_html(deal_id)
 
     return f"""<div class="{card_cls}">
       {overdue_html}
@@ -2323,6 +2358,7 @@ def _my_deal_row_html(deal, key=None, view_as=None):
     structure = _esc(" · ".join(parts)) if parts else "—"
 
     updated = _esc((deal.get("updated_at") or "")[:10] or "—")
+    update_btn = _update_cancel_button_html(str(deal.get("id")))
 
     return (
         f'<tr><td class="company">{company}</td>'
@@ -2332,7 +2368,8 @@ def _my_deal_row_html(deal, key=None, view_as=None):
         f'<td class="num" data-sort="{size_val if size_val is not None else -1}">{size_text}</td>'
         f'<td class="num" data-sort="{gross_val if gross_val is not None else -1}">{gross_text}</td>'
         f'<td>{structure}</td>'
-        f'<td>{updated}</td></tr>'
+        f'<td>{updated}</td>'
+        f'<td class="actions">{update_btn}</td></tr>'
     )
 
 
@@ -2360,6 +2397,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
           <th class="num" data-key="gross" data-type="number">Gross price<span class="arrow"></span></th>
           <th data-key="structure" data-type="string">Structure/Layers<span class="arrow"></span></th>
           <th data-key="updated" data-type="string">Last updated<span class="arrow"></span></th>
+          <th></th>
         </tr>
       </thead>
       <tbody id="board-body">
@@ -2437,6 +2475,18 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   td.company {{ font-weight: 500; }}
   td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
   td.company a:hover {{ border-bottom-color: var(--muted); }}
+  td.actions {{ white-space: nowrap; }}
+  .update-cancel-btn {{
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.06);
+    color: var(--ink);
+    text-decoration: none;
+  }}
+  .update-cancel-btn:hover {{ text-decoration: underline; }}
   .gg-placeholder {{
     max-width: 1000px;
     margin: 96px auto;
@@ -2458,7 +2508,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   var tbody = document.getElementById('board-body');
   if (!tbody) return;
   var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
-  var headers = document.querySelectorAll('#board thead th');
+  var headers = document.querySelectorAll('#board thead th[data-key]');
   var sortState = {{ key: null, dir: 1 }};
 
   function cellSortValue(row, colIndex) {{
@@ -2860,6 +2910,19 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .engagement-badge.in-process {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
   .engagement-badge.not-engaged {{ background: rgba(220,80,80,0.15); color: #e06666; }}
   .engagement-badge.not-engaged:hover {{ text-decoration: underline; }}
+  .update-cancel-btn {{
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 999px;
+    margin-top: 6px;
+    margin-left: 8px;
+    background: rgba(255,255,255,0.06);
+    color: var(--ink);
+    text-decoration: none;
+  }}
+  .update-cancel-btn:hover {{ text-decoration: underline; }}
   .status-pill {{
     display: inline-block;
     font-size: 11px;
