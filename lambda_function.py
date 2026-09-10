@@ -137,14 +137,16 @@ LIVE_SELL_STAGE_IDS = {
     STAGE_CONFIRM, STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
 }
 
-# Hold/Cancel + closed-stage detection (My Deals). Given directly as
-# "verified from live deal_stages API" — taken on trust the way every
-# other bare id supplied this way in this file has been, since this
-# session has no live Pipeline access of its own to re-confirm them.
+# Hold/Cancel/Reactivate + closed-stage detection (My Deals). Given
+# directly as "verified from live deal_stages API" — taken on trust the
+# way every other bare id supplied this way in this file has been, since
+# this session has no live Pipeline access of its own to re-confirm them.
 # HOLD_STAGE_ID is exactly STAGE_HOLD above (same id, same already-live
-# stage — Hold was already in LIVE_SELL_STAGE_IDS, so a Held deal
-# correctly stays in "Total in pipeline"). OBSOLETE_STAGE_ID is verified
-# verbatim in chadgracia/deal-update-form (OBSOLETE_STAGE_ID = 2348038).
+# stage — it stays in LIVE_SELL_STAGE_IDS so a Held deal is still fetched
+# and shown, in My Deals' own "On Hold" section; My Deals' "Total in
+# pipeline" sum excludes it explicitly since that total only counts the
+# active section). OBSOLETE_STAGE_ID is verified verbatim in
+# chadgracia/deal-update-form (OBSOLETE_STAGE_ID = 2348038).
 # Neither WON_STAGE_IDS nor LOST_STAGE_IDS was ever in LIVE_SELL_STAGE_IDS
 # to begin with, so excluding them from "live" needs no separate check —
 # they were simply never in the live whitelist.
@@ -363,6 +365,10 @@ CEF_LABELS = {
     CEF_YES_ID: "Yes",
     CEF_NA_ID: "N/A",
 }
+
+# My Deals visibility badge's amber state (item 3): the Agent Agreement
+# document tenants review/sign, given directly.
+AGENT_AGREEMENT_DOC_URL = "https://docs.google.com/document/d/1tWiM39QFYDWQSjZ-nWOS8yfbbVnwTjmMRPURmznHHQ0/edit?usp=sharing"
 
 # "Matched or later" buy-side stages, shared verbatim by the Matched Buyers
 # section and the Active Intros tab: every known stage id (STAGE_LABELS,
@@ -1397,6 +1403,33 @@ def _feature_requests_list_html(open_items, done_items, show_tenant=False, tenan
     return "".join(rows)
 
 
+def _feature_section_html(tenant_picker, anon_key_email, key=None):
+    """Feature-request box + list, shared verbatim by My Deals and the
+    Demand Board (item 5): tenant_picker (admin, no view_as) is the one
+    case with no single partition to scope to — it aggregates every
+    TENANTS partition plus "admin" instead; every other case (real
+    tenant session, or admin under &view_as) is scoped to anon_key_email.
+    Returns (feature_box_html, feature_list_html)."""
+    if tenant_picker:
+        feature_box_html = _feature_box_html("admin", key=key)
+        tenant_names = {"admin": "Admin"}
+        agg_open, agg_done = [], []
+        for partition in list(TENANTS.keys()) + ["admin"]:
+            items, _ = get_feature_requests(partition)
+            agg_open += items["open"]
+            agg_done += items["done"]
+            tenant_names[partition] = TENANTS[partition]["name"] if partition in TENANTS else "Admin"
+        agg_open.sort(key=lambda it: it["sk"], reverse=True)
+        agg_done.sort(key=lambda it: it["sk"], reverse=True)
+        feature_list_html = _feature_requests_list_html(agg_open, agg_done, show_tenant=True,
+                                                          tenant_names=tenant_names)
+    else:
+        feature_box_html = _feature_box_html(anon_key_email, key=key)
+        feature_items, _ = get_feature_requests(anon_key_email)
+        feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
+    return feature_box_html, feature_list_html
+
+
 # ── Hold / Cancel: direct Pipeline stage writes (My Deals) ───────────────
 # Replaces the old action=deal_request "ask admin" flow outright — Hold
 # and Cancel are now one-click, PUT the deal's stage to Pipeline for
@@ -1481,7 +1514,7 @@ def _send_deal_stage_email(deal, deal_id, tenant_name, target):
     the Pipeline write or the Dynamo overlay (see _handle_deal_stage),
     only get flagged in the audit item. Returns True/False, never
     raises."""
-    action_label = "Hold" if target == "hold" else "Cancel"
+    action_label = {"hold": "Hold", "cancel": "Cancel", "reactivate": "Reactivate"}[target]
     deal_name = _deal_title(deal)
     company = _deal_company_name(deal) or "—"
     subject = f"[Dashboard] {action_label}: {deal_name} — {tenant_name}"
@@ -1527,7 +1560,7 @@ def _dynamo_write_deal_stage_override(tenant_email, deal_id, stage_id, actor, ol
 
 
 def _handle_deal_stage(event):
-    """POST ?action=deal_stage — Hold or Cancel a deal via a DIRECT
+    """POST ?action=deal_stage — Hold, Cancel, or Reactivate a deal via a DIRECT
     Pipeline stage write (never a request/ask — see the replacement note
     above). Auth mirrors _handle_update_intro exactly: the deal's owning
     partition is always derived server-side via _tenant_email_for_deal,
@@ -1550,9 +1583,9 @@ def _handle_deal_stage(event):
         return _json_response({"error": "deal_id is required"}, 400)
 
     target = body.get("target")
-    if target not in ("hold", "cancel"):
+    if target not in ("hold", "cancel", "reactivate"):
         return _json_response({"error": "invalid target"}, 400)
-    target_stage_id = HOLD_STAGE_ID if target == "hold" else OBSOLETE_STAGE_ID
+    target_stage_id = {"hold": HOLD_STAGE_ID, "cancel": OBSOLETE_STAGE_ID, "reactivate": STAGE_INQUIRY}[target]
 
     deals = get_deals_list()
     deal = next((d for d in deals if str(d.get("id")) == deal_id), None)
@@ -1600,6 +1633,9 @@ def _deal_stage_script_html():
     },
     cancel: function(name) {
       return 'Cancel ' + name + '? This marks the deal obsolete and removes it from circulation.';
+    },
+    reactivate: function(name) {
+      return 'Reactivate ' + name + '? This sets the deal back to Inquiry and returns it to your active pipeline.';
     }
   };
   document.querySelectorAll('.deal-stage-btn').forEach(function(btn) {
@@ -1626,26 +1662,26 @@ def _deal_stage_script_html():
 </script>"""
 
 
-def _deal_stage_chip_html(resolved_stage_id):
-    if resolved_stage_id == HOLD_STAGE_ID:
-        return '<span class="stage-chip hold">On hold</span>'
-    if resolved_stage_id == OBSOLETE_STAGE_ID:
-        return '<span class="stage-chip cancelled">Cancelled</span>'
-    return ""
-
-
-def _deal_actions_html(deal_id, deal_name, update_btn, resolved_stage_id, key=None):
-    """update_btn is the existing minted Update link, unchanged. Hold and
-    Cancel disappear in favor of the stage chip the moment either fires
-    (On hold amber, Cancelled gray) — same actions-column real estate the
-    old request-chip used, now driven by the resolved Pipeline stage
-    instead of an unresolved Dynamo request."""
-    chip = _deal_stage_chip_html(resolved_stage_id)
-    if chip:
-        return f'{update_btn} {chip}'
+def _deal_actions_html(deal_id, deal_name, update_btn, section, key=None):
+    """update_btn is the existing minted Update link, unchanged. section is
+    which of My Deals' three stacked tables this row belongs to: "active"
+    rows get Hold + Cancel; "hold" rows get Reactivate (writes stage back
+    to Inquiry — same direct-write path, available to tenant and admin
+    alike, exactly like Hold/Cancel: the data-key value is only ever a
+    real ADMIN_KEY for an admin session, empty for a tenant session, and
+    the server derives the tenant identity from the auth cookie either
+    way, never from this attribute); "cancelled" rows are terminal, no
+    actions."""
     key_attr = _esc(key or "")
     id_attr = _esc(deal_id)
     name_attr = _esc(deal_name)
+    if section == "hold":
+        reactivate_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" '
+                           f'data-deal-id="{id_attr}" data-deal-name="{name_attr}" '
+                           f'data-target="reactivate">Reactivate</button>')
+        return f'{update_btn} {reactivate_btn}'
+    if section == "cancelled":
+        return update_btn
     hold_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
                 f'data-deal-name="{name_attr}" data-target="hold">Hold</button>')
     cancel_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
@@ -2034,63 +2070,43 @@ def _deal_pipeline_size(deal):
         return None
 
 
-# Stage-based won/live predicates for the My Deals summary strip totals.
-# Superseded the earlier deal.get("status")-based guess entirely — stage
-# id is the shape deals.json actually carries (see _deal_stage_id) and
-# WON_STAGE_IDS/LOST_STAGE_IDS/OBSOLETE_STAGE_ID above are given as
-# verified. Callers pass the deal's *resolved* stage (_resolve_deal_stage,
-# override-aware) rather than calling _deal_stage_id directly, so a
-# same-session Hold/Cancel is reflected in the totals immediately without
+# Stage-based won predicate for the My Deals summary strip's "Total
+# closed". Superseded the earlier deal.get("status")-based guess entirely
+# — stage id is the shape deals.json actually carries (see
+# _deal_stage_id) and WON_STAGE_IDS is given as verified. Callers pass
+# the deal's *resolved* stage (_resolve_deal_stage, override-aware)
+# rather than calling _deal_stage_id directly, so a same-session
+# Hold/Cancel/Reactivate is reflected in the totals immediately without
 # waiting for deals.json to resync.
 def _is_won_stage(stage_id):
     return stage_id in WON_STAGE_IDS
 
 
-def _is_live_pipeline_stage(stage_id):
-    """"Live" for the pipeline-total: in the known live-stage whitelist.
-    WON_STAGE_IDS/LOST_STAGE_IDS/OBSOLETE_STAGE_ID were never part of
-    LIVE_SELL_STAGE_IDS to begin with, so excluding them needs no extra
-    check beyond the whitelist membership test itself — a Held deal
-    (HOLD_STAGE_ID, already in the whitelist) correctly stays live."""
-    return stage_id in LIVE_SELL_STAGE_IDS
-
-
 def _my_deal_visibility_state(deal, cef_state):
-    """"live" (Agent Agreement Yes), "setup" (In Process, or the tenant's
-    own CEF is Yes), or "not_live" — single source of truth shared by the
-    My Deals visibility badge and its summary-strip counts."""
+    """Precedence order (item 3): Agent Agreement Yes wins outright
+    regardless of CEF -> "live"; else the tenant's own CEF isn't Yes ->
+    "need_cef" (CEF blocks everything else, including an Agreement
+    that's already In Process); else (CEF is Yes, Agreement is In
+    Process or unset) -> "review_agreement". Single source of truth
+    shared by the My Deals visibility badge and its summary-strip
+    counts."""
     opts = _deal_cf_option_ids(deal, AGENT_AGREEMENT_FIELD)
     if opts & AGENT_ENGAGED_OPTS:
         return "live"
-    if (opts & AGENT_IN_PROCESS_OPTS) or cef_state == CEF_YES_ID:
-        return "setup"
-    return "not_live"
+    if cef_state != CEF_YES_ID:
+        return "need_cef"
+    return "review_agreement"
 
 
-CEF_LINK_HTML = (f'<a class="cef-complete-link" href="{CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">'
-                  'Complete CEF &rarr;</a>')
-
-
-def _my_deal_visibility_badge_html(deal, company, cef_state):
-    """The Engage-RMS mailto on "not_live" is a separate ask (deal
-    activation) from CEF and stays a mailto unchanged. CEF_LINK_HTML is
-    appended alongside it whenever CEF is plausibly still the blocker:
-    always on "not_live" (cef_state can never be CEF_YES_ID there — if it
-    were, _my_deal_visibility_state would have returned "setup" instead),
-    and on "setup" only when that amber state came from the Agent
-    Agreement being In Process rather than from CEF already being Yes
-    (appending it in the CEF-Yes case would tell someone to complete a
-    form they've already completed)."""
+def _my_deal_visibility_badge_html(deal, cef_state):
     state = _my_deal_visibility_state(deal, cef_state)
     if state == "live":
         return '<span class="visibility-badge live">Live — shown to buyers</span>'
-    if state == "setup":
-        cef_link = CEF_LINK_HTML if cef_state != CEF_YES_ID else ""
-        return f'<span class="visibility-badge setup">Setup in progress</span> {cef_link}'
-    subject = urllib.parse.quote(f"Engage RMS re {company}", safe="")
-    href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
-    return (f'<a class="visibility-badge not-live" href="{href}">Not live — engage to activate</a> '
-            f'{CEF_LINK_HTML}')
+    if state == "need_cef":
+        return (f'<a class="visibility-badge need-cef" href="{CEF_FORM_URL}" target="_blank" '
+                f'rel="noopener noreferrer">Need CEF</a>')
+    return (f'<a class="visibility-badge review-agreement" href="{AGENT_AGREEMENT_DOC_URL}" target="_blank" '
+            f'rel="noopener noreferrer">Review agreement &rarr;</a>')
 
 
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
@@ -2569,8 +2585,8 @@ NAV_CSS = """
 FEATURE_CSS = """
   .feature-box {
     position: relative;
-    background: rgba(79,140,255,0.12);
-    border: 1px solid rgba(79,140,255,0.35);
+    background: rgba(61,90,115,0.10);
+    border: 1px solid rgba(61,90,115,0.45);
     border-radius: 10px;
     padding: 18px 44px 18px 20px;
     margin: 0 0 24px;
@@ -2953,13 +2969,13 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 <style>
   * {{ box-sizing: border-box; }}
   :root {{
-    --bg: #14161a;
-    --card: #1c1f26;
-    --line: #2a2e37;
-    --ink: #e8eaed;
-    --muted: #9aa0ac;
-    --accent: #4f8cff;
-    --qp: #2e9d6a;
+    --bg: #f4f2ee;
+    --card: #ffffff;
+    --line: #e7e5e0;
+    --ink: #16181d;
+    --muted: #6b7280;
+    --accent: #3d5a73;
+    --qp: #1f7a4d;
   }}
   body {{
     margin: 0;
@@ -3023,7 +3039,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     font-size: 11px;
     font-weight: 600;
     color: var(--muted);
-    background: rgba(255,255,255,0.06);
+    background: rgba(22,24,29,0.06);
     border-radius: 999px;
     padding: 2px 8px;
     margin-left: 6px;
@@ -3035,8 +3051,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     border-radius: 999px;
     padding: 3px 9px;
   }}
-  .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #c9a227; }}
-  .status-chip.exit {{ background: rgba(255,255,255,0.06); color: var(--muted); }}
+  .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #8a6d1f; }}
+  .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
   .buyer-code {{ font-size: 12px; font-weight: 600; color: var(--ink); }}
   .buyer-range {{ font-size: 11px; color: var(--muted); margin-top: 2px; }}
   .tier-badge {{
@@ -3047,7 +3063,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     letter-spacing: 0.03em;
     padding: 2px 7px;
     border-radius: 999px;
-    color: #14161a;
+    color: #16181d;
   }}
   .tier-badge.tier-qp {{ background: var(--qp); }}
   .tier-badge.tier-accredited {{ background: #c9a227; }}
@@ -3059,7 +3075,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted);
-    background: rgba(255,255,255,0.02);
+    background: rgba(22,24,29,0.02);
     border-bottom: 1px solid var(--line);
   }}
   td.group-empty {{
@@ -3070,7 +3086,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   }}
   .table-scroll {{ overflow-x: auto; }}
   .gg-note {{
-    color: var(--accredited, #c9a227);
+    color: var(--accredited, #8a6d1f);
     font-size: 13px;
     margin: 0 0 16px;
   }}
@@ -3087,7 +3103,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
-  .ei-msg.error {{ color: #e06666; }}
+  .ei-msg.error {{ color: #b23b3b; }}
   .buyer-detail {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
   .buyer-detail a {{ color: var(--accent); text-decoration: none; }}
   .buyer-detail a:hover {{ text-decoration: underline; }}
@@ -3100,8 +3116,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     padding: 2px 7px;
     border-radius: 999px;
     margin-left: 6px;
-    background: rgba(220,80,80,0.15);
-    color: #e06666;
+    background: rgba(178,59,59,0.12);
+    color: #b23b3b;
   }}
 </style>
 </head>
@@ -3115,7 +3131,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 </html>"""
 
 
-def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, resolved_stage_id, key=None,
+def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section, key=None,
                        view_as=None, edit_mode=False):
     deal_id = str(deal.get("id"))
     if company_name:
@@ -3131,7 +3147,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     )
 
     size_text = _esc(_my_deal_size_text(deal))
-    badge_html = _my_deal_visibility_badge_html(deal, company_name or "", cef_state)
+    badge_html = _my_deal_visibility_badge_html(deal, cef_state)
 
     buyer_text = str(buyer_count)
     intro_text = str(stats["intro_count"]) if stats["intro_count"] else "—"
@@ -3163,7 +3179,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         attention_html = f'<span class="attention-chip" title="{tooltip}">Needs attention</span>'
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
-    actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, resolved_stage_id, key=key)
+    actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section, key=key)
 
     return (
         f'<tr><td class="company">{company_cell}</td>'
@@ -3186,29 +3202,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     buy-side signals, not attributes of the Sell deal itself."""
     nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
 
-    # Feature-request box + list. tenant_picker (admin, no view_as) is the
-    # one case with no single partition to scope to — it aggregates every
-    # TENANTS partition plus "admin" instead (see the task's admin-
-    # aggregate requirement); every other case (real tenant session, or
-    # admin under &view_as) is scoped to anon_key_email like everywhere
-    # else on this page.
-    if tenant_picker:
-        feature_box_html = _feature_box_html("admin", key=key)
-        tenant_names = {"admin": "Admin"}
-        agg_open, agg_done = [], []
-        for partition in list(TENANTS.keys()) + ["admin"]:
-            items, _ = get_feature_requests(partition)
-            agg_open += items["open"]
-            agg_done += items["done"]
-            tenant_names[partition] = TENANTS[partition]["name"] if partition in TENANTS else "Admin"
-        agg_open.sort(key=lambda it: it["sk"], reverse=True)
-        agg_done.sort(key=lambda it: it["sk"], reverse=True)
-        feature_list_html = _feature_requests_list_html(agg_open, agg_done, show_tenant=True,
-                                                          tenant_names=tenant_names)
-    else:
-        feature_box_html = _feature_box_html(anon_key_email, key=key)
-        feature_items, _ = get_feature_requests(anon_key_email)
-        feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
+    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key)
 
     summary_html = ""
     subtle_html = ""
@@ -3259,13 +3253,21 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             company_name = _deal_company_name(d)
             override_entry = intro_details.get(str(d.get("id"))) or {}
             deadline = _resolve_deal_deadline(d, override_entry)
+            resolved_stage = _resolve_deal_stage(d, override_entry)
+            if resolved_stage == HOLD_STAGE_ID:
+                section = "hold"
+            elif resolved_stage == OBSOLETE_STAGE_ID:
+                section = "cancelled"
+            else:
+                section = "active"
             rows.append({
                 "deal": d,
                 "company_name": company_name,
                 "deadline": deadline,
                 "stats": _company_stats(company_name),
                 "buyer_count": buyer_counts.get((company_name or "").strip().lower(), 0),
-                "resolved_stage": _resolve_deal_stage(d, override_entry),
+                "resolved_stage": resolved_stage,
+                "section": section,
             })
 
         # Deadline ascending (ISO yyyy-mm-dd sorts correctly as a string),
@@ -3278,43 +3280,50 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         intros_total = 0
         attention_count = 0
         deadlines = []
-        row_htmls = []
+        section_row_htmls = {"active": [], "hold": [], "cancelled": []}
         for r in rows:
             d = r["deal"]
             deadline = r["deadline"]
             stats = r["stats"]
-            is_overdue = False
-            if deadline:
-                deadline_dt = _parse_dt(deadline)
-                is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
-                deadlines.append(deadline)
+            section = r["section"]
 
-            if is_overdue or stats["stalled"] or stats["follow_up_due"]:
-                attention_count += 1
-            intros_total += stats["intro_count"]
+            # Summary-strip counts and totals cover the active section
+            # only — Held and Cancelled deals get their own sections below
+            # and no longer contribute here (see item 2).
+            if section == "active":
+                is_overdue = False
+                if deadline:
+                    deadline_dt = _parse_dt(deadline)
+                    is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
+                    deadlines.append(deadline)
 
-            state = _my_deal_visibility_state(d, cef_state)
-            if state == "live":
-                live_count += 1
-            elif state == "not_live":
-                not_engaged_count += 1
+                if is_overdue or stats["stalled"] or stats["follow_up_due"]:
+                    attention_count += 1
+                intros_total += stats["intro_count"]
 
-            row_htmls.append(_my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
-                                                r["resolved_stage"],
-                                                key=key, view_as=view_as, edit_mode=edit_mode))
+                state = _my_deal_visibility_state(d, cef_state)
+                if state == "live":
+                    live_count += 1
+                elif state == "need_cef":
+                    not_engaged_count += 1
+
+            section_row_htmls[section].append(
+                _my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
+                                   section, key=key, view_as=view_as, edit_mode=edit_mode))
 
         today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         future_deadlines = [dl for dl in deadlines if dl >= today_iso]
 
         # Resolved (override-aware) stage, not the deal's own raw
-        # deal_stage — so a same-session Hold/Cancel drops the deal from
-        # "Total in pipeline" (Cancel) or leaves it counted (Hold stays
-        # live) immediately, without waiting for deals.json to resync.
-        pipeline_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in rows
-                                          if not r["deal"].get("is_archived")
-                                          and _is_live_pipeline_stage(r["resolved_stage"]))
+        # deal_stage — so a same-session Hold/Cancel/Reactivate moves the
+        # deal in or out of "Total in pipeline" immediately, without
+        # waiting for deals.json to resync. Scoped to the active section
+        # only (see above) — Held deals no longer count here.
+        active_rows = [r for r in rows if r["section"] == "active"]
+        pipeline_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in active_rows
+                                          if not r["deal"].get("is_archived"))
                               if v is not None)
-        closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in rows
+        closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in active_rows
                                         if _is_won_stage(r["resolved_stage"]))
                             if v is not None)
 
@@ -3337,8 +3346,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                          if summary_parts else "")
         subtle_html = '<p class="mydeals-subtle">Click a company name for deal details, buyers, and live demand.</p>'
 
-        rows_html = "".join(row_htmls)
-        body_html = f"""<div class="card">
+        def _section_table_html(rows_html, extra_card_class=""):
+            card_cls = f"card {extra_card_class}".strip()
+            return f"""<div class="{card_cls}">
     <table>
       <thead>
         <tr>
@@ -3358,6 +3368,23 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
       </tbody>
     </table>
   </div>"""
+
+        # Three stacked sections; a section with no rows is omitted
+        # entirely (item 2) rather than rendered empty.
+        sections_html = []
+        if section_row_htmls["active"]:
+            sections_html.append(_section_table_html("".join(section_row_htmls["active"])))
+        if section_row_htmls["hold"]:
+            sections_html.append(
+                f'<h2 class="mydeals-section-heading hold">On Hold '
+                f'<span class="count">({len(section_row_htmls["hold"])})</span></h2>'
+                + _section_table_html("".join(section_row_htmls["hold"]), "section-hold"))
+        if section_row_htmls["cancelled"]:
+            sections_html.append(
+                f'<h2 class="mydeals-section-heading cancelled">Cancelled '
+                f'<span class="count">({len(section_row_htmls["cancelled"])})</span></h2>'
+                + _section_table_html("".join(section_row_htmls["cancelled"]), "section-cancelled"))
+        body_html = "".join(sections_html)
         edit_script = _edit_script_html(key) if edit_mode else ""
 
     return f"""<!DOCTYPE html>
@@ -3370,14 +3397,14 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 {NAV_CSS}
 {FEATURE_CSS}
   :root {{
-    --bg: #14161a;
-    --card: #1c1f26;
-    --line: #2a2e37;
-    --ink: #e8eaed;
-    --muted: #9aa0ac;
-    --accent: #4f8cff;
-    --qp: #2e9d6a;
-    --accredited: #c9a227;
+    --bg: #f4f2ee;
+    --card: #ffffff;
+    --line: #e7e5e0;
+    --ink: #16181d;
+    --muted: #6b7280;
+    --accent: #3d5a73;
+    --qp: #1f7a4d;
+    --accredited: #8a6d1f;
   }}
   * {{ box-sizing: border-box; }}
   body {{
@@ -3427,7 +3454,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     font-size: 14px;
   }}
   tbody tr:last-child td {{ border-bottom: none; }}
-  tbody tr:hover {{ background: rgba(255,255,255,0.03); }}
+  tbody tr:hover {{ background: rgba(22,24,29,0.03); }}
   td.company {{ font-weight: 500; }}
   td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
   td.company a:hover {{ border-bottom-color: var(--muted); }}
@@ -3468,7 +3495,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     padding: 4px 10px;
     border-radius: 999px;
     border: none;
-    background: rgba(255,255,255,0.06);
+    background: rgba(22,24,29,0.06);
     color: var(--ink);
     text-decoration: none;
     cursor: pointer;
@@ -3478,27 +3505,20 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .update-cancel-btn:hover, .deal-stage-btn:hover {{
     text-decoration: underline;
   }}
-  .stage-chip {{
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    padding: 3px 9px;
-    border-radius: 999px;
-    white-space: nowrap;
-    margin-right: 4px;
-  }}
-  .stage-chip.hold {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
-  .stage-chip.cancelled {{ background: rgba(255,255,255,0.08); color: var(--muted); }}
-  .cef-complete-link {{
-    font-size: 11px;
+  .mydeals-section-heading {{
+    font-size: 14px;
     font-weight: 600;
-    color: var(--accent);
-    text-decoration: none;
-    white-space: nowrap;
+    margin: 28px 0 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }}
-  .cef-complete-link:hover {{ text-decoration: underline; }}
+  .mydeals-section-heading .count {{ color: var(--muted); font-weight: 500; font-size: 12px; }}
+  .card.section-hold {{ border-color: rgba(201,162,39,0.45); }}
+  .card.section-hold thead th {{ background: rgba(201,162,39,0.08); }}
+  .mydeals-section-heading.hold {{ color: var(--accredited); }}
+  .card.section-cancelled {{ opacity: 0.7; }}
+  .mydeals-section-heading.cancelled {{ color: var(--muted); }}
   .visibility-badge {{
     display: inline-block;
     font-size: 12px;
@@ -3508,12 +3528,13 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     text-decoration: none;
     white-space: nowrap;
   }}
-  .visibility-badge.live {{ background: rgba(46,157,106,0.15); color: var(--qp); }}
-  .visibility-badge.setup {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
-  .visibility-badge.not-live {{ background: rgba(220,80,80,0.15); color: #e06666; }}
-  .visibility-badge.not-live:hover {{ text-decoration: underline; }}
-  .deadline-overdue {{ color: #e06666; font-weight: 600; }}
-  .ei-deadline.overdue-input {{ border-color: #e06666; }}
+  .visibility-badge.live {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
+  .visibility-badge.review-agreement {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .visibility-badge.review-agreement:hover {{ text-decoration: underline; }}
+  .visibility-badge.need-cef {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
+  .visibility-badge.need-cef:hover {{ text-decoration: underline; }}
+  .deadline-overdue {{ color: #b23b3b; font-weight: 600; }}
+  .ei-deadline.overdue-input {{ border-color: #b23b3b; }}
   .attention-chip {{
     display: inline-block;
     font-size: 11px;
@@ -3522,8 +3543,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     letter-spacing: 0.03em;
     padding: 3px 9px;
     border-radius: 999px;
-    background: rgba(220,80,80,0.15);
-    color: #e06666;
+    background: rgba(178,59,59,0.12);
+    color: #b23b3b;
     white-space: nowrap;
   }}
   .ei-deadline {{
@@ -3538,7 +3559,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
-  .ei-msg.error {{ color: #e06666; }}
+  .ei-msg.error {{ color: #b23b3b; }}
   .gg-placeholder {{
     max-width: 1000px;
     margin: 96px auto;
@@ -3784,14 +3805,14 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 {NAV_CSS}
 {FEATURE_CSS}
   :root {{
-    --bg: #14161a;
-    --card: #1c1f26;
-    --line: #2a2e37;
-    --ink: #e8eaed;
-    --muted: #9aa0ac;
-    --accent: #4f8cff;
-    --qp: #2e9d6a;
-    --accredited: #c9a227;
+    --bg: #f4f2ee;
+    --card: #ffffff;
+    --line: #e7e5e0;
+    --ink: #16181d;
+    --muted: #6b7280;
+    --accent: #3d5a73;
+    --qp: #1f7a4d;
+    --accredited: #8a6d1f;
     --unknown: #6b7280;
   }}
   * {{ box-sizing: border-box; }}
@@ -3893,11 +3914,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     letter-spacing: 0.03em;
     padding: 3px 8px;
     border-radius: 999px;
-    color: #14161a;
+    color: #16181d;
     margin-bottom: 8px;
   }}
   .tier-badge.tier-qp {{ background: var(--qp); }}
-  .tier-badge.tier-accredited {{ background: var(--accredited); }}
+  .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--unknown); color: var(--ink); }}
   .buyer-range {{ font-size: 12px; color: var(--muted); }}
   .deal-card {{
@@ -3908,7 +3929,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     margin-bottom: 16px;
   }}
   .deal-card:last-child {{ margin-bottom: 0; }}
-  .deal-card.overdue {{ border-color: #e06666; }}
+  .deal-card.overdue {{ border-color: #b23b3b; }}
   .overdue-chip {{
     display: inline-block;
     font-size: 12px;
@@ -3916,8 +3937,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     padding: 4px 10px;
     border-radius: 999px;
     margin-bottom: 12px;
-    background: rgba(220,80,80,0.15);
-    color: #e06666;
+    background: rgba(178,59,59,0.12);
+    color: #b23b3b;
     text-decoration: none;
   }}
   .overdue-chip:hover {{ text-decoration: underline; }}
@@ -3963,9 +3984,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     margin-top: 6px;
     text-decoration: none;
   }}
-  .engagement-badge.engaged {{ background: rgba(46,157,106,0.15); color: var(--qp); }}
+  .engagement-badge.engaged {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .engagement-badge.in-process {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
-  .engagement-badge.not-engaged {{ background: rgba(220,80,80,0.15); color: #e06666; }}
+  .engagement-badge.not-engaged {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .engagement-badge.not-engaged:hover {{ text-decoration: underline; }}
   .update-cancel-btn {{
     display: inline-block;
@@ -3975,7 +3996,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     border-radius: 999px;
     margin-top: 6px;
     margin-left: 8px;
-    background: rgba(255,255,255,0.06);
+    background: rgba(22,24,29,0.06);
     color: var(--ink);
     text-decoration: none;
   }}
@@ -3985,7 +4006,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     font-size: 11px;
     font-weight: 600;
     color: var(--muted);
-    background: rgba(255,255,255,0.06);
+    background: rgba(22,24,29,0.06);
     border-radius: 999px;
     padding: 2px 8px;
   }}
@@ -3997,7 +4018,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     padding: 3px 9px;
   }}
   .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
-  .status-chip.exit {{ background: rgba(255,255,255,0.06); color: var(--muted); }}
+  .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
   .gg-note {{
     color: var(--accredited);
     font-size: 13px;
@@ -4010,7 +4031,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     text-transform: uppercase;
     letter-spacing: 0.04em;
     color: var(--muted);
-    background: rgba(255,255,255,0.02);
+    background: rgba(22,24,29,0.02);
     border-bottom: 1px solid var(--line);
   }}
   td.group-empty {{
@@ -4033,7 +4054,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
-  .ei-msg.error {{ color: #e06666; }}
+  .ei-msg.error {{ color: #b23b3b; }}
   .buyer-detail {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
   .buyer-detail a {{ color: var(--accent); text-decoration: none; }}
   .buyer-detail a:hover {{ text-decoration: underline; }}
@@ -4047,8 +4068,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     padding: 2px 7px;
     border-radius: 999px;
     margin-left: 6px;
-    background: rgba(220,80,80,0.15);
-    color: #e06666;
+    background: rgba(178,59,59,0.12);
+    color: #b23b3b;
   }}
 </style>
 </head>
@@ -4098,22 +4119,22 @@ def _message_page(title, message, show_signin=False):
     display: flex;
     align-items: center;
     justify-content: center;
-    background: #14161a;
-    color: #e8eaed;
+    background: #f4f2ee;
+    color: #16181d;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     padding: 24px;
   }}
   .gg-card {{
     max-width: 420px;
     text-align: center;
-    background: #1c1f26;
-    border: 1px solid #2a2e37;
+    background: #ffffff;
+    border: 1px solid #e7e5e0;
     border-radius: 10px;
     padding: 32px 28px;
   }}
   .gg-card h1 {{ font-size: 18px; margin: 0 0 12px; }}
-  .gg-card p {{ color: #9aa0ac; font-size: 14px; line-height: 1.5; margin: 0 0 8px; }}
-  .gg-link {{ color: #4f8cff; text-decoration: none; font-weight: 600; }}
+  .gg-card p {{ color: #6b7280; font-size: 14px; line-height: 1.5; margin: 0 0 8px; }}
+  .gg-link {{ color: #3d5a73; text-decoration: none; font-weight: 600; }}
 </style>
 </head>
 <body>
@@ -4126,7 +4147,9 @@ def _message_page(title, message, show_signin=False):
 </html>"""
 
 
-def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
+def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
+                 tenant_picker=False):
+    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key)
     rows_html = "".join(
         f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
         f'{_esc(r["company"])}</a></td>'
@@ -4146,17 +4169,19 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
 <title>Demand Board</title>
 <style>
 {NAV_CSS}
+{FEATURE_CSS}
   :root {{
-    --bg: #14161a;
-    --card: #1c1f26;
-    --line: #2a2e37;
-    --ink: #e8eaed;
-    --muted: #9aa0ac;
-    --accent: #4f8cff;
-    --qp: #2e9d6a;
-    --accredited: #c9a227;
+    --bg: #f4f2ee;
+    --card: #ffffff;
+    --line: #e7e5e0;
+    --ink: #16181d;
+    --muted: #6b7280;
+    --accent: #3d5a73;
+    --qp: #1f7a4d;
+    --accredited: #8a6d1f;
     --unknown: #6b7280;
   }}
+  .feature-section-heading {{ font-size: 16px; font-weight: 600; margin: 32px 0 12px; }}
   * {{ box-sizing: border-box; }}
   body {{
     margin: 0;
@@ -4174,18 +4199,6 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
   }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
   .sub {{ color: var(--muted); font-size: 13px; margin: 0 0 24px; }}
-  .feature-btn {{
-    flex: 0 0 auto;
-    background: var(--accent);
-    color: #fff;
-    font-size: 13px;
-    font-weight: 600;
-    text-decoration: none;
-    padding: 10px 16px;
-    border-radius: 8px;
-    white-space: nowrap;
-  }}
-  .feature-btn:hover {{ opacity: 0.9; }}
   .toolbar {{ display: flex; gap: 12px; margin-bottom: 16px; }}
   #search {{
     flex: 1;
@@ -4237,7 +4250,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
     font-size: 14px;
   }}
   tbody tr:last-child td {{ border-bottom: none; }}
-  tbody tr:hover {{ background: rgba(255,255,255,0.03); }}
+  tbody tr:hover {{ background: rgba(22,24,29,0.03); }}
   td.company {{ font-weight: 500; }}
   td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
   td.company a:hover {{ border-bottom-color: var(--muted); }}
@@ -4248,6 +4261,19 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
   .dot.accredited {{ background: var(--accredited); }}
   .dot.unknown {{ background: var(--unknown); }}
   .empty {{ padding: 40px; text-align: center; color: var(--muted); }}
+  .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
+  .ei-msg.saving {{ color: var(--muted); }}
+  .ei-msg.saved {{ color: var(--qp); }}
+  .ei-msg.error {{ color: #b23b3b; }}
+  .gg-placeholder {{
+    max-width: 1000px;
+    margin: 96px auto;
+    padding: 0 24px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 15px;
+  }}
+  .gg-placeholder.small {{ margin: 0; padding: 24px; }}
 </style>
 </head>
 <body>
@@ -4258,9 +4284,8 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
       <h1>Demand Board</h1>
       <p class="sub">{len(table)} companies with interested buyers</p>
     </div>
-    <a class="feature-btn"
-       href="mailto:cgracia@rainmakersecurities.com?subject=Syndicator%20Dashboard%20feature%20request">Request a feature</a>
   </div>
+  {feature_box_html}
   <div class="toolbar">
     <input id="search" type="text" placeholder="Search companies...">
   </div>
@@ -4286,6 +4311,10 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
     <span><span class="dot qp"></span>QP &mdash; Investor Level = Qualified Purchaser</span>
     <span><span class="dot accredited"></span>Accredited &mdash; IQF Status Yes / Unnecessary</span>
     <span><span class="dot unknown"></span>Unknown &mdash; unclassified</span>
+  </div>
+  <h2 class="feature-section-heading">Feature requests</h2>
+  <div class="card">
+    {feature_list_html}
   </div>
 </div>
 <script>
@@ -4344,6 +4373,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
   }});
 }})();
 </script>
+{_feature_toggle_script_html(key)}
 </body>
 </html>"""
 
@@ -4644,7 +4674,8 @@ def lambda_handler(event, context):
 
     if tab == "demand":
         table = get_company_table()
-        body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as, cef_html=cef_html)
+        body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as, cef_html=cef_html,
+                            anon_key_email=anon_key_email, tenant_picker=(tenant is None))
     elif tab == "mydeals":
         if tenant is None:
             body = render_my_deals_page(viewer_name, tenant_picker=True,
