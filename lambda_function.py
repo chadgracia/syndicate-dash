@@ -27,7 +27,7 @@ constants: Firm, Matched, Inquiry, Hold, Confirm, LOI Signed, Transfer
 Notice, SPA Signed), and the deal is not archived.
 
 My Deals tab: one row per deals.json deal linked to the viewing tenant's
-person_id (TENANTS[email]["person_id"]). Linkage is read the same way
+person_id (auto-enrolled — see _resolve_tenant). Linkage is read the same way
 chadgracia/daily-brief's _deal_people does — a deal's "people" list of
 dicts (each carrying "id"), falling back to the flat "person_ids" list when
 "people" isn't present. No stage/archived filtering here (unlike Sellers):
@@ -62,9 +62,9 @@ Access / identity: two doors, either grants access —
     _make_identity_cookie / _read_identity_email, ported from
     chadgracia/trades/lambda_function.py) before redirecting to a clean
     URL. Later requests read identity from that cookie. The verified email
-    must be in TENANTS (below) or the tenant sees a "not enabled yet" page
-    instead of the board. Neither door open -> access-denied page, no data
-    rendered/fetched.
+    must auto-enroll as a tenant (see _resolve_tenant below) or the tenant
+    sees a "not enabled" page instead of the board. Neither door open ->
+    access-denied page, no data rendered/fetched.
 GET only, except one route: POST ?action=update_intro, admin-only (ADMIN_KEY
 in the POST body — the session cookie alone never authorizes a write), lets
 an admin edit a deal's Intro Status / Next Steps / Buyer Notes. See
@@ -442,13 +442,26 @@ IDENTITY_SECRET = os.environ.get("IDENTITY_SECRET", "")
 
 SIGNIN_URL = "https://trades.graciagroup.com"
 
-# Tenants enabled for this dashboard, keyed by lowercase email. Edited by
-# hand — no other code changes required. person_id is that tenant's
-# Pipeline CRM person id, used to match them against deals.json's people
-# linkage for the My Deals tab — carry it for every entry going forward.
-TENANTS = {
-    "michael@nonpublic.io": {"name": "Michael Ferkol (NonPublic)", "person_id": 1307955474},
+# Auto-enrollment (see _resolve_tenant / _build_tenant_index below): a
+# tenant is any authenticated identity whose email matches a person in
+# people.json (case-insensitive, every email field the record carries —
+# see _person_all_emails) AND who is linked to >=1 deal tagged Sell
+# Order (DEAL_SIDE_FIELD contains DEAL_SIDE_SELL_ID), any stage —
+# Hold/Obsolete/Won/Lost included, deliberately not filtered through
+# _is_live_sell_deal's LIVE_SELL_STAGE_IDS whitelist, since losing
+# someone's dashboard access because their one deal happens to be Held
+# would defeat the point. person_id and a default display name both
+# come from the matched people.json record.
+#
+# TENANT_OVERRIDES supplies a display-name override only — it plays no
+# role in eligibility, which is entirely auto-enrollment now.
+# TENANT_BLOCKLIST denies specific emails outright despite otherwise
+# qualifying (renders the not-enabled page).
+TENANT_OVERRIDES = {
+    "michael@nonpublic.io": {"name": "Michael Ferkol (NonPublic)"},
+    "natoli@mangustacap.com": {"name": "Natoli (Mangusta Capital)"},
 }
+TENANT_BLOCKLIST = set()
 
 # Module-level cache: survives warm Lambda invocations, reset on cold start.
 _cache = {"version": None, "table": None}
@@ -921,6 +934,98 @@ def get_people_by_ids(person_ids):
     return out
 
 
+# Module-level cache for the auto-enrollment email->tenant index, keyed
+# by the people.json snapshot's LastModified only (deliberately not
+# deals.json's — per instruction) — same warm-invocation-survives,
+# cold-start-resets pattern as _cache/_deals_cache above.
+_tenant_cache = {"version": None, "by_email": None}
+
+
+def _person_all_emails(rec):
+    """Every email address a person record carries — the scalar "email"
+    field plus each entry of the "emails" list (itself plain strings or
+    {"address": ...} dicts — same two shapes _person_email_text already
+    handles), lowercased and deduped, so auto-enrollment matches an
+    identity regardless of which address on file they authenticate
+    with. people.json carries both an "email" scalar and an "emails"
+    list per the existing _person_email_text helper (ported from
+    chadgracia/daily-brief) — this indexes every one of them rather
+    than picking just the first, unlike that helper."""
+    if not isinstance(rec, dict):
+        return []
+    out = []
+    seen = set()
+
+    def _add(addr):
+        if isinstance(addr, str) and addr.strip():
+            key = addr.strip().lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+
+    _add(rec.get("email"))
+    emails = rec.get("emails") or []
+    if isinstance(emails, list):
+        for item in emails:
+            _add(item.get("address") if isinstance(item, dict) else item)
+    return out
+
+
+def _build_tenant_index(s3):
+    """email (lowercased) -> {"name", "person_id"} for every auto-
+    enrolled tenant: a people.json person linked to >=1 deal tagged Sell
+    Order (DEAL_SIDE_FIELD contains DEAL_SIDE_SELL_ID), any stage —
+    deliberately not run through _is_live_sell_deal's
+    LIVE_SELL_STAGE_IDS/is_archived filtering, since a Held or Obsolete
+    deal must not cost someone their access. TENANT_BLOCKLIST emails are
+    dropped outright; TENANT_OVERRIDES only ever swaps in a display
+    name, never affects eligibility. When a person has multiple emails
+    on file, each maps to the same tenant record — first match wins
+    ties are impossible since every email is this exact person's own."""
+    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+    people_data = json.loads(people_obj["Body"].read())
+    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+
+    seller_person_ids = set()
+    for deal in get_deals_list():
+        if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
+            seller_person_ids.update(_deal_linked_person_ids(deal))
+
+    by_email = {}
+    for rec in people_list:
+        pid = rec.get("id")
+        if pid is None or pid not in seller_person_ids:
+            continue
+        default_name = _person_display_name(rec)
+        for email in _person_all_emails(rec):
+            if email in TENANT_BLOCKLIST:
+                continue
+            override_name = (TENANT_OVERRIDES.get(email) or {}).get("name")
+            by_email[email] = {"name": override_name or default_name or email, "person_id": pid}
+    return by_email
+
+
+def _tenant_index():
+    s3 = boto3.client("s3")
+    version = _object_version(s3, PEOPLE_KEY)
+    if _tenant_cache["version"] == version and _tenant_cache["by_email"] is not None:
+        return _tenant_cache["by_email"]
+    by_email = _build_tenant_index(s3)
+    _tenant_cache["version"] = version
+    _tenant_cache["by_email"] = by_email
+    return by_email
+
+
+def _resolve_tenant(email):
+    """{"name", "person_id"} for a qualifying (auto-enrolled,
+    non-blocklisted) tenant email, case-insensitive, or None. The single
+    source of truth every access-control check below calls instead of
+    the old TENANTS lookup."""
+    if not email:
+        return None
+    return _tenant_index().get(email.strip().lower())
+
+
 def _tenant_cef_state(person_id):
     """The tenant's own Client Engagement Form option id (CEF_FIELD,
     verified via the one-time person_custom_field_labels fetch — one of
@@ -942,22 +1047,24 @@ def _tenant_cef_state(person_id):
 
 def _cef_badge_html(cef_option_id, tenant_name):
     """Nav-bar badge for the tenant view (and admin &view_as preview),
-    one state per CEF option: Yes -> green "CEF on file"; Pending ->
-    amber "CEF pending"; No or unset (cef_option_id is None or any id
-    outside the verified map) -> red "CEF missing" linking straight to
-    the CEF form itself (CEF_FORM_URL, new tab) — no longer a mailto,
-    since there's now a direct form to send people to; N/A -> no badge
-    at all. Only ever called when there IS a tenant to report on (see
-    the call site's tenant is not None guard) — there's no separate "no
-    tenant" case to handle here."""
+    one state per CEF option: Yes -> green "ID verified"; Pending ->
+    amber "ID pending"; No or unset (cef_option_id is None or any id
+    outside the verified map) -> red "ID required — FINRA compliance"
+    linking straight to the CEF form itself (CEF_FORM_URL, new tab) — no
+    longer a mailto, since there's now a direct form to send people to;
+    N/A -> no badge at all. "CEF" is internal-only from here on (field
+    id, option ids, the form URL, Dynamo/variable names) — every
+    client-facing string says "ID" instead. Only ever called when there
+    IS a tenant to report on (see the call site's tenant is not None
+    guard) — there's no separate "no tenant" case to handle here."""
     if cef_option_id == CEF_NA_ID:
         return ""
     if cef_option_id == CEF_YES_ID:
-        return '<div class="gg-cef-badge cef-ok">&#10003; CEF on file</div>'
+        return '<div class="gg-cef-badge cef-ok">&#10003; ID verified</div>'
     if cef_option_id == CEF_PENDING_ID:
-        return '<div class="gg-cef-badge cef-pending">&#8226; CEF pending</div>'
+        return '<div class="gg-cef-badge cef-pending">&#8226; ID pending</div>'
     return (f'<a class="gg-cef-badge cef-missing" href="{CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">'
-            '&#10007; CEF missing — complete it</a>')
+            '&#10007; ID required — FINRA compliance</a>')
 
 
 def _person_display_name(rec):
@@ -1212,8 +1319,8 @@ def _handle_feature_request(event):
 
     Auth mirrors _handle_update_intro's tenant-write path: ADMIN_KEY in
     the body may act on any partition named by body["tenant"] ("admin" or
-    a TENANTS email) — that's how the admin aggregate view (many
-    partitions on one page) targets a specific one. A tenant's own
+    an auto-enrolled tenant email) — that's how the admin aggregate view
+    (many partitions on one page) targets a specific one. A tenant's own
     identity cookie may only ever act within their own partition; any
     body["tenant"] they send is ignored — the authenticated identity
     always wins. Never raises past this function."""
@@ -1226,13 +1333,13 @@ def _handle_feature_request(event):
         partition = str(body.get("tenant") or "").strip()
         if partition != "admin":
             partition = partition.lower()
-            if partition not in TENANTS:
+            if _resolve_tenant(partition) is None:
                 return _json_response({"error": "invalid tenant"}, 400)
         actor = "admin"
     else:
         identity_email = _read_identity_email(event)
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
-        if not tenant_identity_email or tenant_identity_email not in TENANTS:
+        if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
         partition = tenant_identity_email
         actor = tenant_identity_email
@@ -1407,18 +1514,19 @@ def _feature_section_html(tenant_picker, anon_key_email, key=None):
     """Feature-request box + list, shared verbatim by My Deals and the
     Demand Board (item 5): tenant_picker (admin, no view_as) is the one
     case with no single partition to scope to — it aggregates every
-    TENANTS partition plus "admin" instead; every other case (real
-    tenant session, or admin under &view_as) is scoped to anon_key_email.
-    Returns (feature_box_html, feature_list_html)."""
+    auto-enrolled tenant partition plus "admin" instead; every other case
+    (real tenant session, or admin under &view_as) is scoped to
+    anon_key_email. Returns (feature_box_html, feature_list_html)."""
     if tenant_picker:
         feature_box_html = _feature_box_html("admin", key=key)
+        tenant_index = _tenant_index()
         tenant_names = {"admin": "Admin"}
         agg_open, agg_done = [], []
-        for partition in list(TENANTS.keys()) + ["admin"]:
+        for partition in list(tenant_index.keys()) + ["admin"]:
             items, _ = get_feature_requests(partition)
             agg_open += items["open"]
             agg_done += items["done"]
-            tenant_names[partition] = TENANTS[partition]["name"] if partition in TENANTS else "Admin"
+            tenant_names[partition] = tenant_index[partition]["name"] if partition in tenant_index else "Admin"
         agg_open.sort(key=lambda it: it["sk"], reverse=True)
         agg_done.sort(key=lambda it: it["sk"], reverse=True)
         feature_list_html = _feature_requests_list_html(agg_open, agg_done, show_tenant=True,
@@ -1601,7 +1709,7 @@ def _handle_deal_stage(event):
     else:
         identity_email = _read_identity_email(event)
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
-        if not tenant_identity_email or tenant_identity_email not in TENANTS:
+        if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
         if tenant_identity_email != tenant_email:
             return _json_response({"error": "forbidden"}, 403)
@@ -1613,7 +1721,7 @@ def _handle_deal_stage(event):
     if not ok:
         return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
-    tenant_name = (TENANTS.get(tenant_email) or {}).get("name", tenant_email)
+    tenant_name = (_resolve_tenant(tenant_email) or {}).get("name", tenant_email)
     email_ok = _send_deal_stage_email(deal, deal_id, tenant_name, target)
 
     ok, err = _dynamo_write_deal_stage_override(tenant_email, deal_id, target_stage_id, actor, old_stage_id,
@@ -1832,10 +1940,11 @@ def _pipeline_update_deal_deadline(deal_id, deadline_iso):
 
 
 def _tenant_email_for_deal(deal):
-    """The TENANTS email whose person_id is linked to this deal, or None
-    if no tenant maps to it — writes are rejected outright in that case."""
+    """The auto-enrolled tenant email whose person_id is linked to this
+    deal, or None if no tenant maps to it — writes are rejected outright
+    in that case."""
     linked = _deal_linked_person_ids(deal)
-    for email, info in TENANTS.items():
+    for email, info in _tenant_index().items():
         if info.get("person_id") in linked:
             return email
     return None
@@ -2104,7 +2213,7 @@ def _my_deal_visibility_badge_html(deal, cef_state):
         return '<span class="visibility-badge live">Live — shown to buyers</span>'
     if state == "need_cef":
         return (f'<a class="visibility-badge need-cef" href="{CEF_FORM_URL}" target="_blank" '
-                f'rel="noopener noreferrer">Need CEF</a>')
+                f'rel="noopener noreferrer">ID required</a>')
     return (f'<a class="visibility-badge review-agreement" href="{AGENT_AGREEMENT_DOC_URL}" target="_blank" '
             f'rel="noopener noreferrer">Review agreement &rarr;</a>')
 
@@ -4435,8 +4544,9 @@ def _handle_update_intro(event):
       authorizes a write, even an admin's own) — full rights over status,
       next_steps, notes, follow_up, and deadline, on any deal.
     - Tenant: no ADMIN_KEY, but a valid gg_id identity cookie naming an
-      email in TENANTS — rights restricted to next_steps and follow_up
-      ONLY (status/notes/deadline are rejected outright with 403), and
+      auto-enrolled tenant email (see _resolve_tenant) — rights
+      restricted to next_steps and follow_up ONLY (status/notes/deadline
+      are rejected outright with 403), and
       only on a deal_id whose linked tenant (via person linkage,
       _tenant_email_for_deal) is that same authenticated tenant. No
       Pipeline call ever happens on a tenant post, since status and
@@ -4459,7 +4569,7 @@ def _handle_update_intro(event):
     if not is_admin:
         identity_email = _read_identity_email(event)
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
-        if not tenant_identity_email or tenant_identity_email not in TENANTS:
+        if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
         if (body.get("status") not in (None, "") or body.get("notes") not in (None, "")
                 or body.get("deadline") not in (None, "")):
@@ -4554,8 +4664,8 @@ def _handle_update_intro(event):
 
 
 NOT_ENABLED_MESSAGE = (
-    "This dashboard isn't enabled for your account yet — "
-    "contact cgracia@rainmakersecurities.com."
+    "This dashboard is for sellers. Have a block or shares to sell? "
+    "Contact us at cgracia@rainmakersecurities.com."
 )
 
 
@@ -4621,7 +4731,7 @@ def lambda_handler(event, context):
     anon_key_email = "admin"
     if is_admin_key:
         if view_as:
-            tenant = TENANTS.get(view_as.lower())
+            tenant = _resolve_tenant(view_as)
             if not tenant:
                 return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE))
             viewer_name = tenant["name"]
@@ -4636,7 +4746,7 @@ def lambda_handler(event, context):
                 "Sign in to view the Demand Board.",
                 show_signin=True,
             ), 403)
-        tenant = TENANTS.get(identity_email.strip().lower())
+        tenant = _resolve_tenant(identity_email)
         if not tenant:
             return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE))
         viewer_name = tenant["name"]
