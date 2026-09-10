@@ -1009,7 +1009,22 @@ def _build_tenant_index(s3):
     dropped outright; TENANT_OVERRIDES only ever swaps in a display
     name, never affects eligibility. When a person has multiple emails
     on file, each maps to the same tenant record — first match wins
-    ties are impossible since every email is this exact person's own."""
+    ties are impossible since every email is this exact person's own.
+
+    Matched via str(pid), not raw equality: _deal_linked_person_ids
+    always coerces deal-side person ids to int, but people.json's own
+    "id" field is not reliably int-typed across every record (seen
+    live: natoli@mangustacap.com/person 1307332972's record carries a
+    string id) — a bare `pid in seller_person_ids` against an int set
+    silently drops any such record with no error. Every other
+    people.json/deal-linkage cross-match in this file already goes
+    through str() for exactly this reason (see get_people_by_ids,
+    _build_table's tier_by_id) — this one is brought in line with that
+    same established convention. person_id is still stored as an int
+    when the raw id parses as one, since every downstream consumer
+    (_tenant_email_for_deal, Hold/Cancel/Reactivate's deal-linkage
+    checks) compares it against those same int-coerced deal-linkage
+    sets."""
     people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
     people_data = json.loads(people_obj["Body"].read())
     people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
@@ -1018,12 +1033,17 @@ def _build_tenant_index(s3):
     for deal in get_deals_list():
         if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
             seller_person_ids.update(_deal_linked_person_ids(deal))
+    seller_person_ids_str = {str(pid) for pid in seller_person_ids}
 
     by_email = {}
     for rec in people_list:
         pid = rec.get("id")
-        if pid is None or pid not in seller_person_ids:
+        if pid is None or str(pid) not in seller_person_ids_str:
             continue
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            pass
         default_name = _person_display_name(rec)
         for email in _person_all_emails(rec):
             if email in TENANT_BLOCKLIST:
@@ -4244,14 +4264,39 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 </html>"""
 
 
-def _message_page(title, message, show_signin=False):
+SELL_ORDER_MAILTO_URL = (
+    "mailto:cgracia@rainmakersecurities.com"
+    "?subject=" + urllib.parse.quote("I want to sell", safe="")
+    + "&body=" + urllib.parse.quote("Company, approximate size, and structure:", safe="")
+)
+
+
+def _message_page(title, message, show_signin=False, show_sell_cta=False):
     """Standalone pre-auth / not-enabled page. Reuses the board's own dark
-    palette (not the nav's) since there's no tab shell to sit under here."""
+    palette (not the nav's) since there's no tab shell to sit under here.
+
+    show_sell_cta (item 2): only for the authenticated-but-no-sell-order
+    "Not enabled" case — gives that person a path to become a seller.
+    Neither chadgracia/trades nor chadgracia/web-bid has a general-
+    purpose public sell-order intake: web-bid's own ?side=sell form
+    (trades routes "deal-less" companies to it) requires a company_id
+    already resolved against directory_companies.json and carries no
+    company picker of its own, so it cannot be linked bare from here —
+    this page has no company context to hand it, and an unresolvable
+    company_id makes that form's own POST handler reject the submission
+    outright ("Missing company."). Falls back to the mailto this task
+    specifies instead."""
     signin_html = ""
     if show_signin:
         signin_html = (
             f'<p><a class="gg-link" href="{SIGNIN_URL}">'
             "Sign in via trades.graciagroup.com</a></p>"
+        )
+    sell_cta_html = ""
+    if show_sell_cta:
+        sell_cta_html = (
+            f'<p>Have a block or shares to sell? '
+            f'<a class="gg-link" href="{SELL_ORDER_MAILTO_URL}">Submit a sell order &rarr;</a></p>'
         )
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -4288,6 +4333,7 @@ def _message_page(title, message, show_signin=False):
   <div class="gg-card">
     <h1>{_esc(title)}</h1>
     <p>{_esc(message)}</p>
+    {sell_cta_html}
     {signin_html}
   </div>
 </body>
@@ -4701,10 +4747,7 @@ def _handle_update_intro(event):
     return _json_response({"ok": True})
 
 
-NOT_ENABLED_MESSAGE = (
-    "This dashboard is for sellers. Have a block or shares to sell? "
-    "Contact us at cgracia@rainmakersecurities.com."
-)
+NOT_ENABLED_MESSAGE = "This dashboard is for sellers."
 
 
 def lambda_handler(event, context):
@@ -4771,7 +4814,7 @@ def lambda_handler(event, context):
         if view_as:
             tenant = _resolve_tenant(view_as)
             if not tenant:
-                return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE))
+                return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True))
             viewer_name = tenant["name"]
             anon_key_email = view_as.strip().lower()
         else:
@@ -4786,7 +4829,7 @@ def lambda_handler(event, context):
             ), 403)
         tenant = _resolve_tenant(identity_email)
         if not tenant:
-            return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE))
+            return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True))
         viewer_name = tenant["name"]
         anon_key_email = identity_email.strip().lower()
 
