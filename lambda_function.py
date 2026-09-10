@@ -453,9 +453,11 @@ INTRO_STATUS_LABELS = {
     7207585: "Passed",
     7207586: "Withdrawn",
 }
+INTRO_STATUS_INTRODUCED_ID = 7207579
 INTRO_STATUS_STALLED_ID = 7207584
 INTRO_STATUS_PASSED_ID = 7207585
 INTRO_STATUS_WITHDRAWN_ID = 7207586
+INTRO_STATUS_CLOSED_ID = 7207587
 EXIT_STATUS_IDS = {INTRO_STATUS_STALLED_ID, INTRO_STATUS_PASSED_ID, INTRO_STATUS_WITHDRAWN_ID}
 
 # Active Intros tenant status editing: the six transitions a tenant may set
@@ -466,14 +468,14 @@ EXIT_STATUS_IDS = {INTRO_STATUS_STALLED_ID, INTRO_STATUS_PASSED_ID, INTRO_STATUS
 # dropdown.
 TENANT_ALLOWED_STATUS_IDS = {7207580, 7207581, 7207582, 7207583, 7207584, 7207585}
 
-# Milestone tracking (turn 16, item 1): a status write that sets one of
-# these five ids also records {step: epoch} in the Dynamo intro item's
-# "milestones" map (see _dynamo_write_intro_update) -- add-only, never
-# overwritten once a step is first recorded, so the timestamp always
-# reflects the FIRST time that milestone was reached even if the deal
-# later moves to Stalled and forward again. Stalled/Passed/Withdrawn are
-# deliberately absent from this map: setting one of those three never
-# touches milestones at all (see _handle_update_intro).
+# Milestone tracking (turn 16, item 1; checkbox UI added turn 17): a
+# status write that sets one of these five ids also records
+# {step: epoch} in the Dynamo intro item's "milestones" map (see
+# _dynamo_write_intro_update) -- add-only for a raw status write (the
+# still-shared Company page dropdown path), never overwritten once a
+# step is first recorded. Stalled/Passed/Withdrawn are deliberately
+# absent from this map: setting one of those three never touches
+# milestones at all (see _handle_update_intro).
 MILESTONE_STATUS_IDS = {
     7207580: "NDA",
     7207581: "VDR",
@@ -483,25 +485,39 @@ MILESTONE_STATUS_IDS = {
 }
 MILESTONE_STEPS = ["NDA", "VDR", "Sub Docs", "Wired", "Closed"]
 
-# Each milestone step's position in the ordered pipeline (STATUS_STEPS,
-# below) -- used by _effective_milestones to backfill implied-reached
-# milestones on render: a deal currently AT "Wired" has necessarily passed
-# NDA/VDR/Sub Docs too, even when no explicit milestone timestamp was ever
-# recorded for them (e.g. the status was set directly, skipping steps,
-# before this feature existed, or before an admin started using it).
-MILESTONE_PIPELINE_STEP = {
-    "NDA": "NDA Signed",
-    "VDR": "VDR Link Provided",
-    "Sub Docs": "Signed Sub Docs",
-    "Wired": "Wired",
-    "Closed": "Closed",
-}
+# step name -> its Pipeline status id, the inverse of MILESTONE_STATUS_IDS.
+MILESTONE_STEP_STATUS_ID = {step: sid for sid, step in MILESTONE_STATUS_IDS.items()}
 
-# Item 3 (turn 16): Next Steps placeholder text, keyed by the FURTHEST
-# milestone actually reached (None = nothing beyond Introduced yet).
-# Closed has nothing further to suggest -- _next_step_suggestion falls
-# back to the existing generic placeholder for it, a judgment call since
-# the instruction's five cases stop at Wired.
+# Turn 17, item 1: the four checkbox steps replacing the Active Intros
+# status dropdown -- everything in MILESTONE_STEPS except "Closed",
+# which stays a FLAG value (set via the flag control below), never a
+# checkbox: checking off NDA/VDR/Sub Docs/Wired can move a deal forward
+# or backward within the pipeline, but a deal is only ever marked Closed
+# deliberately, admin-only.
+CHECKBOX_MILESTONE_STEPS = [s for s in MILESTONE_STEPS if s != "Closed"]
+
+# Turn 17, item 2: the flag control's values -> the status id each one
+# writes directly (no milestones touched — see _handle_update_intro).
+# "none" isn't here; it re-derives the status from whatever's currently
+# checked instead of writing a fixed id. Stalled/Passed are tenant-
+# settable (also in TENANT_ALLOWED_STATUS_IDS); Withdrawn/Closed stay
+# admin-only, same restriction the old ten-option dropdown enforced.
+FLAG_STATUS_IDS = {
+    "stalled": INTRO_STATUS_STALLED_ID,
+    "passed": INTRO_STATUS_PASSED_ID,
+    "withdrawn": INTRO_STATUS_WITHDRAWN_ID,
+    "closed": INTRO_STATUS_CLOSED_ID,
+}
+FLAG_ADMIN_ONLY_VALUES = {"withdrawn", "closed"}
+FLAG_LABELS = {"none": "None", "stalled": "Stalled", "passed": "Passed",
+               "withdrawn": "Withdrawn", "closed": "Closed"}
+
+# Item 3 (turn 16), item 4 (turn 17): Next Steps placeholder text, keyed
+# by the FURTHEST milestone CHECKED (the raw stored milestones map --
+# the same ground truth the checkboxes themselves display now, no
+# backfill/inference). Closed isn't a checkbox, so it never reaches
+# here; _next_step_suggestion falls back to the generic placeholder
+# whenever nothing's checked yet.
 NEXT_STEP_SUGGESTIONS = {
     None: "Schedule intro call…",
     "NDA": "Provide VDR access…",
@@ -1997,31 +2013,31 @@ def _resolve_intro_status(deal, override_entry=None):
     }
 
 
-def _effective_milestones(resolved, milestones):
-    """Ordered (MILESTONE_STEPS order) list of milestones reached for
-    display: every step explicitly recorded in the Dynamo milestones map,
-    plus -- only for a non-exit resolved status -- every step the CURRENT
-    pipeline position implies was already passed (see
-    MILESTONE_PIPELINE_STEP). Stalled/Passed/Withdrawn never backfill --
-    there's no ordered pipeline position to backfill from for an exit
-    state -- so an exit row only ever shows whatever was actually
-    recorded before it exited, per item 1's "never erase milestones"."""
-    reached = set((milestones or {}).keys())
-    if not resolved["is_exit"]:
-        idx = STATUS_INDEX.get(resolved["name"], 0)
-        for step, status_name in MILESTONE_PIPELINE_STEP.items():
-            if STATUS_INDEX.get(status_name, 999) <= idx:
-                reached.add(step)
-    return [s for s in MILESTONE_STEPS if s in reached]
+def _derive_status_from_checked(checked_steps):
+    """Turn 17, item 1: the Pipeline status implied by a set of checked
+    milestone checkboxes -- the furthest one reached
+    (CHECKBOX_MILESTONE_STEPS order), or Introduced when nothing's
+    checked. checked_steps is never expected to contain "Closed" --
+    checkboxes only ever cover NDA/VDR/Sub Docs/Wired -- so this can
+    never derive anything past Wired; Closed only ever comes from the
+    flag control."""
+    for step in reversed(CHECKBOX_MILESTONE_STEPS):
+        if step in checked_steps:
+            return MILESTONE_STEP_STATUS_ID[step]
+    return INTRO_STATUS_INTRODUCED_ID
 
 
-def _next_step_suggestion(resolved, milestones):
-    """Item 3: the Next Steps placeholder (shown only while the field is
-    empty -- a native <input placeholder>, never auto-saved) derived from
-    the furthest milestone actually reached, via the same backfilled
-    _effective_milestones list the status cell reads."""
-    reached = [s for s in _effective_milestones(resolved, milestones) if s != "Closed"]
-    furthest = reached[-1] if reached else None
+def _next_step_suggestion(milestones):
+    """Item 3 (turn 16) / item 4 (turn 17): the Next Steps placeholder
+    (shown only while the field is empty -- a native <input
+    placeholder>, never auto-saved), keyed to the furthest CHECKED
+    milestone -- the raw stored map, the same ground truth the
+    checkboxes themselves display (no backfill)."""
+    stored = milestones or {}
+    furthest = None
+    for step in CHECKBOX_MILESTONE_STEPS:
+        if step in stored:
+            furthest = step
     return NEXT_STEP_SUGGESTIONS.get(furthest, "Add next step…")
 
 
@@ -2784,47 +2800,94 @@ def _intro_status_select_html(deal_id, current_id, allowed_ids=None):
             f'{"".join(options)}</select><span class="ei-msg"></span>')
 
 
-def _status_cell_display_html(resolved, milestones):
-    """Item 2 (turn 16): the read side of the Active Intros status cell,
-    three parts, any of which can be empty:
-    (1) one compact line of reached milestones ("NDA ✓ · VDR ✓"), or the
-        current status name alone when nothing beyond Introduced has been
-        reached yet (_effective_milestones already backfills implied
-        steps from the current pipeline position);
-    (2) the exit flag, ONLY when the row is actually flagged — amber
-        "Stalled", gray "Passed"/"Withdrawn" — reusing the existing
-        .status-chip styling rather than the old _status_chip_html's
-        wordier "Stalled — needs a nudge" text, which this replaces;
-    (3) a muted "Awaiting our confirmation" note on a Wired-not-yet-
-        Closed row.
-    Replaces the old 7-segment strip entirely — that strip and this
-    milestones line both existed only to show the same underlying
-    progress, which is what made the old cell (strip + chip + dropdown)
-    read as a duplicate of its own dropdown value."""
-    reached = _effective_milestones(resolved, milestones)
-    milestone_text = " · ".join(f"{step} ✓" for step in reached) if reached else resolved["name"]
-    line_html = f'<div class="status-line">{_esc(milestone_text)}</div>'
+def _milestone_checkboxes_html(deal_id, milestones, disabled=False):
+    """Turn 17, item 1: the four NDA/VDR/Sub Docs/Wired checkboxes
+    replacing the old status dropdown/strip on Active Intros. Checked
+    purely from what's actually recorded in the Dynamo milestones map —
+    deliberately no backfill/implied-reached inference here (unlike the
+    previous pass's now-removed milestone line): once a box is
+    unchecked it STAYS unchecked on every future render regardless of
+    the deal's current Pipeline status, which a backfilled display could
+    not guarantee (the current status alone can't distinguish "never
+    recorded" from "explicitly un-recorded"). "Closed" is never a
+    checkbox — see _flag_select_html."""
+    stored = milestones or {}
+    disabled_attr = " disabled" if disabled else ""
+    boxes = []
+    for step in CHECKBOX_MILESTONE_STEPS:
+        checked_attr = " checked" if step in stored else ""
+        boxes.append(
+            f'<label class="ei-milestone-label"><input type="checkbox" class="ei-milestone" '
+            f'data-deal-id="{_esc(deal_id)}" value="{_esc(step)}"{checked_attr}{disabled_attr}>'
+            f'{_esc(step)}</label>'
+        )
+    return f'<div class="ei-milestones">{"".join(boxes)}</div>'
+
+
+def _current_flag_value(resolved):
+    if resolved["id"] == INTRO_STATUS_STALLED_ID:
+        return "stalled"
+    if resolved["id"] == INTRO_STATUS_PASSED_ID:
+        return "passed"
+    if resolved["id"] == INTRO_STATUS_WITHDRAWN_ID:
+        return "withdrawn"
+    if resolved["name"] == "Closed":
+        return "closed"
+    return "none"
+
+
+def _flag_select_html(deal_id, resolved, admin_controls, disabled=False):
+    """Turn 17, item 2: the compact flag select beside the checkboxes.
+    Tenant-facing rows (admin_controls=False): None/Stalled/Passed.
+    Admin edit rows (admin_controls=True, _intro_row_edit_html only):
+    also Withdrawn/Closed. The row's CURRENT flag is always included
+    even when it's admin-only — same "always show the truth even when
+    it's not a value this viewer could have set" convention
+    _intro_status_select_html already uses (e.g. a tenant viewing a
+    Withdrawn row, which they can't set but also can't be lied to
+    about)."""
+    current = _current_flag_value(resolved)
+    values = ["none", "stalled", "passed"]
+    if admin_controls:
+        values += ["withdrawn", "closed"]
+    elif current not in values:
+        values.append(current)
+    options = "".join(
+        f'<option value="{v}"{" selected" if v == current else ""}>{_esc(FLAG_LABELS[v])}</option>'
+        for v in values
+    )
+    disabled_attr = " disabled" if disabled else ""
+    return f'<select class="ei-flag" data-deal-id="{_esc(deal_id)}"{disabled_attr}>{options}</select>'
+
+
+def _status_milestones_column_html(resolved, deal_id, milestones, admin_controls, disabled=False):
+    """Turn 17: the full Active Intros status cell -- the four milestone
+    checkboxes (item 1), the flag chip when the row is actually flagged
+    (unchanged visual continuity from the previous pass — Stalled amber,
+    Passed/Withdrawn gray, plus a new Closed chip), a muted
+    "Awaiting our confirmation" note on a Wired-not-yet-Closed row, and
+    the flag select (item 2) — one shared .ei-msg at the end covers
+    every control in the cell (see _edit_script_html's saveMilestone).
+    disabled=True renders every control non-interactive: a tenant
+    viewing a Closed row, which is locked read-only for tenants (item
+    2) — admin_controls=True (admin edit mode) is never disabled, since
+    admin has full rights everywhere, Closed rows included."""
+    checkboxes_html = _milestone_checkboxes_html(deal_id, milestones, disabled=disabled)
 
     flag_html = ""
     if resolved["is_exit"]:
         flag_cls = "stalled" if resolved["id"] == INTRO_STATUS_STALLED_ID else "exit"
         flag_html = f'<span class="status-chip {flag_cls}">{_esc(resolved["name"])}</span>'
+    elif resolved["name"] == "Closed":
+        flag_html = '<span class="status-chip closed">Closed</span>'
 
     awaiting_html = ('<div class="status-awaiting">Awaiting our confirmation</div>'
                       if resolved["name"] == "Wired" else "")
 
-    return f'{line_html}{flag_html}{awaiting_html}'
+    select_html = _flag_select_html(deal_id, resolved, admin_controls, disabled=disabled)
 
-
-def _status_column_html(resolved, deal_id, milestones, allowed_ids=None):
-    """The full editable Active Intros status cell: _status_cell_display_html
-    above an editable dropdown. Shared by every editable row: admin
-    (allowed_ids=None, all ten) and tenant (allowed_ids=
-    TENANT_ALLOWED_STATUS_IDS, only ever called on an already-disclosed
-    row — see _intro_row_html)."""
-    display_html = _status_cell_display_html(resolved, milestones)
-    select_html = _intro_status_select_html(deal_id, resolved["id"], allowed_ids=allowed_ids)
-    return f'<div class="status-column">{display_html}{select_html}</div>'
+    return (f'<div class="status-column">{checkboxes_html}{flag_html}{awaiting_html}'
+            f'{select_html}<span class="ei-msg"></span></div>')
 
 
 def _ei_field_html(css_class, deal_id, field, value, placeholder=""):
@@ -2869,24 +2932,24 @@ def _due_chip_html():
 
 
 def _edit_script_html(key):
-    """Plain HTML+fetch(), no frameworks, no Save button: the Status
-    dropdown posts on change; Next Steps / Follow-up / Buyer Notes post
-    on blur or Enter (Enter just blurs, so there's one save path, not
-    two). Each
-    control's own .ei-msg (its very next sibling) shows "Saving…", then
-    either "Saved ✓" (fades after 2s) or the returned error text in red
-    (stays). One shared script, included on both Active Intros and the
+    """Plain HTML+fetch(), no frameworks, no Save button: the Status/Flag
+    dropdown posts on change, a milestone checkbox posts on change too
+    (turn 17), Next Steps / Follow-up / Buyer Notes post on blur or
+    Enter (Enter just blurs, so there's one save path, not two). Each
+    control's own .ei-msg shows "Saving…", then either "Saved ✓" (fades
+    after 2s) or the returned error text in red (stays) — every control
+    except the milestone checkboxes finds its .ei-msg as its very next
+    sibling; the four checkboxes share ONE .ei-msg at the end of their
+    .status-column (see _status_milestones_column_html), found via
+    closest(), since there's no sensible single "next sibling" for four
+    inputs. One shared script, included on both Active Intros and the
     Buyers table when edit_mode is on."""
     admin_key_json = json.dumps(key or "")
     return f"""<script>
 (function() {{
   var ADMIN_KEY = {admin_key_json};
 
-  function saveField(el, field) {{
-    var dealId = el.getAttribute('data-deal-id');
-    var msgEl = el.nextElementSibling;
-    var payload = {{ key: ADMIN_KEY, deal_id: dealId }};
-    payload[field] = el.value;
+  function postUpdate(payload, msgEl) {{
     if (msgEl) {{ msgEl.className = 'ei-msg saving'; msgEl.textContent = 'Saving…'; }}
     fetch('?action=update_intro', {{
       method: 'POST',
@@ -2915,8 +2978,30 @@ def _edit_script_html(key):
     }});
   }}
 
+  function saveField(el, field) {{
+    var dealId = el.getAttribute('data-deal-id');
+    var msgEl = el.nextElementSibling;
+    var payload = {{ key: ADMIN_KEY, deal_id: dealId }};
+    payload[field] = el.value;
+    postUpdate(payload, msgEl);
+  }}
+
+  function saveMilestone(el) {{
+    var dealId = el.getAttribute('data-deal-id');
+    var col = el.closest('.status-column');
+    var msgEl = col ? col.querySelector('.ei-msg') : null;
+    postUpdate({{ key: ADMIN_KEY, deal_id: dealId, milestone_step: el.value,
+                  milestone_checked: el.checked }}, msgEl);
+  }}
+
   document.querySelectorAll('.ei-status').forEach(function(el) {{
     el.addEventListener('change', function() {{ saveField(el, 'status'); }});
+  }});
+  document.querySelectorAll('.ei-flag').forEach(function(el) {{
+    el.addEventListener('change', function() {{ saveField(el, 'flag'); }});
+  }});
+  document.querySelectorAll('.ei-milestone').forEach(function(el) {{
+    el.addEventListener('change', function() {{ saveMilestone(el); }});
   }});
   document.querySelectorAll('.ei-next-steps, .ei-notes, .ei-follow-up, .ei-deadline').forEach(function(el) {{
     var field = el.getAttribute('data-field');
@@ -3231,16 +3316,19 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
                      editable=False, company_repeated=False):
     """Tenant-facing Introduced-or-later row: Company | Buyer | Investor
     Type | Size | Status | Next Steps | Follow-up. editable=True
-    (tenant_edit_mode — see render_intros_page) makes Status (restricted
-    to TENANT_ALLOWED_STATUS_IDS — see _status_column_html) and Next
-    Steps/Follow-up all auto-saving inputs, except on a Passed/Withdrawn
-    row, which renders Next Steps/Follow-up as read-only text instead —
-    nothing left to plan for a dead intro. The Next Steps placeholder
-    (turn 16, item 3) is the suggested action for the furthest milestone
-    reached, not a fixed string. company_repeated (item 7) blanks the
-    company cell (and its Update-deal link, turn 16 item 6) and adds a
-    subtle left-accent instead of repeating the same company name row
-    after row."""
+    (tenant_edit_mode — see render_intros_page) leaves the Status cell's
+    milestone checkboxes and flag select (turn 17 — see
+    _status_milestones_column_html) interactive, and makes Next Steps/
+    Follow-up auto-saving inputs, except on a Passed/Withdrawn row,
+    which renders Next Steps/Follow-up as read-only text instead —
+    nothing left to plan for a dead intro. A Closed row locks the status
+    controls read-only for tenants regardless of editable (item 2) —
+    next_steps/follow_up are unaffected by that lock, only is_dead is.
+    The Next Steps placeholder (turn 16 item 3, turn 17 item 4) is the
+    suggested action for the furthest CHECKED milestone, not a fixed
+    string. company_repeated (item 7) blanks the company cell (and its
+    Update-deal link, turn 16 item 6) and adds a subtle left-accent
+    instead of repeating the same company name row after row."""
     company_name = _deal_company_name(deal)
     if company_repeated:
         company_cell = ""
@@ -3263,16 +3351,15 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     deal_id = str(deal.get("id"))
     milestones = entry.get("milestones")
 
-    if editable:
-        status_html = _status_column_html(resolved, deal_id, milestones, allowed_ids=TENANT_ALLOWED_STATUS_IDS)
-    else:
-        status_html = _status_cell_display_html(resolved, milestones)
+    is_closed_locked = resolved["name"] == "Closed"
+    status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=False,
+                                                   disabled=(not editable) or is_closed_locked)
     if _follow_up_is_due(entry.get("follow_up")):
         status_html += _due_chip_html()
 
     is_dead = resolved["name"] in ("Passed", "Withdrawn")
     if editable and not is_dead:
-        suggestion = _next_step_suggestion(resolved, milestones)
+        suggestion = _next_step_suggestion(milestones)
         next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""),
                                           placeholder=suggestion)
         follow_up_html = _ei_date_field_html(deal_id, _esc(entry.get("follow_up") or ""))
@@ -3329,8 +3416,10 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, 
 def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, key=None, view_as=None,
                           company_repeated=False):
     """Admin edit-mode row for Active Intros: always the real buyer(s),
-    always the true current status (Matched included) via a dropdown of
-    all ten options, plus auto-saving Next Steps/Follow-up inputs."""
+    the same milestone checkboxes + flag select as the tenant-facing row
+    (turn 17 — see _status_milestones_column_html) but never disabled —
+    admin has full rights everywhere, Closed rows included — plus
+    auto-saving Next Steps/Follow-up inputs."""
     deal_id = str(deal.get("id"))
     entry = intro_details.get(deal_id) or {}
     resolved = _resolve_intro_status(deal, entry)
@@ -3355,10 +3444,10 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
 
     size_text = _esc(_deal_size_text(deal))
     milestones = entry.get("milestones")
-    status_html = _status_column_html(resolved, deal_id, milestones, allowed_ids=None)
+    status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=True)
     if _follow_up_is_due(entry.get("follow_up")):
         status_html += _due_chip_html()
-    suggestion = _next_step_suggestion(resolved, milestones)
+    suggestion = _next_step_suggestion(milestones)
     next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""),
                                       placeholder=suggestion)
     follow_up_html = _ei_date_field_html(deal_id, _esc(entry.get("follow_up") or ""))
@@ -3654,9 +3743,18 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .gg-empty-state p:last-child {{ margin-bottom: 0; }}
   .gg-link {{ color: var(--accent); font-weight: 600; text-decoration: none; }}
   .gg-link:hover {{ text-decoration: underline; }}
-  .status-column {{ display: flex; flex-direction: column; gap: 6px; }}
-  .status-line {{ font-size: 13px; color: var(--ink); }}
+  .status-column {{ display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }}
   .status-awaiting {{ font-size: 12px; color: var(--muted); font-style: italic; }}
+  .ei-milestones {{ display: flex; flex-wrap: wrap; gap: 4px 10px; }}
+  .ei-milestone-label {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--ink);
+    white-space: nowrap;
+  }}
+  .ei-milestone {{ margin: 0; }}
   .status-pill {{
     display: inline-block;
     font-size: 11px;
@@ -3676,6 +3774,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   }}
   .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #8a6d1f; }}
   .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
+  .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .buyer-code {{ font-size: 12px; font-weight: 600; color: var(--ink); }}
   .buyer-range {{ font-size: 11px; color: var(--muted); margin-top: 2px; }}
   .tier-badge {{
@@ -3720,7 +3819,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     font-size: 13px;
     margin: 0 0 16px;
   }}
-  .ei-status, .ei-next-steps, .ei-follow-up {{
+  .ei-status, .ei-next-steps, .ei-follow-up, .ei-flag {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -5198,34 +5297,56 @@ def _handle_update_intro(event):
     Two auth modes:
     - Admin: ADMIN_KEY present IN THE BODY (the session cookie alone never
       authorizes a write, even an admin's own) — full rights over status
-      (all ten options), next_steps, notes, follow_up, and deadline, on
-      any deal.
+      (all ten options via any of the three mechanisms below), next_steps,
+      notes, follow_up, and deadline, on any deal, Closed rows included.
     - Tenant: no ADMIN_KEY, but a valid gg_id identity cookie naming an
       auto-enrolled tenant email (see _resolve_tenant) — rights to
-      next_steps and follow_up always, PLUS status but only to one of
-      TENANT_ALLOWED_STATUS_IDS (NDA/VDR/Sub Docs/Wired/Stalled/Passed)
-      and only on a row that's already Introduced-or-later (disclosed) —
-      Matched/Introduced/Withdrawn/Closed stay admin-only, enforced here
-      server-side, not just left off the tenant's dropdown. notes/deadline
-      are still rejected outright with 403 for a tenant. Every tenant
-      write is also scoped to a deal_id whose linked tenant (via person
-      linkage, _tenant_email_for_deal) is that same authenticated tenant.
-      A tenant status write still never touches Pipeline via the deadline
-      path — only status and deadline ever reach Pipeline, and deadline
-      stays admin-only.
+      next_steps and follow_up always, PLUS status on a row that's
+      already Introduced-or-later (disclosed) and NOT Closed (item 2 —
+      a Closed row locks read-only for tenants across every status
+      mechanism). notes/deadline are still rejected outright with 403
+      for a tenant. Every tenant write is also scoped to a deal_id whose
+      linked tenant (via person linkage, _tenant_email_for_deal) is that
+      same authenticated tenant.
+
+    Turn 17: status can be set three mutually exclusive ways (at most one
+    per request):
+    - milestone_step (one of CHECKBOX_MILESTONE_STEPS) + milestone_checked
+      (bool) — a checkbox toggle. Adds/removes that one step in the
+      Dynamo milestones map (add-only per step: checking an
+      already-checked step or unchecking an already-unchecked one is a
+      no-op on the map), then DERIVES the Pipeline status from the
+      resulting checked set (_derive_status_from_checked — furthest
+      checked, or Introduced if none). Tenant-allowed on any
+      Introduced-or-later, non-Closed row; admin everywhere. On a Closed
+      row an admin's checkbox edit still updates the milestones map (for
+      retroactive record-keeping) but never re-derives/overwrites the
+      Closed status itself — checkboxes cap out at Wired and must never
+      demote a Closed deal by accident.
+    - flag (none/stalled/passed/withdrawn/closed) — the compact flag
+      select. Tenant: none/stalled/passed. Admin also: withdrawn/closed.
+      NEVER touches the milestones map. "none" re-derives status from
+      whatever's currently checked (same formula as a checkbox toggle,
+      just without changing the map); the other four write their fixed
+      status id directly, exactly like Setting Closed "writes status
+      7207587 as today."
+    - status (a literal status id) — unchanged from before this turn:
+      the Company page's own admin Buyers-table dropdown
+      (_intro_status_select_html) still posts this directly, and it
+      still records a milestone via the OLD MILESTONE_STATUS_IDS path
+      (including for Closed) since that page's write behavior is out of
+      this turn's scope.
 
     Order: validate -> look up the deal and its owning tenant -> resolve
-    the row's CURRENT status (needed for the tenant transition check AND
-    to backfill implied-reached milestones) -> if status or deadline is
-    part of the write, PUT it to Pipeline first and abort the whole
-    request (writing nothing to Dynamo) on any non-2xx -> write the
-    Dynamo intro-item update (status_override/override_at, next_steps,
-    notes, follow_up, deadline_override/deadline_override_at, and —
-    item 1 — milestones when the new status is one of
-    MILESTONE_STATUS_IDS and that step hasn't already been recorded) ->
-    append an audit item (actor = tenant email or "admin"). Never raises
-    past this function; every failure mode returns a JSON error the UI
-    can show."""
+    the row's CURRENT status (needed for the tenant transition/Closed-
+    lock check AND to derive from milestone_step/flag="none") -> if
+    status or deadline is part of the write, PUT it to Pipeline first
+    and abort the whole request (writing nothing to Dynamo) on any
+    non-2xx -> write the Dynamo intro-item update (status_override/
+    override_at, next_steps, notes, follow_up, deadline_override/
+    deadline_override_at, milestones) -> append an audit item (actor =
+    tenant email or "admin"). Never raises past this function; every
+    failure mode returns a JSON error the UI can show."""
     body = _parse_json_body(event)
 
     admin_key = os.environ.get("ADMIN_KEY")
@@ -5244,16 +5365,40 @@ def _handle_update_intro(event):
     if not deal_id:
         return _json_response({"error": "deal_id is required"}, 400)
 
+    milestone_step = body.get("milestone_step") or None
+    flag = body.get("flag")
+    if flag == "":
+        flag = None
+    raw_status = body.get("status")
+
+    provided = sum([milestone_step is not None, flag is not None, raw_status not in (None, "")])
+    if provided > 1:
+        return _json_response({"error": "only one of status/milestone_step/flag per request"}, 400)
+
+    if milestone_step is not None and milestone_step not in CHECKBOX_MILESTONE_STEPS:
+        return _json_response({"error": "invalid milestone_step"}, 400)
+
+    if flag is not None:
+        if flag != "none" and flag not in FLAG_STATUS_IDS:
+            return _json_response({"error": "invalid flag"}, 400)
+        if flag in FLAG_ADMIN_ONLY_VALUES and not is_admin:
+            return _json_response({"error": "forbidden"}, 403)
+
+    # status_id is resolved here only for the literal "status" mechanism;
+    # milestone_step and flag=="none" can only be derived once the deal's
+    # current milestones are loaded further down (see "status derivation").
     status_id = None
-    if body.get("status") not in (None, ""):
+    if raw_status not in (None, ""):
         try:
-            status_id = int(body.get("status"))
+            status_id = int(raw_status)
         except (TypeError, ValueError):
             return _json_response({"error": "invalid status"}, 400)
         if status_id not in INTRO_STATUS_LABELS:
             return _json_response({"error": "invalid status"}, 400)
         if not is_admin and status_id not in TENANT_ALLOWED_STATUS_IDS:
             return _json_response({"error": "forbidden"}, 403)
+    elif flag not in (None, "none"):
+        status_id = FLAG_STATUS_IDS[flag]
 
     next_steps = body.get("next_steps")
     if next_steps is not None:
@@ -5285,7 +5430,8 @@ def _handle_update_intro(event):
             except ValueError:
                 return _json_response({"error": "invalid deadline date"}, 400)
 
-    if status_id is None and next_steps is None and notes is None and follow_up is None and deadline is None:
+    has_status_intent = status_id is not None or milestone_step is not None or flag is not None
+    if not has_status_intent and next_steps is None and notes is None and follow_up is None and deadline is None:
         return _json_response({"error": "nothing to update"}, 400)
 
     deals = get_deals_list()
@@ -5304,8 +5450,14 @@ def _handle_update_intro(event):
     old_entry = intro_details.get(deal_id) or {}
     old_resolved = _resolve_intro_status(deal, old_entry)
 
-    if status_id is not None and not is_admin and not old_resolved["disclosed"]:
-        return _json_response({"error": "forbidden"}, 403)
+    if has_status_intent and not is_admin:
+        if not old_resolved["disclosed"]:
+            return _json_response({"error": "forbidden"}, 403)
+        if old_resolved["name"] == "Closed":
+            # Item 2: a Closed row locks read-only for tenants across
+            # every status mechanism -- checkbox, flag, and (defensively)
+            # a literal status id too.
+            return _json_response({"error": "forbidden"}, 403)
 
     old_values = {
         "status": old_resolved["id"] if old_resolved["id"] is not None else old_resolved["name"],
@@ -5315,13 +5467,39 @@ def _handle_update_intro(event):
         "deadline": _resolve_deal_deadline(deal, old_entry),
     }
 
-    # Item 1: a status write that lands on NDA/VDR/Sub Docs/Wired/Closed
-    # records that milestone -- once. If it was already in the map (e.g.
-    # re-selecting the same status, or moving forward again after
-    # Stalled), nothing changes; milestones is only passed to the Dynamo
-    # write when there's a genuinely new step to add.
     milestones_update = None
-    if status_id is not None and status_id in MILESTONE_STATUS_IDS:
+
+    if milestone_step is not None:
+        # Item 1 (turn 17): the checkbox toggle. Add/remove exactly the
+        # one step requested -- never touch any other key already in the
+        # map -- then derive the Pipeline status from the resulting
+        # checked set. On a Closed row (admin only -- tenants were
+        # already rejected above) the milestones map still updates, for
+        # retroactive record-keeping, but status_id is forced back to
+        # None so the derivation never demotes a Closed deal.
+        stored = dict(old_entry.get("milestones") or {})
+        milestone_checked = bool(body.get("milestone_checked"))
+        if milestone_checked:
+            stored.setdefault(milestone_step, int(time.time()))
+        else:
+            stored.pop(milestone_step, None)
+        milestones_update = stored
+        status_id = None if old_resolved["name"] == "Closed" else _derive_status_from_checked(set(stored.keys()))
+    elif flag == "none":
+        # Item 2: clearing the flag re-derives from whatever's currently
+        # checked -- same formula as a checkbox toggle, milestones map
+        # untouched (flags never touch it).
+        stored_keys = set((old_entry.get("milestones") or {}).keys())
+        status_id = _derive_status_from_checked(stored_keys)
+    elif flag is None and status_id is not None and status_id in MILESTONE_STATUS_IDS:
+        # Unchanged from before this turn: the Company page's own raw
+        # status dropdown still records a milestone this way (add-only,
+        # once) -- including for Closed, which the new flag control
+        # deliberately does NOT do (see item 2's docstring above).
+        # "flag is None" is what distinguishes this from a flag write:
+        # status_id can be FLAG_STATUS_IDS[flag] too (e.g. "closed" ->
+        # 7207587, which IS in MILESTONE_STATUS_IDS), and that path must
+        # never fall through to here.
         step = MILESTONE_STATUS_IDS[status_id]
         old_milestones = old_entry.get("milestones") or {}
         if step not in old_milestones:
