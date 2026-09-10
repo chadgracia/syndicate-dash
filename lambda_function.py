@@ -458,6 +458,14 @@ INTRO_STATUS_PASSED_ID = 7207585
 INTRO_STATUS_WITHDRAWN_ID = 7207586
 EXIT_STATUS_IDS = {INTRO_STATUS_STALLED_ID, INTRO_STATUS_PASSED_ID, INTRO_STATUS_WITHDRAWN_ID}
 
+# Active Intros tenant status editing: the six transitions a tenant may set
+# themselves (NDA/VDR/Sub Docs/Wired/Stalled/Passed), and only on a row
+# that's already Introduced-or-later (disclosed) -- never Matched,
+# Introduced, Withdrawn, or Closed, which stay admin-only. Enforced
+# server-side in _handle_update_intro, not just omitted from the tenant's
+# dropdown.
+TENANT_ALLOWED_STATUS_IDS = {7207580, 7207581, 7207582, 7207583, 7207584, 7207585}
+
 # Pipeline API v3 write (Intro Status only — see _pipeline_update_deal_status).
 # Auth is Pipeline's query-string scheme — ?api_key=...&app_key=..., no
 # Authorization header — confirmed working for reads against this account.
@@ -2486,6 +2494,68 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
     return "".join(blocks)
 
 
+def _intro_buyer_cell_html(buyer_recs):
+    """Active Intros' disclosed buyer cell (item 5), three lines: (1) bold
+    name(s), plus a green dot when any linked buyer has closed a deal with
+    Rainmaker before; (2) muted entity company (natural-person buyers
+    never show one) and country, joined by " · "; (3) small muted
+    email(s) as mailto links, website, and LinkedIn, also joined by
+    " · ". Each of lines 2/3 truncates with an ellipsis via CSS rather
+    than wrapping into a wall of text, since the buyer column is narrow
+    by design.
+
+    won_deals_total (the closed-with-RMS signal) has never been read by
+    any repo in this org, same trust basis as the website/linked_in
+    fields already read this way below it — implemented on trust, and
+    simply omitted (no dot) if the field turns out to be absent or
+    differently shaped."""
+    if not buyer_recs:
+        return "—"
+
+    names = []
+    any_closed = False
+    for r in buyer_recs:
+        names.append(_esc(_person_display_name(r) or "—"))
+        won = r.get("won_deals_total")
+        try:
+            if won is not None and float(won) > 0:
+                any_closed = True
+        except (TypeError, ValueError):
+            pass
+    dot_html = (' <span class="closed-dot" title="Closed a deal with Rainmaker before"></span>'
+                if any_closed else "")
+    line1 = f'<div class="buyer-cell-name">{", ".join(names)}{dot_html}</div>'
+
+    first = buyer_recs[0]
+    first_cf = first.get("custom_fields") or {}
+    transactor_ids = cf_list(first_cf, TRANSACTOR_TYPE_FIELD)
+    is_natural = (transactor_ids[0] if transactor_ids else None) == NATURAL_PERSON_ID
+    company = first.get("company_name") or ""
+    company = company.strip() if isinstance(company, str) and not is_natural else ""
+    country = first.get("work_country") or first.get("home_country") or ""
+    country = country.strip() if isinstance(country, str) else ""
+    line2_parts = [_esc(p) for p in (company, country) if p]
+    line2 = f'<div class="buyer-cell-sub">{" · ".join(line2_parts)}</div>' if line2_parts else ""
+
+    line3_parts = []
+    emails = [e for e in (_person_email_text(r) for r in buyer_recs) if e]
+    if emails:
+        line3_parts.append(", ".join(f'<a href="mailto:{_esc(e)}">{_esc(e)}</a>' for e in emails))
+    website = first.get("website") or ""
+    website = website.strip() if isinstance(website, str) else ""
+    if website:
+        href = website if "://" in website else f"https://{website}"
+        line3_parts.append(f'<a href="{_esc(href)}" target="_blank" rel="noopener noreferrer">{_esc(website)}</a>')
+    linked_in = first.get("linked_in_url") or ""
+    linked_in = linked_in.strip() if isinstance(linked_in, str) else ""
+    if linked_in:
+        href = linked_in if "://" in linked_in else f"https://{linked_in}"
+        line3_parts.append(f'<a href="{_esc(href)}" target="_blank" rel="noopener noreferrer">LinkedIn</a>')
+    line3 = f'<div class="buyer-cell-links">{" · ".join(line3_parts)}</div>' if line3_parts else ""
+
+    return f'{line1}{line2}{line3}'
+
+
 def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details, anon_key_email, editable=False):
     """editable=True (tenant_edit_mode — a real tenant session, or an admin
     &view_as preview without &edit=1) swaps the plain-text Next Steps /
@@ -2541,21 +2611,43 @@ def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details,
     )
 
 
-def _intro_status_select_html(deal_id, current_id):
+def _intro_status_select_html(deal_id, current_id, allowed_ids=None):
+    """allowed_ids=None -> admin, all ten options (unchanged default for
+    every existing caller). A set -> tenant editing (item 4): only those
+    options are selectable, but the row's current status is always
+    included so the dropdown always shows the truth even when it's a
+    status the tenant themselves couldn't have set (e.g. Introduced) —
+    selecting it back is a no-op, not a privilege escalation."""
     options = []
     for oid, label in INTRO_STATUS_LABELS.items():
+        if allowed_ids is not None and oid not in allowed_ids and oid != current_id:
+            continue
         selected = " selected" if oid == current_id else ""
         options.append(f'<option value="{oid}"{selected}>{_esc(label)}</option>')
     return (f'<select class="ei-status" data-deal-id="{_esc(deal_id)}">'
             f'{"".join(options)}</select><span class="ei-msg"></span>')
 
 
-def _ei_field_html(css_class, deal_id, field, value):
+def _status_column_html(resolved, deal_id, allowed_ids=None):
+    """Item 4: the 7-segment progress strip (or, for an exit state,
+    _status_chip_html instead — Stalled/Passed/Withdrawn were never strip
+    segments) above an editable dropdown. Shared by every editable Active
+    Intros row: admin (allowed_ids=None, all ten) and tenant
+    (allowed_ids=TENANT_ALLOWED_STATUS_IDS, only ever called on an
+    already-disclosed row — see _intro_row_html)."""
+    display_html = (_status_chip_html(resolved["id"], resolved["name"]) if resolved["is_exit"]
+                     else _status_strip_html(resolved["name"]))
+    select_html = _intro_status_select_html(deal_id, resolved["id"], allowed_ids=allowed_ids)
+    return f'<div class="status-column">{display_html}{select_html}</div>'
+
+
+def _ei_field_html(css_class, deal_id, field, value, placeholder=""):
     """An auto-saving text input: saved on blur or Enter (see
     _edit_script_html), with its own inline .ei-msg indicator right
     beside it — no Save button anywhere."""
+    placeholder_attr = f' placeholder="{_esc(placeholder)}"' if placeholder else ""
     return (f'<input type="text" class="{css_class}" data-deal-id="{_esc(deal_id)}" '
-            f'data-field="{field}" maxlength="2000" value="{value}">'
+            f'data-field="{field}" maxlength="2000" value="{value}"{placeholder_attr}>'
             f'<span class="ei-msg"></span>')
 
 
@@ -2912,116 +3004,133 @@ def _group_empty_row_html(message, colspan):
     return f'<tr><td colspan="{colspan}" class="group-empty">{_esc(message)}</td></tr>'
 
 
-def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, follow_up=None, key=None, view_as=None,
-                     editable=False, next_steps=None, notes=None):
-    """editable=True (tenant_edit_mode — see render_intros_page) adds
-    Next Steps / Follow-up / Buyer Notes columns matching the admin edit
-    row's layout: Next Steps and Follow-up as the same auto-saving inputs
-    admin edit mode uses, Buyer Notes as read-only text — tenants never
-    get to edit Status or Buyer Notes."""
+def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=None, view_as=None,
+                     editable=False, company_repeated=False):
+    """Tenant-facing Introduced-or-later row (item 1/4/5/6 columns:
+    Company | Buyer | Investor Type | Size | Status | Next Steps |
+    Follow-up). editable=True (tenant_edit_mode — see render_intros_page)
+    makes Status (restricted to TENANT_ALLOWED_STATUS_IDS — see
+    _status_column_html) and Next Steps/Follow-up all auto-saving inputs,
+    except on a Passed/Withdrawn row, which renders Next Steps/Follow-up
+    as read-only text instead — nothing left to plan for a dead intro.
+    company_repeated (item 7) blanks the company cell and adds a subtle
+    left-accent instead of repeating the same company name row after
+    row."""
     company_name = _deal_company_name(deal)
-    if company_name:
+    if company_repeated:
+        company_cell = ""
+        row_cls = ' class="grouped-row"'
+    elif company_name:
         company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
                         f'{_esc(company_name)}</a>')
+        row_cls = ""
     else:
         company_cell = "—"
-    name = _esc(_deal_title(deal))
+        row_cls = ""
 
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-
-    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True)
-    name_cell += _buyer_contact_detail_html(buyer_recs)
+    buyer_cell = _intro_buyer_cell_html(buyer_recs)
     investor_type, _company_text = _investor_type_and_company(buyer_recs, disclosed=True)
 
     size_text = _esc(_deal_size_text(deal))
-    status_html = _status_display_html(resolved, compact=False)
-    if _follow_up_is_due(follow_up):
+    deal_id = str(deal.get("id"))
+
+    if editable:
+        status_html = _status_column_html(resolved, deal_id, allowed_ids=TENANT_ALLOWED_STATUS_IDS)
+    else:
+        status_html = _status_display_html(resolved, compact=False)
+    if _follow_up_is_due(entry.get("follow_up")):
         status_html += _due_chip_html()
 
-    extra_html = ""
-    if editable:
-        deal_id = str(deal.get("id"))
-        next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(next_steps or ""))
-        follow_up_html = _ei_date_field_html(deal_id, _esc(follow_up or ""))
-        extra_html = f'<td>{next_steps_html}</td><td>{follow_up_html}</td><td>{_esc(notes or "")}</td>'
+    is_dead = resolved["name"] in ("Passed", "Withdrawn")
+    if editable and not is_dead:
+        next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""),
+                                          placeholder="Add next step…")
+        follow_up_html = _ei_date_field_html(deal_id, _esc(entry.get("follow_up") or ""))
+    else:
+        next_steps_html = _esc(entry.get("next_steps") or "—")
+        follow_up_text = _fmt_short_date(entry.get("follow_up"))
+        follow_up_html = _esc(follow_up_text) if follow_up_text else "—"
 
     return (
-        f'<tr><td class="company">{company_cell}</td>'
-        f'<td>{name}</td>'
-        f'<td>{name_cell}</td>'
+        f'<tr{row_cls}><td class="company">{company_cell}</td>'
+        f'<td>{buyer_cell}</td>'
         f'<td>{_esc(investor_type)}</td>'
         f'<td class="num">{size_text}</td>'
-        f'<td>{status_html}</td>{extra_html}</tr>'
+        f'<td>{status_html}</td>'
+        f'<td>{next_steps_html}</td>'
+        f'<td>{follow_up_html}</td></tr>'
     )
 
 
 def _pending_intro_row_html(deal, buyer_recs, anon_key_email, follow_up=None, key=None, view_as=None,
-                             editable=False):
-    """editable pads the row with three blank cells (Next Steps /
-    Follow-up / Buyer Notes) to match the 9-column editable header —
-    pending rows never get inputs, disclosed or not."""
+                             company_repeated=False):
+    """Pending rows never get inputs — only Introduced-or-later rows are
+    editable, disclosed or not. company_repeated: see _intro_row_html."""
     company_name = _deal_company_name(deal)
-    company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
-                    f'{_esc(company_name)}</a>') if company_name else "—"
-    name = _esc(_deal_title(deal))
+    if company_repeated:
+        company_cell = ""
+        row_cls = ' class="pending-row grouped-row"'
+    else:
+        company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
+                        f'{_esc(company_name)}</a>') if company_name else "—"
+        row_cls = ' class="pending-row"'
     buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
     size_text = _esc(_deal_size_text(deal))
     status_html = _status_pill_html("Matched")
     if _follow_up_is_due(follow_up):
         status_html += _due_chip_html()
 
-    extra_html = "<td></td><td></td><td></td>" if editable else ""
-
     return (
-        f'<tr class="pending-row"><td class="company">{company_cell}</td>'
-        f'<td>{name}</td>'
+        f'<tr{row_cls}><td class="company">{company_cell}</td>'
         f'<td>{buyer_cell}</td>'
         f'<td></td>'
         f'<td class="num">{size_text}</td>'
-        f'<td>{status_html}</td>{extra_html}</tr>'
+        f'<td>{status_html}</td>'
+        f'<td></td><td></td></tr>'
     )
 
 
-def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, key=None, view_as=None):
+def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, key=None, view_as=None,
+                          company_repeated=False):
     """Admin edit-mode row for Active Intros: always the real buyer(s),
     always the true current status (Matched included) via a dropdown of
-    all ten options, plus auto-saving Next Steps / Buyer Notes inputs —
-    mirrors _matched_buyer_row_edit_html's rationale exactly."""
+    all ten options, plus auto-saving Next Steps/Follow-up inputs."""
     deal_id = str(deal.get("id"))
     entry = intro_details.get(deal_id) or {}
     resolved = _resolve_intro_status(deal, entry)
 
     company_name = _deal_company_name(deal)
-    company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
-                    f'{_esc(company_name)}</a>') if company_name else "—"
-    name = _esc(_deal_title(deal))
+    if company_repeated:
+        company_cell = ""
+        row_cls = ' class="grouped-row"'
+    else:
+        company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
+                        f'{_esc(company_name)}</a>') if company_name else "—"
+        row_cls = ""
 
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True)
-    if resolved["disclosed"]:
-        name_cell += _buyer_contact_detail_html(buyer_recs)
+    buyer_cell = _intro_buyer_cell_html(buyer_recs)
     investor_type, _company_text = _investor_type_and_company(buyer_recs, disclosed=True)
 
     size_text = _esc(_deal_size_text(deal))
-    select_html = _intro_status_select_html(deal_id, resolved["id"])
+    status_html = _status_column_html(resolved, deal_id, allowed_ids=None)
     if _follow_up_is_due(entry.get("follow_up")):
-        select_html += _due_chip_html()
-    next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""))
+        status_html += _due_chip_html()
+    next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""),
+                                      placeholder="Add next step…")
     follow_up_html = _ei_date_field_html(deal_id, _esc(entry.get("follow_up") or ""))
-    notes_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(entry.get("notes") or ""))
 
     return (
-        f'<tr><td class="company">{company_cell}</td>'
-        f'<td>{name}</td>'
-        f'<td>{name_cell}</td>'
+        f'<tr{row_cls}><td class="company">{company_cell}</td>'
+        f'<td>{buyer_cell}</td>'
         f'<td>{_esc(investor_type)}</td>'
         f'<td class="num">{size_text}</td>'
-        f'<td>{select_html}</td>'
+        f'<td>{status_html}</td>'
         f'<td>{next_steps_html}</td>'
-        f'<td>{follow_up_html}</td>'
-        f'<td>{notes_html}</td></tr>'
+        f'<td>{follow_up_html}</td></tr>'
     )
 
 
@@ -3030,18 +3139,26 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     """tenant is None only for admin-without-view_as — the same
     tenant-picker signal render_my_deals_page uses. tenant_email is always
     a real email otherwise (the logged-in tenant's own, or the previewed
-    tenant's under &view_as), used for the pending rows' anon buyer codes
-    and as the Dynamo partition key for status overrides / edit data.
+    tenant's under &view_as), used for the pending rows' anon buyer codes,
+    as the Dynamo partition key for status overrides / edit data, and
+    (item 3) as the feature-request partition — "admin" in the
+    tenant-picker case, aggregating every partition, exactly like My
+    Deals.
 
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
     — never for a real tenant."""
     nav = _nav_html("intros", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
+    tenant_picker = tenant is None
 
-    if tenant is None:
+    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, tenant_email or "admin", key=key)
+
+    if tenant_picker:
         body_html = (
             '<div class="gg-placeholder">Pick a tenant to preview — '
             'add &amp;view_as=&lt;email&gt; to the URL.</div>'
         )
+        summary_html = ""
+        subtle_html = ""
     else:
         person_id = tenant.get("person_id")
         deals = get_my_matched_buy_deals(person_id) if person_id is not None else []
@@ -3070,68 +3187,141 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             resolved = resolved_by_deal_id[str(d.get("id"))]
             (main_rows if resolved["disclosed"] else pending_rows).append((d, resolved))
 
-        def _due_key(d):
-            follow_up = (intro_details.get(str(d.get("id"))) or {}).get("follow_up")
-            return 0 if _follow_up_is_due(follow_up) else 1
+        def _entry_for(d):
+            return intro_details.get(str(d.get("id"))) or {}
 
-        main_rows.sort(key=lambda dr: (_due_key(dr[0]), -_intro_sort_rank(dr[1]),
+        def _due_key(d):
+            return 0 if _follow_up_is_due(_entry_for(d).get("follow_up")) else 1
+
+        def _stalled_key(resolved):
+            return 0 if resolved["id"] == INTRO_STATUS_STALLED_ID else 1
+
+        # Item 7: due/overdue first, then Stalled, then furthest-progressed
+        # first, then company A-Z.
+        main_rows.sort(key=lambda dr: (_due_key(dr[0]), _stalled_key(dr[1]), -_intro_sort_rank(dr[1]),
                                         (_deal_company_name(dr[0]) or "").lower()))
         pending_rows.sort(key=lambda dr: (_due_key(dr[0]), (_deal_company_name(dr[0]) or "").lower()))
 
-        # tenant_edit_mode: mirrors render_company_page's — the tenant (real
-        # session, or admin &view_as preview without &edit=1) can auto-save
-        # Next Steps / Follow-up on their own Introduced-or-later rows here
-        # too, per the task header's "(and Active Intros where noted)".
+        # Item 7: a company repeated in consecutive rows (within the same
+        # section) is shown once, with a subtle left-accent on the
+        # follow-on rows instead of repeating the name.
+        def _mark_repeats(rows):
+            prev = None
+            flags = []
+            for d, resolved in rows:
+                name = (_deal_company_name(d) or "").strip().lower()
+                flags.append(bool(name and name == prev))
+                prev = name
+            return flags
+
+        main_repeats = _mark_repeats(main_rows)
+        pending_repeats = _mark_repeats(pending_rows)
+
+        # tenant_edit_mode: the tenant (real session, or admin &view_as
+        # preview without &edit=1) can auto-save Next Steps / Follow-up on
+        # every Introduced-or-later row, and now (item 4) Status too,
+        # restricted to TENANT_ALLOWED_STATUS_IDS.
         tenant_edit_mode = tenant is not None and not edit_mode
 
-        if edit_mode or tenant_edit_mode:
-            colspan = 9
-            head_row = ('<th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>'
-                        '<th class="num">Size</th><th>Status</th>'
-                        '<th>Next Steps</th><th>Follow-up</th><th>Buyer Notes</th>')
+        # Item 2: summary strip counts. "In motion" is every disclosed
+        # intro that isn't Stalled or Closed (both terminal in different
+        # ways); "follow-ups due" spans both sections (a pending intro can
+        # carry a follow_up too — see _pending_intro_row_html's own Due
+        # chip).
+        stalled_count = sum(1 for _, r in main_rows if r["id"] == INTRO_STATUS_STALLED_ID)
+        closed_count = sum(1 for _, r in main_rows if r["name"] == "Closed")
+        in_motion_count = len(main_rows) - stalled_count - closed_count
+        due_count = sum(1 for d in kept_deals if _follow_up_is_due(_entry_for(d).get("follow_up")))
+        pending_count = len(pending_rows)
+
+        summary_parts = []
+        if in_motion_count:
+            summary_parts.append(f"{in_motion_count} in motion")
+        if stalled_count:
+            summary_parts.append(f"{stalled_count} stalled")
+        if due_count:
+            summary_parts.append(f"{due_count} follow-ups due")
+        if pending_count:
+            summary_parts.append(f"{pending_count} pending introduction")
+        summary_html = (f'<p class="mydeals-summary">{_esc(" · ".join(summary_parts))}</p>'
+                         if summary_parts else "")
+        subtle_html = ('<p class="mydeals-subtle">Update statuses as buyers progress — '
+                        'we see your changes instantly.</p>')
+
+        head_row = (
+            '<th>Company</th><th>Buyer</th><th>Investor Type</th>'
+            '<th class="num">Size</th>'
+            '<th title="Where this introduction stands">Status</th>'
+            '<th>Next Steps</th>'
+            '<th title="When to check in next">Follow-up</th>'
+        )
+
+        if not kept_deals:
+            # Item 9: no intros anywhere for this tenant — a friendlier,
+            # page-level empty state instead of a near-empty table.
+            my_deals_href = f"?tab=mydeals{_tab_qs_suffix(key, view_as)}"
+            body_html = (
+                f'{note_html}<div class="gg-empty-state">'
+                f'<p>No introductions yet. Your live deals are being shown to buyers — '
+                f'introductions appear here as matches firm up.</p>'
+                f'<p><a class="gg-link" href="{my_deals_href}">View My Deals &rarr;</a></p>'
+                f'</div>'
+            )
         else:
-            colspan = 6
-            head_row = ('<th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>'
-                        '<th class="num">Size</th><th>Status</th>')
-
-        # "Introduced" always renders — even with zero rows — per instruction;
-        # "Pending introductions" only when there's something pending.
-        parts = [_group_header_row_html("Introduced", colspan)]
-        if main_rows:
-            if edit_mode:
-                parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key, view_as=view_as)
-                          for d, _ in main_rows]
+            # "Introduced" always renders — even with zero rows — per
+            # instruction; "Pending introductions" only when there's
+            # something pending.
+            parts = [_group_header_row_html("Introduced", 7)]
+            if main_rows:
+                if edit_mode:
+                    parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key,
+                                                    view_as=view_as, company_repeated=main_repeats[i])
+                              for i, (d, _) in enumerate(main_rows)]
+                else:
+                    parts += [_intro_row_html(d, resolved, people_by_id, person_id, _entry_for(d),
+                                               key=key, view_as=view_as, editable=tenant_edit_mode,
+                                               company_repeated=main_repeats[i])
+                              for i, (d, resolved) in enumerate(main_rows)]
             else:
-                parts += [_intro_row_html(d, resolved, people_by_id, person_id,
-                                           follow_up=(intro_details.get(str(d.get("id"))) or {}).get("follow_up"),
-                                           key=key, view_as=view_as, editable=tenant_edit_mode,
-                                           next_steps=(intro_details.get(str(d.get("id"))) or {}).get("next_steps"),
-                                           notes=(intro_details.get(str(d.get("id"))) or {}).get("notes"))
-                          for d, resolved in main_rows]
-        else:
-            parts.append(_group_empty_row_html("No introductions yet on this deal.", colspan))
+                parts.append(_group_empty_row_html("No introductions yet on this deal.", 7))
 
-        if pending_rows:
-            parts.append(_group_header_row_html("Pending introductions", colspan))
-            if edit_mode:
-                # Edit mode never anonymizes — the admin sees and edits the
-                # real buyer regardless of pending/disclosed.
-                parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key, view_as=view_as)
-                          for d, _ in pending_rows]
-            else:
-                # Pending rows never get inputs even under tenant_edit_mode —
-                # only Introduced-or-later rows are editable.
-                for d, resolved in pending_rows:
-                    linked = _deal_linked_person_ids(d) - {person_id}
-                    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-                    follow_up = (intro_details.get(str(d.get("id"))) or {}).get("follow_up")
-                    parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, follow_up=follow_up,
-                                                          key=key, view_as=view_as, editable=tenant_edit_mode))
+            if pending_rows:
+                parts.append(_group_header_row_html("Pending introductions", 7))
+                parts.append(
+                    f'<tr><td colspan="7" class="group-note">'
+                    f"We're preparing these introductions — buyer identities appear here "
+                    f'the moment we connect you.</td></tr>'
+                )
+                if edit_mode:
+                    # Edit mode never anonymizes — the admin sees and edits
+                    # the real buyer regardless of pending/disclosed.
+                    parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key,
+                                                    view_as=view_as, company_repeated=pending_repeats[i])
+                              for i, (d, _) in enumerate(pending_rows)]
+                else:
+                    # Pending rows never get inputs even under
+                    # tenant_edit_mode — only Introduced-or-later rows are
+                    # editable.
+                    for i, (d, resolved) in enumerate(pending_rows):
+                        linked = _deal_linked_person_ids(d) - {person_id}
+                        buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+                        follow_up = _entry_for(d).get("follow_up")
+                        parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, follow_up=follow_up,
+                                                              key=key, view_as=view_as,
+                                                              company_repeated=pending_repeats[i]))
 
-        rows_html = "".join(parts)
-        table_html = f"""<div class="card">
-      <div class="table-scroll">
+            rows_html = "".join(parts)
+            table_html = f"""<div class="card">
       <table>
+        <colgroup>
+          <col style="width:13%">
+          <col style="width:24%">
+          <col style="width:11%">
+          <col style="width:7%">
+          <col style="width:18%">
+          <col style="width:14%">
+          <col style="width:13%">
+        </colgroup>
         <thead>
           <tr>
             {head_row}
@@ -3139,11 +3329,10 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         </thead>
         <tbody>{rows_html}</tbody>
       </table>
-      </div>
     </div>"""
 
-        edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
-        body_html = f"{note_html}{table_html}{edit_script}"
+            edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
+            body_html = f"{note_html}{table_html}{edit_script}"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -3170,15 +3359,19 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     padding: 32px 24px 64px;
   }}
 {NAV_CSS}
+{FEATURE_CSS}
   .wrap {{ max-width: 1000px; margin: 28px auto 0; }}
-  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 24px; }}
+  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
+  .mydeals-summary {{ color: var(--ink); font-size: 14px; margin: 0 0 4px; }}
+  .mydeals-subtle {{ color: var(--muted); font-size: 13px; margin: 0 0 20px; }}
+  .feature-section-heading {{ font-size: 16px; font-weight: 600; margin: 32px 0 12px; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--line);
     border-radius: 10px;
     overflow: hidden;
   }}
-  table {{ width: 100%; border-collapse: collapse; }}
+  table {{ width: 100%; table-layout: fixed; border-collapse: collapse; }}
   thead th {{
     text-align: left;
     font-size: 12px;
@@ -3187,9 +3380,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     color: var(--muted);
     padding: 12px 16px;
     border-bottom: 1px solid var(--line);
-    white-space: nowrap;
   }}
-  thead th.num, td.num {{ text-align: right; }}
+  thead th.num, td.num {{ text-align: center; }}
   tbody td {{
     padding: 11px 16px;
     border-bottom: 1px solid var(--line);
@@ -3208,7 +3400,22 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     color: var(--muted);
     font-size: 15px;
   }}
-  .status-strip {{ display: flex; align-items: center; gap: 3px; white-space: nowrap; }}
+  .gg-empty-state {{
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 40px 32px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.5;
+  }}
+  .gg-empty-state p {{ margin: 0 0 10px; }}
+  .gg-empty-state p:last-child {{ margin-bottom: 0; }}
+  .gg-link {{ color: var(--accent); font-weight: 600; text-decoration: none; }}
+  .gg-link:hover {{ text-decoration: underline; }}
+  .status-column {{ display: flex; flex-direction: column; gap: 6px; }}
+  .status-strip {{ display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }}
   .status-step {{
     width: 14px;
     height: 6px;
@@ -3218,7 +3425,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   }}
   .status-step.done {{ background: var(--qp); }}
   .status-step.current {{ background: var(--accent); }}
-  .status-label {{ font-size: 12px; color: var(--muted); margin-left: 6px; }}
+  .status-label {{ font-size: 12px; color: var(--muted); margin-left: 6px; white-space: nowrap; }}
   .status-pill {{
     display: inline-block;
     font-size: 11px;
@@ -3254,6 +3461,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--muted); }}
   tr.pending-row {{ opacity: 0.85; }}
+  tr.grouped-row {{ box-shadow: inset 3px 0 0 var(--line); }}
   tr.group-divider td {{
     padding: 8px 16px;
     font-size: 11px;
@@ -3269,29 +3477,51 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     font-size: 13px;
     font-style: italic;
   }}
-  .table-scroll {{ overflow-x: auto; }}
+  td.group-note {{
+    padding: 8px 16px 14px;
+    color: var(--muted);
+    font-size: 12px;
+    font-style: italic;
+    border-bottom: 1px solid var(--line);
+  }}
   .gg-note {{
     color: var(--accredited, #8a6d1f);
     font-size: 13px;
     margin: 0 0 16px;
   }}
-  .ei-status, .ei-next-steps, .ei-notes, .ei-follow-up, .ei-deadline {{
+  .ei-status, .ei-next-steps, .ei-follow-up {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
     border-radius: 6px;
     padding: 5px 8px;
     font-size: 13px;
+    width: 100%;
+    box-sizing: border-box;
   }}
-  .ei-next-steps, .ei-notes {{ width: 140px; }}
-  .ei-follow-up, .ei-deadline {{ width: 150px; }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
   .ei-msg.error {{ color: #b23b3b; }}
-  .buyer-detail {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
-  .buyer-detail a {{ color: var(--accent); text-decoration: none; }}
-  .buyer-detail a:hover {{ text-decoration: underline; }}
+  .buyer-cell-name {{ font-weight: 600; }}
+  .buyer-cell-sub, .buyer-cell-links {{
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .buyer-cell-links a {{ color: var(--accent); text-decoration: none; }}
+  .buyer-cell-links a:hover {{ text-decoration: underline; }}
+  .closed-dot {{
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--qp);
+    vertical-align: middle;
+  }}
   .due-chip {{
     display: inline-block;
     font-size: 10px;
@@ -3300,7 +3530,6 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     letter-spacing: 0.03em;
     padding: 2px 7px;
     border-radius: 999px;
-    margin-left: 6px;
     background: rgba(178,59,59,0.12);
     color: #b23b3b;
   }}
@@ -3310,8 +3539,16 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 {nav}
 <div class="wrap">
   <h1>Active Intros</h1>
+  {feature_box_html}
+  {summary_html}
+  {subtle_html}
   {body_html}
+  <h2 class="feature-section-heading">Feature requests</h2>
+  <div class="card">
+    {feature_list_html}
+  </div>
 </div>
+{_feature_toggle_script_html(key)}
 </body>
 </html>"""
 
@@ -4702,25 +4939,32 @@ def _handle_update_intro(event):
 
     Two auth modes:
     - Admin: ADMIN_KEY present IN THE BODY (the session cookie alone never
-      authorizes a write, even an admin's own) — full rights over status,
-      next_steps, notes, follow_up, and deadline, on any deal.
+      authorizes a write, even an admin's own) — full rights over status
+      (all ten options), next_steps, notes, follow_up, and deadline, on
+      any deal.
     - Tenant: no ADMIN_KEY, but a valid gg_id identity cookie naming an
-      auto-enrolled tenant email (see _resolve_tenant) — rights
-      restricted to next_steps and follow_up ONLY (status/notes/deadline
-      are rejected outright with 403), and
-      only on a deal_id whose linked tenant (via person linkage,
-      _tenant_email_for_deal) is that same authenticated tenant. No
-      Pipeline call ever happens on a tenant post, since status and
-      deadline (the only two fields that ever reach Pipeline) are never
-      part of one.
+      auto-enrolled tenant email (see _resolve_tenant) — rights to
+      next_steps and follow_up always, PLUS status but only to one of
+      TENANT_ALLOWED_STATUS_IDS (NDA/VDR/Sub Docs/Wired/Stalled/Passed)
+      and only on a row that's already Introduced-or-later (disclosed) —
+      Matched/Introduced/Withdrawn/Closed stay admin-only, enforced here
+      server-side, not just left off the tenant's dropdown. notes/deadline
+      are still rejected outright with 403 for a tenant. Every tenant
+      write is also scoped to a deal_id whose linked tenant (via person
+      linkage, _tenant_email_for_deal) is that same authenticated tenant.
+      A tenant status write still never touches Pipeline via the deadline
+      path — only status and deadline ever reach Pipeline, and deadline
+      stays admin-only.
 
-    Order: validate -> look up the deal and its owning tenant -> if status
-    or deadline is part of the write, PUT it to Pipeline first and abort
-    the whole request (writing nothing to Dynamo) on any non-2xx -> write
-    the Dynamo intro-item update (status_override/override_at, next_steps,
-    notes, follow_up, deadline_override/deadline_override_at) -> append an
-    audit item (actor = tenant email or "admin"). Never raises past this
-    function; every failure mode returns a JSON error the UI can show."""
+    Order: validate -> look up the deal and its owning tenant -> resolve
+    the row's CURRENT status (needed for the tenant transition check) ->
+    if status or deadline is part of the write, PUT it to Pipeline first
+    and abort the whole request (writing nothing to Dynamo) on any
+    non-2xx -> write the Dynamo intro-item update (status_override/
+    override_at, next_steps, notes, follow_up, deadline_override/
+    deadline_override_at) -> append an audit item (actor = tenant email or
+    "admin"). Never raises past this function; every failure mode returns
+    a JSON error the UI can show."""
     body = _parse_json_body(event)
 
     admin_key = os.environ.get("ADMIN_KEY")
@@ -4732,8 +4976,7 @@ def _handle_update_intro(event):
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
         if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
-        if (body.get("status") not in (None, "") or body.get("notes") not in (None, "")
-                or body.get("deadline") not in (None, "")):
+        if body.get("notes") not in (None, "") or body.get("deadline") not in (None, ""):
             return _json_response({"error": "forbidden"}, 403)
 
     deal_id = str(body.get("deal_id") or "").strip()
@@ -4741,13 +4984,15 @@ def _handle_update_intro(event):
         return _json_response({"error": "deal_id is required"}, 400)
 
     status_id = None
-    if is_admin and body.get("status") not in (None, ""):
+    if body.get("status") not in (None, ""):
         try:
             status_id = int(body.get("status"))
         except (TypeError, ValueError):
             return _json_response({"error": "invalid status"}, 400)
         if status_id not in INTRO_STATUS_LABELS:
             return _json_response({"error": "invalid status"}, 400)
+        if not is_admin and status_id not in TENANT_ALLOWED_STATUS_IDS:
+            return _json_response({"error": "forbidden"}, 403)
 
     next_steps = body.get("next_steps")
     if next_steps is not None:
@@ -4797,6 +5042,10 @@ def _handle_update_intro(event):
     intro_details, _ = get_intro_details(tenant_email)
     old_entry = intro_details.get(deal_id) or {}
     old_resolved = _resolve_intro_status(deal, old_entry)
+
+    if status_id is not None and not is_admin and not old_resolved["disclosed"]:
+        return _json_response({"error": "forbidden"}, 403)
+
     old_values = {
         "status": old_resolved["id"] if old_resolved["id"] is not None else old_resolved["name"],
         "next_steps": old_entry.get("next_steps"),
