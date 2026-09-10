@@ -1004,6 +1004,8 @@ def get_intro_details(tenant_email):
                 "follow_up": item.get("follow_up"),
                 "status_override": item.get("status_override"),
                 "override_at": item.get("override_at"),
+                "deadline_override": item.get("deadline_override"),
+                "deadline_override_at": item.get("deadline_override_at"),
             }
         return out, False
     except Exception:
@@ -1119,6 +1121,39 @@ def _pipeline_update_deal_status(deal_id, status_id):
         return False, f"{type(e).__name__}: {e}"
 
 
+def _pipeline_update_deal_deadline(deal_id, deadline_iso):
+    """PUT the Deadline field to Pipeline, converting the input's ISO
+    yyyy-mm-dd to the "YYYY/MM/DD" slash format _deal_deadline_text (and
+    _parse_dt) already assume deals.json uses for this field — see
+    DEADLINE_FIELD's own comment: that assumption was never independently
+    verified against a live snapshot, and this mirrors it symmetrically on
+    the write side rather than introducing a second, different guess.
+    Returns (ok, error_message); otherwise identical to
+    _pipeline_update_deal_status, including "abort on any non-2xx"."""
+    try:
+        dt = datetime.strptime(deadline_iso, "%Y-%m-%d")
+    except ValueError:
+        return False, "invalid deadline date"
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    body = json.dumps({"deal": {"custom_fields": {DEADLINE_FIELD: dt.strftime("%Y/%m/%d")}}}).encode("utf-8")
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
+        data=body, method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def _tenant_email_for_deal(deal):
     """The TENANTS email whose person_id is linked to this deal, or None
     if no tenant maps to it — writes are rejected outright in that case."""
@@ -1129,13 +1164,15 @@ def _tenant_email_for_deal(deal):
     return None
 
 
-def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, old_values):
+def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
+                                old_values, actor):
     """Update the intro item's Dynamo-owned attributes (status_override/
     override_at when status_id is not None, next_steps/notes/follow_up
-    when they are not None) and append an audit item
-    (sk=audit#<deal_id>#<epoch_ms>, actor "admin", old and new values).
-    Returns (ok, error_message). Never called when a requested Pipeline
-    write failed — see _handle_update_intro."""
+    when they are not None, deadline_override/deadline_override_at when
+    deadline is not None) and append an audit item
+    (sk=audit#<deal_id>#<epoch_ms>, actor "admin" or the tenant's own
+    email, old and new values). Returns (ok, error_message). Never called
+    when a requested Pipeline write failed — see _handle_update_intro."""
     update_parts = []
     expr_names = {}
     expr_values = {}
@@ -1161,6 +1198,12 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         update_parts.append("follow_up = :fu")
         expr_values[":fu"] = follow_up
         new_values["follow_up"] = follow_up
+    if deadline is not None:
+        update_parts.append("deadline_override = :do")
+        expr_values[":do"] = deadline
+        update_parts.append("deadline_override_at = :doa")
+        expr_values[":doa"] = int(now)
+        new_values["deadline"] = deadline
 
     if not update_parts:
         return True, None
@@ -1178,7 +1221,7 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         table.put_item(Item={
             "tenant": tenant_email,
             "sk": f"audit#{deal_id}#{int(now * 1000)}",
-            "actor": "admin",
+            "actor": actor,
             "old": old_values,
             "new": new_values,
         })
@@ -1267,6 +1310,28 @@ def _deal_deadline_text(deal):
     return dt.strftime("%Y-%m-%d") if dt else str(raw)
 
 
+def _resolve_deal_deadline(deal, override_entry=None):
+    """Newer-wins overlay for Deadline, mirroring _resolve_intro_status's
+    override logic exactly but keyed on deadline_override/
+    deadline_override_at — kept separate from status_override/override_at
+    so the two overlays never shadow each other. override_entry is this
+    deal's Dynamo intro item (from get_intro_details), or None. Returns
+    the resolved ISO yyyy-mm-dd date string, or None."""
+    deadline = _deal_deadline_text(deal)
+    if override_entry:
+        override_val = override_entry.get("deadline_override")
+        override_at = override_entry.get("deadline_override_at")
+        if override_val and override_at:
+            pipeline_dt = _parse_dt(deal.get("updated_at"))
+            try:
+                override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                override_dt = None
+            if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
+                deadline = override_val
+    return deadline
+
+
 def _deal_size_text(deal):
     """Ticket min/max, falling back to the deal's own 'value' field (a
     built-in Pipeline deal attribute, not a custom_field) when both are
@@ -1294,7 +1359,14 @@ def _engagement_badge_html(deal, company):
             '&#10007; Not engaged — contact us to activate this deal</a>')
 
 
-def _deal_card_html(deal, company):
+def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
+    """override_entry is this deal's Dynamo intro item (from
+    get_intro_details, keyed by the deal's own linked tenant — see
+    render_company_page), used to resolve any deadline_override. edit_mode
+    (admin-only, never tenant_edit_mode) swaps the read-only Deadline line
+    for an auto-saving date input. Overdue emphasis (red border + chip)
+    always applies, admin and tenant alike, whenever the resolved deadline
+    is in the past — no date, no warning."""
     name = _esc(_deal_title(deal))
     sid = _deal_stage_id(deal)
     stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
@@ -1306,9 +1378,30 @@ def _deal_card_html(deal, company):
     struct_parts = [p for p in (struct_label, layer_label) if p]
     structure_text = _esc(" · ".join(struct_parts)) if struct_parts else "—"
 
-    deadline = _deal_deadline_text(deal)
-    deadline_html = (f'<div class="dc-line">Deadline: {_esc(deadline)}</div>'
-                      if deadline else "")
+    deal_id = str(deal.get("id"))
+    deadline = _resolve_deal_deadline(deal, override_entry)
+    if edit_mode:
+        deadline_input = _ei_date_field_html(deal_id, deadline or "", css_class="ei-deadline", field="deadline")
+        deadline_html = f'<div class="dc-line">Deadline: {deadline_input}</div>'
+    else:
+        deadline_html = (f'<div class="dc-line">Deadline: {_esc(deadline)}</div>'
+                          if deadline else "")
+
+    is_overdue = False
+    if deadline:
+        deadline_dt = _parse_dt(deadline)
+        is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
+
+    card_cls = "deal-card overdue" if is_overdue else "deal-card"
+    overdue_html = ""
+    if is_overdue:
+        if edit_mode:
+            overdue_html = '<div class="overdue-chip">Deadline passed — update or cancel this deal</div>'
+        else:
+            subject = urllib.parse.quote(f"Deadline passed: {_deal_title(deal)}", safe="")
+            href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
+            overdue_html = (f'<a class="overdue-chip" href="{href}">'
+                             'Deadline passed — update or cancel this deal</a>')
 
     exemption_id = next(iter(_deal_cf_option_ids(deal, EXEMPTION_FIELD)), None)
     exemption_label = EXEMPTION_LABELS.get(exemption_id)
@@ -1320,7 +1413,8 @@ def _deal_card_html(deal, company):
 
     badge_html = _engagement_badge_html(deal, company)
 
-    return f"""<div class="deal-card">
+    return f"""<div class="{card_cls}">
+      {overdue_html}
       <div class="deal-card-head">
         <div class="deal-card-title">{name}</div>
         <div class="deal-card-stage">{stage}</div>
@@ -1450,7 +1544,14 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
     return "".join(blocks)
 
 
-def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details, anon_key_email):
+def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details, anon_key_email, editable=False):
+    """editable=True (tenant_edit_mode — a real tenant session, or an admin
+    &view_as preview without &edit=1) swaps the plain-text Next Steps /
+    Follow-up cells for the same auto-saving inputs admin edit mode uses,
+    while Status and Buyer Notes stay read-only text — tenants never get
+    those two fields. Pending (not-yet-disclosed) rows never get inputs
+    either way, only a blank cell added to keep the column count matching
+    the 8-column editable header."""
     deal_id = str(deal.get("id"))
     entry = intro_details.get(deal_id) or {}
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
@@ -1461,24 +1562,30 @@ def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details,
     if not resolved["disclosed"]:
         buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
         status_html = _status_pill_html("Matched")
+        extra_td = "<td></td>" if editable else ""
         return (
             f'<tr class="pending-row"><td>{buyer_cell}</td>'
             f'<td>—</td><td></td>'
             f'<td class="num">{size_text}</td>'
             f'<td>{status_html}</td>'
-            f'<td></td><td></td></tr>'
+            f'<td></td>{extra_td}<td></td></tr>'
         )
 
     name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True)
     name_cell += _buyer_contact_detail_html(buyer_recs)
     investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
     status_html = _status_display_html(resolved, compact=True)
-
-    next_steps_html = _esc(entry.get("next_steps") or "")
-    follow_up_text = _fmt_follow_up_short(entry.get("follow_up"))
-    if follow_up_text:
-        next_steps_html += f'<div class="follow-up-note">Follow-up: {_esc(follow_up_text)}</div>'
     notes_html = _esc(entry.get("notes") or "")
+
+    if editable:
+        next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""))
+        follow_up_td = f'<td>{_ei_date_field_html(deal_id, _esc(entry.get("follow_up") or ""))}</td>'
+    else:
+        next_steps_html = _esc(entry.get("next_steps") or "")
+        follow_up_text = _fmt_follow_up_short(entry.get("follow_up"))
+        if follow_up_text:
+            next_steps_html += f'<div class="follow-up-note">Follow-up: {_esc(follow_up_text)}</div>'
+        follow_up_td = ""
 
     return (
         f'<tr><td>{name_cell}</td>'
@@ -1487,6 +1594,7 @@ def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details,
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
         f'<td>{next_steps_html}</td>'
+        f'{follow_up_td}'
         f'<td>{notes_html}</td></tr>'
     )
 
@@ -1509,13 +1617,13 @@ def _ei_field_html(css_class, deal_id, field, value):
             f'<span class="ei-msg"></span>')
 
 
-def _ei_date_field_html(deal_id, value):
-    """Auto-saving native date input for Follow-up — same save path as
-    _ei_field_html (blur/Enter via _edit_script_html), just a
-    type="date" input (browser-native picker, ISO yyyy-mm-dd value) with
-    no maxlength."""
-    return (f'<input type="date" class="ei-follow-up" data-deal-id="{_esc(deal_id)}" '
-            f'data-field="follow_up" value="{_esc(value)}">'
+def _ei_date_field_html(deal_id, value, css_class="ei-follow-up", field="follow_up"):
+    """Auto-saving native date input for Follow-up (default) or, via
+    css_class/field, Deadline — same save path as _ei_field_html (blur/
+    Enter via _edit_script_html), just a type="date" input (browser-native
+    picker, ISO yyyy-mm-dd value) with no maxlength."""
+    return (f'<input type="date" class="{css_class}" data-deal-id="{_esc(deal_id)}" '
+            f'data-field="{field}" value="{_esc(value)}">'
             f'<span class="ei-msg"></span>')
 
 
@@ -1590,7 +1698,7 @@ def _edit_script_html(key):
   document.querySelectorAll('.ei-status').forEach(function(el) {{
     el.addEventListener('change', function() {{ saveField(el, 'status'); }});
   }});
-  document.querySelectorAll('.ei-next-steps, .ei-notes, .ei-follow-up').forEach(function(el) {{
+  document.querySelectorAll('.ei-next-steps, .ei-notes, .ei-follow-up, .ei-deadline').forEach(function(el) {{
     var field = el.getAttribute('data-field');
     el.addEventListener('blur', function() {{ saveField(el, field); }});
     el.addEventListener('keydown', function(e) {{
@@ -1777,7 +1885,13 @@ def _group_empty_row_html(message, colspan):
     return f'<tr><td colspan="{colspan}" class="group-empty">{_esc(message)}</td></tr>'
 
 
-def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, follow_up=None, key=None, view_as=None):
+def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, follow_up=None, key=None, view_as=None,
+                     editable=False, next_steps=None, notes=None):
+    """editable=True (tenant_edit_mode — see render_intros_page) adds
+    Next Steps / Follow-up / Buyer Notes columns matching the admin edit
+    row's layout: Next Steps and Follow-up as the same auto-saving inputs
+    admin edit mode uses, Buyer Notes as read-only text — tenants never
+    get to edit Status or Buyer Notes."""
     company_name = _deal_company_name(deal)
     if company_name:
         company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
@@ -1798,17 +1912,28 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, follow_up=No
     if _follow_up_is_due(follow_up):
         status_html += _due_chip_html()
 
+    extra_html = ""
+    if editable:
+        deal_id = str(deal.get("id"))
+        next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(next_steps or ""))
+        follow_up_html = _ei_date_field_html(deal_id, _esc(follow_up or ""))
+        extra_html = f'<td>{next_steps_html}</td><td>{follow_up_html}</td><td>{_esc(notes or "")}</td>'
+
     return (
         f'<tr><td class="company">{company_cell}</td>'
         f'<td>{name}</td>'
         f'<td>{name_cell}</td>'
         f'<td>{_esc(investor_type)}</td>'
         f'<td class="num">{size_text}</td>'
-        f'<td>{status_html}</td></tr>'
+        f'<td>{status_html}</td>{extra_html}</tr>'
     )
 
 
-def _pending_intro_row_html(deal, buyer_recs, anon_key_email, follow_up=None, key=None, view_as=None):
+def _pending_intro_row_html(deal, buyer_recs, anon_key_email, follow_up=None, key=None, view_as=None,
+                             editable=False):
+    """editable pads the row with three blank cells (Next Steps /
+    Follow-up / Buyer Notes) to match the 9-column editable header —
+    pending rows never get inputs, disclosed or not."""
     company_name = _deal_company_name(deal)
     company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
                     f'{_esc(company_name)}</a>') if company_name else "—"
@@ -1819,13 +1944,15 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, follow_up=None, ke
     if _follow_up_is_due(follow_up):
         status_html += _due_chip_html()
 
+    extra_html = "<td></td><td></td><td></td>" if editable else ""
+
     return (
         f'<tr class="pending-row"><td class="company">{company_cell}</td>'
         f'<td>{name}</td>'
         f'<td>{buyer_cell}</td>'
         f'<td></td>'
         f'<td class="num">{size_text}</td>'
-        f'<td>{status_html}</td></tr>'
+        f'<td>{status_html}</td>{extra_html}</tr>'
     )
 
 
@@ -1924,7 +2051,13 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                                         (_deal_company_name(dr[0]) or "").lower()))
         pending_rows.sort(key=lambda dr: (_due_key(dr[0]), (_deal_company_name(dr[0]) or "").lower()))
 
-        if edit_mode:
+        # tenant_edit_mode: mirrors render_company_page's — the tenant (real
+        # session, or admin &view_as preview without &edit=1) can auto-save
+        # Next Steps / Follow-up on their own Introduced-or-later rows here
+        # too, per the task header's "(and Active Intros where noted)".
+        tenant_edit_mode = tenant is not None and not edit_mode
+
+        if edit_mode or tenant_edit_mode:
             colspan = 9
             head_row = ('<th>Company</th><th>Deal</th><th>Buyer name(s)</th><th>Investor Type</th>'
                         '<th class="num">Size</th><th>Status</th>'
@@ -1944,7 +2077,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             else:
                 parts += [_intro_row_html(d, resolved, people_by_id, person_id,
                                            follow_up=(intro_details.get(str(d.get("id"))) or {}).get("follow_up"),
-                                           key=key, view_as=view_as)
+                                           key=key, view_as=view_as, editable=tenant_edit_mode,
+                                           next_steps=(intro_details.get(str(d.get("id"))) or {}).get("next_steps"),
+                                           notes=(intro_details.get(str(d.get("id"))) or {}).get("notes"))
                           for d, resolved in main_rows]
         else:
             parts.append(_group_empty_row_html("No introductions yet on this deal.", colspan))
@@ -1957,12 +2092,14 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                 parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key, view_as=view_as)
                           for d, _ in pending_rows]
             else:
+                # Pending rows never get inputs even under tenant_edit_mode —
+                # only Introduced-or-later rows are editable.
                 for d, resolved in pending_rows:
                     linked = _deal_linked_person_ids(d) - {person_id}
                     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
                     follow_up = (intro_details.get(str(d.get("id"))) or {}).get("follow_up")
                     parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, follow_up=follow_up,
-                                                          key=key, view_as=view_as))
+                                                          key=key, view_as=view_as, editable=tenant_edit_mode))
 
         rows_html = "".join(parts)
         table_html = f"""<div class="card">
@@ -1978,7 +2115,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
       </div>
     </div>"""
 
-        edit_script = _edit_script_html(key) if edit_mode else ""
+        edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
         body_html = f"{note_html}{table_html}{edit_script}"
 
     return f"""<!DOCTYPE html>
@@ -2111,7 +2248,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     font-size: 13px;
     margin: 0 0 16px;
   }}
-  .ei-status, .ei-next-steps, .ei-notes, .ei-follow-up {{
+  .ei-status, .ei-next-steps, .ei-notes, .ei-follow-up, .ei-deadline {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -2120,7 +2257,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     font-size: 13px;
   }}
   .ei-next-steps, .ei-notes {{ width: 140px; }}
-  .ei-follow-up {{ width: 150px; }}
+  .ei-follow-up, .ei-deadline {{ width: 150px; }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
@@ -2398,14 +2535,33 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     back_href = f"?tab={ref}{suffix}"
     back_label = REF_LABELS.get(ref, "My Deals")
 
+    # tenant_edit_mode: the tenant (real session, or admin &view_as preview
+    # without &edit=1) can auto-save Next Steps / Follow-up on their own
+    # Introduced-or-later rows. Mutually exclusive with edit_mode (full
+    # admin edit) — never both, since edit_mode already implies tenant is
+    # not None whenever it renders anything on this page (see lambda_handler:
+    # tenant stays None only for admin-without-view_as, and edit_mode is
+    # only True there or under &view_as&edit=1).
+    tenant_edit_mode = tenant is not None and not edit_mode
+
     your_deals_html = ""
     matched_buyers_html = ""
     if tenant is not None:
         person_id = tenant.get("person_id")
 
+        # Fetched once, unconditionally, and shared by both sections below:
+        # get_intro_details returns every intro#<deal_id> item under this
+        # tenant's own Dynamo partition, which covers deadline_override
+        # entries on their SELL deals (Deal Details) just as much as
+        # status/next_steps/follow_up on their BUY-side matches (Buyers).
+        intro_details, dynamo_failed = get_intro_details(anon_key_email)
+
         sell_deals = get_my_sell_deals(person_id, company) if person_id is not None else []
         if sell_deals:
-            deals_body = "".join(_deal_card_html(d, company) for d in sell_deals)
+            deals_body = "".join(
+                _deal_card_html(d, company, intro_details.get(str(d.get("id"))), edit_mode=edit_mode)
+                for d in sell_deals
+            )
         else:
             deals_body = '<div class="gg-placeholder small">No deals with this company yet.</div>'
         your_deals_html = f"""<section class="cd-section">
@@ -2418,7 +2574,6 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         for d in matched_deals:
             wanted_ids |= _deal_linked_person_ids(d) - {person_id}
         people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
-        intro_details, dynamo_failed = get_intro_details(anon_key_email) if matched_deals else ({}, False)
         resolved_by_deal_id = {str(d.get("id")): _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
                                 for d in matched_deals}
 
@@ -2433,7 +2588,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                                         (_deal_title(d) or "").lower()))
         pending_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
 
-        if edit_mode:
+        if edit_mode or tenant_edit_mode:
             colspan = 8
             head_row = ('<th>Buyer name</th><th>Company</th><th>Investor Type</th>'
                         '<th class="num">Size</th><th>Status</th>'
@@ -2452,7 +2607,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                 rows_parts += [_matched_buyer_row_edit_html(d, person_id, people_by_id, intro_details)
                                for d in main_deals]
             else:
-                rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
+                rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email,
+                                                         editable=tenant_edit_mode)
                                for d in main_deals]
         else:
             rows_parts.append(_group_empty_row_html("No introductions yet on this deal.", colspan))
@@ -2465,7 +2621,10 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                 rows_parts += [_matched_buyer_row_edit_html(d, person_id, people_by_id, intro_details)
                                for d in pending_deals]
             else:
-                rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email)
+                # Pending rows never get inputs even under tenant_edit_mode —
+                # only Introduced-or-later rows are editable.
+                rows_parts += [_matched_buyer_row_html(d, person_id, people_by_id, intro_details, anon_key_email,
+                                                         editable=tenant_edit_mode)
                                for d in pending_deals]
 
         matched_rows_html = "".join(rows_parts)
@@ -2481,7 +2640,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
       </table>
       </div>
     </div>"""
-        edit_script = _edit_script_html(key) if edit_mode else ""
+        edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
         matched_buyers_html = f"""<section class="cd-section">
     <h2>Buyers</h2>
     {matched_body}
@@ -2631,6 +2790,19 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     margin-bottom: 16px;
   }}
   .deal-card:last-child {{ margin-bottom: 0; }}
+  .deal-card.overdue {{ border-color: #e06666; }}
+  .overdue-chip {{
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 4px 10px;
+    border-radius: 999px;
+    margin-bottom: 12px;
+    background: rgba(220,80,80,0.15);
+    color: #e06666;
+    text-decoration: none;
+  }}
+  .overdue-chip:hover {{ text-decoration: underline; }}
   .deal-card-head {{
     display: flex;
     align-items: baseline;
@@ -2717,7 +2889,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     font-style: italic;
   }}
   .table-scroll {{ overflow-x: auto; }}
-  .ei-status, .ei-next-steps, .ei-notes, .ei-follow-up {{
+  .ei-status, .ei-next-steps, .ei-notes, .ei-follow-up, .ei-deadline {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -2726,7 +2898,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     font-size: 13px;
   }}
   .ei-next-steps, .ei-notes {{ width: 140px; }}
-  .ei-follow-up {{ width: 150px; }}
+  .ei-follow-up, .ei-deadline {{ width: 150px; }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
@@ -2759,10 +2931,6 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   <section class="cd-section">
     <h2>Buyer Demand</h2>
     {buyer_demand_body}
-  </section>
-  <section class="cd-section">
-    <h2>Introduced</h2>
-    <div class="gg-placeholder small">Introductions for this company will appear here soon.</div>
   </section>
 </div>
 </body>
@@ -3081,26 +3249,48 @@ MAX_INTRO_TEXT_LEN = 2000
 
 def _handle_update_intro(event):
     """POST ?action=update_intro — the only write path in this Lambda.
-    Admin-only: ADMIN_KEY must be present IN THE BODY (the session cookie
-    alone never authorizes a write, even an admin's own). Order: validate
-    -> look up the deal and its owning tenant -> if status is part of the
-    write, PUT it to Pipeline first and abort the whole request (writing
-    nothing to Dynamo) on any non-2xx -> write the Dynamo intro-item
-    update (status_override/override_at, next_steps, notes, follow_up)
-    -> append an audit item. Never raises past this function; every
-    failure mode returns a JSON error the UI can show."""
+
+    Two auth modes:
+    - Admin: ADMIN_KEY present IN THE BODY (the session cookie alone never
+      authorizes a write, even an admin's own) — full rights over status,
+      next_steps, notes, follow_up, and deadline, on any deal.
+    - Tenant: no ADMIN_KEY, but a valid gg_id identity cookie naming an
+      email in TENANTS — rights restricted to next_steps and follow_up
+      ONLY (status/notes/deadline are rejected outright with 403), and
+      only on a deal_id whose linked tenant (via person linkage,
+      _tenant_email_for_deal) is that same authenticated tenant. No
+      Pipeline call ever happens on a tenant post, since status and
+      deadline (the only two fields that ever reach Pipeline) are never
+      part of one.
+
+    Order: validate -> look up the deal and its owning tenant -> if status
+    or deadline is part of the write, PUT it to Pipeline first and abort
+    the whole request (writing nothing to Dynamo) on any non-2xx -> write
+    the Dynamo intro-item update (status_override/override_at, next_steps,
+    notes, follow_up, deadline_override/deadline_override_at) -> append an
+    audit item (actor = tenant email or "admin"). Never raises past this
+    function; every failure mode returns a JSON error the UI can show."""
     body = _parse_json_body(event)
 
     admin_key = os.environ.get("ADMIN_KEY")
-    if not admin_key or body.get("key") != admin_key:
-        return _json_response({"error": "forbidden"}, 403)
+    is_admin = bool(admin_key) and body.get("key") == admin_key
+
+    tenant_identity_email = None
+    if not is_admin:
+        identity_email = _read_identity_email(event)
+        tenant_identity_email = identity_email.strip().lower() if identity_email else None
+        if not tenant_identity_email or tenant_identity_email not in TENANTS:
+            return _json_response({"error": "forbidden"}, 403)
+        if (body.get("status") not in (None, "") or body.get("notes") not in (None, "")
+                or body.get("deadline") not in (None, "")):
+            return _json_response({"error": "forbidden"}, 403)
 
     deal_id = str(body.get("deal_id") or "").strip()
     if not deal_id:
         return _json_response({"error": "deal_id is required"}, 400)
 
     status_id = None
-    if body.get("status") not in (None, ""):
+    if is_admin and body.get("status") not in (None, ""):
         try:
             status_id = int(body.get("status"))
         except (TypeError, ValueError):
@@ -3114,7 +3304,7 @@ def _handle_update_intro(event):
         if len(next_steps) > MAX_INTRO_TEXT_LEN:
             return _json_response({"error": "next_steps too long"}, 400)
 
-    notes = body.get("notes")
+    notes = body.get("notes") if is_admin else None
     if notes is not None:
         notes = str(notes)
         if len(notes) > MAX_INTRO_TEXT_LEN:
@@ -3129,7 +3319,16 @@ def _handle_update_intro(event):
             except ValueError:
                 return _json_response({"error": "invalid follow_up date"}, 400)
 
-    if status_id is None and next_steps is None and notes is None and follow_up is None:
+    deadline = body.get("deadline") if is_admin else None
+    if deadline is not None:
+        deadline = str(deadline).strip()
+        if deadline:
+            try:
+                datetime.strptime(deadline, "%Y-%m-%d")
+            except ValueError:
+                return _json_response({"error": "invalid deadline date"}, 400)
+
+    if status_id is None and next_steps is None and notes is None and follow_up is None and deadline is None:
         return _json_response({"error": "nothing to update"}, 400)
 
     deals = get_deals_list()
@@ -3141,6 +3340,9 @@ def _handle_update_intro(event):
     if tenant_email is None:
         return _json_response({"error": "deal has no linked tenant"}, 400)
 
+    if not is_admin and tenant_email != tenant_identity_email:
+        return _json_response({"error": "forbidden"}, 403)
+
     intro_details, _ = get_intro_details(tenant_email)
     old_entry = intro_details.get(deal_id) or {}
     old_resolved = _resolve_intro_status(deal, old_entry)
@@ -3149,6 +3351,7 @@ def _handle_update_intro(event):
         "next_steps": old_entry.get("next_steps"),
         "notes": old_entry.get("notes"),
         "follow_up": old_entry.get("follow_up"),
+        "deadline": _resolve_deal_deadline(deal, old_entry),
     }
 
     if status_id is not None:
@@ -3156,7 +3359,14 @@ def _handle_update_intro(event):
         if not ok:
             return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
-    ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, old_values)
+    if deadline:
+        ok, err = _pipeline_update_deal_deadline(deal_id, deadline)
+        if not ok:
+            return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
+
+    actor = "admin" if is_admin else tenant_identity_email
+    ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
+                                          old_values, actor)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
 
