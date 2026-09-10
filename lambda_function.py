@@ -409,6 +409,20 @@ CEF_LABELS = {
 # document tenants review/sign, given directly.
 AGENT_AGREEMENT_DOC_URL = "https://docs.google.com/document/d/1tWiM39QFYDWQSjZ-nWOS8yfbbVnwTjmMRPURmznHHQ0/edit?usp=sharing"
 
+# Accepts (deal-structure preferences a buyer will take) — buyer page's
+# Process Signals block (turn 23). Field id and every option id verified
+# live by the account owner against real person records (unlike
+# TRANSACTOR_TYPE/CEF above, no repo in this org reads this field, so
+# there was no prior person_custom_field_labels fetch to cite).
+ACCEPTS_FIELD = "custom_label_3998063"
+ACCEPTS_LABELS = {
+    7177773: "SPV",
+    7177774: "2-Layer",
+    7177775: "Fees",
+    7177776: "Forwards",
+    7177777: "Commons",
+}
+
 # "Matched or later" buy-side stages, shared verbatim by the Matched Buyers
 # section and the Active Intros tab: every known stage id (STAGE_LABELS,
 # above) except Inquiry and Hold, per instruction to include
@@ -777,6 +791,20 @@ def _fmt_short_date(date_str):
     return f"{dt.strftime('%b')} {dt.day}, '{dt.strftime('%y')}"
 
 
+def _fmt_epoch_short_date(epoch):
+    """"Sep 15, '26" from a Dynamo-stored epoch-seconds timestamp (e.g.
+    notes_updated_at) — same output shape as _fmt_short_date, just from
+    a number instead of a Pipeline date string (_parse_dt doesn't handle
+    bare epoch seconds). None if unset/unparsable."""
+    if epoch is None:
+        return None
+    try:
+        dt = datetime.fromtimestamp(float(epoch), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+    return f"{dt.strftime('%b')} {dt.day}, '{dt.strftime('%y')}"
+
+
 def _deal_title(deal):
     return deal.get("name") or deal.get("title") or f"Deal {deal.get('id', '')}"
 
@@ -808,6 +836,93 @@ def _fmt_ticket_range(min_v, max_v):
     if max_v is None:
         return f"{_fmt_money(min_v)}+"
     return f"{_fmt_money(min_v)} – {_fmt_money(max_v)}"
+
+
+def _person_has_won(rec):
+    """won_deals_total > 0 — the raw signal behind both the closer chip
+    and the closed-dot. Never raises on a missing/malformed field."""
+    if not isinstance(rec, dict):
+        return False
+    won = rec.get("won_deals_total")
+    try:
+        return won is not None and float(won) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _build_firm_won_index():
+    """Turn 23: one fresh people.json pass, returns
+    {"by_company_id": {...won company_ids...}, "by_company_name":
+    {...won lowercased company_names...}} — every company_id (and,
+    separately, every lowercased company_name) that at least one person
+    with won_deals_total > 0 belongs to. Callers look a given buyer's
+    own company_id up in the first set when it's present, falling back
+    to company_name in the second set when it's not (see _closer_kind)
+    — per instruction: "verify company_id survives into the snapshot;
+    if absent, match on company_name exact and report." This sandbox
+    has no live Pipeline/S3 credentials to actually inspect a real
+    people.json snapshot, so whether company_id is populated on every
+    record (vs. present on some, null on others) is NOT verified here
+    — flagging that explicitly rather than claiming a check that
+    wasn't done. Both paths are implemented and exercised by
+    _closer_kind per-record (company_id when present, company_name
+    when it's None), so the fallback is live code either way, not
+    dead speculative branching. Never counts, amounts, dates, or names
+    are kept from
+    this scan -- only the two membership sets, so nothing about who
+    else won or how much can leak through _closer_kind's boolean
+    result. Own fresh S3 fetch (same discard-after-use pattern as
+    get_company_buyer_details) — not merged into get_people_by_ids
+    since most of its callers have no use for this index and it would
+    mean re-deriving it from scratch (it needs the FULL people list,
+    not just the wanted ids) on every call anyway."""
+    s3 = boto3.client("s3")
+    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+    people_data = json.loads(people_obj["Body"].read())
+    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+    by_company_id = set()
+    by_company_name = set()
+    for rec in people_list:
+        if not _person_has_won(rec):
+            continue
+        cid = rec.get("company_id")
+        if cid is not None:
+            by_company_id.add(cid)
+        cname = (rec.get("company_name") or "").strip().lower()
+        if cname:
+            by_company_name.add(cname)
+    return {"by_company_id": by_company_id, "by_company_name": by_company_name}
+
+
+def _closer_kind(rec, firm_won_index):
+    """"person" (this buyer's own won_deals_total > 0), "firm" (a
+    colleague's does, matched by company_id when this record carries
+    one, else by exact lowercased company_name), or None. Drives both
+    the closer chip and the closed-dot's tooltip -- the two must always
+    agree, so both read this one function rather than duplicating the
+    person-or-firm logic."""
+    if not isinstance(rec, dict):
+        return None
+    if _person_has_won(rec):
+        return "person"
+    cid = rec.get("company_id")
+    if cid is not None:
+        if cid in firm_won_index["by_company_id"]:
+            return "firm"
+        return None
+    cname = (rec.get("company_name") or "").strip().lower()
+    if cname and cname in firm_won_index["by_company_name"]:
+        return "firm"
+    return None
+
+
+CLOSER_CHIP_LABELS = {"person": "Proven closer with Rainmaker", "firm": "Firm has closed with Rainmaker"}
+
+
+def _closer_chip_html(kind):
+    if kind is None:
+        return ""
+    return f'<span class="closer-chip">{_esc(CLOSER_CHIP_LABELS[kind])}</span>'
 
 
 def _parse_dt(s):
@@ -1386,6 +1501,7 @@ def get_intro_details(tenant_email):
             out[deal_id] = {
                 "next_steps": item.get("next_steps"),
                 "notes": item.get("notes"),
+                "notes_updated_at": item.get("notes_updated_at"),
                 "follow_up": item.get("follow_up"),
                 "status_override": item.get("status_override"),
                 "override_at": item.get("override_at"),
@@ -2260,6 +2376,13 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         update_parts.append("notes = :no")
         expr_values[":no"] = notes
         new_values["notes"] = notes
+        # Turn 23: the Notes Ledger block on the buyer page shows a
+        # last-edited date per entry -- stamped here (epoch seconds,
+        # matching override_at's own shape) rather than trusting Dynamo's
+        # own item metadata, which this table never otherwise reads.
+        update_parts.append("notes_updated_at = :nua")
+        expr_values[":nua"] = int(now)
+        new_values["notes_updated_at"] = int(now)
     if follow_up is not None:
         update_parts.append("follow_up = :fu")
         expr_values[":fu"] = follow_up
@@ -2711,39 +2834,30 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
     return "".join(blocks)
 
 
-def _intro_buyer_cell_html(primary, more_count, key=None, view_as=None):
+def _intro_buyer_cell_html(primary, more_count, firm_won_index, key=None, view_as=None):
     """Active Intros' disclosed buyer cell (item 2/3, turn 18), three
     lines: (1) the PRIMARY buyer's name (deal.primary_contact_id when
     present, else first-listed — see _select_primary_buyer), linked to
     their buyer page (item 3), plus a muted "+N more" when the deal
-    links additional buyers, plus a green dot if this buyer has closed a
-    deal with Rainmaker before; (2) muted entity company (natural-person
-    buyers never show one) and country; (3) small muted email as a
-    mailto link, website, and LinkedIn. Lines 2/3 truncate with an
-    ellipsis via CSS — the buyer page is where the untruncated detail
-    for OTHER linked buyers lives now (the old inline expand-panel is
-    gone, replaced by that page entirely). Only ever called with a
-    resolved primary buyer from a disclosed (Introduced-or-later) row;
-    pending rows use _pending_buyer_cell_html instead and never link.
-
-    won_deals_total (the closed-with-RMS signal) has never been read by
-    any repo in this org, same trust basis as the website/linked_in
-    fields already read this way below it — implemented on trust, and
-    simply omitted (no dot) if the field turns out to be absent or
-    differently shaped."""
+    links additional buyers, plus a green dot when _closer_kind finds a
+    closer (person or firm — turn 23, same logic and tooltip text as
+    the buyer page's own closer chip, see CLOSER_CHIP_LABELS); (2)
+    muted entity company (natural-person buyers never show one) and
+    country; (3) small muted email as a mailto link, website, and
+    LinkedIn. Lines 2/3 truncate with an ellipsis via CSS — the buyer
+    page is where the untruncated detail for OTHER linked buyers lives
+    now (the old inline expand-panel is gone, replaced by that page
+    entirely). Only ever called with a resolved primary buyer from a
+    disclosed (Introduced-or-later) row; pending rows use
+    _pending_buyer_cell_html instead and never link."""
     if primary is None:
         return "—"
 
     name = _esc(_person_display_name(primary) or "—")
     href = _buyer_href(primary.get("id"), key, view_as)
-    won = primary.get("won_deals_total")
-    is_closed = False
-    try:
-        is_closed = won is not None and float(won) > 0
-    except (TypeError, ValueError):
-        pass
-    dot_html = (' <span class="closed-dot" title="Closed a deal with Rainmaker before"></span>'
-                if is_closed else "")
+    closer_kind = _closer_kind(primary, firm_won_index)
+    dot_html = (f' <span class="closed-dot" title="{_esc(CLOSER_CHIP_LABELS[closer_kind])}"></span>'
+                if closer_kind else "")
     more_html = f' <span class="buyer-cell-more">+{more_count} more</span>' if more_count > 0 else ""
     # Item 6 (turn 20): a clear link affordance -- accent color, hover
     # underline, a small muted "profile →" suffix inside the link (so
@@ -3422,7 +3536,7 @@ def _notes_cell_html(deal_id, notes_value, editable):
     return _esc(notes_value or "—")
 
 
-def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=None, view_as=None,
+def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, firm_won_index, key=None, view_as=None,
                      editable=False, company_repeated=False):
     """Tenant-facing Introduced-or-later row: Company | Buyer | Investor
     Type | Size | Status | Notes. editable=True (tenant_edit_mode — see
@@ -3466,7 +3580,7 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid != tenant_person_id]
     buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
     primary, more_count = _select_primary_buyer(deal, buyer_recs)
-    buyer_cell = _intro_buyer_cell_html(primary, more_count, key=key, view_as=view_as)
+    buyer_cell = _intro_buyer_cell_html(primary, more_count, firm_won_index, key=key, view_as=view_as)
     investor_type_cell = _investor_type_cell_html(buyer_recs)
 
     size_text = _esc(_deal_size_text(deal))
@@ -3525,7 +3639,7 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, 
     )
 
 
-def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, key=None, view_as=None,
+def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, firm_won_index, key=None, view_as=None,
                           company_repeated=False):
     """Admin edit-mode row for Active Intros: always the real buyer(s),
     the same milestone checkboxes + flag select as the tenant-facing row
@@ -3554,7 +3668,7 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
     linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid != tenant_person_id]
     buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
     primary, more_count = _select_primary_buyer(deal, buyer_recs)
-    buyer_cell = _intro_buyer_cell_html(primary, more_count, key=key, view_as=view_as)
+    buyer_cell = _intro_buyer_cell_html(primary, more_count, firm_won_index, key=key, view_as=view_as)
     investor_type_cell = _investor_type_cell_html(buyer_recs)
 
     size_text = _esc(_deal_size_text(deal))
@@ -3620,6 +3734,14 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         for d in kept_deals:
             wanted_ids |= _deal_linked_person_ids(d) - {person_id}
         people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
+        # Turn 23: the closed-dot needs the same person-or-firm closer
+        # signal as the buyer page's chip. Admin edit mode shows the
+        # real buyer (and so the real dot) on every row, pending
+        # included; a tenant only ever sees it on a disclosed row — skip
+        # the extra people.json pass entirely when neither applies.
+        needs_firm_won_index = edit_mode or any(r["disclosed"] for r in resolved_by_deal_id.values())
+        firm_won_index = (_build_firm_won_index() if needs_firm_won_index
+                           else {"by_company_id": set(), "by_company_name": set()})
 
         note_html = ('<p class="gg-note">Status overrides unavailable — showing Pipeline values.</p>'
                      if dynamo_failed else "")
@@ -3709,11 +3831,11 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             parts = [_group_header_row_html("Introduced", 6)]
             if main_rows:
                 if edit_mode:
-                    parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key,
-                                                    view_as=view_as, company_repeated=main_repeats[i])
+                    parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, firm_won_index,
+                                                    key=key, view_as=view_as, company_repeated=main_repeats[i])
                               for i, (d, _) in enumerate(main_rows)]
                 else:
-                    parts += [_intro_row_html(d, resolved, people_by_id, person_id, _entry_for(d),
+                    parts += [_intro_row_html(d, resolved, people_by_id, person_id, _entry_for(d), firm_won_index,
                                                key=key, view_as=view_as, editable=tenant_edit_mode,
                                                company_repeated=main_repeats[i])
                               for i, (d, resolved) in enumerate(main_rows)]
@@ -3730,8 +3852,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                 if edit_mode:
                     # Edit mode never anonymizes — the admin sees and edits
                     # the real buyer regardless of pending/disclosed.
-                    parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key,
-                                                    view_as=view_as, company_repeated=pending_repeats[i])
+                    parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, firm_won_index,
+                                                    key=key, view_as=view_as, company_repeated=pending_repeats[i])
                               for i, (d, _) in enumerate(pending_rows)]
                 else:
                     # Pending rows never get inputs even under
@@ -5043,105 +5165,230 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 </html>"""
 
 
-def _buyer_page_full_html(rec):
-    """The full, disclosed buyer profile (item 3, turn 18) — every field
-    the old inline expand panel showed, now on its own page. Person-
-    record fields only; nothing about any company, deal, or interest is
-    read or shown here."""
-    cf = rec.get("custom_fields") or {}
+def _buyer_identity_html(rec):
+    """Turn 23, block 1 (IDENTITY): name, position/title, firm name
+    (linked to their website) plus a separate LinkedIn link, city/
+    country (work_* falling back to home_*). Every field renders only
+    when present — title/city are implemented on trust the same way
+    phone was (_person_phone_text): no repo in this org reads a person
+    record's "title"/"work_city"/"home_city", but they follow the exact
+    naming convention work_country/home_country already verified
+    working in production. Person-record fields only; nothing about
+    any company, deal, or interest is read or shown here."""
     name = _esc(_person_display_name(rec) or "—")
+    title = (rec.get("title") or "").strip()
+    cf = rec.get("custom_fields") or {}
     transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
-    transactor_id = transactor_ids[0] if transactor_ids else None
-    is_natural = transactor_id == NATURAL_PERSON_ID
-    transactor_label = TRANSACTOR_TYPE_LABELS.get(transactor_id, "")
+    is_natural = (transactor_ids[0] if transactor_ids else None) == NATURAL_PERSON_ID
     company = (rec.get("company_name") or "").strip() if not is_natural else ""
-    country = (rec.get("work_country") or rec.get("home_country") or "").strip()
-    tier_html = _tier_badge_html(classify_person(cf))
-    min_v, max_v = get_person_ticket_range(cf)
-    range_text = _fmt_ticket_range(min_v, max_v)
-    email = _person_email_text(rec)
     website = (rec.get("website") or "").strip()
     linked_in = (rec.get("linked_in_url") or "").strip()
-    won = rec.get("won_deals_total")
-    closed_before = False
-    try:
-        closed_before = won is not None and float(won) > 0
-    except (TypeError, ValueError):
-        pass
-    dt = _parse_dt(rec.get("updated_at"))
-    active_recent = bool(dt and (datetime.now(timezone.utc) - dt).days <= 365)
+    city = (rec.get("work_city") or rec.get("home_city") or "").strip()
+    country = (rec.get("work_country") or rec.get("home_country") or "").strip()
+    location = " · ".join(_esc(p) for p in (city, country) if p)
 
     rows = []
+    if title:
+        rows.append(f'<div class="buyer-page-row">{_esc(title)}</div>')
     if company:
-        rows.append(f'<div class="buyer-page-row">{_esc(company)}</div>')
-    if country:
-        rows.append(f'<div class="buyer-page-row">{_esc(country)}</div>')
-    if tier_html:
-        rows.append(f'<div class="buyer-page-row">{tier_html}</div>')
-    if range_text:
-        rows.append(f'<div class="buyer-page-row">{_esc(range_text)}</div>')
-    if transactor_label:
-        rows.append(f'<div class="buyer-page-row">{_esc(transactor_label)}</div>')
-    contact_parts = []
+        if website:
+            href = website if "://" in website else f"https://{website}"
+            firm_html = f'<a href="{_esc(href)}" target="_blank" rel="noopener noreferrer">{_esc(company)}</a>'
+        else:
+            firm_html = _esc(company)
+        if linked_in:
+            href_l = linked_in if "://" in linked_in else f"https://{linked_in}"
+            firm_html += (f' · <a href="{_esc(href_l)}" target="_blank" rel="noopener noreferrer">'
+                          f'LinkedIn</a>')
+        rows.append(f'<div class="buyer-page-row">{firm_html}</div>')
+    elif linked_in:
+        # No firm name to attach LinkedIn to, but the field is still
+        # present -- give it its own line rather than dropping it.
+        href_l = linked_in if "://" in linked_in else f"https://{linked_in}"
+        rows.append(f'<div class="buyer-page-row"><a href="{_esc(href_l)}" target="_blank" '
+                    f'rel="noopener noreferrer">LinkedIn</a></div>')
+    if location:
+        rows.append(f'<div class="buyer-page-row">{location}</div>')
+    email = _person_email_text(rec)
     if email:
-        contact_parts.append(f'<a href="mailto:{_esc(email)}">{_esc(email)}</a>')
-    if website:
-        href = website if "://" in website else f"https://{website}"
-        contact_parts.append(f'<a href="{_esc(href)}" target="_blank" rel="noopener noreferrer">{_esc(website)}</a>')
-    if linked_in:
-        href = linked_in if "://" in linked_in else f"https://{linked_in}"
-        contact_parts.append(f'<a href="{_esc(href)}" target="_blank" rel="noopener noreferrer">LinkedIn</a>')
-    if contact_parts:
-        rows.append(f'<div class="buyer-page-row">{" · ".join(contact_parts)}</div>')
-    if closed_before:
-        rows.append('<div class="buyer-page-row buyer-page-flag">Has closed with us</div>')
-    if active_recent:
-        rows.append('<div class="buyer-page-row buyer-page-flag">Active this year</div>')
+        rows.append(f'<div class="buyer-page-row"><a href="mailto:{_esc(email)}">{_esc(email)}</a></div>')
 
     return f'<div class="card"><div class="buyer-page-name">{name}</div>{"".join(rows)}</div>'
 
 
-def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
-    """The not-yet-disclosed fallback (item 3, turn 18) — the same code/
-    tier/ticket-range shape as _pending_buyer_cell_html and the Buyer
-    Demand tiles, never a name, company, email, or phone."""
+def _buyer_capacity_html(rec, closer_kind):
+    """Turn 23, block 2 (CAPACITY): tier badge (Unknown -> no badge, via
+    _tier_badge_html), ticket range (custom_label_3052210 map, via the
+    existing get_person_ticket_range/_fmt_ticket_range), transactor type
+    label (custom_label_3759163 map), ID state (custom_label_3796440 --
+    the Client Engagement Form field, reused here as "ID verified": Yes
+    only, every other state (No/Pending/N/A/unset) omitted outright --
+    no red/amber states on a page the TENANT reads about someone else,
+    unlike that same field's own 4-state badge on the tenant's own My
+    Deals row). Plus the closer chip (person_won > firm_won > nothing --
+    see _closer_kind/_closer_chip_html), so every "has this buyer closed
+    before" signal lives in one block."""
     cf = rec.get("custom_fields") or {}
-    code = _anon_buyer_code(anon_key_email, buyer_id)
     tier_html = _tier_badge_html(classify_person(cf))
     min_v, max_v = get_person_ticket_range(cf)
     range_text = _fmt_ticket_range(min_v, max_v)
-    range_html = f'<div class="buyer-page-row">{_esc(range_text)}</div>' if range_text else ""
-    tier_row = f'<div class="buyer-page-row">{tier_html}</div>' if tier_html else ""
-    return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}</div>'
-            f'{tier_row}{range_html}'
-            f'<div class="buyer-page-note">Identity available after introduction.</div></div>')
+    transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
+    transactor_id = transactor_ids[0] if transactor_ids else None
+    transactor_label = TRANSACTOR_TYPE_LABELS.get(transactor_id, "")
+    id_verified = CEF_YES_ID in cf_list(cf, CEF_FIELD)
+    closer_html = _closer_chip_html(closer_kind)
+
+    badges = "".join(h for h in (tier_html, closer_html) if h)
+    rows = []
+    if badges:
+        rows.append(f'<div class="buyer-page-row">{badges}</div>')
+    if range_text:
+        rows.append(f'<div class="buyer-page-row">{_esc(range_text)}</div>')
+    if transactor_label:
+        rows.append(f'<div class="buyer-page-row">{_esc(transactor_label)}</div>')
+    if id_verified:
+        rows.append('<div class="buyer-page-row"><span class="id-verified-chip">ID verified</span></div>')
+
+    if not rows:
+        return ""
+    return f'<div class="card"><h2 class="buyer-section-heading">Capacity</h2>{"".join(rows)}</div>'
 
 
-def _buyer_note_line_html(deal_id, label_prefix, notes_value):
-    field_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(notes_value), placeholder="Add a note…")
-    return (f'<div class="buyer-note-line">'
-            f'<span class="buyer-note-company">{label_prefix} &mdash;</span>{field_html}</div>')
+def _buyer_process_signals_html(rec):
+    """Turn 23, block 5 (PROCESS SIGNALS): Accepts (custom_label_3998063,
+    ACCEPTS_LABELS) as one small chip listing every accepted structure
+    ("Accepts: SPV · Fees"); IQF status as a green "Qualification on
+    file" chip when the SAME IQF_FIELD/IQF_OK_IDS this file's tier
+    classifier already uses (6496840 Yes / 6596073 Unnecessary) is set,
+    otherwise omitted outright -- no partial/negative state shown."""
+    cf = rec.get("custom_fields") or {}
+    accepted_ids = cf_list(cf, ACCEPTS_FIELD)
+    accepted_labels = [ACCEPTS_LABELS[i] for i in accepted_ids if i in ACCEPTS_LABELS]
+    accepts_html = ""
+    if accepted_labels:
+        accepts_html = (f'<span class="accepts-chip">Accepts: '
+                         f'{" &middot; ".join(_esc(label) for label in accepted_labels)}</span>')
+    iqf_html = ""
+    if set(cf_list(cf, IQF_FIELD)) & IQF_OK_IDS:
+        iqf_html = '<span class="iqf-chip">Qualification on file</span>'
+
+    if not (accepts_html or iqf_html):
+        return ""
+    chips = "".join(h for h in (accepts_html, iqf_html) if h)
+    return f'<div class="card"><h2 class="buyer-section-heading">Process signals</h2><div class="buyer-page-row">{chips}</div></div>'
 
 
-def _buyer_notes_section_html(buyer_id, tenant, anon_key_email, edit_mode):
-    """Item 4 (turn 20): the buyer page's "Your notes" section -- one
-    line per company where the viewer has an intro with this buyer,
-    each independently editable via the same auto-save path Active
-    Intros' own Notes column uses (.ei-notes, keyed by THAT deal's own
-    deal_id -- notes are stored per intro item, not per buyer, so each
-    line saves to a different Dynamo record).
+def _track_deal_row_html(deal, entry, resolved, tenant_label=None):
+    """One deal's row in TRACK WITH YOU: company, size, the same read-
+    only milestone checkboxes + flag state Active Intros itself uses
+    (_status_milestones_column_html, disabled=True — never editable
+    here), and outcome (the resolved status pill/chip,
+    _status_display_html). tenant_label is set only in admin edit mode
+    (grouped-by-tenant heading above each of that tenant's rows)."""
+    deal_id = str(deal.get("id"))
+    company_name = _deal_company_name(deal) or "—"
+    size_text = _esc(_deal_size_text(deal))
+    milestones = entry.get("milestones")
+    status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=False, disabled=True)
+    outcome_html = _status_display_html(resolved, compact=True)
+    label_html = f'<div class="track-row-tenant">{tenant_label}</div>' if tenant_label else ""
+    return (
+        f'<div class="track-row">{label_html}'
+        f'<div class="track-row-head"><span class="track-row-company">{_esc(company_name)}</span>'
+        f'<span class="track-row-size">{size_text}</span>{outcome_html}</div>'
+        f'{status_html}</div>'
+    )
+
+
+def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
+    """Turn 23, block 3 (TRACK WITH YOU): every deal linking this buyer
+    to the viewing tenant, read-only (company/size/milestones/flag/
+    outcome — never an input; only the Notes Ledger below is
+    editable). Tenant view: strictly this tenant's own deals, and only
+    the ones already disclosed to them (mirrors the page's own
+    disclosure gate and the Notes Ledger's own scoping — never a
+    pending/Matched-only deal's milestone detail about a buyer they
+    haven't actually been introduced on for THAT deal). Admin edit
+    mode: every tenant's matched-or-later deals with this buyer,
+    disclosed or not, grouped by tenant with a label above each
+    tenant's block of rows."""
+    rows = []
+    if edit_mode:
+        tenant_index = _tenant_index()
+        intro_cache = {}
+        by_tenant = {}
+        for d in get_deals_list():
+            if not _is_matched_or_later_buy_deal(d):
+                continue
+            if buyer_id not in _deal_linked_person_ids(d):
+                continue
+            owner_email = _tenant_email_for_deal(d)
+            if owner_email is None:
+                continue
+            if owner_email not in intro_cache:
+                intro_cache[owner_email], _ = get_intro_details(owner_email)
+            entry = intro_cache[owner_email].get(str(d.get("id"))) or {}
+            resolved = _resolve_intro_status(d, entry)
+            by_tenant.setdefault(owner_email, []).append((d, entry, resolved))
+        for owner_email in sorted(by_tenant, key=lambda e: (tenant_index.get(e) or {}).get("name", e)):
+            tenant_name = (tenant_index.get(owner_email) or {}).get("name", owner_email)
+            deals_for_tenant = by_tenant[owner_email]
+            for i, (d, entry, resolved) in enumerate(deals_for_tenant):
+                label = _esc(tenant_name) if i == 0 else None
+                rows.append(_track_deal_row_html(d, entry, resolved, tenant_label=label))
+    else:
+        person_id = tenant.get("person_id")
+        intro_details, _ = get_intro_details(anon_key_email)
+        for d in get_my_matched_buy_deals(person_id):
+            if buyer_id not in _deal_linked_person_ids(d):
+                continue
+            entry = intro_details.get(str(d.get("id"))) or {}
+            resolved = _resolve_intro_status(d, entry)
+            if not resolved["disclosed"]:
+                continue
+            rows.append(_track_deal_row_html(d, entry, resolved))
+
+    body = "".join(rows) if rows else '<div class="gg-placeholder small">No deals with this buyer yet.</div>'
+    return f'<div class="card buyer-track-card"><h2 class="buyer-section-heading">Track with you</h2>{body}</div>'
+
+
+def _notes_ledger_entry_html(deal_id, label_prefix, notes_value, notes_updated_at):
+    """One NOTES LEDGER entry: company name, the note itself (same
+    2-line auto-saving textarea Active Intros' own Notes column uses —
+    _ei_notes_textarea_html, same .ei-notes save path), and a
+    last-edited date when notes_updated_at is on record (stamped by
+    _dynamo_write_intro_update whenever notes is written — absent for
+    any note that predates turn 23, which simply omits the date rather
+    than showing something wrong)."""
+    field_html = _ei_notes_textarea_html(deal_id, _esc(notes_value), placeholder="Add a note…")
+    edited_text = _fmt_epoch_short_date(notes_updated_at)
+    edited_html = f'<span class="ledger-entry-edited">Last edited {_esc(edited_text)}</span>' if edited_text else ""
+    return (f'<div class="ledger-entry">'
+            f'<div class="ledger-entry-head"><span class="ledger-entry-company">{label_prefix}</span>'
+            f'{edited_html}</div>{field_html}</div>')
+
+
+def _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode):
+    """Turn 23, block 4 (NOTES LEDGER, the page's centerpiece): every
+    Dynamo intro note for this buyer across the viewing tenant's deals,
+    one entry per company — company name, the note, last-edited date,
+    editable inline via the same auto-save path Active Intros' own
+    Notes column uses (.ei-notes, keyed by THAT deal's own deal_id --
+    notes are stored per intro item, not per buyer, so each entry saves
+    to a different Dynamo record).
 
     Tenant view (edit_mode=False, whether a real tenant session or an
     admin &view_as preview without &edit=1 -- the same tenant_edit_mode
     signal every other page uses): only the viewing tenant's own notes,
     scoped to their Introduced-or-later deals with this buyer (mirrors
-    the page's own disclosure gate -- never a pending/anonymized deal).
-    Admin edit mode: every tenant's notes on every matched-or-later buy
-    deal linking this buyer, disclosed or not, each line labeled by
-    tenant then company. Only ever called after the page's own
-    full_access check already passed -- there is nothing to show
-    otherwise."""
-    lines = []
+    the page's own disclosure gate -- never a pending/anonymized deal,
+    which is exactly what makes every listed entry here safe to render
+    as an editable field unconditionally). Admin edit mode: every
+    tenant's notes on every matched-or-later buy deal linking this
+    buyer, disclosed or not, each entry labeled by tenant then company.
+    Only ever called after the page's own full_access check already
+    passed -- there is nothing to show otherwise."""
+    entries = []
     if edit_mode:
         tenant_index = _tenant_index()
         intro_cache = {}
@@ -5162,7 +5409,8 @@ def _buyer_notes_section_html(buyer_id, tenant, anon_key_email, edit_mode):
             company_name = _deal_company_name(d) or "—"
             tenant_name = (tenant_index.get(owner_email) or {}).get("name", owner_email)
             label = f'{_esc(tenant_name)} &middot; {_esc(company_name)}'
-            lines.append(_buyer_note_line_html(str(d.get("id")), label, notes_value))
+            entries.append(_notes_ledger_entry_html(str(d.get("id")), label, notes_value,
+                                                      entry.get("notes_updated_at")))
     else:
         person_id = tenant.get("person_id")
         intro_details, _ = get_intro_details(anon_key_email)
@@ -5176,32 +5424,50 @@ def _buyer_notes_section_html(buyer_id, tenant, anon_key_email, edit_mode):
             if notes_value is None:
                 notes_value = entry.get("next_steps") or ""
             company_name = _deal_company_name(d) or "—"
-            lines.append(_buyer_note_line_html(str(d.get("id")), _esc(company_name), notes_value))
+            entries.append(_notes_ledger_entry_html(str(d.get("id")), _esc(company_name), notes_value,
+                                                      entry.get("notes_updated_at")))
 
-    body = "".join(lines) if lines else '<div class="gg-placeholder small">No notes yet.</div>'
-    return f'<div class="card buyer-notes-card"><h2 class="buyer-notes-heading">Your notes</h2>{body}</div>'
+    body = ("".join(entries) if entries
+            else '<div class="gg-placeholder small">No notes yet — add one from Active Intros or right here.</div>')
+    return f'<div class="card buyer-notes-card"><h2 class="buyer-section-heading">Notes</h2>{body}</div>'
+
+
+def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
+    """The not-yet-disclosed fallback (item 3, turn 18) — the same code/
+    tier/ticket-range shape as _pending_buyer_cell_html and the Buyer
+    Demand tiles, never a name, company, email, or phone."""
+    cf = rec.get("custom_fields") or {}
+    code = _anon_buyer_code(anon_key_email, buyer_id)
+    tier_html = _tier_badge_html(classify_person(cf))
+    min_v, max_v = get_person_ticket_range(cf)
+    range_text = _fmt_ticket_range(min_v, max_v)
+    range_html = f'<div class="buyer-page-row">{_esc(range_text)}</div>' if range_text else ""
+    tier_row = f'<div class="buyer-page-row">{tier_html}</div>' if tier_html else ""
+    return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}</div>'
+            f'{tier_row}{range_html}'
+            f'<div class="buyer-page-note">Identity available after introduction.</div></div>')
 
 
 def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=None, view_as=None, edit_mode=False,
                        cef_html=""):
     """Item 3 (turn 18): ?buyer=<person_id> — replaces the old inline
     <details> expansion on Active Intros with a real page. DISCLOSURE
-    GATE: the full profile (_buyer_page_full_html — name, entity
-    company, country, tier, ticket range, transactor type, website/
-    LinkedIn/mailto, "Has closed with us", activity recency) renders
-    only when the viewing tenant has at least one Introduced-or-later
-    deal linked to this specific person (_tenant_has_disclosed_deal_with,
-    checked across EVERY company the tenant has matched buy deals in,
-    not just wherever the viewer clicked in from) — otherwise the
-    anonymized card (_buyer_page_anonymized_html: code/tier/ticket range
-    only) with "Identity available after introduction." edit_mode=True
-    (admin) always gets the full profile, gate skipped entirely. Nothing
-    about this buyer's OTHER companies, other tenants, or their
-    interests is ever looked up or shown here.
+    GATE: the full profile (five blocks, turn 23 — Identity, Capacity
+    (+ closer chip), Track With You, Notes Ledger, Process Signals)
+    renders only when the viewing tenant has at least one Introduced-
+    or-later deal linked to this specific person
+    (_tenant_has_disclosed_deal_with, checked across EVERY company the
+    tenant has matched buy deals in, not just wherever the viewer
+    clicked in from) — otherwise the anonymized card
+    (_buyer_page_anonymized_html: code/tier/ticket range only,
+    UNCHANGED by turn 23) with "Identity available after introduction."
+    edit_mode=True (admin) always gets the full profile, gate skipped
+    entirely. Nothing about this buyer's OTHER companies, other
+    tenants' demand, or their Pipeline interests is ever looked up or
+    shown here.
 
-    Full access also unlocks the "Your notes" section (item 4, turn 20
-    — _buyer_notes_section_html), so the edit script (checkbox/flag/
-    text-field auto-save) is only ever included when there's actually
+    Full access also unlocks the edit script (checkbox/flag/text-field
+    auto-save), so it's only ever included when there's actually
     something on the page it needs to wire up.
 
     tenant stays None only for admin-without-view_as (the same
@@ -5232,8 +5498,14 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
             person_id = tenant.get("person_id")
             full_access = edit_mode or _tenant_has_disclosed_deal_with(person_id, anon_key_email, buyer_id)
             if full_access:
-                notes_html = _buyer_notes_section_html(buyer_id, tenant, anon_key_email, edit_mode)
-                body_html = _buyer_page_full_html(rec) + notes_html
+                closer_kind = _closer_kind(rec, _build_firm_won_index())
+                body_html = (
+                    _buyer_identity_html(rec)
+                    + _buyer_capacity_html(rec, closer_kind)
+                    + _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode)
+                    + _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode)
+                    + _buyer_process_signals_html(rec)
+                )
                 edit_script_html = _edit_script_html(key)
             else:
                 body_html = _buyer_page_anonymized_html(rec, anon_key_email, buyer_id)
@@ -5263,7 +5535,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     padding: 32px 24px 64px;
   }}
-  .wrap {{ max-width: 560px; margin: 28px auto 0; }}
+  .wrap {{ max-width: 640px; margin: 28px auto 0; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--line);
@@ -5277,6 +5549,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .buyer-page-flag {{ color: var(--qp); font-weight: 600; }}
   .buyer-page-code {{ font-size: 18px; font-weight: 600; }}
   .buyer-page-note {{ color: var(--muted); font-size: 13px; margin-top: 14px; }}
+  .buyer-section-heading {{ font-size: 16px; font-weight: 600; margin: 0 0 12px; }}
   .tier-badge {{
     display: inline-block;
     font-size: 10px;
@@ -5286,11 +5559,38 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     padding: 2px 7px;
     border-radius: 999px;
     color: #16181d;
+    margin-right: 6px;
   }}
   .tier-badge.tier-qp {{ background: var(--qp); }}
   .tier-badge.tier-accredited {{ background: #c9a227; }}
+  .tier-badge.tier-unknown {{ background: var(--muted); }}
+  /* Turn 23: closer chip (block 2) and small green signal chips
+     (block 2's ID verified, block 5's IQF) -- all the same pill shape,
+     green fill, white text, used only where the underlying boolean is
+     True (see _closer_chip_html / _buyer_capacity_html /
+     _buyer_process_signals_html — the false/unset case is always just
+     omitted, never a red/amber chip). */
+  .closer-chip, .id-verified-chip, .iqf-chip {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--qp);
+    color: #ffffff;
+    margin-right: 6px;
+  }}
+  .accepts-chip {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: rgba(22,24,29,0.06);
+    color: var(--muted);
+  }}
   .gg-placeholder {{
-    max-width: 560px;
+    max-width: 640px;
     margin: 96px auto;
     padding: 0 24px;
     text-align: center;
@@ -5298,12 +5598,63 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     font-size: 15px;
   }}
   .gg-placeholder.small {{ margin: 0; padding: 8px 0; text-align: left; font-size: 13px; }}
-  .buyer-notes-card {{ margin-top: 16px; }}
-  .buyer-notes-heading {{ font-size: 16px; font-weight: 600; margin: 0 0 12px; }}
-  .buyer-note-line {{ margin-top: 10px; }}
-  .buyer-note-line:first-of-type {{ margin-top: 0; }}
-  .buyer-note-company {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }}
-  .ei-notes {{
+  .buyer-track-card, .buyer-notes-card {{ margin-top: 16px; }}
+  .track-row {{ margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }}
+  .track-row:first-of-type {{ margin-top: 0; padding-top: 0; border-top: none; }}
+  .track-row-tenant {{
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }}
+  .track-row-head {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }}
+  .track-row-company {{ font-size: 14px; font-weight: 600; }}
+  .track-row-size {{ font-size: 13px; color: var(--muted); }}
+  .ledger-entry {{ margin-top: 14px; }}
+  .ledger-entry:first-of-type {{ margin-top: 0; }}
+  .ledger-entry-head {{
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+  }}
+  .ledger-entry-company {{ font-size: 13px; font-weight: 600; }}
+  .ledger-entry-edited {{ font-size: 11px; color: var(--muted); white-space: nowrap; }}
+  .status-column {{ display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }}
+  .status-awaiting {{ font-size: 12px; color: var(--muted); font-style: italic; }}
+  .ei-milestones {{ display: flex; flex-wrap: wrap; gap: 4px 10px; }}
+  .ei-milestone-label {{
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--ink);
+    white-space: nowrap;
+  }}
+  .ei-milestone {{ margin: 0; }}
+  .status-pill {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    background: rgba(22,24,29,0.06);
+    border-radius: 999px;
+    padding: 2px 8px;
+  }}
+  .status-chip {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    border-radius: 999px;
+    padding: 3px 9px;
+  }}
+  .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #8a6d1f; }}
+  .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
+  .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
+  .ei-status, .ei-notes, .ei-flag {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -5313,6 +5664,9 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     width: 100%;
     box-sizing: border-box;
   }}
+  select.ei-flag.flag-stalled {{ border-color: #c9a227; background: rgba(201,162,39,0.15); color: #8a6d1f; }}
+  select.ei-flag.flag-exit {{ border-color: var(--muted); background: rgba(22,24,29,0.06); }}
+  textarea.ei-notes {{ resize: vertical; min-height: 44px; font-family: inherit; line-height: 1.35; }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
