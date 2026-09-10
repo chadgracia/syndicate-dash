@@ -228,12 +228,16 @@ def _deal_update_form_url(deal_id):
     return f"{DEAL_UPDATE_FORM_URL}?deal_id={deal_id}&token={token}"
 
 
-def _update_cancel_button_html(deal_id):
+def _update_cancel_button_html(deal_id, label="Update / Cancel"):
+    """label defaults to "Update / Cancel" everywhere except My Deals,
+    which now has its own separate one-click Hold/Cancel REQUEST controls
+    alongside this link and passes label="Update" so the three don't read
+    as duplicates — same minted link, unchanged."""
     url = _deal_update_form_url(deal_id)
     if not url:
         return ""
     return (f'<a class="update-cancel-btn" href="{url}" target="_blank" rel="noopener noreferrer">'
-            'Update / Cancel</a>')
+            f'{_esc(label)}</a>')
 
 
 # Public buyer-facing deal detail page. Verified verbatim in
@@ -250,6 +254,22 @@ def _update_cancel_button_html(deal_id):
 # is CRMDealDetails).
 def _deal_public_url(deal_id):
     return f"https://trades.graciagroup.com/deal/{deal_id}"
+
+
+# Copy-icon markup (the double-rectangle SVG) verified verbatim in
+# chadgracia/trades, which uses it for its own "copy deal ID" button —
+# reused as-is here rather than inventing a different icon. No checkmark
+# state (trades swaps in a check SVG + "copied" class on click; this one
+# just copies, per instruction).
+COPY_ICON_SVG = ('<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">'
+                  '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"></rect>'
+                  '<path d="M10.5 3.5v-1a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h1"></path>'
+                  '</svg>')
+
+
+def _copy_id_button_html(value):
+    return (f'<button type="button" class="copy-id" data-copy-url="{_esc(value)}" '
+            f'title="Copy link" aria-label="Copy deal link">{COPY_ICON_SVG}</button>')
 
 
 # Deal Card section. Agent Agreement field id, and the "Yes" option ids,
@@ -320,6 +340,7 @@ CEF_NO_ID = 6600513
 CEF_PENDING_ID = 6600514
 CEF_YES_ID = 6600515
 CEF_NA_ID = 6600516
+CEF_FORM_URL = "https://www.rainmakersecurities.com/client-engagement-form-for-entity-persons"
 CEF_LABELS = {
     CEF_NO_ID: "No",
     CEF_PENDING_ID: "Pending",
@@ -901,20 +922,20 @@ def _cef_badge_html(cef_option_id, tenant_name):
     """Nav-bar badge for the tenant view (and admin &view_as preview),
     one state per CEF option: Yes -> green "CEF on file"; Pending ->
     amber "CEF pending"; No or unset (cef_option_id is None or any id
-    outside the verified map) -> red "CEF missing — contact us" (mailto,
-    subject "CEF for <tenant name>"); N/A -> no badge at all. Only ever
-    called when there IS a tenant to report on (see the call site's
-    tenant is not None guard) — there's no separate "no tenant" case to
-    handle here."""
+    outside the verified map) -> red "CEF missing" linking straight to
+    the CEF form itself (CEF_FORM_URL, new tab) — no longer a mailto,
+    since there's now a direct form to send people to; N/A -> no badge
+    at all. Only ever called when there IS a tenant to report on (see
+    the call site's tenant is not None guard) — there's no separate "no
+    tenant" case to handle here."""
     if cef_option_id == CEF_NA_ID:
         return ""
     if cef_option_id == CEF_YES_ID:
         return '<div class="gg-cef-badge cef-ok">&#10003; CEF on file</div>'
     if cef_option_id == CEF_PENDING_ID:
         return '<div class="gg-cef-badge cef-pending">&#8226; CEF pending</div>'
-    subject = urllib.parse.quote(f"CEF for {tenant_name}", safe="")
-    href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
-    return f'<a class="gg-cef-badge cef-missing" href="{href}">&#10007; CEF missing — contact us</a>'
+    return (f'<a class="gg-cef-badge cef-missing" href="{CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">'
+            '&#10007; CEF missing — complete it</a>')
 
 
 def _person_display_name(rec):
@@ -1358,6 +1379,225 @@ def _feature_requests_list_html(open_items, done_items, show_tenant=False, tenan
     return "".join(rows)
 
 
+# ── Hold / Cancel requests (My Deals) ────────────────────────────────────
+# Never a direct Pipeline write — these only record the ask for admin to
+# act on manually. One item per deal (sk is NOT epoch-suffixed, unlike
+# feature requests), stored under the deal's own linked tenant partition
+# (_tenant_email_for_deal — the same helper _handle_update_intro already
+# uses), so the write endpoint never needs a client-supplied partition:
+# ownership is always derived from the deal record itself.
+
+def get_deal_requests(tenant_partition):
+    """{deal_id_str: {"request", "by", "at", "resolved"}} for every
+    request item under this tenant partition, via one Query. Never
+    raises: any failure returns ({}, True)."""
+    try:
+        table = _dynamo_table()
+        resp = table.query(
+            KeyConditionExpression=Key("tenant").eq(tenant_partition) & Key("sk").begins_with("request#"),
+        )
+        out = {}
+        for item in resp.get("Items", []):
+            sk = item.get("sk") or ""
+            if not sk.startswith("request#"):
+                continue
+            deal_id = sk[len("request#"):]
+            if not deal_id:
+                continue
+            out[deal_id] = {
+                "request": item.get("request"),
+                "by": item.get("by"),
+                "at": item.get("at"),
+                "resolved": bool(item.get("resolved")),
+            }
+        return out, False
+    except Exception:
+        return {}, True
+
+
+def _dynamo_write_deal_request(tenant_partition, deal_id, request_type, actor):
+    now = time.time()
+    try:
+        table = _dynamo_table()
+        table.put_item(Item={
+            "tenant": tenant_partition,
+            "sk": f"request#{deal_id}",
+            "request": request_type,
+            "by": actor,
+            "at": datetime.now(timezone.utc).isoformat(),
+            "resolved": False,
+        })
+        table.put_item(Item={
+            "tenant": tenant_partition,
+            "sk": f"audit#request#{deal_id}#{int(now * 1000)}",
+            "actor": actor,
+            "old": {},
+            "new": {"request": request_type},
+        })
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _dynamo_resolve_deal_request(tenant_partition, deal_id, actor):
+    """ConditionExpression=attribute_exists(sk) for the same reason as
+    _dynamo_toggle_feature_request's: without it, update_item would
+    silently upsert a phantom "resolved" item for a deal_id that never
+    had a request at all."""
+    now = time.time()
+    try:
+        table = _dynamo_table()
+        table.update_item(
+            Key={"tenant": tenant_partition, "sk": f"request#{deal_id}"},
+            UpdateExpression="SET resolved = :r",
+            ConditionExpression="attribute_exists(sk)",
+            ExpressionAttributeValues={":r": True},
+        )
+        table.put_item(Item={
+            "tenant": tenant_partition,
+            "sk": f"audit#request#{deal_id}#{int(now * 1000)}",
+            "actor": actor,
+            "old": {"resolved": False},
+            "new": {"resolved": True},
+        })
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _handle_deal_request(event):
+    """POST ?action=deal_request — a tenant's one-click "Hold" or "Cancel"
+    ask, or an admin's "Mark resolved". Auth mirrors _handle_update_intro
+    exactly: the deal's owning partition is always derived server-side via
+    _tenant_email_for_deal, never taken from the client, so a tenant post
+    can only ever land in their own partition — the ownership check is
+    "does this deal's linked tenant match the authenticated identity",
+    not anything the client can steer. ADMIN_KEY may act on any deal.
+    Never raises past this function."""
+    body = _parse_json_body(event)
+
+    admin_key = os.environ.get("ADMIN_KEY")
+    is_admin = bool(admin_key) and body.get("key") == admin_key
+
+    deal_id = str(body.get("deal_id") or "").strip()
+    if not deal_id:
+        return _json_response({"error": "deal_id is required"}, 400)
+
+    deals = get_deals_list()
+    deal = next((d for d in deals if str(d.get("id")) == deal_id), None)
+    if deal is None:
+        return _json_response({"error": "deal not found"}, 404)
+
+    tenant_email = _tenant_email_for_deal(deal)
+    if tenant_email is None:
+        return _json_response({"error": "deal has no linked tenant"}, 400)
+
+    if is_admin:
+        actor = "admin"
+    else:
+        identity_email = _read_identity_email(event)
+        tenant_identity_email = identity_email.strip().lower() if identity_email else None
+        if not tenant_identity_email or tenant_identity_email not in TENANTS:
+            return _json_response({"error": "forbidden"}, 403)
+        if tenant_identity_email != tenant_email:
+            return _json_response({"error": "forbidden"}, 403)
+        actor = tenant_identity_email
+
+    if body.get("resolved"):
+        if not is_admin:
+            return _json_response({"error": "forbidden"}, 403)
+        ok, err = _dynamo_resolve_deal_request(tenant_email, deal_id, actor)
+        if not ok:
+            return _json_response({"error": f"Save failed: {err}"}, 502)
+        return _json_response({"ok": True})
+
+    request_type = body.get("request")
+    if request_type not in ("hold", "cancel"):
+        return _json_response({"error": "invalid request"}, 400)
+
+    ok, err = _dynamo_write_deal_request(tenant_email, deal_id, request_type, actor)
+    if not ok:
+        return _json_response({"error": f"Save failed: {err}"}, 502)
+    return _json_response({"ok": True})
+
+
+def _deal_request_script_html():
+    return """<script>
+(function() {
+  function post(payload, onDone) {
+    fetch('?action=deal_request', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    }).then(function(r) {
+      return r.json().then(function(data) { return { ok: r.ok, data: data }; });
+    }).then(onDone).catch(function(err) { onDone({ ok: false, data: { error: String(err) } }); });
+  }
+  document.querySelectorAll('.deal-request-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      post({ key: btn.getAttribute('data-key'), deal_id: btn.getAttribute('data-deal-id'),
+             request: btn.getAttribute('data-request') }, function(res) {
+        if (res.ok) { window.location.reload(); }
+        else { alert((res.data && res.data.error) || 'Error'); }
+      });
+    });
+  });
+  document.querySelectorAll('.request-resolve-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      post({ key: btn.getAttribute('data-key'), deal_id: btn.getAttribute('data-deal-id'), resolved: true },
+        function(res) {
+          if (res.ok) { window.location.reload(); }
+          else { alert((res.data && res.data.error) || 'Error'); }
+        });
+    });
+  });
+})();
+</script>"""
+
+
+def _deal_request_actions_html(deal_id, update_btn, request_entry, key):
+    """update_btn is the existing minted Update link, passed in unchanged.
+    show_resolve (key truthy, i.e. an admin session) also renders "Mark
+    resolved" next to the chip — never for a plain tenant view, which only
+    ever sees the chip itself."""
+    key_attr = _esc(key or "")
+    if request_entry and not request_entry.get("resolved"):
+        label = "Hold requested" if request_entry.get("request") == "hold" else "Cancel requested"
+        chip = f'<span class="request-chip">{_esc(label)}</span>'
+        resolve_btn = ""
+        if key:
+            resolve_btn = (f'<button type="button" class="request-resolve-btn" data-key="{key_attr}" '
+                            f'data-deal-id="{_esc(deal_id)}">Mark resolved</button>')
+        return f'{update_btn} {chip} {resolve_btn}'
+    hold_btn = (f'<button type="button" class="deal-request-btn" data-key="{key_attr}" '
+                f'data-deal-id="{_esc(deal_id)}" data-request="hold">Hold</button>')
+    cancel_btn = (f'<button type="button" class="deal-request-btn" data-key="{key_attr}" '
+                  f'data-deal-id="{_esc(deal_id)}" data-request="cancel">Cancel</button>')
+    return f'{update_btn} {hold_btn} {cancel_btn}'
+
+
+def _unresolved_request_row_html(deal_id, company_name, entry, show_tenant=False, tenant_name=None, key=None):
+    label = "Hold requested" if entry.get("request") == "hold" else "Cancel requested"
+    tag = f'<span class="feature-tenant-tag">{_esc(tenant_name)}</span> ' if show_tenant and tenant_name else ""
+    key_attr = _esc(key or "")
+    resolve_btn = (f'<button type="button" class="request-resolve-btn" data-key="{key_attr}" '
+                   f'data-deal-id="{_esc(deal_id)}">Mark resolved</button>')
+    return (f'<div class="feature-row">'
+            f'<div class="feature-row-text">{tag}<strong>{_esc(company_name or "—")}</strong> — '
+            f'{_esc(label)} by {_esc(entry.get("by") or "—")}</div>'
+            f'<div class="feature-row-meta">{resolve_btn}</div>'
+            f'</div>')
+
+
+def _unresolved_requests_block_html(rows_html):
+    if not rows_html:
+        return ""
+    return f"""<h2 class="feature-section-heading">Open Hold / Cancel requests</h2>
+  <div class="card">
+    {rows_html}
+  </div>"""
+
+
 def _default_intro_status(deal):
     """Derived status when the Intro Status field is empty/absent for a
     deal (including when the deals.json snapshot hasn't picked up the
@@ -1724,6 +1964,59 @@ def _my_deal_size_text(deal):
         return _fmt_money(None)
 
 
+def _deal_pipeline_size(deal):
+    """Numeric size for the summary strip's dollar totals: the larger of
+    min/max ticket size, else the deal's own "value" field. None if
+    neither is present — callers must skip rather than treat as 0."""
+    min_val = _deal_cf_number(deal, TICKET_MIN_FIELD)
+    max_val = _deal_cf_number(deal, TICKET_MAX_FIELD)
+    candidates = [v for v in (min_val, max_val) if v is not None]
+    if candidates:
+        return max(candidates)
+    try:
+        return float(deal.get("value"))
+    except (TypeError, ValueError):
+        return None
+
+
+# "Won"/"Lost"/"Dead" markers: UNVERIFIED against a live deals.json
+# snapshot (same caveat as DEADLINE_FIELD above — no repo this org's code
+# lives in ever reads them). The only trace found anywhere is a
+# dead/unused lookup table in chadgracia/CRMDealDetails
+# (map_option_value's 'Status' dict: {'1': 'Open', '2': 'Won',
+# '3': 'Inquiry', '4': 'Lost', '5': 'Dead'}), which is never actually
+# invoked in that file either — so this is a best-effort guess at
+# Pipeline's built-in numeric "status" deal attribute, not the
+# custom_label deal_stage field LIVE_SELL_STAGE_IDS is built from.
+# Degrades safely: if deals.json doesn't carry a "status" key, or uses a
+# different shape, no deal ever matches either predicate below and the
+# "Total closed" summary segment is simply omitted rather than showing a
+# wrong number. LIVE_SELL_STAGE_IDS (e.g. STAGE_SPA_SIGNED) alone doesn't
+# distinguish a deal that has actually closed from one still working
+# toward it — a Won deal can still carry a "live" stage id — so "Total in
+# pipeline" excludes DEAL_STATUS_CLOSED_IDS explicitly on top of the
+# existing _is_live_sell_deal check, per instruction ("live = not
+# won/lost/dead per stage").
+DEAL_STATUS_WON_ID = 2
+DEAL_STATUS_LOST_ID = 4
+DEAL_STATUS_DEAD_ID = 5
+DEAL_STATUS_CLOSED_IDS = {DEAL_STATUS_WON_ID, DEAL_STATUS_LOST_ID, DEAL_STATUS_DEAD_ID}
+
+
+def _is_won_deal(deal):
+    try:
+        return int(deal.get("status")) == DEAL_STATUS_WON_ID
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_closed_deal(deal):
+    try:
+        return int(deal.get("status")) in DEAL_STATUS_CLOSED_IDS
+    except (TypeError, ValueError):
+        return False
+
+
 def _my_deal_visibility_state(deal, cef_state):
     """"live" (Agent Agreement Yes), "setup" (In Process, or the tenant's
     own CEF is Yes), or "not_live" — single source of truth shared by the
@@ -1736,16 +2029,30 @@ def _my_deal_visibility_state(deal, cef_state):
     return "not_live"
 
 
+CEF_LINK_HTML = (f'<a class="cef-complete-link" href="{CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">'
+                  'Complete CEF &rarr;</a>')
+
+
 def _my_deal_visibility_badge_html(deal, company, cef_state):
+    """The Engage-RMS mailto on "not_live" is a separate ask (deal
+    activation) from CEF and stays a mailto unchanged. CEF_LINK_HTML is
+    appended alongside it whenever CEF is plausibly still the blocker:
+    always on "not_live" (cef_state can never be CEF_YES_ID there — if it
+    were, _my_deal_visibility_state would have returned "setup" instead),
+    and on "setup" only when that amber state came from the Agent
+    Agreement being In Process rather than from CEF already being Yes
+    (appending it in the CEF-Yes case would tell someone to complete a
+    form they've already completed)."""
     state = _my_deal_visibility_state(deal, cef_state)
     if state == "live":
         return '<span class="visibility-badge live">Live — shown to buyers</span>'
     if state == "setup":
-        return '<span class="visibility-badge setup">Setup in progress</span>'
+        cef_link = CEF_LINK_HTML if cef_state != CEF_YES_ID else ""
+        return f'<span class="visibility-badge setup">Setup in progress</span> {cef_link}'
     subject = urllib.parse.quote(f"Engage RMS re {company}", safe="")
     href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
-    return (f'<a class="visibility-badge not-live" href="{href}">'
-            'Not live — engage to activate</a>')
+    return (f'<a class="visibility-badge not-live" href="{href}">Not live — engage to activate</a> '
+            f'{CEF_LINK_HTML}')
 
 
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
@@ -2770,8 +3077,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 </html>"""
 
 
-def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, key=None, view_as=None,
-                       edit_mode=False):
+def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, request_entry, key=None,
+                       view_as=None, edit_mode=False):
     deal_id = str(deal.get("id"))
     if company_name:
         company_cell = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
@@ -2782,8 +3089,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     public_url = _deal_public_url(deal_id)
     deal_id_cell = (
         f'<a href="{public_url}" target="_blank" rel="noopener noreferrer">#{deal_id}</a>'
-        f'<button type="button" class="copy-link-btn" data-copy-url="{public_url}" '
-        f'title="Copy link" aria-label="Copy deal link">&#128203;</button>'
+        f'{_copy_id_button_html(public_url)}'
     )
 
     size_text = _esc(_my_deal_size_text(deal))
@@ -2818,7 +3124,8 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         tooltip = _esc(" · ".join(reasons))
         attention_html = f'<span class="attention-chip" title="{tooltip}">Needs attention</span>'
 
-    update_btn = _update_cancel_button_html(deal_id)
+    update_btn = _update_cancel_button_html(deal_id, label="Update")
+    actions_html = _deal_request_actions_html(deal_id, update_btn, request_entry, key)
 
     return (
         f'<tr><td class="company">{company_cell}</td>'
@@ -2829,7 +3136,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         f'<td class="num">{intro_text}</td>'
         f'<td>{deadline_html}</td>'
         f'<td>{attention_html}</td>'
-        f'<td class="actions">{update_btn}</td></tr>'
+        f'<td class="actions">{actions_html}</td></tr>'
     )
 
 
@@ -2865,7 +3172,42 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         feature_items, _ = get_feature_requests(anon_key_email)
         feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
 
+    # Unresolved Hold/Cancel requests block (admin only — key truthy).
+    # tenant_picker (aggregate) loops every TENANTS partition, since a
+    # request always lives under its deal's own owning tenant (never
+    # "admin" — a deal always belongs to exactly one real tenant, unlike
+    # feature requests which can be filed under the literal "admin"
+    # partition too). Single-tenant admin view (&view_as) only looks at
+    # anon_key_email's own partition.
+    unresolved_requests_html = ""
+    if key:
+        deals_by_id = None
+        if tenant_picker:
+            deals_by_id = {str(d.get("id")): d for d in get_deals_list()}
+            rows = []
+            for partition in TENANTS:
+                reqs, _ = get_deal_requests(partition)
+                for deal_id, entry in reqs.items():
+                    if entry.get("resolved"):
+                        continue
+                    d = deals_by_id.get(deal_id)
+                    rows.append(_unresolved_request_row_html(
+                        deal_id, _deal_company_name(d) if d else None, entry,
+                        show_tenant=True, tenant_name=TENANTS[partition]["name"], key=key))
+            unresolved_requests_html = _unresolved_requests_block_html("".join(rows))
+        elif anon_key_email:
+            reqs, _ = get_deal_requests(anon_key_email)
+            unresolved = {k: v for k, v in reqs.items() if not v.get("resolved")}
+            if unresolved:
+                deals_by_id = {str(d.get("id")): d for d in (deals or [])}
+                rows = [_unresolved_request_row_html(
+                            deal_id, _deal_company_name(deals_by_id[deal_id]) if deal_id in deals_by_id else None,
+                            entry, key=key)
+                        for deal_id, entry in unresolved.items()]
+                unresolved_requests_html = _unresolved_requests_block_html("".join(rows))
+
     summary_html = ""
+    subtle_html = ""
     edit_script = ""
     if tenant_picker:
         body_html = (
@@ -2879,6 +3221,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         buyer_counts = {row["company"].strip().lower(): row["total"] for row in company_table}
 
         intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
+        deal_requests, _ = get_deal_requests(anon_key_email) if anon_key_email else ({}, True)
         cef_state = _tenant_cef_state(person_id)
 
         # Per-company buy-side aggregation (Intros count, Stalled/follow-up
@@ -2953,7 +3296,17 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 not_engaged_count += 1
 
             row_htmls.append(_my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
+                                                deal_requests.get(str(d.get("id"))),
                                                 key=key, view_as=view_as, edit_mode=edit_mode))
+
+        today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        future_deadlines = [dl for dl in deadlines if dl >= today_iso]
+
+        pipeline_total = sum(v for v in (_deal_pipeline_size(d) for d in deals
+                                          if _is_live_sell_deal(d) and not _is_closed_deal(d))
+                              if v is not None)
+        closed_total = sum(v for v in (_deal_pipeline_size(d) for d in deals if _is_won_deal(d))
+                            if v is not None)
 
         summary_parts = []
         if live_count:
@@ -2964,10 +3317,15 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             summary_parts.append(f"{intros_total} intros in motion")
         if attention_count:
             summary_parts.append(f"{attention_count} need attention")
-        if deadlines:
-            summary_parts.append(f"next deadline {deadlines[0]}")
+        if pipeline_total:
+            summary_parts.append(f"Total in pipeline: {_fmt_money(pipeline_total)}")
+        if closed_total:
+            summary_parts.append(f"Total closed: {_fmt_money(closed_total)}")
+        if future_deadlines:
+            summary_parts.append(f"next deadline {min(future_deadlines)}")
         summary_html = (f'<p class="mydeals-summary">{_esc(" · ".join(summary_parts))}</p>'
                          if summary_parts else "")
+        subtle_html = '<p class="mydeals-subtle">Click a company name for deal details, buyers, and live demand.</p>'
 
         rows_html = "".join(row_htmls)
         body_html = f"""<div class="card">
@@ -3021,7 +3379,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   }}
   .wrap {{ max-width: 1100px; margin: 0 auto; }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
-  .mydeals-summary {{ color: var(--muted); font-size: 13px; margin: 0 0 20px; }}
+  .mydeals-summary {{ color: var(--muted); font-size: 13px; margin: 0 0 4px; }}
+  .mydeals-subtle {{ color: var(--muted); font-size: 12px; margin: 0 0 20px; }}
   .feature-section-heading {{ font-size: 16px; font-weight: 600; margin: 32px 0 12px; }}
   .card {{
     background: var(--card);
@@ -3065,29 +3424,71 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   td.deal-id {{ white-space: nowrap; }}
   td.deal-id a {{ color: var(--accent); text-decoration: none; }}
   td.deal-id a:hover {{ text-decoration: underline; }}
-  .copy-link-btn {{
-    background: none;
-    border: none;
+  .copy-id {{
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    margin-left: 4px;
+    padding: 0;
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 4px;
     color: var(--muted);
     cursor: pointer;
-    font-size: 12px;
-    margin-left: 4px;
-    padding: 2px;
+    line-height: 0;
     vertical-align: middle;
   }}
-  .copy-link-btn:hover {{ color: var(--ink); }}
+  .copy-id svg {{
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }}
+  .copy-id:hover {{ border-color: var(--accent); color: var(--accent); }}
   td.actions {{ white-space: nowrap; }}
-  .update-cancel-btn {{
+  .update-cancel-btn, .deal-request-btn, .request-resolve-btn {{
     display: inline-block;
     font-size: 12px;
     font-weight: 600;
     padding: 4px 10px;
     border-radius: 999px;
+    border: none;
     background: rgba(255,255,255,0.06);
     color: var(--ink);
     text-decoration: none;
+    cursor: pointer;
+    margin: 0 4px 4px 0;
+    font-family: inherit;
   }}
-  .update-cancel-btn:hover {{ text-decoration: underline; }}
+  .update-cancel-btn:hover, .deal-request-btn:hover, .request-resolve-btn:hover {{
+    text-decoration: underline;
+  }}
+  .request-chip {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: rgba(201,162,39,0.15);
+    color: var(--accredited);
+    white-space: nowrap;
+    margin-right: 4px;
+  }}
+  .cef-complete-link {{
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    text-decoration: none;
+    white-space: nowrap;
+  }}
+  .cef-complete-link:hover {{ text-decoration: underline; }}
   .visibility-badge {{
     display: inline-block;
     font-size: 12px;
@@ -3145,6 +3546,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   <h1>My Deals</h1>
   {feature_box_html}
   {summary_html}
+  {subtle_html}
+  {unresolved_requests_html}
   {body_html}
   <h2 class="feature-section-heading">Feature requests</h2>
   <div class="card">
@@ -3153,17 +3556,32 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 </div>
 {edit_script}
 {_feature_toggle_script_html(key)}
+{_deal_request_script_html()}
 <script>
 (function() {{
-  document.querySelectorAll('.copy-link-btn').forEach(function(btn) {{
-    btn.addEventListener('click', function() {{
-      var url = btn.getAttribute('data-copy-url');
-      var orig = btn.textContent;
-      navigator.clipboard.writeText(url).then(function() {{
-        btn.textContent = '\\u2713';
-        setTimeout(function() {{ btn.textContent = orig; }}, 1500);
-      }}).catch(function() {{}});
+  function copyTextToClipboard(text) {{
+    if (navigator.clipboard && window.isSecureContext) {{
+      return navigator.clipboard.writeText(text);
+    }}
+    return new Promise(function(resolve, reject) {{
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try {{ ok = document.execCommand('copy'); }} catch (e) {{ ok = false; }}
+      document.body.removeChild(ta);
+      ok ? resolve() : reject(new Error('Copy failed'));
     }});
+  }}
+  document.addEventListener('click', function(event) {{
+    var btn = event.target.closest ? event.target.closest('.copy-id') : null;
+    if (!btn) return;
+    event.preventDefault();
+    copyTextToClipboard(btn.getAttribute('data-copy-url')).catch(function() {{}});
   }});
 }})();
 </script>
@@ -4118,6 +4536,11 @@ def lambda_handler(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_feature_request(event)
+
+    if query.get("action") == "deal_request":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_deal_request(event)
 
     if method != "GET":
         return _forbidden()
