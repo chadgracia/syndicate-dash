@@ -89,6 +89,13 @@ BUCKET = "full-pipeline-cache"
 PEOPLE_KEY = "people.json"
 INTEREST_KEY = "interest_people.json"
 DEALS_KEY = "deals.json"
+# Turn 24: the buyer page's "About the firm" card. New to this codebase --
+# no other Lambda in this org has been confirmed to read companies.json, so
+# its shape is assumed (on the same {"companies": [...]} + "id" convention
+# every other snapshot in this bucket uses) rather than verified. See
+# get_company_record, which fails soft (returns None, card omits itself)
+# on any shape mismatch rather than erroring.
+COMPANIES_KEY = "companies.json"
 
 INVESTOR_LEVEL_FIELD = "custom_label_3923758"
 QP_ID = 6950564
@@ -422,6 +429,11 @@ ACCEPTS_LABELS = {
     7177776: "Forwards",
     7177777: "Commons",
 }
+
+# Turn 24: PitchBook profile link, on the companies.json record's own
+# custom_fields (given directly, same trust basis as every other bare
+# option/field id supplied this way in this file).
+COMPANY_PITCHBOOK_FIELD = "custom_label_3320818"
 
 # "Matched or later" buy-side stages, shared verbatim by the Matched Buyers
 # section and the Active Intros tab: every known stage id (STAGE_LABELS,
@@ -1196,6 +1208,42 @@ def get_company_buyer_details(company):
             "updated_at": rec.get("updated_at"),
         })
     return out
+
+
+def get_company_record(company_id, company_name):
+    """Turn 24: companies.json lookup for the buyer page's "About the
+    firm" card. Fresh S3 fetch, discarded after use (same pattern as
+    get_company_buyer_details). Matched by company_id first (the same
+    id _closer_kind already reads off a buyer's own record for the
+    firm-won check) — falling back to an exact, case-insensitive
+    company_name match when company_id is absent, the identical two-
+    path strategy _closer_kind/_build_firm_won_index use and for the
+    same stated reason (verify company_id survives into the snapshot;
+    if absent, match on name). Returns None on ANY failure — missing
+    file, unexpected shape, or no match — so the card simply omits
+    itself rather than showing something wrong; this file's shape is
+    unverified in this sandbox (see COMPANIES_KEY)."""
+    try:
+        s3 = boto3.client("s3")
+        companies_obj = s3.get_object(Bucket=BUCKET, Key=COMPANIES_KEY)
+        companies_data = json.loads(companies_obj["Body"].read())
+        companies_list = (companies_data.get("companies", [])
+                           if isinstance(companies_data, dict) else (companies_data or []))
+    except Exception:
+        return None
+    if not isinstance(companies_list, list):
+        return None
+    if company_id is not None:
+        for rec in companies_list:
+            if isinstance(rec, dict) and rec.get("id") == company_id:
+                return rec
+        return None
+    if company_name:
+        target = company_name.strip().lower()
+        for rec in companies_list:
+            if isinstance(rec, dict) and (rec.get("name") or "").strip().lower() == target:
+                return rec
+    return None
 
 
 def get_people_by_ids(person_ids):
@@ -5165,93 +5213,139 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 </html>"""
 
 
-def _buyer_identity_html(rec):
-    """Turn 23, block 1 (IDENTITY): name, position/title, firm name
-    (linked to their website) plus a separate LinkedIn link, city/
-    country (work_* falling back to home_*). Every field renders only
-    when present — title/city are implemented on trust the same way
-    phone was (_person_phone_text): no repo in this org reads a person
-    record's "title"/"work_city"/"home_city", but they follow the exact
-    naming convention work_country/home_country already verified
-    working in production. Person-record fields only; nothing about
-    any company, deal, or interest is read or shown here."""
+def _buyer_header_html(rec, closer_kind):
+    """Turn 24: the buyer page's single header card, merging what used
+    to be two separate blocks (IDENTITY + CAPACITY, turn 23) into one —
+    name large; one line beneath it joining title (if present) · firm
+    name · city/country (work_* falling back to home_*); a second line
+    of mailto/LinkedIn/website links; the closer chip and ID-verified
+    chip (custom_label_3796440, the Client Engagement Form field, Yes
+    only -- every other state omitted, no red/amber states on a page
+    the TENANT reads about someone else) right-aligned; and a trailing
+    chip row for tier badge / ticket range (custom_label_3052210 map) /
+    transactor type label (custom_label_3759163 map) -- the old
+    separate near-empty "Capacity" card is gone. Every field renders
+    only when present. title/city are implemented on trust the same
+    way phone was (_person_phone_text): no repo in this org reads a
+    person record's "title"/"work_city"/"home_city", but they follow
+    the exact naming convention work_country/home_country already
+    verified working in production. Person-record fields only; nothing
+    about any company, deal, or interest is read or shown here."""
     name = _esc(_person_display_name(rec) or "—")
     title = (rec.get("title") or "").strip()
     cf = rec.get("custom_fields") or {}
     transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
-    is_natural = (transactor_ids[0] if transactor_ids else None) == NATURAL_PERSON_ID
-    company = (rec.get("company_name") or "").strip() if not is_natural else ""
-    website = (rec.get("website") or "").strip()
-    linked_in = (rec.get("linked_in_url") or "").strip()
+    transactor_id = transactor_ids[0] if transactor_ids else None
+    is_natural = transactor_id == NATURAL_PERSON_ID
+    firm_name = (rec.get("company_name") or "").strip() if not is_natural else ""
     city = (rec.get("work_city") or rec.get("home_city") or "").strip()
     country = (rec.get("work_country") or rec.get("home_country") or "").strip()
-    location = " · ".join(_esc(p) for p in (city, country) if p)
+    location = ", ".join(p for p in (city, country) if p)
 
-    rows = []
-    if title:
-        rows.append(f'<div class="buyer-page-row">{_esc(title)}</div>')
-    if company:
-        if website:
-            href = website if "://" in website else f"https://{website}"
-            firm_html = f'<a href="{_esc(href)}" target="_blank" rel="noopener noreferrer">{_esc(company)}</a>'
-        else:
-            firm_html = _esc(company)
-        if linked_in:
-            href_l = linked_in if "://" in linked_in else f"https://{linked_in}"
-            firm_html += (f' · <a href="{_esc(href_l)}" target="_blank" rel="noopener noreferrer">'
-                          f'LinkedIn</a>')
-        rows.append(f'<div class="buyer-page-row">{firm_html}</div>')
-    elif linked_in:
-        # No firm name to attach LinkedIn to, but the field is still
-        # present -- give it its own line rather than dropping it.
-        href_l = linked_in if "://" in linked_in else f"https://{linked_in}"
-        rows.append(f'<div class="buyer-page-row"><a href="{_esc(href_l)}" target="_blank" '
-                    f'rel="noopener noreferrer">LinkedIn</a></div>')
-    if location:
-        rows.append(f'<div class="buyer-page-row">{location}</div>')
+    line1_parts = [p for p in (title, firm_name, location) if p]
+    line1_html = (f'<div class="buyer-header-line">{" &middot; ".join(_esc(p) for p in line1_parts)}</div>'
+                  if line1_parts else "")
+
     email = _person_email_text(rec)
+    website = (rec.get("website") or "").strip()
+    linked_in = (rec.get("linked_in_url") or "").strip()
+    line2_links = []
     if email:
-        rows.append(f'<div class="buyer-page-row"><a href="mailto:{_esc(email)}">{_esc(email)}</a></div>')
+        line2_links.append(f'<a href="mailto:{_esc(email)}">{_esc(email)}</a>')
+    if linked_in:
+        href_l = linked_in if "://" in linked_in else f"https://{linked_in}"
+        line2_links.append(f'<a href="{_esc(href_l)}" target="_blank" rel="noopener noreferrer">LinkedIn</a>')
+    if website:
+        href_w = website if "://" in website else f"https://{website}"
+        line2_links.append(f'<a href="{_esc(href_w)}" target="_blank" rel="noopener noreferrer">{_esc(website)}</a>')
+    line2_html = (f'<div class="buyer-header-line buyer-header-links">{" &middot; ".join(line2_links)}</div>'
+                  if line2_links else "")
 
-    return f'<div class="card"><div class="buyer-page-name">{name}</div>{"".join(rows)}</div>'
+    id_verified = CEF_YES_ID in cf_list(cf, CEF_FIELD)
+    badge_parts = [h for h in (_closer_chip_html(closer_kind),
+                                '<span class="id-verified-chip">ID verified</span>' if id_verified else "") if h]
+    badges_html = f'<div class="buyer-header-badges">{"".join(badge_parts)}</div>' if badge_parts else ""
 
-
-def _buyer_capacity_html(rec, closer_kind):
-    """Turn 23, block 2 (CAPACITY): tier badge (Unknown -> no badge, via
-    _tier_badge_html), ticket range (custom_label_3052210 map, via the
-    existing get_person_ticket_range/_fmt_ticket_range), transactor type
-    label (custom_label_3759163 map), ID state (custom_label_3796440 --
-    the Client Engagement Form field, reused here as "ID verified": Yes
-    only, every other state (No/Pending/N/A/unset) omitted outright --
-    no red/amber states on a page the TENANT reads about someone else,
-    unlike that same field's own 4-state badge on the tenant's own My
-    Deals row). Plus the closer chip (person_won > firm_won > nothing --
-    see _closer_kind/_closer_chip_html), so every "has this buyer closed
-    before" signal lives in one block."""
-    cf = rec.get("custom_fields") or {}
     tier_html = _tier_badge_html(classify_person(cf))
     min_v, max_v = get_person_ticket_range(cf)
     range_text = _fmt_ticket_range(min_v, max_v)
-    transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
-    transactor_id = transactor_ids[0] if transactor_ids else None
+    range_html = f'<span class="capacity-chip">{_esc(range_text)}</span>' if range_text else ""
     transactor_label = TRANSACTOR_TYPE_LABELS.get(transactor_id, "")
-    id_verified = CEF_YES_ID in cf_list(cf, CEF_FIELD)
-    closer_html = _closer_chip_html(closer_kind)
+    transactor_html = f'<span class="capacity-chip">{_esc(transactor_label)}</span>' if transactor_label else ""
+    chips = "".join(h for h in (tier_html, range_html, transactor_html) if h)
+    chip_row_html = f'<div class="buyer-header-chips">{chips}</div>' if chips else ""
 
-    badges = "".join(h for h in (tier_html, closer_html) if h)
+    return (
+        f'<div class="card buyer-header"><div class="buyer-header-top">'
+        f'<div><div class="buyer-page-name">{name}</div>{line1_html}{line2_html}</div>'
+        f'{badges_html}</div>{chip_row_html}</div>'
+    )
+
+
+def _truncate_words(text, limit):
+    """(visible_prefix, remainder) split at `limit` words. remainder is
+    "" when text is already short enough to show whole — callers treat
+    a non-empty remainder as "needs a more-expander"."""
+    words = text.split()
+    if len(words) <= limit:
+        return text, ""
+    return " ".join(words[:limit]), " " + " ".join(words[limit:])
+
+
+def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
+    """Turn 24, LEFT column: "About <firm>" — companies.json fields
+    only (get_company_record), each rendered only when present (this
+    snapshot's shape is unverified in this sandbox, see COMPANIES_KEY —
+    every field here degrades to "omit the line" rather than erroring
+    on a mismatch). description: rendered as-is (no rewriting), trimmed
+    to ~60 words with a zero-JS <details>/<summary> "more" expander;
+    ADMIN-ONLY for now, with an "(internal — review before publishing)"
+    marker — tenants see the rest of the card (location, founded year,
+    PitchBook link) without it until a real publish flow exists.
+    founded year is read verbatim from a "founded_year" field ONLY —
+    never derived or computed from anything else (a deal date, a
+    person's updated_at, etc.) — so a company with no real value there
+    simply has no "Founded" line, rather than a guessed one. PitchBook
+    link (custom_label_3320818) as "PitchBook profile →" when present.
+    Returns "" (card omitted) when there's nothing this viewer can see —
+    natural-person buyers (no firm at all) never even reach this."""
+    if company_rec is None or not firm_name:
+        return ""
+    description = (company_rec.get("description") or "").strip()
+    city = (company_rec.get("city") or "").strip()
+    country = (company_rec.get("country") or "").strip()
+    location = ", ".join(p for p in (city, country) if p)
+    founded = company_rec.get("founded_year")
+    founded_text = str(founded).strip() if founded else ""
+    cf = company_rec.get("custom_fields") or {}
+    pb_raw = cf.get(COMPANY_PITCHBOOK_FIELD)
+    if isinstance(pb_raw, list):
+        pb_raw = pb_raw[0] if pb_raw else None
+    pitchbook_url = str(pb_raw).strip() if pb_raw else ""
+
     rows = []
-    if badges:
-        rows.append(f'<div class="buyer-page-row">{badges}</div>')
-    if range_text:
-        rows.append(f'<div class="buyer-page-row">{_esc(range_text)}</div>')
-    if transactor_label:
-        rows.append(f'<div class="buyer-page-row">{_esc(transactor_label)}</div>')
-    if id_verified:
-        rows.append('<div class="buyer-page-row"><span class="id-verified-chip">ID verified</span></div>')
+    if edit_mode and description:
+        visible, rest = _truncate_words(description, 60)
+        if rest:
+            desc_html = (f'<p class="firm-description">{_esc(visible)}'
+                         f'<details class="firm-more"><summary>… more</summary>'
+                         f'<span>{_esc(rest)}</span></details></p>')
+        else:
+            desc_html = f'<p class="firm-description">{_esc(description)}</p>'
+        rows.append(desc_html)
+        rows.append('<div class="firm-internal-note">(internal — review before publishing)</div>')
+    if location:
+        rows.append(f'<div class="buyer-page-row">{_esc(location)}</div>')
+    if founded_text:
+        rows.append(f'<div class="buyer-page-row">Founded {_esc(founded_text)}</div>')
+    if pitchbook_url:
+        href = pitchbook_url if "://" in pitchbook_url else f"https://{pitchbook_url}"
+        rows.append(f'<div class="buyer-page-row"><a href="{_esc(href)}" target="_blank" '
+                    f'rel="noopener noreferrer">PitchBook profile &rarr;</a></div>')
 
     if not rows:
         return ""
-    return f'<div class="card"><h2 class="buyer-section-heading">Capacity</h2>{"".join(rows)}</div>'
+    return f'<div class="card"><h2 class="buyer-section-heading">About {_esc(firm_name)}</h2>{"".join(rows)}</div>'
 
 
 def _buyer_process_signals_html(rec):
@@ -5279,24 +5373,28 @@ def _buyer_process_signals_html(rec):
 
 
 def _track_deal_row_html(deal, entry, resolved, tenant_label=None):
-    """One deal's row in TRACK WITH YOU: company, size, the same read-
-    only milestone checkboxes + flag state Active Intros itself uses
-    (_status_milestones_column_html, disabled=True — never editable
-    here), and outcome (the resolved status pill/chip,
-    _status_display_html). tenant_label is set only in admin edit mode
-    (grouped-by-tenant heading above each of that tenant's rows)."""
+    """One deal's row in TRACK WITH YOU: company · size · the resolved
+    status as a flag chip (_status_display_html, compact — a pill for
+    an in-progress status, a colored chip for Stalled/Passed/Withdrawn/
+    Closed), then the same read-only milestone checkboxes Active
+    Intros itself uses (_milestone_checkboxes_html, disabled=True --
+    never editable here; turn 24 dropped the disabled flag SELECT
+    _status_milestones_column_html also drew, since the flag chip
+    alone already carries that state — one signal, not two). tenant_
+    label is set only in admin edit mode (grouped-by-tenant heading
+    above each of that tenant's rows)."""
     deal_id = str(deal.get("id"))
     company_name = _deal_company_name(deal) or "—"
     size_text = _esc(_deal_size_text(deal))
     milestones = entry.get("milestones")
-    status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=False, disabled=True)
-    outcome_html = _status_display_html(resolved, compact=True)
+    checkboxes_html = _milestone_checkboxes_html(deal_id, milestones, disabled=True)
+    flag_chip_html = _status_display_html(resolved, compact=True)
     label_html = f'<div class="track-row-tenant">{tenant_label}</div>' if tenant_label else ""
     return (
         f'<div class="track-row">{label_html}'
         f'<div class="track-row-head"><span class="track-row-company">{_esc(company_name)}</span>'
-        f'<span class="track-row-size">{size_text}</span>{outcome_html}</div>'
-        f'{status_html}</div>'
+        f'<span class="track-row-size">{size_text}</span>{flag_chip_html}</div>'
+        f'{checkboxes_html}</div>'
     )
 
 
@@ -5452,21 +5550,21 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                        cef_html=""):
     """Item 3 (turn 18): ?buyer=<person_id> — replaces the old inline
     <details> expansion on Active Intros with a real page. DISCLOSURE
-    GATE: the full profile (five blocks, turn 23 — Identity, Capacity
-    (+ closer chip), Track With You, Notes Ledger, Process Signals)
-    renders only when the viewing tenant has at least one Introduced-
-    or-later deal linked to this specific person
-    (_tenant_has_disclosed_deal_with, checked across EVERY company the
-    tenant has matched buy deals in, not just wherever the viewer
-    clicked in from) — otherwise the anonymized card
-    (_buyer_page_anonymized_html: code/tier/ticket range only,
-    UNCHANGED by turn 23) with "Identity available after introduction."
-    edit_mode=True (admin) always gets the full profile, gate skipped
-    entirely. Nothing about this buyer's OTHER companies, other
-    tenants' demand, or their Pipeline interests is ever looked up or
-    shown here.
+    GATE: the full profile (turn 24 layout — one header card, then a
+    two-column body: About-the-firm + Process Signals on the left,
+    Track With You + Notes on the right) renders only when the viewing
+    tenant has at least one Introduced-or-later deal linked to this
+    specific person (_tenant_has_disclosed_deal_with, checked across
+    EVERY company the tenant has matched buy deals in, not just
+    wherever the viewer clicked in from) — otherwise the anonymized
+    card (_buyer_page_anonymized_html: code/tier/ticket range only,
+    UNCHANGED by this redesign) with "Identity available after
+    introduction." edit_mode=True (admin) always gets the full profile,
+    gate skipped entirely. Nothing about this buyer's OTHER companies,
+    other tenants' demand, or their Pipeline interests is ever looked
+    up or shown here.
 
-    Full access also unlocks the edit script (checkbox/flag/text-field
+    Full access also unlocks the edit script (checkbox/text-field
     auto-save), so it's only ever included when there's actually
     something on the page it needs to wire up.
 
@@ -5499,12 +5597,32 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
             full_access = edit_mode or _tenant_has_disclosed_deal_with(person_id, anon_key_email, buyer_id)
             if full_access:
                 closer_kind = _closer_kind(rec, _build_firm_won_index())
-                body_html = (
-                    _buyer_identity_html(rec)
-                    + _buyer_capacity_html(rec, closer_kind)
-                    + _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode)
-                    + _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode)
+                header_html = _buyer_header_html(rec, closer_kind)
+
+                # About-the-firm: only ever looked up for an entity buyer
+                # (a natural person has no firm to look up) and only when
+                # there's a company_id or company_name to key the lookup
+                # on at all -- same company_id-first, company_name-
+                # fallback strategy as _closer_kind (see get_company_record).
+                cf = rec.get("custom_fields") or {}
+                transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
+                is_natural = (transactor_ids[0] if transactor_ids else None) == NATURAL_PERSON_ID
+                firm_name = (rec.get("company_name") or "").strip() if not is_natural else ""
+                company_id = rec.get("company_id")
+                company_rec = get_company_record(company_id, firm_name) if firm_name else None
+
+                left_html = (
+                    _buyer_about_firm_html(firm_name, company_rec, edit_mode)
                     + _buyer_process_signals_html(rec)
+                )
+                right_html = (
+                    _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode)
+                    + _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode)
+                )
+                body_html = (
+                    header_html
+                    + f'<div class="buyer-columns"><div class="buyer-col-left">{left_html}</div>'
+                    + f'<div class="buyer-col-right">{right_html}</div></div>'
                 )
                 edit_script_html = _edit_script_html(key)
             else:
@@ -5535,21 +5653,38 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     padding: 32px 24px 64px;
   }}
-  .wrap {{ max-width: 640px; margin: 28px auto 0; }}
+  .wrap {{ max-width: 900px; margin: 28px auto 0; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--line);
     border-radius: 10px;
-    padding: 24px;
+    padding: 20px;
   }}
-  .buyer-page-name {{ font-size: 20px; font-weight: 600; margin: 0 0 4px; }}
-  .buyer-page-row {{ font-size: 14px; color: var(--ink); margin-top: 8px; }}
+  .buyer-page-name {{ font-size: 21px; font-weight: 600; margin: 0 0 2px; }}
+  .buyer-page-row {{ font-size: 14px; color: var(--ink); margin-top: 6px; }}
   .buyer-page-row a {{ color: var(--accent); text-decoration: none; }}
   .buyer-page-row a:hover {{ text-decoration: underline; }}
-  .buyer-page-flag {{ color: var(--qp); font-weight: 600; }}
   .buyer-page-code {{ font-size: 18px; font-weight: 600; }}
   .buyer-page-note {{ color: var(--muted); font-size: 13px; margin-top: 14px; }}
-  .buyer-section-heading {{ font-size: 16px; font-weight: 600; margin: 0 0 12px; }}
+  .buyer-section-heading {{ font-size: 15px; font-weight: 600; margin: 0 0 10px; }}
+  /* Turn 24: single header card -- name, two info lines, badges
+     right-aligned, then a trailing chip row for tier/ticket/transactor
+     (see _buyer_header_html). */
+  .buyer-header-top {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }}
+  .buyer-header-line {{ font-size: 13px; color: var(--muted); margin-top: 4px; }}
+  .buyer-header-line a {{ color: var(--accent); text-decoration: none; }}
+  .buyer-header-line a:hover {{ text-decoration: underline; }}
+  .buyer-header-badges {{ display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }}
+  .buyer-header-chips {{ display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }}
+  .capacity-chip {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: rgba(22,24,29,0.06);
+    color: var(--ink);
+  }}
   .tier-badge {{
     display: inline-block;
     font-size: 10px;
@@ -5559,17 +5694,15 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     padding: 2px 7px;
     border-radius: 999px;
     color: #16181d;
-    margin-right: 6px;
   }}
   .tier-badge.tier-qp {{ background: var(--qp); }}
   .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--muted); }}
-  /* Turn 23: closer chip (block 2) and small green signal chips
-     (block 2's ID verified, block 5's IQF) -- all the same pill shape,
-     green fill, white text, used only where the underlying boolean is
-     True (see _closer_chip_html / _buyer_capacity_html /
-     _buyer_process_signals_html — the false/unset case is always just
-     omitted, never a red/amber chip). */
+  /* Closer chip and small green signal chips (ID verified, IQF) -- all
+     the same pill shape, green fill, white text, used only where the
+     underlying boolean is True (see _closer_chip_html /
+     _buyer_header_html / _buyer_process_signals_html — the false/unset
+     case is always just omitted, never a red/amber chip). */
   .closer-chip, .id-verified-chip, .iqf-chip {{
     display: inline-block;
     font-size: 11px;
@@ -5578,7 +5711,6 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     border-radius: 999px;
     background: var(--qp);
     color: #ffffff;
-    margin-right: 6px;
   }}
   .accepts-chip {{
     display: inline-block;
@@ -5597,9 +5729,20 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     color: var(--muted);
     font-size: 15px;
   }}
-  .gg-placeholder.small {{ margin: 0; padding: 8px 0; text-align: left; font-size: 13px; }}
-  .buyer-track-card, .buyer-notes-card {{ margin-top: 16px; }}
-  .track-row {{ margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }}
+  .gg-placeholder.small {{ margin: 0; padding: 6px 0; text-align: left; font-size: 13px; }}
+  /* Turn 24: header card, then a two-column body (single column under
+     680px) -- About the firm + Process signals on the left, Track
+     with you + Notes on the right (see render_buyer_page). Cards
+     within a column stack with a tight gap; an empty column (nothing
+     to show in either of its cards) just collapses to nothing, never
+     a visible empty box. */
+  .buyer-header {{ margin-bottom: 14px; }}
+  .buyer-columns {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }}
+  .buyer-col-left, .buyer-col-right {{ display: flex; flex-direction: column; gap: 14px; min-width: 0; }}
+  @media (max-width: 680px) {{
+    .buyer-columns {{ grid-template-columns: 1fr; }}
+  }}
+  .track-row {{ margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }}
   .track-row:first-of-type {{ margin-top: 0; padding-top: 0; border-top: none; }}
   .track-row-tenant {{
     font-size: 11px;
@@ -5607,12 +5750,12 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     text-transform: uppercase;
     letter-spacing: 0.03em;
     color: var(--muted);
-    margin-bottom: 8px;
+    margin-bottom: 6px;
   }}
-  .track-row-head {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }}
+  .track-row-head {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }}
   .track-row-company {{ font-size: 14px; font-weight: 600; }}
   .track-row-size {{ font-size: 13px; color: var(--muted); }}
-  .ledger-entry {{ margin-top: 14px; }}
+  .ledger-entry {{ margin-top: 12px; }}
   .ledger-entry:first-of-type {{ margin-top: 0; }}
   .ledger-entry-head {{
     display: flex;
@@ -5623,8 +5766,6 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   }}
   .ledger-entry-company {{ font-size: 13px; font-weight: 600; }}
   .ledger-entry-edited {{ font-size: 11px; color: var(--muted); white-space: nowrap; }}
-  .status-column {{ display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }}
-  .status-awaiting {{ font-size: 12px; color: var(--muted); font-style: italic; }}
   .ei-milestones {{ display: flex; flex-wrap: wrap; gap: 4px 10px; }}
   .ei-milestone-label {{
     display: inline-flex;
@@ -5654,7 +5795,16 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #8a6d1f; }}
   .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
-  .ei-status, .ei-notes, .ei-flag {{
+  /* "About the firm" card: description is admin-only for now (a
+     zero-JS <details>/<summary> "more" expander), everyone else sees
+     just location/founded/PitchBook -- see _buyer_about_firm_html. */
+  .firm-description {{ font-size: 14px; line-height: 1.5; margin: 0 0 2px; color: var(--ink); }}
+  .firm-more {{ display: inline; }}
+  .firm-more summary {{ display: inline; cursor: pointer; color: var(--accent); list-style: none; }}
+  .firm-more summary::-webkit-details-marker {{ display: none; }}
+  .firm-more[open] summary {{ display: none; }}
+  .firm-internal-note {{ font-size: 11px; color: #b23b3b; font-style: italic; margin-top: 6px; }}
+  .ei-notes {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -5664,8 +5814,6 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     width: 100%;
     box-sizing: border-box;
   }}
-  select.ei-flag.flag-stalled {{ border-color: #c9a227; background: rgba(201,162,39,0.15); color: #8a6d1f; }}
-  select.ei-flag.flag-exit {{ border-color: var(--muted); background: rgba(22,24,29,0.06); }}
   textarea.ei-notes {{ resize: vertical; min-height: 44px; font-family: inherit; line-height: 1.35; }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
