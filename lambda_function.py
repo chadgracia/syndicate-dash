@@ -3841,6 +3841,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .update-cancel-btn:hover, .deal-stage-btn:hover {{
     text-decoration: underline;
   }}
+  .update-cancel-btn {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
+  .deal-stage-btn[data-target="hold"] {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .deal-stage-btn[data-target="cancel"] {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .mydeals-section-heading {{
     font-size: 14px;
     font-weight: 600;
