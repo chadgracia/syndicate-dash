@@ -246,6 +246,34 @@ def _deal_update_form_url(deal_id):
     return f"{DEAL_UPDATE_FORM_URL}?deal_id={deal_id}&token={token}"
 
 
+def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow_up_due, needs_agreement,
+                               key=None, view_as=None):
+    """Item 2: ONE specific action chip per row, chosen by priority
+    (highest first) — replaces the old generic "Needs attention" chip.
+    ID-missing is deliberately excluded here: that's the Visibility
+    column's own job (see _my_deal_visibility_badge_html's "need_cef"
+    state) and must never be duplicated in this chip. When more than one
+    condition applies, the top-priority chip carries a title/tooltip
+    naming the rest."""
+    candidates = []
+    if is_overdue:
+        update_url = _deal_update_form_url(deal_id)
+        if update_url:
+            candidates.append(("update deadline", "overdue", "Update deadline &rarr;", update_url, True))
+    if stalled or follow_up_due:
+        href = _company_href(company_name, "mydeals", key, view_as)
+        candidates.append(("nudge buyers", "nudge", "Nudge buyers &rarr;", href, False))
+    if needs_agreement:
+        candidates.append(("sign agreement", "sign", "Sign agreement &rarr;", AGENT_AGREEMENT_DOC_URL, True))
+    if not candidates:
+        return ""
+    phrase, css_class, label, href, new_tab = candidates[0]
+    rest = [c[0] for c in candidates[1:]]
+    title_attr = f' title="{_esc("Also: " + ", ".join(rest))}"' if rest else ""
+    target_attr = ' target="_blank" rel="noopener noreferrer"' if new_tab else ""
+    return f'<a class="action-chip {css_class}"{title_attr} href="{href}"{target_attr}>{label}</a>'
+
+
 def _update_cancel_button_html(deal_id, label="Update / Cancel"):
     """label defaults to "Update / Cancel" everywhere except My Deals,
     which now has its own separate one-click Hold/Cancel REQUEST controls
@@ -1787,14 +1815,14 @@ def _deal_actions_html(deal_id, deal_name, update_btn, section, key=None):
         reactivate_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" '
                            f'data-deal-id="{id_attr}" data-deal-name="{name_attr}" '
                            f'data-target="reactivate">Reactivate</button>')
-        return f'{update_btn} {reactivate_btn}'
+        return f'<div class="actions-stack">{update_btn}{reactivate_btn}</div>'
     if section == "cancelled":
-        return update_btn
+        return f'<div class="actions-stack">{update_btn}</div>'
     hold_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
                 f'data-deal-name="{name_attr}" data-target="hold">Hold</button>')
     cancel_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
                   f'data-deal-name="{name_attr}" data-target="cancel">Cancel</button>')
-    return f'{update_btn} {hold_btn} {cancel_btn}'
+    return f'<div class="actions-stack">{update_btn}{hold_btn}{cancel_btn}</div>'
 
 
 def _default_intro_status(deal):
@@ -2619,8 +2647,8 @@ def _matched_buyer_row_edit_html(deal, tenant_person_id, people_by_id, intro_det
 # the (unchanged, separately dark-themed) Demand Board.
 NAV_CSS = """
   .gg-nav {
-    background: #16181d;
-    border-bottom: 1px solid rgba(244,242,238,0.12);
+    background: transparent;
+    border-bottom: 1px solid var(--line);
   }
   .gg-nav-inner {
     max-width: 1000px;
@@ -2631,7 +2659,7 @@ NAV_CSS = """
     gap: 24px;
   }
   .gg-brand {
-    color: #f4f2ee;
+    color: var(--accent);
     font-weight: 700;
     font-size: 14px;
     letter-spacing: 0.02em;
@@ -2643,21 +2671,21 @@ NAV_CSS = """
     flex: 1;
   }
   .gg-tab {
-    color: #9aa0ac;
+    color: var(--muted);
     text-decoration: none;
     font-size: 13px;
     font-weight: 600;
     padding: 8px 14px;
     border-radius: 6px;
   }
-  .gg-tab:hover { color: #f4f2ee; }
+  .gg-tab:hover { color: var(--ink); }
   .gg-tab.active {
-    color: #f4f2ee;
-    background: rgba(244,242,238,0.08);
-    box-shadow: inset 0 -2px 0 #1f7a4d;
+    color: var(--accent);
+    background: rgba(61,90,115,0.10);
+    box-shadow: inset 0 -2px 0 var(--accent);
   }
   .gg-viewer {
-    color: #9aa0ac;
+    color: var(--muted);
     font-size: 13px;
     white-space: nowrap;
   }
@@ -2681,9 +2709,9 @@ NAV_CSS = """
     white-space: nowrap;
     text-decoration: none;
   }
-  .gg-cef-badge.cef-ok { background: rgba(46,157,106,0.15); color: #2e9d6a; }
-  .gg-cef-badge.cef-pending { background: rgba(201,162,39,0.15); color: #c9a227; }
-  .gg-cef-badge.cef-missing { background: rgba(220,80,80,0.15); color: #e06666; }
+  .gg-cef-badge.cef-ok { background: rgba(31,122,77,0.15); color: var(--qp); }
+  .gg-cef-badge.cef-pending { background: rgba(201,162,39,0.15); color: var(--accredited); }
+  .gg-cef-badge.cef-missing { background: rgba(178,59,59,0.12); color: #b23b3b; }
   .gg-cef-badge.cef-missing:hover { text-decoration: underline; }
 """
 
@@ -3094,7 +3122,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     padding: 32px 24px 64px;
   }}
 {NAV_CSS}
-  .wrap {{ max-width: 1000px; margin: 0 auto; }}
+  .wrap {{ max-width: 1000px; margin: 28px auto 0; }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 24px; }}
   .card {{
     background: var(--card);
@@ -3275,17 +3303,10 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     else:
         deadline_html = "—"
 
-    reasons = []
-    if is_overdue:
-        reasons.append("Deadline passed")
-    if stats["stalled"]:
-        reasons.append("A buyer is Stalled")
-    if stats["follow_up_due"]:
-        reasons.append("Follow-up due")
-    attention_html = ""
-    if reasons:
-        tooltip = _esc(" · ".join(reasons))
-        attention_html = f'<span class="attention-chip" title="{tooltip}">Needs attention</span>'
+    needs_agreement = _my_deal_visibility_state(deal, cef_state) == "review_agreement"
+    action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
+                                                  stats["follow_up_due"], needs_agreement,
+                                                  key=key, view_as=view_as)
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
     actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section, key=key)
@@ -3298,7 +3319,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         f'<td class="num">{buyer_text}</td>'
         f'<td class="num">{intro_text}</td>'
         f'<td>{deadline_html}</td>'
-        f'<td>{attention_html}</td>'
+        f'<td>{action_chip_html}</td>'
         f'<td class="actions">{actions_html}</td></tr>'
     )
 
@@ -3436,6 +3457,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                                         if _is_won_stage(r["resolved_stage"]))
                             if v is not None)
 
+        # Each part is escaped individually rather than the joined string as
+        # a whole, so the dollar totals can carry their own <span> for
+        # medium-weight emphasis (item 4) without that markup being
+        # escaped away.
         summary_parts = []
         if live_count:
             summary_parts.append(f"{live_count} live")
@@ -3446,12 +3471,14 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         if attention_count:
             summary_parts.append(f"{attention_count} need attention")
         if pipeline_total:
-            summary_parts.append(f"Total in pipeline: {_fmt_money(pipeline_total)}")
+            summary_parts.append(f'Total in pipeline: <span class="mydeals-total">'
+                                  f'{_esc(_fmt_money(pipeline_total))}</span>')
         if closed_total:
-            summary_parts.append(f"Total closed: {_fmt_money(closed_total)}")
+            summary_parts.append(f'Total closed: <span class="mydeals-total">'
+                                  f'{_esc(_fmt_money(closed_total))}</span>')
         if future_deadlines:
-            summary_parts.append(f"next deadline {min(future_deadlines)}")
-        summary_html = (f'<p class="mydeals-summary">{_esc(" · ".join(summary_parts))}</p>'
+            summary_parts.append(f"next deadline {_esc(min(future_deadlines))}")
+        summary_html = (f'<p class="mydeals-summary">{" · ".join(summary_parts)}</p>'
                          if summary_parts else "")
         subtle_html = '<p class="mydeals-subtle">Click a company name for deal details, buyers, and live demand.</p>'
 
@@ -3523,10 +3550,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     padding: 32px 24px 64px;
   }}
-  .wrap {{ max-width: 1100px; margin: 0 auto; }}
+  .wrap {{ max-width: 1100px; margin: 28px auto 0; }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
-  .mydeals-summary {{ color: var(--muted); font-size: 13px; margin: 0 0 4px; }}
-  .mydeals-subtle {{ color: var(--muted); font-size: 12px; margin: 0 0 20px; }}
+  .mydeals-summary {{ color: var(--ink); font-size: 14px; margin: 0 0 4px; }}
+  .mydeals-total {{ font-weight: 600; }}
+  .mydeals-subtle {{ color: var(--muted); font-size: 13px; margin: 0 0 20px; }}
   .feature-section-heading {{ font-size: 16px; font-weight: 600; margin: 32px 0 12px; }}
   .card {{
     background: var(--card);
@@ -3596,19 +3624,28 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     stroke-linejoin: round;
   }}
   .copy-id:hover {{ border-color: var(--accent); color: var(--accent); }}
-  td.actions {{ white-space: nowrap; }}
+  td.actions {{ white-space: nowrap; width: 96px; }}
+  .actions-stack {{
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+  }}
   .update-cancel-btn, .deal-stage-btn {{
-    display: inline-block;
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    text-align: center;
     font-size: 12px;
     font-weight: 600;
-    padding: 4px 10px;
-    border-radius: 999px;
+    padding: 4px 8px;
+    border-radius: 6px;
     border: none;
     background: rgba(22,24,29,0.06);
     color: var(--ink);
     text-decoration: none;
     cursor: pointer;
-    margin: 0 4px 4px 0;
+    margin: 0;
     font-family: inherit;
   }}
   .update-cancel-btn:hover, .deal-stage-btn:hover {{
@@ -3644,18 +3681,19 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .visibility-badge.need-cef:hover {{ text-decoration: underline; }}
   .deadline-overdue {{ color: #b23b3b; font-weight: 600; }}
   .ei-deadline.overdue-input {{ border-color: #b23b3b; }}
-  .attention-chip {{
+  .action-chip {{
     display: inline-block;
     font-size: 11px;
     font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
     padding: 3px 9px;
     border-radius: 999px;
-    background: rgba(178,59,59,0.12);
-    color: #b23b3b;
+    text-decoration: none;
     white-space: nowrap;
+    cursor: pointer;
   }}
+  .action-chip:hover {{ text-decoration: underline; }}
+  .action-chip.overdue {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
+  .action-chip.nudge, .action-chip.sign {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
   .ei-deadline {{
     background: var(--bg);
     border: 1px solid var(--line);
@@ -4299,7 +4337,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     padding: 32px 24px 64px;
   }}
-  .wrap {{ max-width: 1000px; margin: 0 auto; }}
+  .wrap {{ max-width: 1000px; margin: 28px auto 0; }}
   .header-row {{
     display: flex;
     align-items: flex-start;
