@@ -2398,10 +2398,21 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     background: var(--card);
     border: 1px solid var(--line);
     border-radius: 10px;
-    overflow: hidden;
   }}
   table {{ width: 100%; border-collapse: collapse; }}
+  /* Sticky header needs the card unclipped (overflow:hidden on an
+     ancestor defeats position:sticky), so the rounded top corners are
+     applied directly to the header cells instead of via .card overflow
+     clipping. */
+  thead th:first-child {{ border-top-left-radius: 10px; }}
+  thead th:last-child {{ border-top-right-radius: 10px; }}
+  tbody tr:last-child td:first-child {{ border-bottom-left-radius: 10px; }}
+  tbody tr:last-child td:last-child {{ border-bottom-right-radius: 10px; }}
   thead th {{
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--card);
     text-align: left;
     font-size: 12px;
     text-transform: uppercase;
@@ -3063,10 +3074,21 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html=""):
     background: var(--card);
     border: 1px solid var(--line);
     border-radius: 10px;
-    overflow: hidden;
   }}
   table {{ width: 100%; border-collapse: collapse; }}
+  /* Sticky header needs the card unclipped (overflow:hidden on an
+     ancestor defeats position:sticky), so the rounded top corners are
+     applied directly to the header cells instead of via .card overflow
+     clipping. */
+  thead th:first-child {{ border-top-left-radius: 10px; }}
+  thead th:last-child {{ border-top-right-radius: 10px; }}
+  tbody tr:last-child td:first-child {{ border-bottom-left-radius: 10px; }}
+  tbody tr:last-child td:last-child {{ border-bottom-right-radius: 10px; }}
   thead th {{
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    background: var(--card);
     text-align: left;
     font-size: 12px;
     text-transform: uppercase;
