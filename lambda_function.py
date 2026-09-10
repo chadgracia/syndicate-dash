@@ -466,6 +466,50 @@ EXIT_STATUS_IDS = {INTRO_STATUS_STALLED_ID, INTRO_STATUS_PASSED_ID, INTRO_STATUS
 # dropdown.
 TENANT_ALLOWED_STATUS_IDS = {7207580, 7207581, 7207582, 7207583, 7207584, 7207585}
 
+# Milestone tracking (turn 16, item 1): a status write that sets one of
+# these five ids also records {step: epoch} in the Dynamo intro item's
+# "milestones" map (see _dynamo_write_intro_update) -- add-only, never
+# overwritten once a step is first recorded, so the timestamp always
+# reflects the FIRST time that milestone was reached even if the deal
+# later moves to Stalled and forward again. Stalled/Passed/Withdrawn are
+# deliberately absent from this map: setting one of those three never
+# touches milestones at all (see _handle_update_intro).
+MILESTONE_STATUS_IDS = {
+    7207580: "NDA",
+    7207581: "VDR",
+    7207582: "Sub Docs",
+    7207583: "Wired",
+    7207587: "Closed",
+}
+MILESTONE_STEPS = ["NDA", "VDR", "Sub Docs", "Wired", "Closed"]
+
+# Each milestone step's position in the ordered pipeline (STATUS_STEPS,
+# below) -- used by _effective_milestones to backfill implied-reached
+# milestones on render: a deal currently AT "Wired" has necessarily passed
+# NDA/VDR/Sub Docs too, even when no explicit milestone timestamp was ever
+# recorded for them (e.g. the status was set directly, skipping steps,
+# before this feature existed, or before an admin started using it).
+MILESTONE_PIPELINE_STEP = {
+    "NDA": "NDA Signed",
+    "VDR": "VDR Link Provided",
+    "Sub Docs": "Signed Sub Docs",
+    "Wired": "Wired",
+    "Closed": "Closed",
+}
+
+# Item 3 (turn 16): Next Steps placeholder text, keyed by the FURTHEST
+# milestone actually reached (None = nothing beyond Introduced yet).
+# Closed has nothing further to suggest -- _next_step_suggestion falls
+# back to the existing generic placeholder for it, a judgment call since
+# the instruction's five cases stop at Wired.
+NEXT_STEP_SUGGESTIONS = {
+    None: "Schedule intro call…",
+    "NDA": "Provide VDR access…",
+    "VDR": "Send sub docs…",
+    "Sub Docs": "Confirm wire details…",
+    "Wired": "We'll confirm closing.",
+}
+
 # Pipeline API v3 write (Intro Status only — see _pipeline_update_deal_status).
 # Auth is Pipeline's query-string scheme — ?api_key=...&app_key=..., no
 # Authorization header — confirmed working for reads against this account.
@@ -1250,8 +1294,9 @@ def _dynamo_table():
 
 def get_intro_details(tenant_email):
     """{deal_id_str: {"next_steps", "notes", "follow_up", "status_override",
-    "override_at"}} for every intro item under this tenant, via a single
-    Query on the syndicate-dash table (never one GetItem per deal). Never
+    "override_at", ..., "milestones"}} for every intro item under this
+    tenant, via a single Query on the syndicate-dash table (never one
+    GetItem per deal). Never
     raises: any failure (missing table, network, permissions) returns
     ({}, True) so the caller can fall back to Pipeline-only data and show
     a small note instead of a broken page. Returns (entries,
@@ -1279,6 +1324,7 @@ def get_intro_details(tenant_email):
                 "deadline_override_at": item.get("deadline_override_at"),
                 "stage_override": item.get("stage_override"),
                 "stage_override_at": item.get("stage_override_at"),
+                "milestones": item.get("milestones") or {},
             }
         return out, False
     except Exception:
@@ -1951,6 +1997,34 @@ def _resolve_intro_status(deal, override_entry=None):
     }
 
 
+def _effective_milestones(resolved, milestones):
+    """Ordered (MILESTONE_STEPS order) list of milestones reached for
+    display: every step explicitly recorded in the Dynamo milestones map,
+    plus -- only for a non-exit resolved status -- every step the CURRENT
+    pipeline position implies was already passed (see
+    MILESTONE_PIPELINE_STEP). Stalled/Passed/Withdrawn never backfill --
+    there's no ordered pipeline position to backfill from for an exit
+    state -- so an exit row only ever shows whatever was actually
+    recorded before it exited, per item 1's "never erase milestones"."""
+    reached = set((milestones or {}).keys())
+    if not resolved["is_exit"]:
+        idx = STATUS_INDEX.get(resolved["name"], 0)
+        for step, status_name in MILESTONE_PIPELINE_STEP.items():
+            if STATUS_INDEX.get(status_name, 999) <= idx:
+                reached.add(step)
+    return [s for s in MILESTONE_STEPS if s in reached]
+
+
+def _next_step_suggestion(resolved, milestones):
+    """Item 3: the Next Steps placeholder (shown only while the field is
+    empty -- a native <input placeholder>, never auto-saved) derived from
+    the furthest milestone actually reached, via the same backfilled
+    _effective_milestones list the status cell reads."""
+    reached = [s for s in _effective_milestones(resolved, milestones) if s != "Closed"]
+    furthest = reached[-1] if reached else None
+    return NEXT_STEP_SUGGESTIONS.get(furthest, "Add next step…")
+
+
 # ── Admin write path: Intro Status / Next Steps / Buyer Notes ───────────────
 
 def _pipeline_update_deal_status(deal_id, status_id):
@@ -2027,14 +2101,18 @@ def _tenant_email_for_deal(deal):
 
 
 def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
-                                old_values, actor):
+                                old_values, actor, milestones=None):
     """Update the intro item's Dynamo-owned attributes (status_override/
     override_at when status_id is not None, next_steps/notes/follow_up
     when they are not None, deadline_override/deadline_override_at when
-    deadline is not None) and append an audit item
-    (sk=audit#<deal_id>#<epoch_ms>, actor "admin" or the tenant's own
-    email, old and new values). Returns (ok, error_message). Never called
-    when a requested Pipeline write failed — see _handle_update_intro."""
+    deadline is not None, milestones when milestones is not None -- the
+    caller (_handle_update_intro) has already merged it add-only against
+    the item's prior milestones map, so this just SETs the whole map
+    wholesale rather than touching a single nested key) and append an
+    audit item (sk=audit#<deal_id>#<epoch_ms>, actor "admin" or the
+    tenant's own email, old and new values). Returns (ok, error_message).
+    Never called when a requested Pipeline write failed — see
+    _handle_update_intro."""
     update_parts = []
     expr_names = {}
     expr_values = {}
@@ -2048,6 +2126,10 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         update_parts.append("override_at = :oa")
         expr_values[":oa"] = int(now)
         new_values["status_override"] = status_id
+    if milestones is not None:
+        update_parts.append("milestones = :ms")
+        expr_values[":ms"] = milestones
+        new_values["milestones"] = milestones
     if next_steps is not None:
         update_parts.append("next_steps = :ns")
         expr_values[":ns"] = next_steps
@@ -2494,15 +2576,87 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
     return "".join(blocks)
 
 
+def _buyer_expand_panel_html(buyer_recs):
+    """Item 5 (turn 16): the full detail panel inside each buyer's
+    <details> toggle (see _intro_buyer_cell_html) — everything already
+    disclosable about THIS buyer on THIS intro (full name, entity
+    company, country, tier badge, ticket range, transactor type, full
+    website/LinkedIn/mailto links, closed-with-Rainmaker, and record
+    activity), one block per linked buyer. Nothing about any OTHER
+    company or interest this buyer may have is looked up or shown here —
+    every field read is the same person-record field the collapsed cell
+    and the Buyer Demand tiles already read, just shown untruncated."""
+    now = datetime.now(timezone.utc)
+    blocks = []
+    for r in buyer_recs:
+        cf = r.get("custom_fields") or {}
+        name = _esc(_person_display_name(r) or "—")
+        transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
+        transactor_id = transactor_ids[0] if transactor_ids else None
+        is_natural = transactor_id == NATURAL_PERSON_ID
+        transactor_label = TRANSACTOR_TYPE_LABELS.get(transactor_id, "")
+        company = (r.get("company_name") or "").strip() if not is_natural else ""
+        country = (r.get("work_country") or r.get("home_country") or "").strip()
+        tier = classify_person(cf)
+        tier_label = TIER_LABELS.get(tier, "Unknown")
+        min_v, max_v = get_person_ticket_range(cf)
+        range_text = _fmt_ticket_range(min_v, max_v)
+        email = _person_email_text(r)
+        website = (r.get("website") or "").strip()
+        linked_in = (r.get("linked_in_url") or "").strip()
+        won = r.get("won_deals_total")
+        closed_before = False
+        try:
+            closed_before = won is not None and float(won) > 0
+        except (TypeError, ValueError):
+            pass
+        dt = _parse_dt(r.get("updated_at"))
+        active_recent = bool(dt and (now - dt).days <= 365)
+
+        rows = [f'<div class="buyer-panel-name">{name}</div>']
+        if company:
+            rows.append(f'<div class="buyer-panel-row">{_esc(company)}</div>')
+        if country:
+            rows.append(f'<div class="buyer-panel-row">{_esc(country)}</div>')
+        rows.append(f'<div class="buyer-panel-row"><span class="tier-badge tier-{tier}">'
+                     f'{_esc(tier_label)}</span></div>')
+        if range_text:
+            rows.append(f'<div class="buyer-panel-row">{_esc(range_text)}</div>')
+        if transactor_label:
+            rows.append(f'<div class="buyer-panel-row">{_esc(transactor_label)}</div>')
+        contact_parts = []
+        if email:
+            contact_parts.append(f'<a href="mailto:{_esc(email)}">{_esc(email)}</a>')
+        if website:
+            href = website if "://" in website else f"https://{website}"
+            contact_parts.append(f'<a href="{_esc(href)}" target="_blank" rel="noopener noreferrer">'
+                                  f'{_esc(website)}</a>')
+        if linked_in:
+            href = linked_in if "://" in linked_in else f"https://{linked_in}"
+            contact_parts.append(f'<a href="{_esc(href)}" target="_blank" rel="noopener noreferrer">LinkedIn</a>')
+        if contact_parts:
+            rows.append(f'<div class="buyer-panel-row">{" · ".join(contact_parts)}</div>')
+        if closed_before:
+            rows.append('<div class="buyer-panel-row buyer-panel-flag">Has closed with us</div>')
+        if active_recent:
+            rows.append('<div class="buyer-panel-row buyer-panel-flag">Active this year</div>')
+        blocks.append(f'<div class="buyer-panel-block">{"".join(rows)}</div>')
+    return "".join(blocks)
+
+
 def _intro_buyer_cell_html(buyer_recs):
     """Active Intros' disclosed buyer cell (item 5), three lines: (1) bold
-    name(s), plus a green dot when any linked buyer has closed a deal with
-    Rainmaker before; (2) muted entity company (natural-person buyers
-    never show one) and country, joined by " · "; (3) small muted
-    email(s) as mailto links, website, and LinkedIn, also joined by
-    " · ". Each of lines 2/3 truncates with an ellipsis via CSS rather
-    than wrapping into a wall of text, since the buyer column is narrow
-    by design.
+    name(s) as a <details>/<summary> toggle expanding the full detail
+    panel (_buyer_expand_panel_html) inline — no new page — plus a green
+    dot when any linked buyer has closed a deal with Rainmaker before;
+    (2) muted entity company (natural-person buyers never show one) and
+    country, joined by " · "; (3) small muted email(s) as mailto links,
+    website, and LinkedIn, also joined by " · ". Each of lines 2/3
+    truncates with an ellipsis via CSS rather than wrapping into a wall
+    of text, since the buyer column is narrow by design — the expand
+    panel is where the untruncated version lives. Only ever called for a
+    disclosed (Introduced-or-later) row; pending rows use
+    _pending_buyer_cell_html instead and never get this toggle.
 
     won_deals_total (the closed-with-RMS signal) has never been read by
     any repo in this org, same trust basis as the website/linked_in
@@ -2524,7 +2678,9 @@ def _intro_buyer_cell_html(buyer_recs):
             pass
     dot_html = (' <span class="closed-dot" title="Closed a deal with Rainmaker before"></span>'
                 if any_closed else "")
-    line1 = f'<div class="buyer-cell-name">{", ".join(names)}{dot_html}</div>'
+    line1 = (f'<details class="buyer-expand"><summary class="buyer-cell-name">'
+             f'{", ".join(names)}{dot_html}</summary>'
+             f'{_buyer_expand_panel_html(buyer_recs)}</details>')
 
     first = buyer_recs[0]
     first_cf = first.get("custom_fields") or {}
@@ -2628,15 +2784,45 @@ def _intro_status_select_html(deal_id, current_id, allowed_ids=None):
             f'{"".join(options)}</select><span class="ei-msg"></span>')
 
 
-def _status_column_html(resolved, deal_id, allowed_ids=None):
-    """Item 4: the 7-segment progress strip (or, for an exit state,
-    _status_chip_html instead — Stalled/Passed/Withdrawn were never strip
-    segments) above an editable dropdown. Shared by every editable Active
-    Intros row: admin (allowed_ids=None, all ten) and tenant
-    (allowed_ids=TENANT_ALLOWED_STATUS_IDS, only ever called on an
-    already-disclosed row — see _intro_row_html)."""
-    display_html = (_status_chip_html(resolved["id"], resolved["name"]) if resolved["is_exit"]
-                     else _status_strip_html(resolved["name"]))
+def _status_cell_display_html(resolved, milestones):
+    """Item 2 (turn 16): the read side of the Active Intros status cell,
+    three parts, any of which can be empty:
+    (1) one compact line of reached milestones ("NDA ✓ · VDR ✓"), or the
+        current status name alone when nothing beyond Introduced has been
+        reached yet (_effective_milestones already backfills implied
+        steps from the current pipeline position);
+    (2) the exit flag, ONLY when the row is actually flagged — amber
+        "Stalled", gray "Passed"/"Withdrawn" — reusing the existing
+        .status-chip styling rather than the old _status_chip_html's
+        wordier "Stalled — needs a nudge" text, which this replaces;
+    (3) a muted "Awaiting our confirmation" note on a Wired-not-yet-
+        Closed row.
+    Replaces the old 7-segment strip entirely — that strip and this
+    milestones line both existed only to show the same underlying
+    progress, which is what made the old cell (strip + chip + dropdown)
+    read as a duplicate of its own dropdown value."""
+    reached = _effective_milestones(resolved, milestones)
+    milestone_text = " · ".join(f"{step} ✓" for step in reached) if reached else resolved["name"]
+    line_html = f'<div class="status-line">{_esc(milestone_text)}</div>'
+
+    flag_html = ""
+    if resolved["is_exit"]:
+        flag_cls = "stalled" if resolved["id"] == INTRO_STATUS_STALLED_ID else "exit"
+        flag_html = f'<span class="status-chip {flag_cls}">{_esc(resolved["name"])}</span>'
+
+    awaiting_html = ('<div class="status-awaiting">Awaiting our confirmation</div>'
+                      if resolved["name"] == "Wired" else "")
+
+    return f'{line_html}{flag_html}{awaiting_html}'
+
+
+def _status_column_html(resolved, deal_id, milestones, allowed_ids=None):
+    """The full editable Active Intros status cell: _status_cell_display_html
+    above an editable dropdown. Shared by every editable row: admin
+    (allowed_ids=None, all ten) and tenant (allowed_ids=
+    TENANT_ALLOWED_STATUS_IDS, only ever called on an already-disclosed
+    row — see _intro_row_html)."""
+    display_html = _status_cell_display_html(resolved, milestones)
     select_html = _intro_status_select_html(deal_id, resolved["id"], allowed_ids=allowed_ids)
     return f'<div class="status-column">{display_html}{select_html}</div>'
 
@@ -3004,18 +3190,57 @@ def _group_empty_row_html(message, colspan):
     return f'<tr><td colspan="{colspan}" class="group-empty">{_esc(message)}</td></tr>'
 
 
+def _company_update_link_html(person_id, company_name):
+    """Item 6 (turn 16): a small muted "Update deal ->" link under the
+    company name on each Active Intros row, to the tenant's own Sell
+    Order deal for that company (get_my_sell_deals — never the buy-side
+    intro deal this row itself represents) via the same minted deal-
+    update-form URL as My Deals' Update/Cancel button. Most-recently-
+    updated Sell deal wins when a tenant somehow has more than one on
+    file for the same company (get_my_deals already sorts that way).
+    Omitted outright when HMAC_SECRET isn't configured (see
+    _deal_update_form_url, which returns None) or the tenant has no Sell
+    deal on file for this company."""
+    sell_deals = get_my_sell_deals(person_id, company_name)
+    if not sell_deals:
+        return ""
+    update_url = _deal_update_form_url(str(sell_deals[0].get("id")))
+    if not update_url:
+        return ""
+    return (f'<div class="company-update-link"><a href="{update_url}" target="_blank" '
+            f'rel="noopener noreferrer">Update deal &rarr;</a></div>')
+
+
+def _investor_type_cell_html(buyer_recs):
+    """Item 4 (turn 16): the Investor Type cell's text plus, on its own
+    line beneath it, the same tier badge (QP/Accredited/Unknown via
+    classify_person) the Pending Introductions / Buyer Demand tiles
+    already use — computed from the first linked buyer, the same "first
+    buyer" convention _investor_type_and_company already uses for type/
+    company."""
+    investor_type, _company_text = _investor_type_and_company(buyer_recs, disclosed=True)
+    tier_html = ""
+    if buyer_recs:
+        tier = classify_person(buyer_recs[0].get("custom_fields") or {})
+        tier_label = TIER_LABELS.get(tier, "Unknown")
+        tier_html = f'<div class="tier-badge tier-{tier}">{_esc(tier_label)}</div>'
+    return f'{_esc(investor_type)}{tier_html}'
+
+
 def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=None, view_as=None,
                      editable=False, company_repeated=False):
-    """Tenant-facing Introduced-or-later row (item 1/4/5/6 columns:
-    Company | Buyer | Investor Type | Size | Status | Next Steps |
-    Follow-up). editable=True (tenant_edit_mode — see render_intros_page)
-    makes Status (restricted to TENANT_ALLOWED_STATUS_IDS — see
-    _status_column_html) and Next Steps/Follow-up all auto-saving inputs,
-    except on a Passed/Withdrawn row, which renders Next Steps/Follow-up
-    as read-only text instead — nothing left to plan for a dead intro.
-    company_repeated (item 7) blanks the company cell and adds a subtle
-    left-accent instead of repeating the same company name row after
-    row."""
+    """Tenant-facing Introduced-or-later row: Company | Buyer | Investor
+    Type | Size | Status | Next Steps | Follow-up. editable=True
+    (tenant_edit_mode — see render_intros_page) makes Status (restricted
+    to TENANT_ALLOWED_STATUS_IDS — see _status_column_html) and Next
+    Steps/Follow-up all auto-saving inputs, except on a Passed/Withdrawn
+    row, which renders Next Steps/Follow-up as read-only text instead —
+    nothing left to plan for a dead intro. The Next Steps placeholder
+    (turn 16, item 3) is the suggested action for the furthest milestone
+    reached, not a fixed string. company_repeated (item 7) blanks the
+    company cell (and its Update-deal link, turn 16 item 6) and adds a
+    subtle left-accent instead of repeating the same company name row
+    after row."""
     company_name = _deal_company_name(deal)
     if company_repeated:
         company_cell = ""
@@ -3023,6 +3248,7 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     elif company_name:
         company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
                         f'{_esc(company_name)}</a>')
+        company_cell += _company_update_link_html(tenant_person_id, company_name)
         row_cls = ""
     else:
         company_cell = "—"
@@ -3031,22 +3257,24 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
     buyer_cell = _intro_buyer_cell_html(buyer_recs)
-    investor_type, _company_text = _investor_type_and_company(buyer_recs, disclosed=True)
+    investor_type_cell = _investor_type_cell_html(buyer_recs)
 
     size_text = _esc(_deal_size_text(deal))
     deal_id = str(deal.get("id"))
+    milestones = entry.get("milestones")
 
     if editable:
-        status_html = _status_column_html(resolved, deal_id, allowed_ids=TENANT_ALLOWED_STATUS_IDS)
+        status_html = _status_column_html(resolved, deal_id, milestones, allowed_ids=TENANT_ALLOWED_STATUS_IDS)
     else:
-        status_html = _status_display_html(resolved, compact=False)
+        status_html = _status_cell_display_html(resolved, milestones)
     if _follow_up_is_due(entry.get("follow_up")):
         status_html += _due_chip_html()
 
     is_dead = resolved["name"] in ("Passed", "Withdrawn")
     if editable and not is_dead:
+        suggestion = _next_step_suggestion(resolved, milestones)
         next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""),
-                                          placeholder="Add next step…")
+                                          placeholder=suggestion)
         follow_up_html = _ei_date_field_html(deal_id, _esc(entry.get("follow_up") or ""))
     else:
         next_steps_html = _esc(entry.get("next_steps") or "—")
@@ -3056,7 +3284,7 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     return (
         f'<tr{row_cls}><td class="company">{company_cell}</td>'
         f'<td>{buyer_cell}</td>'
-        f'<td>{_esc(investor_type)}</td>'
+        f'<td>{investor_type_cell}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
         f'<td>{next_steps_html}</td>'
@@ -3064,17 +3292,23 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     )
 
 
-def _pending_intro_row_html(deal, buyer_recs, anon_key_email, follow_up=None, key=None, view_as=None,
-                             company_repeated=False):
+def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, follow_up=None, key=None,
+                             view_as=None, company_repeated=False):
     """Pending rows never get inputs — only Introduced-or-later rows are
-    editable, disclosed or not. company_repeated: see _intro_row_html."""
+    editable, disclosed or not — but they still get the Update-deal link
+    (turn 16, item 6), which is about the tenant's own Sell deal, not
+    buyer disclosure. company_repeated: see _intro_row_html."""
     company_name = _deal_company_name(deal)
     if company_repeated:
         company_cell = ""
         row_cls = ' class="pending-row grouped-row"'
-    else:
+    elif company_name:
         company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
-                        f'{_esc(company_name)}</a>') if company_name else "—"
+                        f'{_esc(company_name)}</a>')
+        company_cell += _company_update_link_html(tenant_person_id, company_name)
+        row_cls = ' class="pending-row"'
+    else:
+        company_cell = "—"
         row_cls = ' class="pending-row"'
     buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
     size_text = _esc(_deal_size_text(deal))
@@ -3105,28 +3339,34 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
     if company_repeated:
         company_cell = ""
         row_cls = ' class="grouped-row"'
-    else:
+    elif company_name:
         company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
-                        f'{_esc(company_name)}</a>') if company_name else "—"
+                        f'{_esc(company_name)}</a>')
+        company_cell += _company_update_link_html(tenant_person_id, company_name)
+        row_cls = ""
+    else:
+        company_cell = "—"
         row_cls = ""
 
     linked = _deal_linked_person_ids(deal) - {tenant_person_id}
     buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
     buyer_cell = _intro_buyer_cell_html(buyer_recs)
-    investor_type, _company_text = _investor_type_and_company(buyer_recs, disclosed=True)
+    investor_type_cell = _investor_type_cell_html(buyer_recs)
 
     size_text = _esc(_deal_size_text(deal))
-    status_html = _status_column_html(resolved, deal_id, allowed_ids=None)
+    milestones = entry.get("milestones")
+    status_html = _status_column_html(resolved, deal_id, milestones, allowed_ids=None)
     if _follow_up_is_due(entry.get("follow_up")):
         status_html += _due_chip_html()
+    suggestion = _next_step_suggestion(resolved, milestones)
     next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""),
-                                      placeholder="Add next step…")
+                                      placeholder=suggestion)
     follow_up_html = _ei_date_field_html(deal_id, _esc(entry.get("follow_up") or ""))
 
     return (
         f'<tr{row_cls}><td class="company">{company_cell}</td>'
         f'<td>{buyer_cell}</td>'
-        f'<td>{_esc(investor_type)}</td>'
+        f'<td>{investor_type_cell}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
         f'<td>{next_steps_html}</td>'
@@ -3306,8 +3546,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                         linked = _deal_linked_person_ids(d) - {person_id}
                         buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
                         follow_up = _entry_for(d).get("follow_up")
-                        parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, follow_up=follow_up,
-                                                              key=key, view_as=view_as,
+                        parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, person_id,
+                                                              follow_up=follow_up, key=key, view_as=view_as,
                                                               company_repeated=pending_repeats[i]))
 
             rows_html = "".join(parts)
@@ -3415,17 +3655,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .gg-link {{ color: var(--accent); font-weight: 600; text-decoration: none; }}
   .gg-link:hover {{ text-decoration: underline; }}
   .status-column {{ display: flex; flex-direction: column; gap: 6px; }}
-  .status-strip {{ display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }}
-  .status-step {{
-    width: 14px;
-    height: 6px;
-    border-radius: 3px;
-    background: var(--line);
-    flex: 0 0 auto;
-  }}
-  .status-step.done {{ background: var(--qp); }}
-  .status-step.current {{ background: var(--accent); }}
-  .status-label {{ font-size: 12px; color: var(--muted); margin-left: 6px; white-space: nowrap; }}
+  .status-line {{ font-size: 13px; color: var(--ink); }}
+  .status-awaiting {{ font-size: 12px; color: var(--muted); font-style: italic; }}
   .status-pill {{
     display: inline-block;
     font-size: 11px;
@@ -3514,6 +3745,33 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   }}
   .buyer-cell-links a {{ color: var(--accent); text-decoration: none; }}
   .buyer-cell-links a:hover {{ text-decoration: underline; }}
+  .buyer-expand summary {{ cursor: pointer; list-style: none; }}
+  .buyer-expand summary::-webkit-details-marker {{ display: none; }}
+  .buyer-expand summary::after {{
+    content: "▸";
+    display: inline-block;
+    margin-left: 5px;
+    font-size: 10px;
+    color: var(--muted);
+    transition: transform 0.15s;
+  }}
+  .buyer-expand[open] summary::after {{ transform: rotate(90deg); }}
+  .buyer-panel-block {{
+    margin-top: 8px;
+    padding: 9px 11px;
+    background: var(--bg);
+    border-radius: 6px;
+    font-size: 12px;
+  }}
+  .buyer-panel-block + .buyer-panel-block {{ margin-top: 6px; }}
+  .buyer-panel-name {{ font-weight: 600; margin-bottom: 4px; }}
+  .buyer-panel-row {{ color: var(--ink); margin-top: 3px; }}
+  .buyer-panel-row a {{ color: var(--accent); text-decoration: none; }}
+  .buyer-panel-row a:hover {{ text-decoration: underline; }}
+  .buyer-panel-flag {{ color: var(--qp); font-weight: 600; }}
+  .company-update-link {{ margin-top: 3px; }}
+  .company-update-link a {{ font-size: 12px; color: var(--muted); text-decoration: none; }}
+  .company-update-link a:hover {{ color: var(--accent); text-decoration: underline; }}
   .closed-dot {{
     display: inline-block;
     width: 7px;
@@ -4957,14 +5215,17 @@ def _handle_update_intro(event):
       stays admin-only.
 
     Order: validate -> look up the deal and its owning tenant -> resolve
-    the row's CURRENT status (needed for the tenant transition check) ->
-    if status or deadline is part of the write, PUT it to Pipeline first
-    and abort the whole request (writing nothing to Dynamo) on any
-    non-2xx -> write the Dynamo intro-item update (status_override/
-    override_at, next_steps, notes, follow_up, deadline_override/
-    deadline_override_at) -> append an audit item (actor = tenant email or
-    "admin"). Never raises past this function; every failure mode returns
-    a JSON error the UI can show."""
+    the row's CURRENT status (needed for the tenant transition check AND
+    to backfill implied-reached milestones) -> if status or deadline is
+    part of the write, PUT it to Pipeline first and abort the whole
+    request (writing nothing to Dynamo) on any non-2xx -> write the
+    Dynamo intro-item update (status_override/override_at, next_steps,
+    notes, follow_up, deadline_override/deadline_override_at, and —
+    item 1 — milestones when the new status is one of
+    MILESTONE_STATUS_IDS and that step hasn't already been recorded) ->
+    append an audit item (actor = tenant email or "admin"). Never raises
+    past this function; every failure mode returns a JSON error the UI
+    can show."""
     body = _parse_json_body(event)
 
     admin_key = os.environ.get("ADMIN_KEY")
@@ -5054,6 +5315,19 @@ def _handle_update_intro(event):
         "deadline": _resolve_deal_deadline(deal, old_entry),
     }
 
+    # Item 1: a status write that lands on NDA/VDR/Sub Docs/Wired/Closed
+    # records that milestone -- once. If it was already in the map (e.g.
+    # re-selecting the same status, or moving forward again after
+    # Stalled), nothing changes; milestones is only passed to the Dynamo
+    # write when there's a genuinely new step to add.
+    milestones_update = None
+    if status_id is not None and status_id in MILESTONE_STATUS_IDS:
+        step = MILESTONE_STATUS_IDS[status_id]
+        old_milestones = old_entry.get("milestones") or {}
+        if step not in old_milestones:
+            milestones_update = dict(old_milestones)
+            milestones_update[step] = int(time.time())
+
     if status_id is not None:
         ok, err = _pipeline_update_deal_status(deal_id, status_id)
         if not ok:
@@ -5066,7 +5340,7 @@ def _handle_update_intro(event):
 
     actor = "admin" if is_admin else tenant_identity_email
     ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
-                                          old_values, actor)
+                                          old_values, actor, milestones=milestones_update)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
 
