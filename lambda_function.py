@@ -235,6 +235,23 @@ def _update_cancel_button_html(deal_id):
     return (f'<a class="update-cancel-btn" href="{url}" target="_blank" rel="noopener noreferrer">'
             'Update / Cancel</a>')
 
+
+# Public buyer-facing deal detail page. Verified verbatim in
+# chadgracia/trades (the link the live marketplace grid itself puts on
+# every deal id: f"https://trades.graciagroup.com/deal/{deal['id']}"),
+# and confirmed as the route chadgracia/CRMDealDetails serves (it reads
+# deal_id from either the query string or a path param, fetches the deal
+# from Pipeline unconditionally, and renders — no auth/visibility gate,
+# so every deal id resolves to a real page; there is no "no public page"
+# case to fall back from). Note this is trades.graciagroup.com, not
+# desk.graciagroup.com — the two are separate CloudFront routes serving
+# different Lambdas (desk.graciagroup.com/update/ is deal-update-form,
+# desk.graciagroup.com/bid/ is trades' bid submission; trades.graciagroup.com/deal/
+# is CRMDealDetails).
+def _deal_public_url(deal_id):
+    return f"https://trades.graciagroup.com/deal/{deal_id}"
+
+
 # Deal Card section. Agent Agreement field id, and the "Yes" option ids,
 # verified verbatim in chadgracia/daily-brief (CF_AGENT_AGREEMENT,
 # AGENT_YES_OPTS); storage shape (scalar OR list) confirmed in
@@ -1387,6 +1404,49 @@ def _engagement_badge_html(deal, company):
             '&#10007; Not engaged — contact us to activate this deal</a>')
 
 
+def _my_deal_size_text(deal):
+    """"$1M – $5M" from min/max ticket size (TICKET_MIN_FIELD/
+    TICKET_MAX_FIELD); a single value when only one of the two is set;
+    falls back to the deal's own "value" field, same as _deal_size_text,
+    when neither is set."""
+    min_val = _deal_cf_number(deal, TICKET_MIN_FIELD)
+    max_val = _deal_cf_number(deal, TICKET_MAX_FIELD)
+    if min_val is not None and max_val is not None:
+        return f"{_fmt_money(min_val)} – {_fmt_money(max_val)}"
+    if max_val is not None:
+        return _fmt_money(max_val)
+    if min_val is not None:
+        return _fmt_money(min_val)
+    try:
+        return _fmt_money(float(deal.get("value")))
+    except (TypeError, ValueError):
+        return _fmt_money(None)
+
+
+def _my_deal_visibility_state(deal, cef_state):
+    """"live" (Agent Agreement Yes), "setup" (In Process, or the tenant's
+    own CEF is Yes), or "not_live" — single source of truth shared by the
+    My Deals visibility badge and its summary-strip counts."""
+    opts = _deal_cf_option_ids(deal, AGENT_AGREEMENT_FIELD)
+    if opts & AGENT_ENGAGED_OPTS:
+        return "live"
+    if (opts & AGENT_IN_PROCESS_OPTS) or cef_state == CEF_YES_ID:
+        return "setup"
+    return "not_live"
+
+
+def _my_deal_visibility_badge_html(deal, company, cef_state):
+    state = _my_deal_visibility_state(deal, cef_state)
+    if state == "live":
+        return '<span class="visibility-badge live">Live — shown to buyers</span>'
+    if state == "setup":
+        return '<span class="visibility-badge setup">Setup in progress</span>'
+    subject = urllib.parse.quote(f"Engage RMS re {company}", safe="")
+    href = f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}"
+    return (f'<a class="visibility-badge not-live" href="{href}">'
+            'Not live — engage to activate</a>')
+
+
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
@@ -2324,58 +2384,79 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 </html>"""
 
 
-def _my_deal_row_html(deal, key=None, view_as=None):
-    company_name = _deal_company_name(deal)
+def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, key=None, view_as=None,
+                       edit_mode=False):
+    deal_id = str(deal.get("id"))
     if company_name:
-        company = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
-                   f'{_esc(company_name)}</a>')
+        company_cell = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
+                         f'{_esc(company_name)}</a>')
     else:
-        company = "—"
-    name = _esc(_deal_title(deal))
+        company_cell = "—"
 
-    side_ids = _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
-    if DEAL_SIDE_SELL_ID in side_ids:
-        side = "Sell"
-    elif DEAL_SIDE_BUY_ID in side_ids:
-        side = "Buy"
+    public_url = _deal_public_url(deal_id)
+    deal_id_cell = (
+        f'<a href="{public_url}" target="_blank" rel="noopener noreferrer">#{deal_id}</a>'
+        f'<button type="button" class="copy-link-btn" data-copy-url="{public_url}" '
+        f'title="Copy link" aria-label="Copy deal link">&#128203;</button>'
+    )
+
+    size_text = _esc(_my_deal_size_text(deal))
+    badge_html = _my_deal_visibility_badge_html(deal, company_name or "", cef_state)
+
+    buyer_text = str(buyer_count)
+    intro_text = str(stats["intro_count"]) if stats["intro_count"] else "—"
+
+    is_overdue = False
+    if deadline:
+        deadline_dt = _parse_dt(deadline)
+        is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
+
+    if edit_mode:
+        deadline_css = "ei-deadline overdue-input" if is_overdue else "ei-deadline"
+        deadline_html = _ei_date_field_html(deal_id, deadline or "", css_class=deadline_css, field="deadline")
+    elif deadline:
+        deadline_cls = ' class="deadline-overdue"' if is_overdue else ""
+        deadline_html = f'<span{deadline_cls}>{_esc(deadline)}</span>'
     else:
-        side = "—"
+        deadline_html = "—"
 
-    sid = _deal_stage_id(deal)
-    stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
+    reasons = []
+    if is_overdue:
+        reasons.append("Deadline passed")
+    if stats["stalled"]:
+        reasons.append("A buyer is Stalled")
+    if stats["follow_up_due"]:
+        reasons.append("Follow-up due")
+    attention_html = ""
+    if reasons:
+        tooltip = _esc(" · ".join(reasons))
+        attention_html = f'<span class="attention-chip" title="{tooltip}">Needs attention</span>'
 
-    ticket_max = _deal_cf_number(deal, TICKET_MAX_FIELD)
-    ticket_min = _deal_cf_number(deal, TICKET_MIN_FIELD)
-    size_val = ticket_max if ticket_max is not None else ticket_min
-    size_text = _fmt_money(size_val)
-
-    gross_val = _deal_cf_number(deal, GROSS_FIELD)
-    gross_text = _fmt_money(gross_val)
-
-    struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
-    layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
-    parts = [p for p in (struct_label, layer_label) if p]
-    structure = _esc(" · ".join(parts)) if parts else "—"
-
-    updated = _esc((deal.get("updated_at") or "")[:10] or "—")
-    update_btn = _update_cancel_button_html(str(deal.get("id")))
+    update_btn = _update_cancel_button_html(deal_id)
 
     return (
-        f'<tr><td class="company">{company}</td>'
-        f'<td>{name}</td>'
-        f'<td>{side}</td>'
-        f'<td>{stage}</td>'
-        f'<td class="num" data-sort="{size_val if size_val is not None else -1}">{size_text}</td>'
-        f'<td class="num" data-sort="{gross_val if gross_val is not None else -1}">{gross_text}</td>'
-        f'<td>{structure}</td>'
-        f'<td>{updated}</td>'
+        f'<tr><td class="company">{company_cell}</td>'
+        f'<td class="deal-id">{deal_id_cell}</td>'
+        f'<td>{size_text}</td>'
+        f'<td>{badge_html}</td>'
+        f'<td class="num">{buyer_text}</td>'
+        f'<td class="num">{intro_text}</td>'
+        f'<td>{deadline_html}</td>'
+        f'<td>{attention_html}</td>'
         f'<td class="actions">{update_btn}</td></tr>'
     )
 
 
-def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None, cef_html=""):
-    nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, cef_html=cef_html)
+def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None, cef_html="",
+                          edit_mode=False, person_id=None, anon_key_email=None):
+    """deals is always Sell-order-tagged only (see lambda_handler's mydeals
+    branch). person_id/anon_key_email are needed here (not just deals)
+    because the Buyers/Intros/Needs-attention columns are company-level
+    buy-side signals, not attributes of the Sell deal itself."""
+    nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
 
+    summary_html = ""
+    edit_script = ""
     if tenant_picker:
         body_html = (
             '<div class="gg-placeholder">Pick a tenant to preview — '
@@ -2384,27 +2465,122 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     elif not deals:
         body_html = '<div class="gg-placeholder">No deals yet.</div>'
     else:
-        rows_html = "".join(_my_deal_row_html(d, key=key, view_as=view_as) for d in deals)
+        company_table = get_company_table()
+        buyer_counts = {row["company"].strip().lower(): row["total"] for row in company_table}
+
+        intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
+        cef_state = _tenant_cef_state(person_id)
+
+        # Per-company buy-side aggregation (Intros count, Stalled/follow-up
+        # flags), memoized per distinct company so two Sell deals for the
+        # same company don't redo the same get_my_matched_buy_deals scan.
+        company_stats_cache = {}
+
+        def _company_stats(company_name):
+            cache_key = (company_name or "").strip().lower()
+            if cache_key in company_stats_cache:
+                return company_stats_cache[cache_key]
+            matched = (get_my_matched_buy_deals(person_id, company_name)
+                       if person_id is not None and company_name else [])
+            intro_count = 0
+            stalled = False
+            follow_up_due = False
+            for d in matched:
+                entry = intro_details.get(str(d.get("id"))) or {}
+                resolved = _resolve_intro_status(d, entry)
+                if resolved["disclosed"]:
+                    intro_count += 1
+                if resolved["id"] == INTRO_STATUS_STALLED_ID:
+                    stalled = True
+                if _follow_up_is_due(entry.get("follow_up")):
+                    follow_up_due = True
+            stats = {"intro_count": intro_count, "stalled": stalled, "follow_up_due": follow_up_due}
+            company_stats_cache[cache_key] = stats
+            return stats
+
+        rows = []
+        for d in deals:
+            company_name = _deal_company_name(d)
+            override_entry = intro_details.get(str(d.get("id"))) or {}
+            deadline = _resolve_deal_deadline(d, override_entry)
+            rows.append({
+                "deal": d,
+                "company_name": company_name,
+                "deadline": deadline,
+                "stats": _company_stats(company_name),
+                "buyer_count": buyer_counts.get((company_name or "").strip().lower(), 0),
+            })
+
+        # Deadline ascending (ISO yyyy-mm-dd sorts correctly as a string),
+        # no-deadline rows last, then company A-Z.
+        rows.sort(key=lambda r: ((0, r["deadline"]) if r["deadline"] else (1, ""),
+                                  (r["company_name"] or "").lower()))
+
+        live_count = 0
+        not_engaged_count = 0
+        intros_total = 0
+        attention_count = 0
+        deadlines = []
+        row_htmls = []
+        for r in rows:
+            d = r["deal"]
+            deadline = r["deadline"]
+            stats = r["stats"]
+            is_overdue = False
+            if deadline:
+                deadline_dt = _parse_dt(deadline)
+                is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
+                deadlines.append(deadline)
+
+            if is_overdue or stats["stalled"] or stats["follow_up_due"]:
+                attention_count += 1
+            intros_total += stats["intro_count"]
+
+            state = _my_deal_visibility_state(d, cef_state)
+            if state == "live":
+                live_count += 1
+            elif state == "not_live":
+                not_engaged_count += 1
+
+            row_htmls.append(_my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
+                                                key=key, view_as=view_as, edit_mode=edit_mode))
+
+        summary_parts = []
+        if live_count:
+            summary_parts.append(f"{live_count} live")
+        if not_engaged_count:
+            summary_parts.append(f"{not_engaged_count} not engaged")
+        if intros_total:
+            summary_parts.append(f"{intros_total} intros in motion")
+        if attention_count:
+            summary_parts.append(f"{attention_count} need attention")
+        if deadlines:
+            summary_parts.append(f"next deadline {deadlines[0]}")
+        summary_html = (f'<p class="mydeals-summary">{_esc(" · ".join(summary_parts))}</p>'
+                         if summary_parts else "")
+
+        rows_html = "".join(row_htmls)
         body_html = f"""<div class="card">
-    <table id="board">
+    <table>
       <thead>
         <tr>
-          <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
-          <th data-key="name" data-type="string">Deal<span class="arrow"></span></th>
-          <th data-key="side" data-type="string">Buy/Sell<span class="arrow"></span></th>
-          <th data-key="stage" data-type="string">Stage<span class="arrow"></span></th>
-          <th class="num" data-key="size" data-type="number">Size<span class="arrow"></span></th>
-          <th class="num" data-key="gross" data-type="number">Gross price<span class="arrow"></span></th>
-          <th data-key="structure" data-type="string">Structure/Layers<span class="arrow"></span></th>
-          <th data-key="updated" data-type="string">Last updated<span class="arrow"></span></th>
+          <th>Company</th>
+          <th>Deal ID</th>
+          <th>Size</th>
+          <th>Visibility</th>
+          <th class="num">Buyers</th>
+          <th class="num">Intros</th>
+          <th>Deadline</th>
+          <th></th>
           <th></th>
         </tr>
       </thead>
-      <tbody id="board-body">
+      <tbody>
         {rows_html}
       </tbody>
     </table>
   </div>"""
+        edit_script = _edit_script_html(key) if edit_mode else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -2421,6 +2597,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     --ink: #e8eaed;
     --muted: #9aa0ac;
     --accent: #4f8cff;
+    --qp: #2e9d6a;
+    --accredited: #c9a227;
   }}
   * {{ box-sizing: border-box; }}
   body {{
@@ -2430,8 +2608,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     padding: 32px 24px 64px;
   }}
-  .wrap {{ max-width: 1000px; margin: 0 auto; }}
-  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 24px; }}
+  .wrap {{ max-width: 1100px; margin: 0 auto; }}
+  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
+  .mydeals-summary {{ color: var(--muted); font-size: 13px; margin: 0 0 20px; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--line);
@@ -2458,13 +2637,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     color: var(--muted);
     padding: 12px 16px;
     border-bottom: 1px solid var(--line);
-    cursor: pointer;
-    user-select: none;
     white-space: nowrap;
   }}
-  thead th:hover {{ color: var(--ink); }}
   thead th.num, td.num {{ text-align: right; }}
-  thead th .arrow {{ font-size: 10px; margin-left: 4px; color: var(--accent); }}
   tbody td {{
     padding: 11px 16px;
     border-bottom: 1px solid var(--line);
@@ -2475,6 +2650,20 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   td.company {{ font-weight: 500; }}
   td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
   td.company a:hover {{ border-bottom-color: var(--muted); }}
+  td.deal-id {{ white-space: nowrap; }}
+  td.deal-id a {{ color: var(--accent); text-decoration: none; }}
+  td.deal-id a:hover {{ text-decoration: underline; }}
+  .copy-link-btn {{
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 12px;
+    margin-left: 4px;
+    padding: 2px;
+    vertical-align: middle;
+  }}
+  .copy-link-btn:hover {{ color: var(--ink); }}
   td.actions {{ white-space: nowrap; }}
   .update-cancel-btn {{
     display: inline-block;
@@ -2487,6 +2676,46 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     text-decoration: none;
   }}
   .update-cancel-btn:hover {{ text-decoration: underline; }}
+  .visibility-badge {{
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 600;
+    padding: 4px 10px;
+    border-radius: 999px;
+    text-decoration: none;
+    white-space: nowrap;
+  }}
+  .visibility-badge.live {{ background: rgba(46,157,106,0.15); color: var(--qp); }}
+  .visibility-badge.setup {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .visibility-badge.not-live {{ background: rgba(220,80,80,0.15); color: #e06666; }}
+  .visibility-badge.not-live:hover {{ text-decoration: underline; }}
+  .deadline-overdue {{ color: #e06666; font-weight: 600; }}
+  .ei-deadline.overdue-input {{ border-color: #e06666; }}
+  .attention-chip {{
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: rgba(220,80,80,0.15);
+    color: #e06666;
+    white-space: nowrap;
+  }}
+  .ei-deadline {{
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 13px;
+    width: 150px;
+  }}
+  .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
+  .ei-msg.saving {{ color: var(--muted); }}
+  .ei-msg.saved {{ color: var(--qp); }}
+  .ei-msg.error {{ color: #e06666; }}
   .gg-placeholder {{
     max-width: 1000px;
     margin: 96px auto;
@@ -2501,48 +2730,20 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 {nav}
 <div class="wrap">
   <h1>My Deals</h1>
+  {summary_html}
   {body_html}
 </div>
+{edit_script}
 <script>
 (function() {{
-  var tbody = document.getElementById('board-body');
-  if (!tbody) return;
-  var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
-  var headers = document.querySelectorAll('#board thead th[data-key]');
-  var sortState = {{ key: null, dir: 1 }};
-
-  function cellSortValue(row, colIndex) {{
-    var cell = row.children[colIndex];
-    var raw = cell.getAttribute('data-sort');
-    return raw !== null ? raw : cell.textContent.trim();
-  }}
-
-  function applySort(colIndex, key, type) {{
-    var dir = (sortState.key === key) ? -sortState.dir : 1;
-    sortState = {{ key: key, dir: dir }};
-    headers.forEach(function(h) {{
-      var arrow = h.querySelector('.arrow');
-      if (!arrow) return;
-      arrow.textContent = '';
-    }});
-    var activeHeader = headers[colIndex];
-    var arrow = activeHeader.querySelector('.arrow');
-    if (arrow) arrow.textContent = dir === 1 ? '\\u25B2' : '\\u25BC';
-
-    rows.sort(function(a, b) {{
-      var av = cellSortValue(a, colIndex);
-      var bv = cellSortValue(b, colIndex);
-      if (type === 'number') {{
-        return (parseFloat(av) - parseFloat(bv)) * dir;
-      }}
-      return av.localeCompare(bv) * dir;
-    }});
-    rows.forEach(function(row) {{ tbody.appendChild(row); }});
-  }}
-
-  headers.forEach(function(h, idx) {{
-    h.addEventListener('click', function() {{
-      applySort(idx, h.getAttribute('data-key'), h.getAttribute('data-type'));
+  document.querySelectorAll('.copy-link-btn').forEach(function(btn) {{
+    btn.addEventListener('click', function() {{
+      var url = btn.getAttribute('data-copy-url');
+      var orig = btn.textContent;
+      navigator.clipboard.writeText(url).then(function() {{
+        btn.textContent = '\\u2713';
+        setTimeout(function() {{ btn.textContent = orig; }}, 1500);
+      }}).catch(function() {{}});
     }});
   }});
 }})();
@@ -3582,7 +3783,8 @@ def lambda_handler(event, context):
             deals = ([d for d in get_my_deals(person_id) if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)]
                      if person_id is not None else [])
             body = render_my_deals_page(viewer_name, deals=deals,
-                                         key=nav_key, view_as=nav_view_as, cef_html=cef_html)
+                                         key=nav_key, view_as=nav_view_as, cef_html=cef_html,
+                                         edit_mode=edit_mode, person_id=person_id, anon_key_email=anon_key_email)
     else:
         body = render_intros_page(viewer_name, tenant=tenant, tenant_email=anon_key_email,
                                    key=nav_key, view_as=nav_view_as, edit_mode=edit_mode,
