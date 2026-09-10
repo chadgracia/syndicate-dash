@@ -246,27 +246,29 @@ def _deal_update_form_url(deal_id):
     return f"{DEAL_UPDATE_FORM_URL}?deal_id={deal_id}&token={token}"
 
 
-def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow_up_due, needs_agreement,
+def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow_up_due, visibility_state,
                                no_interest, key=None, view_as=None):
-    """Item 2/3 (the "Next Steps" column): ONE specific action chip per
-    row, chosen by priority (highest first) — replaces the old generic
-    "Needs attention" chip. Priority: deadline passed > no interest
-    (item 3: last notification >3 days old and zero Introduced-or-later
-    intros) > nudge buyers (a stalled or overdue-follow-up intro) > sign
-    agreement. no_interest and nudge are mutually exclusive by
-    construction — nudge requires an existing intro, no_interest
-    requires zero — so their relative order never actually matters, but
-    is given in the specified sequence regardless. ID-missing is
-    deliberately excluded here: that's the Visibility column's own job
-    (see _my_deal_visibility_badge_html's "need_cef" state) and must
-    never be duplicated in this chip. When more than one condition
-    applies, the top-priority chip carries a title/tooltip naming the
-    rest."""
+    """Next Steps (item 2): ONE specific action chip per row, chosen by
+    priority (highest first): a) deadline passed (red, Update link) >
+    b) terms incomplete (red, Update link) > c) no interest (amber: last
+    real notification >3 days old and zero Introduced-or-later intros)
+    > d) nudge buyers (amber: a stalled or overdue-follow-up intro) >
+    e) ID required (red, CEF form link) > f) sign agreement (amber,
+    agreement template link). At most one of {b, e, f} ever applies —
+    they're the three "not live" visibility_state values and that state
+    machine is first-match-wins (see _my_deal_visibility_state) — while
+    a/c/d are independent conditions that can co-occur with any of them
+    or each other. When more than one candidate applies, the top-priority
+    chip carries a title/tooltip naming the rest."""
     candidates = []
     if is_overdue:
         update_url = _deal_update_form_url(deal_id)
         if update_url:
             candidates.append(("update deadline", "overdue", "Update deadline &rarr;", update_url, True))
+    if visibility_state == "terms_incomplete":
+        update_url = _deal_update_form_url(deal_id)
+        if update_url:
+            candidates.append(("provide deal terms", "terms", "Provide deal terms &rarr;", update_url, True))
     if no_interest:
         update_url = _deal_update_form_url(deal_id)
         if update_url:
@@ -275,7 +277,9 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow
     if stalled or follow_up_due:
         href = _company_href(company_name, "mydeals", key, view_as)
         candidates.append(("nudge buyers", "nudge", "Nudge buyers &rarr;", href, False))
-    if needs_agreement:
+    if visibility_state == "id_required":
+        candidates.append(("id required", "id-required", "ID required &rarr;", CEF_FORM_URL, True))
+    if visibility_state == "agreement_unsigned":
         candidates.append(("sign agreement", "sign", "Sign agreement &rarr;", AGENT_AGREEMENT_DOC_URL, True))
     if not candidates:
         return ""
@@ -2316,31 +2320,58 @@ def _is_won_stage(stage_id):
     return stage_id in WON_STAGE_IDS
 
 
-def _my_deal_visibility_state(deal, cef_state):
-    """Precedence order (item 3): Agent Agreement Yes wins outright
-    regardless of CEF -> "live"; else the tenant's own CEF isn't Yes ->
-    "need_cef" (CEF blocks everything else, including an Agreement
-    that's already In Process); else (CEF is Yes, Agreement is In
-    Process or unset) -> "review_agreement". Single source of truth
-    shared by the My Deals visibility badge and its summary-strip
-    counts."""
-    opts = _deal_cf_option_ids(deal, AGENT_AGREEMENT_FIELD)
-    if opts & AGENT_ENGAGED_OPTS:
-        return "live"
+def _deal_terms_complete(deal):
+    """State 3's "terms incomplete" gate: a ticket-size bound (min OR max)
+    present, AND each of Mgmt Fee/Carry/Seller Fee individually carries a
+    defined numeric value. 0.0 counts as defined — _deal_cf_number
+    already returns 0.0 (not None) for a scalar zero, and only returns
+    None for a genuinely null/empty/absent field, which is exactly the
+    distinction this gate needs."""
+    has_size = (_deal_cf_number(deal, TICKET_MIN_FIELD) is not None
+                or _deal_cf_number(deal, TICKET_MAX_FIELD) is not None)
+    if not has_size:
+        return False
+    return all(_deal_cf_number(deal, field) is not None
+               for field in (MGMT_FEE_FIELD, CARRY_FIELD, SELLER_FEE_FIELD))
+
+
+def _my_deal_visibility_state(deal, cef_state, is_held):
+    """Strict state machine, first match wins (item 1): (1) ID/CEF not
+    Yes -> "id_required"; (2) Agent Agreement not Yes — In-Process counts
+    as unsigned — -> "agreement_unsigned"; (3) deal terms incomplete (see
+    _deal_terms_complete) -> "terms_incomplete"; (4) stage is Hold
+    (is_held, override-aware — the caller derives this from the same
+    resolved-stage/section logic My Deals' sectioning already uses) ->
+    "held"; (5) otherwise -> "live". Single source of truth shared by
+    the Visibility badge, the Next Steps chip, and the summary-strip
+    counts. Obsolete/Cancelled rows run through this exact same ladder
+    unchanged — their muted treatment is the Cancelled section's own
+    card styling, not a distinct visibility state."""
     if cef_state != CEF_YES_ID:
-        return "need_cef"
-    return "review_agreement"
+        return "id_required"
+    opts = _deal_cf_option_ids(deal, AGENT_AGREEMENT_FIELD)
+    if not (opts & AGENT_ENGAGED_OPTS):
+        return "agreement_unsigned"
+    if not _deal_terms_complete(deal):
+        return "terms_incomplete"
+    if is_held:
+        return "held"
+    return "live"
 
 
-def _my_deal_visibility_badge_html(deal, cef_state):
-    state = _my_deal_visibility_state(deal, cef_state)
-    if state == "live":
-        return '<span class="visibility-badge live">Live — shown to buyers</span>'
-    if state == "need_cef":
-        return (f'<a class="visibility-badge need-cef" href="{CEF_FORM_URL}" target="_blank" '
-                f'rel="noopener noreferrer">ID required</a>')
-    return (f'<a class="visibility-badge review-agreement" href="{AGENT_AGREEMENT_DOC_URL}" target="_blank" '
-            f'rel="noopener noreferrer">Review agreement &rarr;</a>')
+def _my_deal_visibility_badge_html(deal, cef_state, is_held):
+    """State-only — no links (item 1); Next Steps carries the actionable
+    links for these same states now (item 2)."""
+    state = _my_deal_visibility_state(deal, cef_state, is_held)
+    if state == "id_required":
+        return '<span class="visibility-badge id-required">Not live — ID required</span>'
+    if state == "agreement_unsigned":
+        return '<span class="visibility-badge agreement-unsigned">Not live — agreement unsigned</span>'
+    if state == "terms_incomplete":
+        return '<span class="visibility-badge terms-incomplete">Not live — awaiting deal terms</span>'
+    if state == "held":
+        return '<span class="visibility-badge held">Held — not shown to buyers</span>'
+    return '<span class="visibility-badge live">Live — shown to buyers</span>'
 
 
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
@@ -3380,8 +3411,9 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         f'{_copy_id_button_html(public_url)}'
     )
 
+    is_held = section == "hold"
     size_text = _esc(_my_deal_size_text(deal))
-    badge_html = _my_deal_visibility_badge_html(deal, cef_state)
+    badge_html = _my_deal_visibility_badge_html(deal, cef_state, is_held)
 
     buyer_text = str(buyer_count)
     intro_text = str(stats["intro_count"]) if stats["intro_count"] else "—"
@@ -3407,10 +3439,10 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     else:
         deadline_html = "—"
 
-    needs_agreement = _my_deal_visibility_state(deal, cef_state) == "review_agreement"
+    visibility_state = _my_deal_visibility_state(deal, cef_state, is_held)
     no_interest = bool(notified_state and notified_state[1] > 3 and stats["intro_count"] == 0)
     action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
-                                                  stats["follow_up_due"], needs_agreement, no_interest,
+                                                  stats["follow_up_due"], visibility_state, no_interest,
                                                   key=key, view_as=view_as)
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
@@ -3514,6 +3546,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 
         live_count = 0
         not_engaged_count = 0
+        terms_incomplete_count = 0
         intros_total = 0
         attention_count = 0
         deadlines = []
@@ -3538,11 +3571,15 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                     attention_count += 1
                 intros_total += stats["intro_count"]
 
-                state = _my_deal_visibility_state(d, cef_state)
+                # is_held=False: this loop is already gated to the active
+                # section, which by construction never holds a Held deal.
+                state = _my_deal_visibility_state(d, cef_state, False)
                 if state == "live":
                     live_count += 1
-                elif state == "need_cef":
+                elif state == "id_required":
                     not_engaged_count += 1
+                elif state == "terms_incomplete":
+                    terms_incomplete_count += 1
 
             section_row_htmls[section].append(
                 _my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
@@ -3573,6 +3610,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             summary_parts.append(f"{live_count} live")
         if not_engaged_count:
             summary_parts.append(f"{not_engaged_count} not engaged")
+        if terms_incomplete_count:
+            summary_parts.append(f"{terms_incomplete_count} awaiting terms")
         if intros_total:
             summary_parts.append(f"{intros_total} intros in motion")
         if attention_count:
@@ -3783,10 +3822,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     white-space: nowrap;
   }}
   .visibility-badge.live {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
-  .visibility-badge.review-agreement {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
-  .visibility-badge.review-agreement:hover {{ text-decoration: underline; }}
-  .visibility-badge.need-cef {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
-  .visibility-badge.need-cef:hover {{ text-decoration: underline; }}
+  .visibility-badge.held {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .visibility-badge.id-required, .visibility-badge.agreement-unsigned, .visibility-badge.terms-incomplete {{
+    background: rgba(178,59,59,0.12); color: #b23b3b;
+  }}
   .deadline-overdue {{ color: #b23b3b; font-weight: 600; }}
   .ei-deadline.overdue-input {{ border-color: #b23b3b; }}
   .action-chip {{
@@ -3800,7 +3839,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     cursor: pointer;
   }}
   .action-chip:hover {{ text-decoration: underline; }}
-  .action-chip.overdue {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
+  .action-chip.overdue, .action-chip.terms, .action-chip.id-required {{
+    background: rgba(178,59,59,0.12); color: #b23b3b;
+  }}
   .action-chip.no-interest, .action-chip.nudge, .action-chip.sign {{
     background: rgba(201,162,39,0.15); color: var(--accredited);
   }}
