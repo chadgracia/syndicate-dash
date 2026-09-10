@@ -2274,25 +2274,6 @@ def _engagement_badge_html(deal, company):
             '&#10007; Not engaged — contact us to activate this deal</a>')
 
 
-def _my_deal_size_text(deal):
-    """"$1M – $5M" from min/max ticket size (TICKET_MIN_FIELD/
-    TICKET_MAX_FIELD); a single value when only one of the two is set;
-    falls back to the deal's own "value" field, same as _deal_size_text,
-    when neither is set."""
-    min_val = _deal_cf_number(deal, TICKET_MIN_FIELD)
-    max_val = _deal_cf_number(deal, TICKET_MAX_FIELD)
-    if min_val is not None and max_val is not None:
-        return f"{_fmt_money(min_val)} – {_fmt_money(max_val)}"
-    if max_val is not None:
-        return _fmt_money(max_val)
-    if min_val is not None:
-        return _fmt_money(min_val)
-    try:
-        return _fmt_money(float(deal.get("value")))
-    except (TypeError, ValueError):
-        return _fmt_money(None)
-
-
 def _deal_pipeline_size(deal):
     """Numeric size for the summary strip's dollar totals: the larger of
     min/max ticket size, else the deal's own "value" field. None if
@@ -3400,30 +3381,47 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
                        key=None, view_as=None, edit_mode=False):
     deal_id = str(deal.get("id"))
     if company_name:
-        company_cell = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
+        company_link = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
                          f'{_esc(company_name)}</a>')
     else:
-        company_cell = "—"
+        company_link = "—"
 
+    # Deal ID now renders under the company name (its own no-longer-a-
+    # column) — same copy icon, smaller muted type via .deal-id-sub.
     public_url = _deal_public_url(deal_id)
-    deal_id_cell = (
+    deal_id_sub = (
+        f'<div class="deal-id-sub">'
         f'<a href="{public_url}" target="_blank" rel="noopener noreferrer">#{deal_id}</a>'
-        f'{_copy_id_button_html(public_url)}'
+        f'{_copy_id_button_html(public_url)}</div>'
     )
 
     is_held = section == "hold"
-    size_text = _esc(_my_deal_size_text(deal))
     badge_html = _my_deal_visibility_badge_html(deal, cef_state, is_held)
+    visibility_state = _my_deal_visibility_state(deal, cef_state, is_held)
 
     buyer_text = str(buyer_count)
     intro_text = str(stats["intro_count"]) if stats["intro_count"] else "—"
 
+    # Notified privacy rule (item 4): the real n/d numbers only ever show
+    # when this row is actually Live -- in tenant view and admin
+    # view_as alike, any non-live or Held state renders "-" instead,
+    # regardless of whether a notification really happened (the "no
+    # interest" chip condition below still fires off the real
+    # notified_state either way — it's the display, not the data, that's
+    # gated). Admin edit mode (&edit=1) is the one exception: it always
+    # shows the real value, marked "(internal)" only when it's actually
+    # overriding what a tenant/view_as session would otherwise see.
     notified_state = _deal_notified_state(deal_id, alert_history)
-    if notified_state:
+    show_real_notified = edit_mode or visibility_state == "live"
+    if notified_state and show_real_notified:
         notified_n, notified_days = notified_state
-        notified_text = f"{notified_n} · {notified_days}d ago"
+        line1 = f"{notified_n} Notified"
+        line2 = f"{notified_days}d ago"
+        if edit_mode and visibility_state != "live":
+            line2 += " (internal)"
+        notified_html = f"{_esc(line1)}<br>{_esc(line2)}"
     else:
-        notified_text = "—"
+        notified_html = "—"
 
     is_overdue = False
     if deadline:
@@ -3439,7 +3437,6 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     else:
         deadline_html = "—"
 
-    visibility_state = _my_deal_visibility_state(deal, cef_state, is_held)
     no_interest = bool(notified_state and notified_state[1] > 3 and stats["intro_count"] == 0)
     action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
                                                   stats["follow_up_due"], visibility_state, no_interest,
@@ -3449,13 +3446,11 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section, key=key)
 
     return (
-        f'<tr><td class="company">{company_cell}</td>'
-        f'<td class="deal-id">{deal_id_cell}</td>'
-        f'<td>{size_text}</td>'
+        f'<tr><td class="company">{company_link}{deal_id_sub}</td>'
         f'<td>{badge_html}</td>'
         f'<td class="num">{buyer_text}</td>'
+        f'<td>{notified_html}</td>'
         f'<td class="num">{intro_text}</td>'
-        f'<td>{_esc(notified_text)}</td>'
         f'<td>{deadline_html}</td>'
         f'<td>{action_chip_html}</td>'
         f'<td class="actions">{actions_html}</td></tr>'
@@ -3635,12 +3630,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
       <thead>
         <tr>
           <th>Company</th>
-          <th>Deal ID</th>
-          <th>Size</th>
           <th>Visibility</th>
           <th class="num">Buyers</th>
-          <th class="num">Intros</th>
           <th>Notified</th>
+          <th class="num">Intros</th>
           <th>Deadline</th>
           <th>Next Steps</th>
           <th></th>
@@ -3697,7 +3690,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     padding: 32px 24px 64px;
   }}
-  .wrap {{ max-width: 1100px; margin: 28px auto 0; }}
+  /* 1000px, matching the other tabs (was 1100px) — Deal ID and Size no
+     longer have their own columns, so this table needs less room than
+     it used to, not more. */
+  .wrap {{ max-width: 1000px; margin: 28px auto 0; }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
   .mydeals-summary {{ color: var(--ink); font-size: 14px; margin: 0 0 4px; }}
   .mydeals-total {{ font-weight: 600; }}
@@ -3712,7 +3708,15 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   /* Sticky header needs the card unclipped (overflow:hidden on an
      ancestor defeats position:sticky), so the rounded top corners are
      applied directly to the header cells instead of via .card overflow
-     clipping. */
+     clipping. Also why this table has no .table-scroll wrapper (unlike
+     Active Intros/the company page) — overflow-x:auto on a wrapper
+     forces overflow-y to auto too (per the CSS overflow spec, whenever
+     one axis goes non-visible the other stops being visible), which
+     would make that wrapper — not the page — the sticky header's
+     scrolling ancestor and break "pin to viewport while the page
+     scrolls". Item 5's fit is handled by trimming columns and width
+     instead (Deal ID/Size removed from the row entirely, .wrap back
+     down to 1000px). */
   thead th:first-child {{ border-top-left-radius: 10px; }}
   thead th:last-child {{ border-top-right-radius: 10px; }}
   tbody tr:last-child td:first-child {{ border-bottom-left-radius: 10px; }}
@@ -3739,12 +3743,16 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   }}
   tbody tr:last-child td {{ border-bottom: none; }}
   tbody tr:hover {{ background: rgba(22,24,29,0.03); }}
-  td.company {{ font-weight: 500; }}
+  td.company {{ font-weight: 500; white-space: nowrap; }}
   td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
   td.company a:hover {{ border-bottom-color: var(--muted); }}
-  td.deal-id {{ white-space: nowrap; }}
-  td.deal-id a {{ color: var(--accent); text-decoration: none; }}
-  td.deal-id a:hover {{ text-decoration: underline; }}
+  .deal-id-sub {{
+    margin-top: 3px;
+    font-size: 12px;
+    font-weight: 400;
+  }}
+  .deal-id-sub a {{ color: var(--muted); text-decoration: none; }}
+  .deal-id-sub a:hover {{ color: var(--accent); text-decoration: underline; }}
   .copy-id {{
     display: inline-flex;
     align-items: center;
