@@ -3453,10 +3453,46 @@ def _investor_type_cell_html(buyer_recs):
     return f'{_esc(investor_type)}{tier_html}'
 
 
+def _ei_notes_textarea_html(deal_id, value, placeholder=""):
+    """Turn 21: Notes' auto-saving field on Active Intros is a 2-line
+    textarea rather than a single-line input — same .ei-notes class, same
+    blur/Enter save path (_edit_script_html), same next-sibling .ei-msg
+    convention, just a taller control since notes can run longer than one
+    line. A <textarea>'s initial text is its content, not a value=
+    attribute, unlike _ei_field_html's <input> — value must already be
+    escaped by the caller, exactly like _ei_field_html expects. The
+    Company page's own admin-only Buyer Notes column keeps its single-
+    line .ei-notes <input> (_ei_field_html) untouched — the two never
+    collide since each page embeds its own <style>/<script>, so a
+    textarea and an input can safely share one class name across pages."""
+    placeholder_attr = f' placeholder="{_esc(placeholder)}"' if placeholder else ""
+    return (f'<textarea class="ei-notes" data-deal-id="{_esc(deal_id)}" data-field="notes" '
+            f'maxlength="2000" rows="2"{placeholder_attr}>{value}</textarea>'
+            f'<span class="ei-msg"></span>')
+
+
+def _notes_cell_html(deal_id, notes_value, follow_up_val, due_html, editable):
+    """Turn 21: the merged Notes+Follow-up cell — a 2-line textarea (or
+    read-only text) on top, a compact row underneath with the Follow-up
+    date input (same _ei_followup_field_html save path as before, just
+    relocated) beside the Due chip when the follow-up is due/overdue.
+    editable=False renders both halves as plain text (used for
+    Passed/Withdrawn rows and non-editable tenant views)."""
+    if editable:
+        notes_html = _ei_notes_textarea_html(deal_id, _esc(notes_value), placeholder="Add a note…")
+        followup_html = _ei_followup_field_html(deal_id, _esc(follow_up_val or ""))
+    else:
+        notes_html = _esc(notes_value or "—")
+        follow_up_text = _fmt_short_date(follow_up_val)
+        followup_html = _esc(follow_up_text) if follow_up_text else "—"
+    return f'{notes_html}<div class="notes-followup-row">{followup_html}{due_html}</div>'
+
+
 def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=None, view_as=None,
                      editable=False, company_repeated=False):
     """Tenant-facing Introduced-or-later row: Company | Buyer | Investor
-    Type | Size | Status | Notes | Follow-up. editable=True
+    Type | Size | Status | Notes (the Follow-up column is gone — turn 21;
+    Follow-up now lives inside the Notes cell, see below). editable=True
     (tenant_edit_mode — see render_intros_page) leaves the Status cell's
     milestone checkboxes and flag select (turn 17 — see
     _status_milestones_column_html) interactive, and makes Notes/
@@ -3475,7 +3511,13 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     data stays visible; the next_steps input itself is retired from
     this page. company_repeated (item 7) blanks the company cell (and
     its Update-deal link, turn 16 item 6) and adds a subtle left-accent
-    instead of repeating the same company name row after row."""
+    instead of repeating the same company name row after row.
+
+    Turn 21: Notes is now a 2-line textarea (same auto-save-on-blur path,
+    just a taller field), and the freed Follow-up column has folded into
+    a compact row under the textarea — the same date input/Due chip as
+    before (_ei_followup_field_html, unchanged save path), just
+    relocated. See _notes_cell_html."""
     company_name = _deal_company_name(deal)
     if company_repeated:
         company_cell = ""
@@ -3510,13 +3552,7 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     notes_value = entry.get("notes")
     if notes_value is None:
         notes_value = entry.get("next_steps") or ""
-    if editable and not is_dead:
-        notes_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(notes_value), placeholder="Add a note…")
-        follow_up_html = due_html + _ei_followup_field_html(deal_id, _esc(follow_up_val or ""))
-    else:
-        notes_html = _esc(notes_value or "—")
-        follow_up_text = _fmt_short_date(follow_up_val)
-        follow_up_html = due_html + (_esc(follow_up_text) if follow_up_text else "—")
+    notes_cell_html = _notes_cell_html(deal_id, notes_value, follow_up_val, due_html, editable and not is_dead)
 
     return (
         f'<tr{row_cls}><td class="company">{company_cell}</td>'
@@ -3524,8 +3560,7 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
-        f'<td>{notes_html}</td>'
-        f'<td>{follow_up_html}</td></tr>'
+        f'<td class="notes-cell">{notes_cell_html}</td></tr>'
     )
 
 
@@ -3558,7 +3593,7 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, 
         f'<td></td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
-        f'<td></td><td>{due_html}</td></tr>'
+        f'<td class="notes-cell">{due_html}</td></tr>'
     )
 
 
@@ -3569,7 +3604,8 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
     (turn 17 — see _status_milestones_column_html) but never disabled —
     admin has full rights everywhere, Closed rows included — plus
     auto-saving Notes/Follow-up inputs (item 3, turn 20 — see
-    _intro_row_html for the Notes/next_steps fallback)."""
+    _intro_row_html for the Notes/next_steps fallback; turn 21 folded
+    Follow-up into the Notes cell — see _notes_cell_html)."""
     deal_id = str(deal.get("id"))
     entry = intro_details.get(deal_id) or {}
     resolved = _resolve_intro_status(deal, entry)
@@ -3601,8 +3637,7 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
     notes_value = entry.get("notes")
     if notes_value is None:
         notes_value = entry.get("next_steps") or ""
-    notes_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(notes_value), placeholder="Add a note…")
-    follow_up_html = due_html + _ei_followup_field_html(deal_id, _esc(follow_up_val or ""))
+    notes_cell_html = _notes_cell_html(deal_id, notes_value, follow_up_val, due_html, True)
 
     return (
         f'<tr{row_cls}><td class="company">{company_cell}</td>'
@@ -3610,8 +3645,7 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
-        f'<td>{notes_html}</td>'
-        f'<td>{follow_up_html}</td></tr>'
+        f'<td class="notes-cell">{notes_cell_html}</td></tr>'
     )
 
 
@@ -3735,8 +3769,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             '<th>Company</th><th>Buyer</th><th>Investor Type</th>'
             '<th class="num">Size</th>'
             '<th title="Where this introduction stands">Status</th>'
-            '<th>Notes</th>'
-            '<th title="When to check in next">Follow-up</th>'
+            '<th title="Free-form notes, plus when to check in next">Notes</th>'
         )
 
         if not kept_deals:
@@ -3754,7 +3787,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             # "Introduced" always renders — even with zero rows — per
             # instruction; "Pending introductions" only when there's
             # something pending.
-            parts = [_group_header_row_html("Introduced", 7)]
+            parts = [_group_header_row_html("Introduced", 6)]
             if main_rows:
                 if edit_mode:
                     parts += [_intro_row_edit_html(d, people_by_id, person_id, intro_details, key=key,
@@ -3766,12 +3799,12 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                                                company_repeated=main_repeats[i])
                               for i, (d, resolved) in enumerate(main_rows)]
             else:
-                parts.append(_group_empty_row_html("No introductions yet on this deal.", 7))
+                parts.append(_group_empty_row_html("No introductions yet on this deal.", 6))
 
             if pending_rows:
-                parts.append(_group_header_row_html("Pending introductions", 7))
+                parts.append(_group_header_row_html("Pending introductions", 6))
                 parts.append(
-                    f'<tr><td colspan="7" class="group-note">'
+                    f'<tr><td colspan="6" class="group-note">'
                     f"We're preparing these introductions — buyer identities appear here "
                     f'the moment we connect you.</td></tr>'
                 )
@@ -3802,8 +3835,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
           <col style="width:11%">
           <col style="width:7%">
           <col style="width:18%">
-          <col style="width:14%">
-          <col style="width:13%">
+          <col style="width:27%">
         </colgroup>
         <thead>
           <tr>
@@ -4049,6 +4081,27 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     color: var(--ink);
     cursor: pointer;
   }}
+  /* Turn 21: the Follow-up column is gone — its date input/Due chip now
+     live in a compact row under the Notes textarea (see
+     _notes_cell_html). Notes itself becomes a 2-line textarea, taking
+     the freed column width. */
+  textarea.ei-notes {{
+    resize: vertical;
+    min-height: 44px;
+    font-family: inherit;
+    line-height: 1.35;
+  }}
+  .notes-followup-row {{
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    color: var(--muted);
+    font-size: 12px;
+  }}
+  .notes-followup-row .ei-date-wrap {{ width: 118px; flex: 0 0 auto; }}
+  .notes-followup-row .ei-follow-up {{ width: 118px; }}
+  .notes-followup-row .due-chip {{ margin-bottom: 0; }}
 </style>
 </head>
 <body>
