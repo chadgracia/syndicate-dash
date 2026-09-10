@@ -2345,7 +2345,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             'add &amp;view_as=&lt;email&gt; to the URL.</div>'
         )
     elif not deals:
-        body_html = '<div class="gg-placeholder">You have no active deals yet.</div>'
+        body_html = '<div class="gg-placeholder">No deals yet.</div>'
     else:
         rows_html = "".join(_my_deal_row_html(d, key=key, view_as=view_as) for d in deals)
         body_html = f"""<div class="card">
@@ -3513,7 +3513,11 @@ def lambda_handler(event, context):
                                          key=nav_key, view_as=nav_view_as, cef_html=cef_html)
         else:
             person_id = tenant.get("person_id")
-            deals = get_my_deals(person_id) if person_id is not None else []
+            # My Deals shows only Sell Order-tagged deals — the buy side
+            # (Matched Buyers / Active Intros) and untouched ?company= pages
+            # keep seeing exactly what they saw before this filter.
+            deals = ([d for d in get_my_deals(person_id) if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)]
+                     if person_id is not None else [])
             body = render_my_deals_page(viewer_name, deals=deals,
                                          key=nav_key, view_as=nav_view_as, cef_html=cef_html)
     else:
