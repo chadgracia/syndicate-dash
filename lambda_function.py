@@ -1057,6 +1057,307 @@ def get_intro_details(tenant_email):
         return {}, True
 
 
+# ── Feature-request capture ──────────────────────────────────────────────
+# Own Query, deliberately NOT merged into get_intro_details's — that query
+# is called from several places that have nothing to do with feature
+# requests (_handle_update_intro, both intro-status renderers) and its
+# sk begins_with("intro#") filter would have to be dropped org-wide to
+# pick up "feature#" items too, adding a second responsibility everywhere
+# it's already used. One extra Query per normal page load here instead;
+# the admin aggregate view (render_my_deals_page's tenant_picker branch)
+# is the only place that issues more than one, by necessity — it has no
+# single partition to query.
+MAX_FEATURE_TEXT_LEN = 2000
+
+
+def get_feature_requests(tenant_partition):
+    """{"open": [...], "done": [...]} feature-request items for one Dynamo
+    partition (sk begins_with "feature#"), each item newest-first within
+    its bucket (the sk's own epoch-ms suffix sorts correctly as a string).
+    Never raises: any failure returns ({"open": [], "done": []}, True)."""
+    try:
+        table = _dynamo_table()
+        resp = table.query(
+            KeyConditionExpression=Key("tenant").eq(tenant_partition) & Key("sk").begins_with("feature#"),
+        )
+        items = []
+        for item in resp.get("Items", []):
+            sk = item.get("sk") or ""
+            if not sk.startswith("feature#"):
+                continue
+            items.append({
+                "sk": sk,
+                "tenant": tenant_partition,
+                "text": item.get("text") or "",
+                "submitted_by": item.get("submitted_by"),
+                "created_at": item.get("created_at"),
+                "done": bool(item.get("done")),
+                "done_by": item.get("done_by"),
+                "done_at": item.get("done_at"),
+            })
+        items.sort(key=lambda it: it["sk"], reverse=True)
+        return {"open": [it for it in items if not it["done"]],
+                "done": [it for it in items if it["done"]]}, False
+    except Exception:
+        return {"open": [], "done": []}, True
+
+
+def _dynamo_write_feature_request(tenant_partition, text, actor):
+    try:
+        table = _dynamo_table()
+        table.put_item(Item={
+            "tenant": tenant_partition,
+            "sk": f"feature#{int(time.time() * 1000)}",
+            "text": text,
+            "submitted_by": actor,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "done": False,
+        })
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _dynamo_toggle_feature_request(tenant_partition, feature_sk, done, actor):
+    """Flips done and appends an audit item (sk=audit#<feature_sk>#<epoch_ms>,
+    mirroring _dynamo_write_intro_update's own audit sk shape). Reopening
+    (done=False) removes done_by/done_at rather than nulling them out.
+
+    ConditionExpression="attribute_exists(sk)" is load-bearing: without it,
+    DynamoDB's update_item silently upserts a brand-new item for any
+    (tenant, feature_sk) pair that doesn't already exist — which would let
+    a tenant "toggle" an sk copied or guessed from another partition and
+    have it silently create garbage in their OWN partition instead of
+    failing. With the condition, that case raises (caught below) and
+    nothing is written."""
+    now = time.time()
+    try:
+        table = _dynamo_table()
+        if done:
+            table.update_item(
+                Key={"tenant": tenant_partition, "sk": feature_sk},
+                UpdateExpression="SET done = :d, done_by = :db, done_at = :da",
+                ConditionExpression="attribute_exists(sk)",
+                ExpressionAttributeValues={
+                    ":d": True, ":db": actor, ":da": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        else:
+            table.update_item(
+                Key={"tenant": tenant_partition, "sk": feature_sk},
+                UpdateExpression="SET done = :d REMOVE done_by, done_at",
+                ConditionExpression="attribute_exists(sk)",
+                ExpressionAttributeValues={":d": False},
+            )
+        table.put_item(Item={
+            "tenant": tenant_partition,
+            "sk": f"audit#{feature_sk}#{int(now * 1000)}",
+            "actor": actor,
+            "old": {"done": not done},
+            "new": {"done": done},
+        })
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _handle_feature_request(event):
+    """POST ?action=feature_request — create ({text}) or toggle
+    ({feature_sk, done}) a feature-request item.
+
+    Auth mirrors _handle_update_intro's tenant-write path: ADMIN_KEY in
+    the body may act on any partition named by body["tenant"] ("admin" or
+    a TENANTS email) — that's how the admin aggregate view (many
+    partitions on one page) targets a specific one. A tenant's own
+    identity cookie may only ever act within their own partition; any
+    body["tenant"] they send is ignored — the authenticated identity
+    always wins. Never raises past this function."""
+    body = _parse_json_body(event)
+
+    admin_key = os.environ.get("ADMIN_KEY")
+    is_admin = bool(admin_key) and body.get("key") == admin_key
+
+    if is_admin:
+        partition = str(body.get("tenant") or "").strip()
+        if partition != "admin":
+            partition = partition.lower()
+            if partition not in TENANTS:
+                return _json_response({"error": "invalid tenant"}, 400)
+        actor = "admin"
+    else:
+        identity_email = _read_identity_email(event)
+        tenant_identity_email = identity_email.strip().lower() if identity_email else None
+        if not tenant_identity_email or tenant_identity_email not in TENANTS:
+            return _json_response({"error": "forbidden"}, 403)
+        partition = tenant_identity_email
+        actor = tenant_identity_email
+
+    feature_sk = body.get("feature_sk")
+    if feature_sk is not None:
+        feature_sk = str(feature_sk).strip()
+        if not feature_sk.startswith("feature#"):
+            return _json_response({"error": "invalid feature_sk"}, 400)
+        if "done" not in body:
+            return _json_response({"error": "done is required"}, 400)
+        ok, err = _dynamo_toggle_feature_request(partition, feature_sk, bool(body.get("done")), actor)
+        if not ok:
+            return _json_response({"error": f"Save failed: {err}"}, 502)
+        return _json_response({"ok": True})
+
+    text = str(body.get("text") or "").strip()
+    if not text:
+        return _json_response({"error": "text is required"}, 400)
+    if len(text) > MAX_FEATURE_TEXT_LEN:
+        return _json_response({"error": "text too long"}, 400)
+
+    ok, err = _dynamo_write_feature_request(partition, text, actor)
+    if not ok:
+        return _json_response({"error": f"Save failed: {err}"}, 502)
+    return _json_response({"ok": True})
+
+
+def _fmt_feature_date(iso_str):
+    dt = _parse_dt(iso_str)
+    return dt.strftime("%b %-d, %Y") if dt else None
+
+
+def _feature_box_html(partition, key=None):
+    """Submit box: "same auto-save fetch pattern" as the rest of the app
+    (Saving…/Saved ✓/error via one shared inline .ei-msg), just triggered
+    by a Submit button/Enter instead of blur, since this creates a new
+    item rather than editing an existing field. Dismissable per page load
+    only (box.hidden, no persistence) — reappears on the next load, by
+    design. Reloads the page on success so the new item shows up in the
+    list below without needing separate DOM-insertion logic."""
+    key_json = json.dumps(key or "")
+    tenant_json = json.dumps(partition)
+    return f"""<div class="feature-box" id="feature-box">
+  <button type="button" class="feature-box-dismiss" id="feature-box-dismiss" aria-label="Dismiss">&times;</button>
+  <h2>Help shape this dashboard</h2>
+  <p>Tell us one feature you'd like — submit as many as you want.</p>
+  <div class="feature-box-form">
+    <input type="text" id="feature-input" maxlength="{MAX_FEATURE_TEXT_LEN}" placeholder="I'd like…">
+    <button type="button" id="feature-submit-btn">Submit</button>
+  </div>
+  <span class="ei-msg" id="feature-msg"></span>
+</div>
+<script>
+(function() {{
+  var KEY = {key_json};
+  var TENANT = {tenant_json};
+  var box = document.getElementById('feature-box');
+  var dismiss = document.getElementById('feature-box-dismiss');
+  if (dismiss) dismiss.addEventListener('click', function() {{ box.hidden = true; }});
+
+  var input = document.getElementById('feature-input');
+  var btn = document.getElementById('feature-submit-btn');
+  var msg = document.getElementById('feature-msg');
+
+  function submit() {{
+    var text = input.value.trim();
+    if (!text) return;
+    msg.className = 'ei-msg saving';
+    msg.textContent = 'Saving…';
+    fetch('?action=feature_request', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ key: KEY, tenant: TENANT, text: text }})
+    }}).then(function(r) {{
+      return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }});
+    }}).then(function(res) {{
+      if (res.ok) {{
+        msg.className = 'ei-msg saved';
+        msg.textContent = 'Saved ✓';
+        input.value = '';
+        setTimeout(function() {{ window.location.reload(); }}, 700);
+      }} else {{
+        msg.className = 'ei-msg error';
+        msg.textContent = (res.data && res.data.error) || 'Error';
+      }}
+    }}).catch(function(err) {{
+      msg.className = 'ei-msg error';
+      msg.textContent = 'Error: ' + err;
+    }});
+  }}
+
+  btn.addEventListener('click', submit);
+  input.addEventListener('keydown', function(e) {{
+    if (e.key === 'Enter') {{ e.preventDefault(); submit(); }}
+  }});
+}})();
+</script>"""
+
+
+def _feature_toggle_script_html(key):
+    key_json = json.dumps(key or "")
+    return f"""<script>
+(function() {{
+  var KEY = {key_json};
+  document.querySelectorAll('.feature-toggle-btn').forEach(function(btn) {{
+    btn.addEventListener('click', function() {{
+      var sk = btn.getAttribute('data-sk');
+      var tenant = btn.getAttribute('data-tenant');
+      var done = btn.getAttribute('data-done') === 'true';
+      var msgEl = btn.nextElementSibling;
+      if (msgEl) {{ msgEl.className = 'ei-msg saving'; msgEl.textContent = 'Saving…'; }}
+      fetch('?action=feature_request', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ key: KEY, tenant: tenant, feature_sk: sk, done: done }})
+      }}).then(function(r) {{
+        return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }});
+      }}).then(function(res) {{
+        if (res.ok) {{
+          window.location.reload();
+        }} else if (msgEl) {{
+          msgEl.className = 'ei-msg error';
+          msgEl.textContent = (res.data && res.data.error) || 'Error';
+        }}
+      }}).catch(function(err) {{
+        if (msgEl) {{ msgEl.className = 'ei-msg error'; msgEl.textContent = 'Error: ' + err; }}
+      }});
+    }});
+  }});
+}})();
+</script>"""
+
+
+def _feature_request_row_html(item, show_tenant=False, tenant_name=None):
+    text_html = _esc(item["text"])
+    tenant_tag = (f'<span class="feature-tenant-tag">{_esc(tenant_name)}</span> '
+                  if show_tenant and tenant_name else "")
+    sk_attr = _esc(item["sk"])
+    tenant_attr = _esc(item["tenant"])
+    if item["done"]:
+        done_date = _fmt_feature_date(item.get("done_at"))
+        meta = f"Done &#10003; {_esc(done_date)}" if done_date else "Done &#10003;"
+        toggle_btn = (f'<button type="button" class="feature-toggle-btn" data-sk="{sk_attr}" '
+                      f'data-tenant="{tenant_attr}" data-done="false">Reopen</button>')
+        row_cls = "feature-row done"
+    else:
+        created = _fmt_feature_date(item.get("created_at"))
+        meta = f"Requested {_esc(created)}" if created else "Requested"
+        toggle_btn = (f'<button type="button" class="feature-toggle-btn" data-sk="{sk_attr}" '
+                      f'data-tenant="{tenant_attr}" data-done="true">Mark done</button>')
+        row_cls = "feature-row"
+
+    return (f'<div class="{row_cls}">'
+            f'<div class="feature-row-text">{tenant_tag}{text_html}</div>'
+            f'<div class="feature-row-meta">{meta}&nbsp;&nbsp;{toggle_btn}<span class="ei-msg"></span></div>'
+            f'</div>')
+
+
+def _feature_requests_list_html(open_items, done_items, show_tenant=False, tenant_names=None):
+    if not open_items and not done_items:
+        return '<div class="gg-placeholder small">No feature requests yet.</div>'
+    names = tenant_names or {}
+    rows = [_feature_request_row_html(it, show_tenant=show_tenant, tenant_name=names.get(it["tenant"]))
+            for it in open_items]
+    rows += [_feature_request_row_html(it, show_tenant=show_tenant, tenant_name=names.get(it["tenant"]))
+             for it in done_items]
+    return "".join(rows)
+
+
 def _default_intro_status(deal):
     """Derived status when the Intro Status field is empty/absent for a
     deal (including when the deals.json snapshot hasn't picked up the
@@ -1916,6 +2217,91 @@ NAV_CSS = """
   .gg-cef-badge.cef-missing:hover { text-decoration: underline; }
 """
 
+# Feature-request submit box + list, shared verbatim by render_my_deals_page
+# and render_company_page (both embed this via {FEATURE_CSS} the same way
+# every page already embeds {NAV_CSS}) so the two pages' boxes/lists never
+# drift from each other.
+FEATURE_CSS = """
+  .feature-box {
+    position: relative;
+    background: rgba(79,140,255,0.12);
+    border: 1px solid rgba(79,140,255,0.35);
+    border-radius: 10px;
+    padding: 18px 44px 18px 20px;
+    margin: 0 0 24px;
+  }
+  .feature-box h2 { font-size: 15px; font-weight: 700; margin: 0 0 4px; }
+  .feature-box p { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+  .feature-box-dismiss {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px;
+  }
+  .feature-box-dismiss:hover { color: var(--ink); }
+  .feature-box-form { display: flex; gap: 10px; flex-wrap: wrap; }
+  #feature-input {
+    flex: 1;
+    min-width: 200px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 9px 12px;
+    font-size: 14px;
+  }
+  #feature-submit-btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 9px 18px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #feature-submit-btn:hover { opacity: 0.9; }
+  .feature-box .ei-msg { display: block; margin-top: 8px; }
+  .feature-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+    flex-wrap: wrap;
+  }
+  .feature-row:last-child { border-bottom: none; }
+  .feature-row.done { opacity: 0.6; }
+  .feature-row.done .feature-row-text { text-decoration: line-through; }
+  .feature-row-text { flex: 1 1 200px; }
+  .feature-row-meta { flex: 0 0 auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+  .feature-toggle-btn {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 3px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .feature-toggle-btn:hover { border-color: var(--accent); }
+  .feature-tenant-tag {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    margin-right: 6px;
+  }
+"""
+
 
 def _tab_qs_suffix(key=None, view_as=None):
     """&key=...&view_as=... to append to tab links, so admin key / preview
@@ -2455,6 +2841,30 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     buy-side signals, not attributes of the Sell deal itself."""
     nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
 
+    # Feature-request box + list. tenant_picker (admin, no view_as) is the
+    # one case with no single partition to scope to — it aggregates every
+    # TENANTS partition plus "admin" instead (see the task's admin-
+    # aggregate requirement); every other case (real tenant session, or
+    # admin under &view_as) is scoped to anon_key_email like everywhere
+    # else on this page.
+    if tenant_picker:
+        feature_box_html = _feature_box_html("admin", key=key)
+        tenant_names = {"admin": "Admin"}
+        agg_open, agg_done = [], []
+        for partition in list(TENANTS.keys()) + ["admin"]:
+            items, _ = get_feature_requests(partition)
+            agg_open += items["open"]
+            agg_done += items["done"]
+            tenant_names[partition] = TENANTS[partition]["name"] if partition in TENANTS else "Admin"
+        agg_open.sort(key=lambda it: it["sk"], reverse=True)
+        agg_done.sort(key=lambda it: it["sk"], reverse=True)
+        feature_list_html = _feature_requests_list_html(agg_open, agg_done, show_tenant=True,
+                                                          tenant_names=tenant_names)
+    else:
+        feature_box_html = _feature_box_html(anon_key_email, key=key)
+        feature_items, _ = get_feature_requests(anon_key_email)
+        feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
+
     summary_html = ""
     edit_script = ""
     if tenant_picker:
@@ -2590,6 +3000,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 <title>My Deals</title>
 <style>
 {NAV_CSS}
+{FEATURE_CSS}
   :root {{
     --bg: #14161a;
     --card: #1c1f26;
@@ -2611,6 +3022,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .wrap {{ max-width: 1100px; margin: 0 auto; }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
   .mydeals-summary {{ color: var(--muted); font-size: 13px; margin: 0 0 20px; }}
+  .feature-section-heading {{ font-size: 16px; font-weight: 600; margin: 32px 0 12px; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--line);
@@ -2724,16 +3136,23 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     color: var(--muted);
     font-size: 15px;
   }}
+  .gg-placeholder.small {{ margin: 0; padding: 24px; }}
 </style>
 </head>
 <body>
 {nav}
 <div class="wrap">
   <h1>My Deals</h1>
+  {feature_box_html}
   {summary_html}
   {body_html}
+  <h2 class="feature-section-heading">Feature requests</h2>
+  <div class="card">
+    {feature_list_html}
+  </div>
 </div>
 {edit_script}
+{_feature_toggle_script_html(key)}
 <script>
 (function() {{
   document.querySelectorAll('.copy-link-btn').forEach(function(btn) {{
@@ -2796,6 +3215,15 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     suffix = _tab_qs_suffix(key, view_as)
     back_href = f"?tab={ref}{suffix}"
     back_label = REF_LABELS.get(ref, "My Deals")
+
+    # Feature-request box + list: always scoped to anon_key_email's own
+    # partition (the viewing tenant's own email, the previewed tenant's
+    # under &view_as, or the literal "admin" when neither applies) — no
+    # cross-tenant aggregation here, that's render_my_deals_page's
+    # tenant_picker branch only (see get_feature_requests).
+    feature_items, _ = get_feature_requests(anon_key_email)
+    feature_box_html = _feature_box_html(anon_key_email, key=key)
+    feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
 
     # tenant_edit_mode: the tenant (real session, or admin &view_as preview
     # without &edit=1) can auto-save Next Steps / Follow-up on their own
@@ -2927,6 +3355,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 <title>{_esc(company)}</title>
 <style>
 {NAV_CSS}
+{FEATURE_CSS}
   :root {{
     --bg: #14161a;
     --card: #1c1f26;
@@ -3201,11 +3630,19 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 <div class="wrap">
   <a class="cd-back" href="{back_href}">&larr; Back to {_esc(back_label)}</a>
   <h1>{_esc(company)}</h1>
+  {feature_box_html}
   {your_deals_html}
   {matched_buyers_html}
   <section class="cd-section">
     <h2>Buyer Demand</h2>
     {buyer_demand_body}
+  </section>
+  <section class="cd-section">
+    <h2>Feature requests</h2>
+    <div class="card">
+      {feature_list_html}
+    </div>
+    {_feature_toggle_script_html(key)}
   </section>
 </div>
 </body>
@@ -3676,6 +4113,11 @@ def lambda_handler(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_update_intro(event)
+
+    if query.get("action") == "feature_request":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_feature_request(event)
 
     if method != "GET":
         return _forbidden()
