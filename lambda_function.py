@@ -246,14 +246,15 @@ def _deal_update_form_url(deal_id):
     return f"{DEAL_UPDATE_FORM_URL}?deal_id={deal_id}&token={token}"
 
 
-def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow_up_due, visibility_state,
+def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibility_state,
                                key=None, view_as=None):
     """Next Steps: ONE specific action chip per row, chosen by priority
     (highest first): a) deadline passed (red, Update link) > b) terms
-    incomplete (red, Update link) > c) nudge buyers (amber: a stalled or
-    overdue-follow-up intro) > d) ID required (red, CEF form link) >
-    e) sign agreement (amber, agreement template link). At most one of
-    {b, d, e} ever applies — they're three of the "not live"
+    incomplete (red, Update link) > c) nudge buyers (amber: a stalled
+    intro — turn 22 dropped the overdue-follow-up half of this
+    condition, see _company_stats) > d) ID required (red, CEF form
+    link) > e) sign agreement (amber, agreement template link). At most
+    one of {b, d, e} ever applies — they're three of the "not live"
     visibility_state values and that state machine is first-match-wins
     (see _my_deal_visibility_state) — while a/c are independent
     conditions that can co-occur with any of them or each other. When
@@ -268,7 +269,7 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow
         update_url = _deal_update_form_url(deal_id)
         if update_url:
             candidates.append(("provide deal terms", "terms", "Provide deal terms &rarr;", update_url, True))
-    if stalled or follow_up_due:
+    if stalled:
         href = _company_href(company_name, "mydeals", key, view_as)
         candidates.append(("nudge buyers", "nudge", "Nudge buyers &rarr;", href, False))
     if visibility_state == "id_required":
@@ -2985,49 +2986,13 @@ def _ei_date_field_html(deal_id, value, css_class="ei-follow-up", field="follow_
             f'<span class="ei-msg"></span>')
 
 
-def _ei_followup_field_html(deal_id, value):
-    """Item 5 (turn 18): the Follow-up date input wrapped so a SET date
-    displays humanized ("Sep 11, '26") whenever it's not actively being
-    edited — the native <input type=date> underneath still auto-saves on
-    blur/Enter exactly like _ei_date_field_html; a thin JS layer in
-    _edit_script_html shows/hides the humanized overlay on focus/blur and
-    keeps its text in sync with the picked date. The overlay span comes
-    BEFORE the input in markup (not after) purely so the input's
-    nextElementSibling stays the .ei-msg save indicator, unchanged from
-    every other auto-saving field — position:absolute puts the overlay
-    visually on top of the input regardless of DOM order. Follow-up
-    only; Deadline (_ei_date_field_html directly) is unchanged."""
-    display_text = _fmt_short_date(value) or ""
-    hidden_attr = "" if display_text else " hidden"
-    return (
-        f'<div class="ei-date-wrap">'
-        f'<span class="ei-date-display"{hidden_attr}>{_esc(display_text)}</span>'
-        f'<input type="date" class="ei-follow-up" data-deal-id="{_esc(deal_id)}" '
-        f'data-field="follow_up" value="{_esc(value)}">'
-        f'<span class="ei-msg"></span>'
-        f'</div>'
-    )
-
-
 def _fmt_follow_up_short(follow_up):
-    """"Sep 20" style, no year — for the read-only tenant-facing note and
-    the edit-mode Due chip's tooltip. None if unset/unparsable."""
+    """"Sep 20" style, no year — for the Company page's read-only
+    tenant-facing follow-up note (its Buyers table's own Follow-up
+    column, unaffected by turn 22's removal of follow-up dates from
+    Active Intros/My Deals). None if unset/unparsable."""
     dt = _parse_dt(follow_up)
     return dt.strftime("%b %-d") if dt else None
-
-
-def _follow_up_is_due(follow_up):
-    """True when follow_up is a real date that is today or earlier (UTC
-    calendar date, no time-of-day component since follow_up is stored as
-    a bare ISO date string)."""
-    dt = _parse_dt(follow_up)
-    if not dt:
-        return False
-    return dt.date() <= datetime.now(timezone.utc).date()
-
-
-def _due_chip_html():
-    return '<span class="due-chip" title="Follow-up due">Due</span>'
 
 
 def _edit_script_html(key):
@@ -3107,33 +3072,6 @@ def _edit_script_html(key):
     el.addEventListener('blur', function() {{ saveField(el, field); }});
     el.addEventListener('keydown', function(e) {{
       if (e.key === 'Enter') {{ e.preventDefault(); el.blur(); }}
-    }});
-  }});
-
-  // Item 5 (turn 18): the Follow-up field shows a humanized date
-  // ("Sep 11, '26") on top of the native date input whenever it's not
-  // being actively edited — hidden on focus (to reveal the real
-  // input/picker), refreshed and re-shown on blur or change.
-  var MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  document.querySelectorAll('.ei-follow-up').forEach(function(el) {{
-    var wrap = el.closest('.ei-date-wrap');
-    var display = wrap ? wrap.querySelector('.ei-date-display') : null;
-    if (!display) return;
-    function refresh() {{
-      if (!el.value) {{ display.hidden = true; display.textContent = ''; return; }}
-      var parts = el.value.split('-');
-      var d = new Date(Date.UTC(+parts[0], +parts[1] - 1, +parts[2]));
-      display.textContent = MONTHS[d.getUTCMonth()] + ' ' + d.getUTCDate() + ", '" +
-        String(d.getUTCFullYear()).slice(-2);
-      display.hidden = false;
-    }}
-    el.addEventListener('focus', function() {{ display.hidden = true; }});
-    el.addEventListener('blur', refresh);
-    el.addEventListener('change', refresh);
-    display.addEventListener('click', function() {{
-      display.hidden = true;
-      el.focus();
-      if (el.showPicker) {{ try {{ el.showPicker(); }} catch (e) {{}} }}
     }});
   }});
 }})();
@@ -3471,36 +3409,30 @@ def _ei_notes_textarea_html(deal_id, value, placeholder=""):
             f'<span class="ei-msg"></span>')
 
 
-def _notes_cell_html(deal_id, notes_value, follow_up_val, due_html, editable):
-    """Turn 21: the merged Notes+Follow-up cell — a 2-line textarea (or
-    read-only text) on top, a compact row underneath with the Follow-up
-    date input (same _ei_followup_field_html save path as before, just
-    relocated) beside the Due chip when the follow-up is due/overdue.
-    editable=False renders both halves as plain text (used for
-    Passed/Withdrawn rows and non-editable tenant views)."""
+def _notes_cell_html(deal_id, notes_value, editable):
+    """The Notes cell — a 2-line auto-saving textarea when editable, plain
+    text otherwise (Passed/Withdrawn rows, non-editable tenant views).
+    Turn 21 folded the Follow-up column in here as a compact sub-row;
+    turn 22 removed follow-up dates from the UI entirely (column, date
+    input, Due chip, and the sort/summary/chip logic keyed off it — see
+    _handle_update_intro's follow_up parsing for the still-live but now
+    UI-dormant backend field), so this cell is Notes alone again."""
     if editable:
-        notes_html = _ei_notes_textarea_html(deal_id, _esc(notes_value), placeholder="Add a note…")
-        followup_html = _ei_followup_field_html(deal_id, _esc(follow_up_val or ""))
-    else:
-        notes_html = _esc(notes_value or "—")
-        follow_up_text = _fmt_short_date(follow_up_val)
-        followup_html = _esc(follow_up_text) if follow_up_text else "—"
-    return f'{notes_html}<div class="notes-followup-row">{followup_html}{due_html}</div>'
+        return _ei_notes_textarea_html(deal_id, _esc(notes_value), placeholder="Add a note…")
+    return _esc(notes_value or "—")
 
 
 def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=None, view_as=None,
                      editable=False, company_repeated=False):
     """Tenant-facing Introduced-or-later row: Company | Buyer | Investor
-    Type | Size | Status | Notes (the Follow-up column is gone — turn 21;
-    Follow-up now lives inside the Notes cell, see below). editable=True
-    (tenant_edit_mode — see render_intros_page) leaves the Status cell's
-    milestone checkboxes and flag select (turn 17 — see
-    _status_milestones_column_html) interactive, and makes Notes/
-    Follow-up auto-saving inputs, except on a Passed/Withdrawn row,
-    which renders Notes/Follow-up as read-only text instead — nothing
-    left to plan for a dead intro. A Closed row locks the status
-    controls read-only for tenants regardless of editable (item 2) —
-    notes/follow_up are unaffected by that lock, only is_dead is.
+    Type | Size | Status | Notes. editable=True (tenant_edit_mode — see
+    render_intros_page) leaves the Status cell's milestone checkboxes
+    and flag select (turn 17 — see _status_milestones_column_html)
+    interactive, and makes Notes an auto-saving textarea, except on a
+    Passed/Withdrawn row, which renders Notes as read-only text instead
+    — nothing left to plan for a dead intro. A Closed row locks the
+    status controls read-only for tenants regardless of editable
+    (item 2) — notes is unaffected by that lock, only is_dead is.
 
     Notes replaces Next Steps entirely (item 3, turn 20): free text, no
     suggested placeholder, stored in the same Dynamo "notes" attribute
@@ -3513,11 +3445,11 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     its Update-deal link, turn 16 item 6) and adds a subtle left-accent
     instead of repeating the same company name row after row.
 
-    Turn 21: Notes is now a 2-line textarea (same auto-save-on-blur path,
-    just a taller field), and the freed Follow-up column has folded into
-    a compact row under the textarea — the same date input/Due chip as
-    before (_ei_followup_field_html, unchanged save path), just
-    relocated. See _notes_cell_html."""
+    Turn 21 made Notes a 2-line textarea and folded the Follow-up column
+    into a compact row underneath it; turn 22 removed follow-up dates
+    from the UI entirely (see _notes_cell_html), so Notes now simply
+    fills the whole cell — the underlying "follow_up" Dynamo attribute
+    and its write path are untouched, just dormant."""
     company_name = _deal_company_name(deal)
     if company_repeated:
         company_cell = ""
@@ -3545,14 +3477,11 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=False,
                                                    disabled=(not editable) or is_closed_locked)
 
-    follow_up_val = entry.get("follow_up")
-    due_html = _due_chip_html() if _follow_up_is_due(follow_up_val) else ""
-
     is_dead = resolved["name"] in ("Passed", "Withdrawn")
     notes_value = entry.get("notes")
     if notes_value is None:
         notes_value = entry.get("next_steps") or ""
-    notes_cell_html = _notes_cell_html(deal_id, notes_value, follow_up_val, due_html, editable and not is_dead)
+    notes_cell_html = _notes_cell_html(deal_id, notes_value, editable and not is_dead)
 
     return (
         f'<tr{row_cls}><td class="company">{company_cell}</td>'
@@ -3564,7 +3493,7 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     )
 
 
-def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, follow_up=None, key=None,
+def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, key=None,
                              view_as=None, company_repeated=False):
     """Pending rows never get inputs — only Introduced-or-later rows are
     editable, disclosed or not — but they still get the Update-deal link
@@ -3585,7 +3514,6 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, 
     buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
     size_text = _esc(_deal_size_text(deal))
     status_html = _status_pill_html("Matched")
-    due_html = _due_chip_html() if _follow_up_is_due(follow_up) else ""
 
     return (
         f'<tr{row_cls}><td class="company">{company_cell}</td>'
@@ -3593,7 +3521,7 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, 
         f'<td></td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
-        f'<td class="notes-cell">{due_html}</td></tr>'
+        f'<td class="notes-cell"></td></tr>'
     )
 
 
@@ -3602,10 +3530,10 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
     """Admin edit-mode row for Active Intros: always the real buyer(s),
     the same milestone checkboxes + flag select as the tenant-facing row
     (turn 17 — see _status_milestones_column_html) but never disabled —
-    admin has full rights everywhere, Closed rows included — plus
-    auto-saving Notes/Follow-up inputs (item 3, turn 20 — see
-    _intro_row_html for the Notes/next_steps fallback; turn 21 folded
-    Follow-up into the Notes cell — see _notes_cell_html)."""
+    admin has full rights everywhere, Closed rows included — plus an
+    auto-saving Notes textarea (item 3, turn 20 — see _intro_row_html
+    for the Notes/next_steps fallback; turn 22 removed Follow-up from
+    the UI entirely — see _notes_cell_html)."""
     deal_id = str(deal.get("id"))
     entry = intro_details.get(deal_id) or {}
     resolved = _resolve_intro_status(deal, entry)
@@ -3632,12 +3560,10 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
     size_text = _esc(_deal_size_text(deal))
     milestones = entry.get("milestones")
     status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=True)
-    follow_up_val = entry.get("follow_up")
-    due_html = _due_chip_html() if _follow_up_is_due(follow_up_val) else ""
     notes_value = entry.get("notes")
     if notes_value is None:
         notes_value = entry.get("next_steps") or ""
-    notes_cell_html = _notes_cell_html(deal_id, notes_value, follow_up_val, due_html, True)
+    notes_cell_html = _notes_cell_html(deal_id, notes_value, True)
 
     return (
         f'<tr{row_cls}><td class="company">{company_cell}</td>'
@@ -3706,17 +3632,15 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         def _entry_for(d):
             return intro_details.get(str(d.get("id"))) or {}
 
-        def _due_key(d):
-            return 0 if _follow_up_is_due(_entry_for(d).get("follow_up")) else 1
-
         def _stalled_key(resolved):
             return 0 if resolved["id"] == INTRO_STATUS_STALLED_ID else 1
 
-        # Item 7: due/overdue first, then Stalled, then furthest-progressed
-        # first, then company A-Z.
-        main_rows.sort(key=lambda dr: (_due_key(dr[0]), _stalled_key(dr[1]), -_intro_sort_rank(dr[1]),
+        # Item 7 (turn 22 dropped the due/overdue-follow-up tier that used
+        # to sort first — follow-up dates are gone from the UI entirely):
+        # Stalled first, then furthest-progressed first, then company A-Z.
+        main_rows.sort(key=lambda dr: (_stalled_key(dr[1]), -_intro_sort_rank(dr[1]),
                                         (_deal_company_name(dr[0]) or "").lower()))
-        pending_rows.sort(key=lambda dr: (_due_key(dr[0]), (_deal_company_name(dr[0]) or "").lower()))
+        pending_rows.sort(key=lambda dr: (_deal_company_name(dr[0]) or "").lower())
 
         # Item 7: a company repeated in consecutive rows (within the same
         # section) is shown once, with a subtle left-accent on the
@@ -3734,20 +3658,18 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         pending_repeats = _mark_repeats(pending_rows)
 
         # tenant_edit_mode: the tenant (real session, or admin &view_as
-        # preview without &edit=1) can auto-save Next Steps / Follow-up on
-        # every Introduced-or-later row, and now (item 4) Status too,
-        # restricted to TENANT_ALLOWED_STATUS_IDS.
+        # preview without &edit=1) can auto-save Notes on every
+        # Introduced-or-later row, and now (item 4) Status too, restricted
+        # to TENANT_ALLOWED_STATUS_IDS.
         tenant_edit_mode = tenant is not None and not edit_mode
 
         # Item 2: summary strip counts. "In motion" is every disclosed
         # intro that isn't Stalled or Closed (both terminal in different
-        # ways); "follow-ups due" spans both sections (a pending intro can
-        # carry a follow_up too — see _pending_intro_row_html's own Due
-        # chip).
+        # ways). Turn 22 dropped the "follow-ups due" segment along with
+        # every other follow-up-date UI surface.
         stalled_count = sum(1 for _, r in main_rows if r["id"] == INTRO_STATUS_STALLED_ID)
         closed_count = sum(1 for _, r in main_rows if r["name"] == "Closed")
         in_motion_count = len(main_rows) - stalled_count - closed_count
-        due_count = sum(1 for d in kept_deals if _follow_up_is_due(_entry_for(d).get("follow_up")))
         pending_count = len(pending_rows)
 
         summary_parts = []
@@ -3755,9 +3677,6 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             summary_parts.append(f"{in_motion_count} in motion")
         if stalled_count:
             summary_parts.append(f"{stalled_count} stalled")
-        if due_count:
-            # Item 5 (turn 18): "1 follow-up due" / "2 follow-ups due".
-            summary_parts.append(f"{due_count} follow-up{'s' if due_count != 1 else ''} due")
         if pending_count:
             summary_parts.append(f"{pending_count} pending introduction{'s' if pending_count != 1 else ''}")
         summary_html = (f'<p class="mydeals-summary">{_esc(" · ".join(summary_parts))}</p>'
@@ -3769,7 +3688,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             '<th>Company</th><th>Buyer</th><th>Investor Type</th>'
             '<th class="num">Size</th>'
             '<th title="Where this introduction stands">Status</th>'
-            '<th title="Free-form notes, plus when to check in next">Notes</th>'
+            '<th>Notes</th>'
         )
 
         if not kept_deals:
@@ -3821,9 +3740,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                     for i, (d, resolved) in enumerate(pending_rows):
                         linked = _deal_linked_person_ids(d) - {person_id}
                         buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-                        follow_up = _entry_for(d).get("follow_up")
                         parts.append(_pending_intro_row_html(d, buyer_recs, tenant_email, person_id,
-                                                              follow_up=follow_up, key=key, view_as=view_as,
+                                                              key=key, view_as=view_as,
                                                               company_repeated=pending_repeats[i]))
 
             rows_html = "".join(parts)
@@ -4005,7 +3923,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     font-size: 13px;
     margin: 0 0 16px;
   }}
-  .ei-status, .ei-notes, .ei-follow-up, .ei-flag {{
+  .ei-status, .ei-notes, .ei-flag {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -4053,55 +3971,15 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     background: var(--qp);
     vertical-align: middle;
   }}
-  .due-chip {{
-    display: inline-block;
-    font-size: 10px;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 0.03em;
-    padding: 2px 7px;
-    border-radius: 999px;
-    background: rgba(178,59,59,0.12);
-    color: #b23b3b;
-    margin-bottom: 4px;
-  }}
-  /* Item 5 (turn 18): the Follow-up field's humanized-date overlay,
-     shown whenever the input isn't focused (see _edit_script_html). */
-  .ei-date-wrap {{ position: relative; width: 100%; }}
-  .ei-date-display {{
-    position: absolute;
-    inset: 0;
-    display: flex;
-    align-items: center;
-    background: var(--bg);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    padding: 5px 8px;
-    font-size: 13px;
-    color: var(--ink);
-    cursor: pointer;
-  }}
-  /* Turn 21: the Follow-up column is gone — its date input/Due chip now
-     live in a compact row under the Notes textarea (see
-     _notes_cell_html). Notes itself becomes a 2-line textarea, taking
-     the freed column width. */
+  /* Turn 21 folded the Follow-up column into the Notes cell; turn 22
+     removed follow-up dates from the UI entirely, so Notes is just a
+     2-line textarea filling the whole (still widened) cell. */
   textarea.ei-notes {{
     resize: vertical;
     min-height: 44px;
     font-family: inherit;
     line-height: 1.35;
   }}
-  .notes-followup-row {{
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-top: 6px;
-    color: var(--muted);
-    font-size: 12px;
-  }}
-  .notes-followup-row .ei-date-wrap {{ width: 118px; flex: 0 0 auto; }}
-  .notes-followup-row .ei-follow-up {{ width: 118px; }}
-  .notes-followup-row .due-chip {{ margin-bottom: 0; }}
 </style>
 </head>
 <body>
@@ -4162,8 +4040,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         deadline_html = "—"
 
     action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
-                                                  stats["follow_up_due"], visibility_state,
-                                                  key=key, view_as=view_as)
+                                                  visibility_state, key=key, view_as=view_as)
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
     actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section, key=key)
@@ -4207,9 +4084,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
         cef_state = _tenant_cef_state(person_id)
 
-        # Per-company buy-side aggregation (Intros count, Stalled/follow-up
-        # flags), memoized per distinct company so two Sell deals for the
-        # same company don't redo the same get_my_matched_buy_deals scan.
+        # Per-company buy-side aggregation (Intros count, Stalled flag),
+        # memoized per distinct company so two Sell deals for the same
+        # company don't redo the same get_my_matched_buy_deals scan.
+        # Turn 22: follow_up is no longer read here — see _my_deal_action_chip_html.
         company_stats_cache = {}
 
         def _company_stats(company_name):
@@ -4220,7 +4098,6 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                        if person_id is not None and company_name else [])
             intro_count = 0
             stalled = False
-            follow_up_due = False
             for d in matched:
                 entry = intro_details.get(str(d.get("id"))) or {}
                 resolved = _resolve_intro_status(d, entry)
@@ -4228,9 +4105,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                     intro_count += 1
                 if resolved["id"] == INTRO_STATUS_STALLED_ID:
                     stalled = True
-                if _follow_up_is_due(entry.get("follow_up")):
-                    follow_up_due = True
-            stats = {"intro_count": intro_count, "stalled": stalled, "follow_up_due": follow_up_due}
+            stats = {"intro_count": intro_count, "stalled": stalled}
             company_stats_cache[cache_key] = stats
             return stats
 
@@ -4284,7 +4159,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                     is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
                     deadlines.append(deadline)
 
-                if is_overdue or stats["stalled"] or stats["follow_up_due"]:
+                if is_overdue or stats["stalled"]:
                     attention_count += 1
                 intros_total += stats["intro_count"]
 
@@ -5939,6 +5814,13 @@ def _handle_update_intro(event):
         if len(notes) > MAX_INTRO_TEXT_LEN:
             return _json_response({"error": "notes too long"}, 400)
 
+    # Turn 22: Active Intros/My Deals no longer read or write follow_up
+    # anywhere (column, date input, Due chip, overdue-first sort tier,
+    # "follow-ups due" summary segment, and the Nudge-buyers chip
+    # condition are all gone) -- the attribute and this write path stay
+    # intact but dormant there, reserved for a future digest feature.
+    # The Company page's Buyers table has its own separate Follow-up
+    # column and is unaffected -- it still reads/writes this same field.
     follow_up = body.get("follow_up")
     if follow_up is not None:
         follow_up = str(follow_up).strip()
