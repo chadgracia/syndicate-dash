@@ -247,19 +247,18 @@ def _deal_update_form_url(deal_id):
 
 
 def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow_up_due, visibility_state,
-                               no_interest, key=None, view_as=None):
-    """Next Steps (item 2): ONE specific action chip per row, chosen by
-    priority (highest first): a) deadline passed (red, Update link) >
-    b) terms incomplete (red, Update link) > c) no interest (amber: last
-    real notification >3 days old and zero Introduced-or-later intros)
-    > d) nudge buyers (amber: a stalled or overdue-follow-up intro) >
-    e) ID required (red, CEF form link) > f) sign agreement (amber,
-    agreement template link). At most one of {b, e, f} ever applies —
-    they're the three "not live" visibility_state values and that state
-    machine is first-match-wins (see _my_deal_visibility_state) — while
-    a/c/d are independent conditions that can co-occur with any of them
-    or each other. When more than one candidate applies, the top-priority
-    chip carries a title/tooltip naming the rest."""
+                               key=None, view_as=None):
+    """Next Steps: ONE specific action chip per row, chosen by priority
+    (highest first): a) deadline passed (red, Update link) > b) terms
+    incomplete (red, Update link) > c) nudge buyers (amber: a stalled or
+    overdue-follow-up intro) > d) ID required (red, CEF form link) >
+    e) sign agreement (amber, agreement template link). At most one of
+    {b, d, e} ever applies — they're three of the "not live"
+    visibility_state values and that state machine is first-match-wins
+    (see _my_deal_visibility_state) — while a/c are independent
+    conditions that can co-occur with any of them or each other. When
+    more than one candidate applies, the top-priority chip carries a
+    title/tooltip naming the rest."""
     candidates = []
     if is_overdue:
         update_url = _deal_update_form_url(deal_id)
@@ -269,11 +268,6 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow
         update_url = _deal_update_form_url(deal_id)
         if update_url:
             candidates.append(("provide deal terms", "terms", "Provide deal terms &rarr;", update_url, True))
-    if no_interest:
-        update_url = _deal_update_form_url(deal_id)
-        if update_url:
-            candidates.append(("review terms", "no-interest", "No interest · review terms &rarr;",
-                                update_url, True))
     if stalled or follow_up_due:
         href = _company_href(company_name, "mydeals", key, view_as)
         candidates.append(("nudge buyers", "nudge", "Nudge buyers &rarr;", href, False))
@@ -917,71 +911,6 @@ def get_deals_list():
     _deals_cache["version"] = version
     _deals_cache["deals"] = deals
     return deals
-
-
-# chadgracia/deal-notifier's durable notification log (item 2 prerequisite,
-# confirmed present): {deal_id_str: {"last_alerted": iso_ts,
-# "recipients_count": int, "dry_run": bool, "company": str, "recipients":
-# [{"name","company","email"}, ...]}}, written by that Lambda's
-# handle_alert_post to notifier-alerts.json in this SAME full-pipeline-cache
-# bucket, and read here the same way.
-#
-# Scope caveat (reported, not silently assumed): this log covers ONLY
-# deal-notifier's manual, admin-triggered "alert this deal" action. Its
-# separate automated daily digest (run_digest) never writes here -- it only
-# logs an aggregate send count to CloudWatch, nothing per-deal or durable.
-# A deal whose only outreach was that automated digest will read "never
-# notified" below, not because nothing was sent but because nothing durable
-# exists to read for it.
-NOTIFIER_ALERTS_KEY = "notifier-alerts.json"
-_notifier_alerts_cache = {"version": None, "history": None}
-
-
-def get_notifier_alert_history():
-    """{deal_id_str: {...}} from notifier-alerts.json, fresh-checked via the
-    same cheap head_object-version pattern as get_deals_list. Never raises —
-    a missing file, a permissions error, or a malformed body all just mean
-    "no notification data", same as every other S3 read in this file."""
-    s3 = boto3.client("s3")
-    try:
-        version = _object_version(s3, NOTIFIER_ALERTS_KEY)
-    except Exception:
-        return {}
-    if _notifier_alerts_cache["version"] == version and _notifier_alerts_cache["history"] is not None:
-        return _notifier_alerts_cache["history"]
-    try:
-        obj = s3.get_object(Bucket=BUCKET, Key=NOTIFIER_ALERTS_KEY)
-        history = json.loads(obj["Body"].read()) or {}
-        if not isinstance(history, dict):
-            history = {}
-    except Exception:
-        history = {}
-    _notifier_alerts_cache["version"] = version
-    _notifier_alerts_cache["history"] = history
-    return history
-
-
-def _deal_notified_state(deal_id, alert_history):
-    """(distinct_buyer_count, days_since_last_send) for deal_id's most
-    recent REAL (non-dry-run) alert, or None if never notified. Buyer
-    count is deduped by email rather than trusting the log's own
-    recipients_count verbatim, since "distinct buyers" is the ask and the
-    source list isn't guaranteed unique. A dry_run entry (deal-notifier
-    routes every email to Chad for testing, not real buyers) never counts
-    as a real notification."""
-    hist = alert_history.get(str(deal_id))
-    if not hist or hist.get("dry_run"):
-        return None
-    sent_dt = _parse_dt(hist.get("last_alerted"))
-    if sent_dt is None:
-        return None
-    recipients = hist.get("recipients") or []
-    emails = {(r.get("email") or "").strip().lower() for r in recipients if r.get("email")}
-    count = len(emails) if emails else int(hist.get("recipients_count") or 0)
-    if count <= 0:
-        return None
-    days = (datetime.now(timezone.utc).date() - sent_dt.date()).days
-    return count, days
 
 
 def get_my_deals(person_id):
@@ -3387,7 +3316,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 </html>"""
 
 
-def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section, alert_history,
+def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section,
                        key=None, view_as=None, edit_mode=False):
     deal_id = str(deal.get("id"))
     if company_name:
@@ -3412,27 +3341,6 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     buyer_text = str(buyer_count)
     intro_text = str(stats["intro_count"]) if stats["intro_count"] else "—"
 
-    # Notified privacy rule (item 4): the real n/d numbers only ever show
-    # when this row is actually Live -- in tenant view and admin
-    # view_as alike, any non-live or Held state renders "-" instead,
-    # regardless of whether a notification really happened (the "no
-    # interest" chip condition below still fires off the real
-    # notified_state either way — it's the display, not the data, that's
-    # gated). Admin edit mode (&edit=1) is the one exception: it always
-    # shows the real value, marked "(internal)" only when it's actually
-    # overriding what a tenant/view_as session would otherwise see.
-    notified_state = _deal_notified_state(deal_id, alert_history)
-    show_real_notified = edit_mode or visibility_state == "live"
-    if notified_state and show_real_notified:
-        notified_n, notified_days = notified_state
-        line1 = f"{notified_n} Notified"
-        line2 = f"{notified_days}d ago"
-        if edit_mode and visibility_state != "live":
-            line2 += " (internal)"
-        notified_html = f"{_esc(line1)}<br>{_esc(line2)}"
-    else:
-        notified_html = "—"
-
     is_overdue = False
     if deadline:
         deadline_dt = _parse_dt(deadline)
@@ -3447,14 +3355,8 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     else:
         deadline_html = "—"
 
-    # Item 6: "no interest" only ever fires for a Live row -- a non-live
-    # row's real problem is its paperwork (ID/agreement/terms), which the
-    # priority chain in _my_deal_action_chip_html already surfaces
-    # instead once this is False.
-    no_interest = bool(visibility_state == "live" and notified_state and notified_state[1] > 3
-                        and stats["intro_count"] == 0)
     action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
-                                                  stats["follow_up_due"], visibility_state, no_interest,
+                                                  stats["follow_up_due"], visibility_state,
                                                   key=key, view_as=view_as)
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
@@ -3464,7 +3366,6 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         f'<tr><td class="company">{company_link}{deal_id_sub}</td>'
         f'<td>{badge_html}</td>'
         f'<td class="num">{buyer_text}</td>'
-        f'<td class="num">{notified_html}</td>'
         f'<td class="num">{intro_text}</td>'
         f'<td>{deadline_html}</td>'
         f'<td>{action_chip_html}</td>'
@@ -3498,7 +3399,6 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 
         intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
         cef_state = _tenant_cef_state(person_id)
-        alert_history = get_notifier_alert_history()
 
         # Per-company buy-side aggregation (Intros count, Stalled/follow-up
         # flags), memoized per distinct company so two Sell deals for the
@@ -3593,7 +3493,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 
             section_row_htmls[section].append(
                 _my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
-                                   section, alert_history, key=key, view_as=view_as, edit_mode=edit_mode))
+                                   section, key=key, view_as=view_as, edit_mode=edit_mode))
 
         today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         future_deadlines = [dl for dl in deadlines if dl >= today_iso]
@@ -3653,21 +3553,19 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             return f"""<div class="{card_cls}">
     <table>
       <colgroup>
-        <col style="width:15%">
-        <col style="width:18%">
-        <col style="width:7%">
+        <col style="width:17%">
+        <col style="width:21%">
+        <col style="width:8%">
+        <col style="width:8%">
         <col style="width:12%">
-        <col style="width:7%">
-        <col style="width:11%">
-        <col style="width:19%">
-        <col style="width:11%">
+        <col style="width:22%">
+        <col style="width:12%">
       </colgroup>
       <thead>
         <tr>
           <th>Company</th>
           <th>Visibility</th>
           <th class="num">Buyers</th>
-          <th class="num">Notified</th>
           <th class="num">Intros</th>
           <th>Deadline</th>
           <th>Next Steps</th>
@@ -3890,7 +3788,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .action-chip.overdue, .action-chip.terms, .action-chip.id-required {{
     background: rgba(178,59,59,0.12); color: #b23b3b;
   }}
-  .action-chip.no-interest, .action-chip.nudge, .action-chip.sign {{
+  .action-chip.nudge, .action-chip.sign {{
     background: rgba(201,162,39,0.15); color: var(--accredited);
   }}
   .ei-deadline {{
