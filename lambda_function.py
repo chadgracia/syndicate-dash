@@ -488,6 +488,13 @@ MILESTONE_STEPS = ["NDA", "VDR", "Sub Docs", "Wired", "Closed"]
 # step name -> its Pipeline status id, the inverse of MILESTONE_STATUS_IDS.
 MILESTONE_STEP_STATUS_ID = {step: sid for sid, step in MILESTONE_STATUS_IDS.items()}
 
+# Item 2 (turn 20): "Sub Docs" -> "Docs Sent" is a DISPLAY-only rename —
+# the internal step key stays "Sub Docs" everywhere else (Dynamo
+# milestones map keys, MILESTONE_STATUS_IDS, derivation) so already-
+# stored "Sub Docs" entries in live tenant data keep matching their
+# checkbox on render; only the checkbox's own label text changes.
+MILESTONE_STEP_LABELS = {"Sub Docs": "Docs Sent"}
+
 # Turn 17, item 1: the four checkbox steps replacing the Active Intros
 # status dropdown -- everything in MILESTONE_STEPS except "Closed",
 # which stays a FLAG value (set via the flag control below), never a
@@ -511,20 +518,6 @@ FLAG_STATUS_IDS = {
 FLAG_ADMIN_ONLY_VALUES = {"withdrawn", "closed"}
 FLAG_LABELS = {"none": "None", "stalled": "Stalled", "passed": "Passed",
                "withdrawn": "Withdrawn", "closed": "Closed"}
-
-# Item 3 (turn 16), item 4 (turn 17): Next Steps placeholder text, keyed
-# by the FURTHEST milestone CHECKED (the raw stored milestones map --
-# the same ground truth the checkboxes themselves display now, no
-# backfill/inference). Closed isn't a checkbox, so it never reaches
-# here; _next_step_suggestion falls back to the generic placeholder
-# whenever nothing's checked yet.
-NEXT_STEP_SUGGESTIONS = {
-    None: "Schedule intro call…",
-    "NDA": "Provide VDR access…",
-    "VDR": "Send sub docs…",
-    "Sub Docs": "Confirm wire details…",
-    "Wired": "We'll confirm closing.",
-}
 
 # Pipeline API v3 write (Intro Status only — see _pipeline_update_deal_status).
 # Auth is Pipeline's query-string scheme — ?api_key=...&app_key=..., no
@@ -1418,12 +1411,27 @@ def get_intro_details(tenant_email):
 # single partition to query.
 MAX_FEATURE_TEXT_LEN = 2000
 
+# Item 5 (turn 20): each feature-request item now stores which page it
+# was submitted from. A page's own box tags new items with its own page;
+# a page's own list filters to just that page; an item with no "page"
+# attribute at all (written before this turn) is treated as "my-deals",
+# where the box lived exclusively before per-page requests existed. The
+# admin aggregate view (no single tenant/page to scope to) is the one
+# exception -- it shows every item, every page, labeled by both.
+FEATURE_PAGES = {"my-deals", "intros", "demand", "company"}
+FEATURE_PAGE_LABELS = {"my-deals": "My Deals", "intros": "Active Intros", "demand": "Demand Board",
+                        "company": "Company"}
 
-def get_feature_requests(tenant_partition):
+
+def get_feature_requests(tenant_partition, page=None):
     """{"open": [...], "done": [...]} feature-request items for one Dynamo
     partition (sk begins_with "feature#"), each item newest-first within
     its bucket (the sk's own epoch-ms suffix sorts correctly as a string).
-    Never raises: any failure returns ({"open": [], "done": []}, True)."""
+    page=None returns every item regardless of page (the admin aggregate
+    view only); any other value filters to items whose stored "page"
+    matches it, with a missing "page" attribute treated as "my-deals"
+    (see FEATURE_PAGES above). Never raises: any failure returns
+    ({"open": [], "done": []}, True)."""
     try:
         table = _dynamo_table()
         resp = table.query(
@@ -1434,6 +1442,9 @@ def get_feature_requests(tenant_partition):
             sk = item.get("sk") or ""
             if not sk.startswith("feature#"):
                 continue
+            item_page = item.get("page") or "my-deals"
+            if page is not None and item_page != page:
+                continue
             items.append({
                 "sk": sk,
                 "tenant": tenant_partition,
@@ -1443,6 +1454,7 @@ def get_feature_requests(tenant_partition):
                 "done": bool(item.get("done")),
                 "done_by": item.get("done_by"),
                 "done_at": item.get("done_at"),
+                "page": item_page,
             })
         items.sort(key=lambda it: it["sk"], reverse=True)
         return {"open": [it for it in items if not it["done"]],
@@ -1451,7 +1463,7 @@ def get_feature_requests(tenant_partition):
         return {"open": [], "done": []}, True
 
 
-def _dynamo_write_feature_request(tenant_partition, text, actor):
+def _dynamo_write_feature_request(tenant_partition, text, actor, page):
     try:
         table = _dynamo_table()
         table.put_item(Item={
@@ -1461,6 +1473,7 @@ def _dynamo_write_feature_request(tenant_partition, text, actor):
             "submitted_by": actor,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "done": False,
+            "page": page,
         })
         return True, None
     except Exception as e:
@@ -1559,7 +1572,15 @@ def _handle_feature_request(event):
     if len(text) > MAX_FEATURE_TEXT_LEN:
         return _json_response({"error": "text too long"}, 400)
 
-    ok, err = _dynamo_write_feature_request(partition, text, actor)
+    # Item 5 (turn 20): tag the new item with the page it was submitted
+    # from. An unrecognized/missing page quietly falls back to
+    # "my-deals" rather than failing the whole request -- this is a
+    # low-stakes feedback box, not worth a hard error over a bad tag.
+    page = str(body.get("page") or "").strip()
+    if page not in FEATURE_PAGES:
+        page = "my-deals"
+
+    ok, err = _dynamo_write_feature_request(partition, text, actor, page)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
     return _json_response({"ok": True})
@@ -1570,16 +1591,20 @@ def _fmt_feature_date(iso_str):
     return dt.strftime("%b %-d, %Y") if dt else None
 
 
-def _feature_box_html(partition, key=None):
+def _feature_box_html(partition, key=None, page="my-deals"):
     """Submit box: "same auto-save fetch pattern" as the rest of the app
     (Saving…/Saved ✓/error via one shared inline .ei-msg), just triggered
     by a Submit button/Enter instead of blur, since this creates a new
     item rather than editing an existing field. Dismissable per page load
     only (box.hidden, no persistence) — reappears on the next load, by
     design. Reloads the page on success so the new item shows up in the
-    list below without needing separate DOM-insertion logic."""
+    list below without needing separate DOM-insertion logic.
+
+    page (item 5, turn 20) tags the new item so this same page's own
+    list (and no other page's) picks it up — see get_feature_requests."""
     key_json = json.dumps(key or "")
     tenant_json = json.dumps(partition)
+    page_json = json.dumps(page)
     return f"""<div class="feature-box" id="feature-box">
   <button type="button" class="feature-box-dismiss" id="feature-box-dismiss" aria-label="Dismiss">&times;</button>
   <h2>Help shape this dashboard</h2>
@@ -1594,6 +1619,7 @@ def _feature_box_html(partition, key=None):
 (function() {{
   var KEY = {key_json};
   var TENANT = {tenant_json};
+  var PAGE = {page_json};
   var box = document.getElementById('feature-box');
   var dismiss = document.getElementById('feature-box-dismiss');
   if (dismiss) dismiss.addEventListener('click', function() {{ box.hidden = true; }});
@@ -1610,7 +1636,7 @@ def _feature_box_html(partition, key=None):
     fetch('?action=feature_request', {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ key: KEY, tenant: TENANT, text: text }})
+      body: JSON.stringify({{ key: KEY, tenant: TENANT, text: text, page: PAGE }})
     }}).then(function(r) {{
       return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }});
     }}).then(function(res) {{
@@ -1671,10 +1697,15 @@ def _feature_toggle_script_html(key):
 </script>"""
 
 
-def _feature_request_row_html(item, show_tenant=False, tenant_name=None):
+def _feature_request_row_html(item, show_tenant=False, tenant_name=None, show_page=False):
     text_html = _esc(item["text"])
     tenant_tag = (f'<span class="feature-tenant-tag">{_esc(tenant_name)}</span> '
                   if show_tenant and tenant_name else "")
+    # Item 5 (turn 20): the admin aggregate view labels every item by
+    # page too, since it shows every page's requests together.
+    page_tag = (f'<span class="feature-page-tag">'
+                f'{_esc(FEATURE_PAGE_LABELS.get(item.get("page"), item.get("page")))}</span> '
+                if show_page and item.get("page") else "")
     sk_attr = _esc(item["sk"])
     tenant_attr = _esc(item["tenant"])
     if item["done"]:
@@ -1691,31 +1722,37 @@ def _feature_request_row_html(item, show_tenant=False, tenant_name=None):
         row_cls = "feature-row"
 
     return (f'<div class="{row_cls}">'
-            f'<div class="feature-row-text">{tenant_tag}{text_html}</div>'
+            f'<div class="feature-row-text">{tenant_tag}{page_tag}{text_html}</div>'
             f'<div class="feature-row-meta">{meta}&nbsp;&nbsp;{toggle_btn}<span class="ei-msg"></span></div>'
             f'</div>')
 
 
-def _feature_requests_list_html(open_items, done_items, show_tenant=False, tenant_names=None):
+def _feature_requests_list_html(open_items, done_items, show_tenant=False, tenant_names=None, show_page=False):
     if not open_items and not done_items:
         return '<div class="gg-placeholder small">No feature requests yet.</div>'
     names = tenant_names or {}
-    rows = [_feature_request_row_html(it, show_tenant=show_tenant, tenant_name=names.get(it["tenant"]))
+    rows = [_feature_request_row_html(it, show_tenant=show_tenant, tenant_name=names.get(it["tenant"]),
+                                        show_page=show_page)
             for it in open_items]
-    rows += [_feature_request_row_html(it, show_tenant=show_tenant, tenant_name=names.get(it["tenant"]))
+    rows += [_feature_request_row_html(it, show_tenant=show_tenant, tenant_name=names.get(it["tenant"]),
+                                         show_page=show_page)
              for it in done_items]
     return "".join(rows)
 
 
-def _feature_section_html(tenant_picker, anon_key_email, key=None):
-    """Feature-request box + list, shared verbatim by My Deals and the
-    Demand Board (item 5): tenant_picker (admin, no view_as) is the one
-    case with no single partition to scope to — it aggregates every
+def _feature_section_html(tenant_picker, anon_key_email, key=None, page="my-deals"):
+    """Feature-request box + list, shared verbatim by My Deals, Active
+    Intros, and the Demand Board (item 5, turn 20 — page-scoped):
+    tenant_picker (admin, no view_as) is the one case with no single
+    partition to scope to — it aggregates every
     auto-enrolled tenant partition plus "admin" instead; every other case
     (real tenant session, or admin under &view_as) is scoped to
     anon_key_email. Returns (feature_box_html, feature_list_html)."""
     if tenant_picker:
-        feature_box_html = _feature_box_html("admin", key=key)
+        # Admin aggregate: every tenant partition, every page, unfiltered
+        # (get_feature_requests(partition) with no page= defaults to
+        # None -- everything) -- each row labeled by both tenant and page.
+        feature_box_html = _feature_box_html("admin", key=key, page=page)
         tenant_index = _tenant_index()
         tenant_names = {"admin": "Admin"}
         agg_open, agg_done = [], []
@@ -1727,10 +1764,10 @@ def _feature_section_html(tenant_picker, anon_key_email, key=None):
         agg_open.sort(key=lambda it: it["sk"], reverse=True)
         agg_done.sort(key=lambda it: it["sk"], reverse=True)
         feature_list_html = _feature_requests_list_html(agg_open, agg_done, show_tenant=True,
-                                                          tenant_names=tenant_names)
+                                                          tenant_names=tenant_names, show_page=True)
     else:
-        feature_box_html = _feature_box_html(anon_key_email, key=key)
-        feature_items, _ = get_feature_requests(anon_key_email)
+        feature_box_html = _feature_box_html(anon_key_email, key=key, page=page)
+        feature_items, _ = get_feature_requests(anon_key_email, page=page)
         feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
     return feature_box_html, feature_list_html
 
@@ -2107,20 +2144,6 @@ def _derive_status_from_checked(checked_steps):
         if step in checked_steps:
             return MILESTONE_STEP_STATUS_ID[step]
     return INTRO_STATUS_INTRODUCED_ID
-
-
-def _next_step_suggestion(milestones):
-    """Item 3 (turn 16) / item 4 (turn 17): the Next Steps placeholder
-    (shown only while the field is empty -- a native <input
-    placeholder>, never auto-saved), keyed to the furthest CHECKED
-    milestone -- the raw stored map, the same ground truth the
-    checkboxes themselves display (no backfill)."""
-    stored = milestones or {}
-    furthest = None
-    for step in CHECKBOX_MILESTONE_STEPS:
-        if step in stored:
-            furthest = step
-    return NEXT_STEP_SUGGESTIONS.get(furthest, "Add next step…")
 
 
 # ── Admin write path: Intro Status / Next Steps / Buyer Notes ───────────────
@@ -2577,9 +2600,13 @@ def _buyer_name_cell_html(buyer_recs, show_contact, link=False, key=None, view_a
     if not buyer_recs:
         return "—"
     if link:
+        # Item 6 (turn 20): the same clear link affordance as Active
+        # Intros -- accent color, hover underline, muted "profile →"
+        # suffix (see .buyer-link/.buyer-link-suffix CSS below).
         names = ", ".join(
             f'<a class="buyer-link" href="{_buyer_href(r.get("id"), key, view_as)}">'
-            f'{_esc(_person_display_name(r) or "—")}</a>'
+            f'{_esc(_person_display_name(r) or "—")}'
+            f'<span class="buyer-link-suffix"> profile &rarr;</span></a>'
             for r in buyer_recs
         )
     else:
@@ -2717,7 +2744,11 @@ def _intro_buyer_cell_html(primary, more_count, key=None, view_as=None):
     dot_html = (' <span class="closed-dot" title="Closed a deal with Rainmaker before"></span>'
                 if is_closed else "")
     more_html = f' <span class="buyer-cell-more">+{more_count} more</span>' if more_count > 0 else ""
-    line1 = f'<div class="buyer-cell-name"><a href="{href}">{name}</a>{dot_html}{more_html}</div>'
+    # Item 6 (turn 20): a clear link affordance -- accent color, hover
+    # underline, a small muted "profile →" suffix inside the link (so
+    # the whole thing, name and suffix alike, is one click target).
+    line1 = (f'<div class="buyer-cell-name"><a class="buyer-link" href="{href}">{name}'
+             f'<span class="buyer-link-suffix"> profile &rarr;</span></a>{dot_html}{more_html}</div>')
 
     cf = primary.get("custom_fields") or {}
     transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
@@ -2822,7 +2853,7 @@ def _intro_status_select_html(deal_id, current_id, allowed_ids=None):
 
 
 def _milestone_checkboxes_html(deal_id, milestones, disabled=False):
-    """Turn 17, item 1: the four NDA/VDR/Sub Docs/Wired checkboxes
+    """Turn 17, item 1: the four NDA/VDR/Docs Sent/Wired checkboxes
     replacing the old status dropdown/strip on Active Intros. Checked
     purely from what's actually recorded in the Dynamo milestones map —
     deliberately no backfill/implied-reached inference here (unlike the
@@ -2831,16 +2862,19 @@ def _milestone_checkboxes_html(deal_id, milestones, disabled=False):
     the deal's current Pipeline status, which a backfilled display could
     not guarantee (the current status alone can't distinguish "never
     recorded" from "explicitly un-recorded"). "Closed" is never a
-    checkbox — see _flag_select_html."""
+    checkbox — see _flag_select_html. The checkbox's value= attribute
+    (and data-deal-id) always carries the internal step key, never the
+    display label (item 2, turn 20) — see MILESTONE_STEP_LABELS."""
     stored = milestones or {}
     disabled_attr = " disabled" if disabled else ""
     boxes = []
     for step in CHECKBOX_MILESTONE_STEPS:
         checked_attr = " checked" if step in stored else ""
+        label = MILESTONE_STEP_LABELS.get(step, step)
         boxes.append(
             f'<label class="ei-milestone-label"><input type="checkbox" class="ei-milestone" '
             f'data-deal-id="{_esc(deal_id)}" value="{_esc(step)}"{checked_attr}{disabled_attr}>'
-            f'{_esc(step)}</label>'
+            f'{_esc(label)}</label>'
         )
     return f'<div class="ei-milestones">{"".join(boxes)}</div>'
 
@@ -3306,6 +3340,16 @@ FEATURE_CSS = """
     color: var(--accent);
     margin-right: 6px;
   }
+  .feature-page-tag {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    background: rgba(22,24,29,0.06);
+    border-radius: 999px;
+    padding: 1px 8px;
+    margin-right: 6px;
+  }
 """
 
 
@@ -3412,19 +3456,25 @@ def _investor_type_cell_html(buyer_recs):
 def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=None, view_as=None,
                      editable=False, company_repeated=False):
     """Tenant-facing Introduced-or-later row: Company | Buyer | Investor
-    Type | Size | Status | Next Steps | Follow-up. editable=True
+    Type | Size | Status | Notes | Follow-up. editable=True
     (tenant_edit_mode — see render_intros_page) leaves the Status cell's
     milestone checkboxes and flag select (turn 17 — see
-    _status_milestones_column_html) interactive, and makes Next Steps/
+    _status_milestones_column_html) interactive, and makes Notes/
     Follow-up auto-saving inputs, except on a Passed/Withdrawn row,
-    which renders Next Steps/Follow-up as read-only text instead —
-    nothing left to plan for a dead intro. A Closed row locks the status
+    which renders Notes/Follow-up as read-only text instead — nothing
+    left to plan for a dead intro. A Closed row locks the status
     controls read-only for tenants regardless of editable (item 2) —
-    next_steps/follow_up are unaffected by that lock, only is_dead is.
-    The Next Steps placeholder (turn 16 item 3, turn 17 item 4) is the
-    suggested action for the furthest CHECKED milestone, not a fixed
-    string. company_repeated (item 7) blanks the company cell (and its
-    Update-deal link, turn 16 item 6) and adds a subtle left-accent
+    notes/follow_up are unaffected by that lock, only is_dead is.
+
+    Notes replaces Next Steps entirely (item 3, turn 20): free text, no
+    suggested placeholder, stored in the same Dynamo "notes" attribute
+    the Company page's admin-only Buyer Notes column already writes —
+    tenant and admin now share that one field. A row with legacy
+    next_steps but no notes yet shows the next_steps text as the
+    initial value (read once, never written back to next_steps) so old
+    data stays visible; the next_steps input itself is retired from
+    this page. company_repeated (item 7) blanks the company cell (and
+    its Update-deal link, turn 16 item 6) and adds a subtle left-accent
     instead of repeating the same company name row after row."""
     company_name = _deal_company_name(deal)
     if company_repeated:
@@ -3457,13 +3507,14 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
     due_html = _due_chip_html() if _follow_up_is_due(follow_up_val) else ""
 
     is_dead = resolved["name"] in ("Passed", "Withdrawn")
+    notes_value = entry.get("notes")
+    if notes_value is None:
+        notes_value = entry.get("next_steps") or ""
     if editable and not is_dead:
-        suggestion = _next_step_suggestion(milestones)
-        next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""),
-                                          placeholder=suggestion)
+        notes_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(notes_value), placeholder="Add a note…")
         follow_up_html = due_html + _ei_followup_field_html(deal_id, _esc(follow_up_val or ""))
     else:
-        next_steps_html = _esc(entry.get("next_steps") or "—")
+        notes_html = _esc(notes_value or "—")
         follow_up_text = _fmt_short_date(follow_up_val)
         follow_up_html = due_html + (_esc(follow_up_text) if follow_up_text else "—")
 
@@ -3473,7 +3524,7 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=N
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
-        f'<td>{next_steps_html}</td>'
+        f'<td>{notes_html}</td>'
         f'<td>{follow_up_html}</td></tr>'
     )
 
@@ -3517,7 +3568,8 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
     the same milestone checkboxes + flag select as the tenant-facing row
     (turn 17 — see _status_milestones_column_html) but never disabled —
     admin has full rights everywhere, Closed rows included — plus
-    auto-saving Next Steps/Follow-up inputs."""
+    auto-saving Notes/Follow-up inputs (item 3, turn 20 — see
+    _intro_row_html for the Notes/next_steps fallback)."""
     deal_id = str(deal.get("id"))
     entry = intro_details.get(deal_id) or {}
     resolved = _resolve_intro_status(deal, entry)
@@ -3546,9 +3598,10 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
     status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=True)
     follow_up_val = entry.get("follow_up")
     due_html = _due_chip_html() if _follow_up_is_due(follow_up_val) else ""
-    suggestion = _next_step_suggestion(milestones)
-    next_steps_html = _ei_field_html("ei-next-steps", deal_id, "next_steps", _esc(entry.get("next_steps") or ""),
-                                      placeholder=suggestion)
+    notes_value = entry.get("notes")
+    if notes_value is None:
+        notes_value = entry.get("next_steps") or ""
+    notes_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(notes_value), placeholder="Add a note…")
     follow_up_html = due_html + _ei_followup_field_html(deal_id, _esc(follow_up_val or ""))
 
     return (
@@ -3557,7 +3610,7 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, ke
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{size_text}</td>'
         f'<td>{status_html}</td>'
-        f'<td>{next_steps_html}</td>'
+        f'<td>{notes_html}</td>'
         f'<td>{follow_up_html}</td></tr>'
     )
 
@@ -3578,7 +3631,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     nav = _nav_html("intros", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
     tenant_picker = tenant is None
 
-    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, tenant_email or "admin", key=key)
+    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, tenant_email or "admin", key=key,
+                                                                   page="intros")
 
     if tenant_picker:
         body_html = (
@@ -3681,7 +3735,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             '<th>Company</th><th>Buyer</th><th>Investor Type</th>'
             '<th class="num">Size</th>'
             '<th title="Where this introduction stands">Status</th>'
-            '<th>Next Steps</th>'
+            '<th>Notes</th>'
             '<th title="When to check in next">Follow-up</th>'
         )
 
@@ -3919,7 +3973,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     font-size: 13px;
     margin: 0 0 16px;
   }}
-  .ei-status, .ei-next-steps, .ei-follow-up, .ei-flag {{
+  .ei-status, .ei-notes, .ei-follow-up, .ei-flag {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -3939,8 +3993,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .ei-msg.saved {{ color: var(--qp); }}
   .ei-msg.error {{ color: #b23b3b; }}
   .buyer-cell-name {{ font-weight: 600; }}
-  .buyer-cell-name a {{ color: inherit; text-decoration: none; }}
-  .buyer-cell-name a:hover {{ text-decoration: underline; }}
+  .buyer-cell-name a.buyer-link {{ color: var(--accent); text-decoration: none; }}
+  .buyer-cell-name a.buyer-link:hover {{ text-decoration: underline; }}
+  .buyer-link-suffix {{ font-weight: 400; font-size: 11px; color: var(--muted); }}
   .buyer-cell-more {{ font-weight: 400; font-size: 12px; color: var(--muted); }}
   .buyer-cell-sub, .buyer-cell-links {{
     font-size: 12px;
@@ -4079,7 +4134,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     buy-side signals, not attributes of the Sell deal itself."""
     nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
 
-    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key)
+    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
+                                                                   page="my-deals")
 
     summary_html = ""
     subtle_html = ""
@@ -4626,8 +4682,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     # under &view_as, or the literal "admin" when neither applies) — no
     # cross-tenant aggregation here, that's render_my_deals_page's
     # tenant_picker branch only (see get_feature_requests).
-    feature_items, _ = get_feature_requests(anon_key_email)
-    feature_box_html = _feature_box_html(anon_key_email, key=key)
+    feature_items, _ = get_feature_requests(anon_key_email, page="company")
+    feature_box_html = _feature_box_html(anon_key_email, key=key, page="company")
     feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
 
     # tenant_edit_mode: the tenant (real session, or admin &view_as preview
@@ -4934,8 +4990,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .dc-value {{ font-size: 16px; font-weight: 600; }}
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
   .buyer-contact {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
-  a.buyer-link {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
-  a.buyer-link:hover {{ border-bottom-color: var(--accent); }}
+  a.buyer-link {{ color: var(--accent); text-decoration: none; }}
+  a.buyer-link:hover {{ text-decoration: underline; }}
+  .buyer-link-suffix {{ font-weight: 400; font-size: 11px; color: var(--muted); }}
   .engagement-badge {{
     display: inline-block;
     font-size: 12px;
@@ -5132,6 +5189,71 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
             f'<div class="buyer-page-note">Identity available after introduction.</div></div>')
 
 
+def _buyer_note_line_html(deal_id, label_prefix, notes_value):
+    field_html = _ei_field_html("ei-notes", deal_id, "notes", _esc(notes_value), placeholder="Add a note…")
+    return (f'<div class="buyer-note-line">'
+            f'<span class="buyer-note-company">{label_prefix} &mdash;</span>{field_html}</div>')
+
+
+def _buyer_notes_section_html(buyer_id, tenant, anon_key_email, edit_mode):
+    """Item 4 (turn 20): the buyer page's "Your notes" section -- one
+    line per company where the viewer has an intro with this buyer,
+    each independently editable via the same auto-save path Active
+    Intros' own Notes column uses (.ei-notes, keyed by THAT deal's own
+    deal_id -- notes are stored per intro item, not per buyer, so each
+    line saves to a different Dynamo record).
+
+    Tenant view (edit_mode=False, whether a real tenant session or an
+    admin &view_as preview without &edit=1 -- the same tenant_edit_mode
+    signal every other page uses): only the viewing tenant's own notes,
+    scoped to their Introduced-or-later deals with this buyer (mirrors
+    the page's own disclosure gate -- never a pending/anonymized deal).
+    Admin edit mode: every tenant's notes on every matched-or-later buy
+    deal linking this buyer, disclosed or not, each line labeled by
+    tenant then company. Only ever called after the page's own
+    full_access check already passed -- there is nothing to show
+    otherwise."""
+    lines = []
+    if edit_mode:
+        tenant_index = _tenant_index()
+        intro_cache = {}
+        for d in get_deals_list():
+            if not _is_matched_or_later_buy_deal(d):
+                continue
+            if buyer_id not in _deal_linked_person_ids(d):
+                continue
+            owner_email = _tenant_email_for_deal(d)
+            if owner_email is None:
+                continue
+            if owner_email not in intro_cache:
+                intro_cache[owner_email], _ = get_intro_details(owner_email)
+            entry = intro_cache[owner_email].get(str(d.get("id"))) or {}
+            notes_value = entry.get("notes")
+            if notes_value is None:
+                notes_value = entry.get("next_steps") or ""
+            company_name = _deal_company_name(d) or "—"
+            tenant_name = (tenant_index.get(owner_email) or {}).get("name", owner_email)
+            label = f'{_esc(tenant_name)} &middot; {_esc(company_name)}'
+            lines.append(_buyer_note_line_html(str(d.get("id")), label, notes_value))
+    else:
+        person_id = tenant.get("person_id")
+        intro_details, _ = get_intro_details(anon_key_email)
+        for d in get_my_matched_buy_deals(person_id):
+            if buyer_id not in _deal_linked_person_ids(d):
+                continue
+            entry = intro_details.get(str(d.get("id"))) or {}
+            if not _resolve_intro_status(d, entry)["disclosed"]:
+                continue
+            notes_value = entry.get("notes")
+            if notes_value is None:
+                notes_value = entry.get("next_steps") or ""
+            company_name = _deal_company_name(d) or "—"
+            lines.append(_buyer_note_line_html(str(d.get("id")), _esc(company_name), notes_value))
+
+    body = "".join(lines) if lines else '<div class="gg-placeholder small">No notes yet.</div>'
+    return f'<div class="card buyer-notes-card"><h2 class="buyer-notes-heading">Your notes</h2>{body}</div>'
+
+
 def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=None, view_as=None, edit_mode=False,
                        cef_html=""):
     """Item 3 (turn 18): ?buyer=<person_id> — replaces the old inline
@@ -5149,6 +5271,11 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     about this buyer's OTHER companies, other tenants, or their
     interests is ever looked up or shown here.
 
+    Full access also unlocks the "Your notes" section (item 4, turn 20
+    — _buyer_notes_section_html), so the edit script (checkbox/flag/
+    text-field auto-save) is only ever included when there's actually
+    something on the page it needs to wire up.
+
     tenant stays None only for admin-without-view_as (the same
     tenant-picker signal every other page uses) — there's no tenant
     context to gate disclosure against, so that case gets the same
@@ -5161,6 +5288,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     except (TypeError, ValueError):
         buyer_id = None
 
+    edit_script_html = ""
     if tenant is None:
         body_html = (
             '<div class="gg-placeholder">Pick a tenant to preview — '
@@ -5175,8 +5303,12 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
         else:
             person_id = tenant.get("person_id")
             full_access = edit_mode or _tenant_has_disclosed_deal_with(person_id, anon_key_email, buyer_id)
-            body_html = (_buyer_page_full_html(rec) if full_access
-                         else _buyer_page_anonymized_html(rec, anon_key_email, buyer_id))
+            if full_access:
+                notes_html = _buyer_notes_section_html(buyer_id, tenant, anon_key_email, edit_mode)
+                body_html = _buyer_page_full_html(rec) + notes_html
+                edit_script_html = _edit_script_html(key)
+            else:
+                body_html = _buyer_page_anonymized_html(rec, anon_key_email, buyer_id)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -5237,6 +5369,26 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     color: var(--muted);
     font-size: 15px;
   }}
+  .gg-placeholder.small {{ margin: 0; padding: 8px 0; text-align: left; font-size: 13px; }}
+  .buyer-notes-card {{ margin-top: 16px; }}
+  .buyer-notes-heading {{ font-size: 16px; font-weight: 600; margin: 0 0 12px; }}
+  .buyer-note-line {{ margin-top: 10px; }}
+  .buyer-note-line:first-of-type {{ margin-top: 0; }}
+  .buyer-note-company {{ display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }}
+  .ei-notes {{
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 13px;
+    width: 100%;
+    box-sizing: border-box;
+  }}
+  .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
+  .ei-msg.saving {{ color: var(--muted); }}
+  .ei-msg.saved {{ color: var(--qp); }}
+  .ei-msg.error {{ color: #b23b3b; }}
 </style>
 </head>
 <body>
@@ -5244,6 +5396,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
 <div class="wrap">
   {body_html}
 </div>
+{edit_script_html}
 </body>
 </html>"""
 
@@ -5326,7 +5479,8 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
 
 def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
                  tenant_picker=False):
-    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key)
+    feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
+                                                                   page="demand")
     rows_html = "".join(
         f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
         f'{_esc(r["company"])}</a></td>'
@@ -5617,10 +5771,11 @@ def _handle_update_intro(event):
       next_steps and follow_up always, PLUS status on a row that's
       already Introduced-or-later (disclosed) and NOT Closed (item 2 —
       a Closed row locks read-only for tenants across every status
-      mechanism). notes/deadline are still rejected outright with 403
-      for a tenant. Every tenant write is also scoped to a deal_id whose
-      linked tenant (via person linkage, _tenant_email_for_deal) is that
-      same authenticated tenant.
+      mechanism), PLUS notes (item 3, turn 20 — no longer admin-only)
+      on any disclosed row, Closed included. deadline is still rejected
+      outright with 403 for a tenant. Every tenant write is also scoped
+      to a deal_id whose linked tenant (via person linkage,
+      _tenant_email_for_deal) is that same authenticated tenant.
 
     Turn 17: status can be set three mutually exclusive ways (at most one
     per request):
@@ -5671,7 +5826,7 @@ def _handle_update_intro(event):
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
         if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
-        if body.get("notes") not in (None, "") or body.get("deadline") not in (None, ""):
+        if body.get("deadline") not in (None, ""):
             return _json_response({"error": "forbidden"}, 403)
 
     deal_id = str(body.get("deal_id") or "").strip()
@@ -5719,7 +5874,13 @@ def _handle_update_intro(event):
         if len(next_steps) > MAX_INTRO_TEXT_LEN:
             return _json_response({"error": "next_steps too long"}, 400)
 
-    notes = body.get("notes") if is_admin else None
+    # Item 3 (turn 20): Notes is no longer admin-only -- it's the same
+    # Dynamo "notes" attribute Active Intros' tenant-facing Notes column
+    # now writes to directly (replacing next_steps there), shared with
+    # the Company page's admin-only Buyer Notes column. Tenant rights
+    # are still gated to a disclosed row -- see the disclosure check
+    # below, once old_resolved is available.
+    notes = body.get("notes")
     if notes is not None:
         notes = str(notes)
         if len(notes) > MAX_INTRO_TEXT_LEN:
@@ -5771,6 +5932,14 @@ def _handle_update_intro(event):
             # every status mechanism -- checkbox, flag, and (defensively)
             # a literal status id too.
             return _json_response({"error": "forbidden"}, 403)
+
+    if notes is not None and not is_admin and not old_resolved["disclosed"]:
+        # Item 3 (turn 20): a tenant may only write Notes on a row
+        # that's already Introduced-or-later -- same disclosure gate as
+        # status, but NOT the Closed-lock above: Notes stays editable
+        # after a deal closes (there's still reason to annotate it),
+        # unlike the status controls.
+        return _json_response({"error": "forbidden"}, 403)
 
     old_values = {
         "status": old_resolved["id"] if old_resolved["id"] is not None else old_resolved["name"],
