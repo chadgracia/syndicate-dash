@@ -272,7 +272,7 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, follow
     if no_interest:
         update_url = _deal_update_form_url(deal_id)
         if update_url:
-            candidates.append(("review terms", "no-interest", "No interest — review terms &rarr;",
+            candidates.append(("review terms", "no-interest", "No interest · review terms &rarr;",
                                 update_url, True))
     if stalled or follow_up_due:
         href = _company_href(company_name, "mydeals", key, view_as)
@@ -657,6 +657,16 @@ def _fmt_money(v):
         n = v / 1_000
         return f"${n:.0f}K" if n == int(n) else f"${n:.1f}K"
     return f"${v:,.0f}"
+
+
+def _fmt_short_date(date_str):
+    """"Sep 15, '26" (item 2) from any _parse_dt-parseable date string, or
+    None if it doesn't parse — callers fall back to the raw string rather
+    than hiding an unparseable-but-present value."""
+    dt = _parse_dt(date_str)
+    if dt is None:
+        return None
+    return f"{dt.strftime('%b')} {dt.day}, '{dt.strftime('%y')}"
 
 
 def _deal_title(deal):
@@ -2345,14 +2355,14 @@ def _my_deal_visibility_badge_html(deal, cef_state, is_held):
     links for these same states now (item 2)."""
     state = _my_deal_visibility_state(deal, cef_state, is_held)
     if state == "id_required":
-        return '<span class="visibility-badge id-required">Not live — ID required</span>'
+        return '<span class="visibility-badge id-required">Not live · ID required</span>'
     if state == "agreement_unsigned":
-        return '<span class="visibility-badge agreement-unsigned">Not live — agreement unsigned</span>'
+        return '<span class="visibility-badge agreement-unsigned">Not live · unsigned agreement</span>'
     if state == "terms_incomplete":
-        return '<span class="visibility-badge terms-incomplete">Not live — awaiting deal terms</span>'
+        return '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>'
     if state == "held":
-        return '<span class="visibility-badge held">Held — not shown to buyers</span>'
-    return '<span class="visibility-badge live">Live — shown to buyers</span>'
+        return '<span class="visibility-badge held">Held · not shown to buyers</span>'
+    return '<span class="visibility-badge live">Live · shown to buyers</span>'
 
 
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
@@ -3433,11 +3443,16 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         deadline_html = _ei_date_field_html(deal_id, deadline or "", css_class=deadline_css, field="deadline")
     elif deadline:
         deadline_cls = ' class="deadline-overdue"' if is_overdue else ""
-        deadline_html = f'<span{deadline_cls}>{_esc(deadline)}</span>'
+        deadline_html = f'<span{deadline_cls}>{_esc(_fmt_short_date(deadline) or deadline)}</span>'
     else:
         deadline_html = "—"
 
-    no_interest = bool(notified_state and notified_state[1] > 3 and stats["intro_count"] == 0)
+    # Item 6: "no interest" only ever fires for a Live row -- a non-live
+    # row's real problem is its paperwork (ID/agreement/terms), which the
+    # priority chain in _my_deal_action_chip_html already surfaces
+    # instead once this is False.
+    no_interest = bool(visibility_state == "live" and notified_state and notified_state[1] > 3
+                        and stats["intro_count"] == 0)
     action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
                                                   stats["follow_up_due"], visibility_state, no_interest,
                                                   key=key, view_as=view_as)
@@ -3449,7 +3464,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         f'<tr><td class="company">{company_link}{deal_id_sub}</td>'
         f'<td>{badge_html}</td>'
         f'<td class="num">{buyer_text}</td>'
-        f'<td>{notified_html}</td>'
+        f'<td class="num">{notified_html}</td>'
         f'<td class="num">{intro_text}</td>'
         f'<td>{deadline_html}</td>'
         f'<td>{action_chip_html}</td>'
@@ -3618,21 +3633,41 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             summary_parts.append(f'Total closed: <span class="mydeals-total">'
                                   f'{_esc(_fmt_money(closed_total))}</span>')
         if future_deadlines:
-            summary_parts.append(f"next deadline {_esc(min(future_deadlines))}")
+            next_deadline = min(future_deadlines)
+            summary_parts.append(f"next deadline {_esc(_fmt_short_date(next_deadline) or next_deadline)}")
         summary_html = (f'<p class="mydeals-summary">{" · ".join(summary_parts)}</p>'
                          if summary_parts else "")
         subtle_html = '<p class="mydeals-subtle">Click a company name for deal details, buyers, and live demand.</p>'
 
         def _section_table_html(rows_html, extra_card_class=""):
             card_cls = f"card {extra_card_class}".strip()
+            # table-layout:fixed + an explicit colgroup (item 1's actual
+            # fix) — with the default table-layout:auto this table had,
+            # nowrap badge/chip text was free to force each column wider
+            # than its share of the card, so the table's real width (measured
+            # in a real browser, not eyeballed) exceeded the card's and the
+            # actions column bled out past its right edge. Fixed layout
+            # makes these percentages the real column widths regardless of
+            # content, and the badges/chips below wrap (max ~2 lines for
+            # their actual text) instead of forcing more.
             return f"""<div class="{card_cls}">
     <table>
+      <colgroup>
+        <col style="width:15%">
+        <col style="width:18%">
+        <col style="width:7%">
+        <col style="width:12%">
+        <col style="width:7%">
+        <col style="width:11%">
+        <col style="width:19%">
+        <col style="width:11%">
+      </colgroup>
       <thead>
         <tr>
           <th>Company</th>
           <th>Visibility</th>
           <th class="num">Buyers</th>
-          <th>Notified</th>
+          <th class="num">Notified</th>
           <th class="num">Intros</th>
           <th>Deadline</th>
           <th>Next Steps</th>
@@ -3704,7 +3739,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     border: 1px solid var(--line);
     border-radius: 10px;
   }}
-  table {{ width: 100%; border-collapse: collapse; }}
+  table {{ width: 100%; table-layout: fixed; border-collapse: collapse; }}
   /* Sticky header needs the card unclipped (overflow:hidden on an
      ancestor defeats position:sticky), so the rounded top corners are
      applied directly to the header cells instead of via .card overflow
@@ -3735,7 +3770,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     border-bottom: 1px solid var(--line);
     white-space: nowrap;
   }}
-  thead th.num, td.num {{ text-align: right; }}
+  thead th.num, td.num {{ text-align: center; }}
   tbody td {{
     padding: 11px 16px;
     border-bottom: 1px solid var(--line);
@@ -3743,11 +3778,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   }}
   tbody tr:last-child td {{ border-bottom: none; }}
   tbody tr:hover {{ background: rgba(22,24,29,0.03); }}
-  td.company {{ font-weight: 500; white-space: nowrap; }}
+  td.company {{ font-weight: 500; }}
   td.company a {{ color: inherit; text-decoration: none; border-bottom: 1px solid var(--line); }}
   td.company a:hover {{ border-bottom-color: var(--muted); }}
   .deal-id-sub {{
-    margin-top: 3px;
+    margin-top: 7px;
     font-size: 12px;
     font-weight: 400;
   }}
@@ -3779,7 +3814,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     stroke-linejoin: round;
   }}
   .copy-id:hover {{ border-color: var(--accent); color: var(--accent); }}
-  td.actions {{ white-space: nowrap; width: 96px; }}
+  td.actions {{ white-space: nowrap; }}
   .actions-stack {{
     display: flex;
     flex-direction: column;
@@ -3824,10 +3859,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     display: inline-block;
     font-size: 12px;
     font-weight: 600;
+    line-height: 1.3;
     padding: 4px 10px;
-    border-radius: 999px;
+    border-radius: 14px;
     text-decoration: none;
-    white-space: nowrap;
+    white-space: normal;
   }}
   .visibility-badge.live {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .visibility-badge.held {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
@@ -3840,10 +3876,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     display: inline-block;
     font-size: 11px;
     font-weight: 700;
+    line-height: 1.3;
     padding: 3px 9px;
-    border-radius: 999px;
+    border-radius: 12px;
     text-decoration: none;
-    white-space: nowrap;
+    white-space: normal;
     cursor: pointer;
   }}
   .action-chip:hover {{ text-decoration: underline; }}
