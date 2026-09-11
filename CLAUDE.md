@@ -2,6 +2,20 @@
 
 Seller-facing dashboard Lambda (function name `syndicate-dash`, us-east-1, Function URL). One file: lambda_function.py. Deploy: push to main → GitHub Actions OIDC → update-function-code. Chad is a coding novice: never suggest terminal steps for him; console clicks only.
 
+## Speed rules — read before every task
+Default to FAST MODE. A task is fast unless Chad writes "CAREFUL MODE" or it changes client-facing disclosure, money math, write paths, or emails.
+
+FAST MODE means:
+- Touch only the functions named in the instruction. Do not sweep the file, audit adjacent code, or look for related problems.
+- No new tests. Run tests/test_suite.py ONCE at the end; if green, commit.
+- No written report. Reply with at most three lines: what changed, anything that failed, anything you had to guess.
+- No screenshots, no diff reviews, no before/after tables, no benchmark fixtures.
+- No re-verification of anything already stated in CLAUDE.md or in the instruction.
+- If something looks wrong outside the task's scope, note it in one line — do not fix it.
+- If a required fact is missing, stop and ask in one sentence.
+
+CAREFUL MODE (only when stated, or when the change touches disclosure/money/writes/email): full verification, regression tests for the changed behavior, and a brief report of root cause and risks.
+
 ## Hard conventions
 - All literal { } in f-string CSS/JS are doubled. Run `python3 -m py_compile lambda_function.py` before every commit.
 - No screenshots/Playwright unless the task explicitly asks.
