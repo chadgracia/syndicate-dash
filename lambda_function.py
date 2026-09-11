@@ -3589,7 +3589,10 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, resolved, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
         anon_key_email=anon_key_email, firm_won_index=firm_won_index, company_repeated=company_repeated)
-    row_cls = f' class="{extra_cls}"' if extra_cls else ""
+    is_stalled = surface == "intros" and resolved["id"] == INTRO_STATUS_STALLED_ID
+    row_id = f' id="intro-row-{deal_id}"' if is_stalled else ""
+    classes = " ".join(c for c in (extra_cls, "stalled-row" if is_stalled else "") if c)
+    row_cls = f' class="{classes}"' if classes else ""
 
     milestones = entry.get("milestones")
     is_closed_locked = resolved["name"] == "Closed"
@@ -3603,7 +3606,7 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
     notes_cell_html = _notes_cell_html(deal_id, notes_value, editable and not is_dead)
 
     return (
-        f'<tr{row_cls}>{col1_open}{col1}</td>'
+        f'<tr{row_id}{row_cls}>{col1_open}{col1}</td>'
         f'<td>{col2}</td>'
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
@@ -3655,7 +3658,10 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, resolved, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
         firm_won_index=firm_won_index, company_repeated=company_repeated)
-    row_cls = f' class="{extra_cls}"' if extra_cls else ""
+    is_stalled = surface == "intros" and resolved["id"] == INTRO_STATUS_STALLED_ID
+    row_id = f' id="intro-row-{deal_id}"' if is_stalled else ""
+    classes = " ".join(c for c in (extra_cls, "stalled-row" if is_stalled else "") if c)
+    row_cls = f' class="{classes}"' if classes else ""
 
     milestones = entry.get("milestones")
     status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=True)
@@ -3665,7 +3671,7 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
     notes_cell_html = _notes_cell_html(deal_id, notes_value, True)
 
     return (
-        f'<tr{row_cls}>{col1_open}{col1}</td>'
+        f'<tr{row_id}{row_cls}>{col1_open}{col1}</td>'
         f'<td>{col2}</td>'
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
@@ -4354,12 +4360,18 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 
         summary_parts = []
         if in_motion_count:
-            summary_parts.append(f"{in_motion_count} in motion")
+            summary_parts.append(_esc(f"{in_motion_count} in motion"))
         if stalled_count:
-            summary_parts.append(f"{stalled_count} stalled")
+            # Nav pass, item 2: the strip's stalled segment is a same-page
+            # anchor to the first stalled row (main_rows is already sorted
+            # stalled-first via _stalled_key, so main_rows[0] is it). Parts
+            # are escaped individually (rather than after the join) so this
+            # anchor tag survives into summary_html.
+            first_stalled_id = str(main_rows[0][0].get("id"))
+            summary_parts.append(f'<a href="#intro-row-{_esc(first_stalled_id)}">{_esc(f"{stalled_count} stalled")}</a>')
         if pending_count:
-            summary_parts.append(f"{pending_count} pending introduction{'s' if pending_count != 1 else ''}")
-        summary_html = (f'<p class="mydeals-summary">{_esc(" · ".join(summary_parts))}</p>'
+            summary_parts.append(_esc(f"{pending_count} pending introduction{'s' if pending_count != 1 else ''}"))
+        summary_html = (f'<p class="mydeals-summary">{" · ".join(summary_parts)}</p>'
                          if summary_parts else "")
         subtle_html = ('<p class="mydeals-subtle">Update statuses as buyers progress — '
                         'we see your changes instantly.</p>')
@@ -4620,6 +4632,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   tr.pending-row {{ opacity: 0.85; }}
   tr.grouped-row {{ box-shadow: inset 3px 0 0 var(--line); }}
   tr.closed-out-row {{ opacity: 0.7; }}
+  /* Nav pass, item 2: a soft amber left-border accent on Stalled rows so
+     the top of the triage queue visibly differs from healthy rows. */
+  tr.stalled-row {{ box-shadow: inset 3px 0 0 #c9a227; }}
   .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
   details.closed-out-section {{ margin-top: 20px; }}
   details.closed-out-section summary {{
@@ -4778,8 +4793,24 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         per_share_html = (f'<div class="mydeals-per-share">{_esc(per_share_text)}</div>'
                            if per_share_text else "")
 
-    buyer_text = str(buyer_count)
-    intro_text = str(stats["intro_count"]) if stats["intro_count"] else "—"
+    # Nav pass, item 1: "counts become doors" -- a nonzero Buyers/Intros
+    # count links straight to the matching section on this company's own
+    # page (Buyers count -> Buyer Demand, the raw interest tally that
+    # column reports; Intros count -> the Buyers table, where actual
+    # introductions live). Zero / "—" stays plain text -- nothing to
+    # click through to. Styled to still read as a plain number
+    # (.mydeals-count-link: inherits color, no underline) with only a
+    # hover affordance, never a blue-underlined link.
+    if buyer_count and company_name:
+        buyer_href = f"{_company_href(company_name, 'mydeals', key, view_as)}#demand"
+        buyer_text = f'<a class="mydeals-count-link" href="{buyer_href}">{buyer_count}</a>'
+    else:
+        buyer_text = str(buyer_count)
+    if stats["intro_count"] and company_name:
+        intro_href = f"{_company_href(company_name, 'mydeals', key, view_as)}#buyers"
+        intro_text = f'<a class="mydeals-count-link" href="{intro_href}">{stats["intro_count"]}</a>'
+    else:
+        intro_text = "—"
 
     if is_won:
         # Item 1 (turn 26): no deadline warnings on the trophy shelf — a
@@ -5211,6 +5242,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     padding: 2px 8px;
   }}
   .mydeals-per-share {{ margin-top: 4px; font-size: 12px; color: var(--muted); }}
+  /* Nav pass, item 1: a count that's a door to the company page still
+     reads as a plain number -- no default blue/underline -- with only
+     a subtle hover affordance. */
+  .mydeals-count-link {{ color: inherit; text-decoration: none; }}
+  .mydeals-count-link:hover {{ color: var(--accent); text-decoration: underline; }}
   .copy-id {{
     display: inline-flex;
     align-items: center;
@@ -5632,6 +5668,13 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     {edit_script}
   </section>"""
 
+    # Nav pass, item 3: the section-nav's "Buyers (N)" count is every row
+    # the Buyers table actually shows -- introduced plus still-pending --
+    # not the closed-out section, which is collapsed by default. main_deals/
+    # pending_deals only exist when tenant is not None (see above); an admin
+    # with no &view_as never renders that table, so the nav count is 0.
+    buyers_nav_count = (len(main_deals) + len(pending_deals)) if tenant is not None else 0
+
     buyers = get_company_buyer_details(company)
     buyers.sort(key=lambda b: b["updated_at"] or "", reverse=True)
     buyers.sort(key=lambda b: TIER_ORDER.get(b["tier"], 3))
@@ -5679,7 +5722,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     margin-bottom: 12px;
   }}
   .cd-back:hover {{ color: var(--ink); }}
-  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 28px; }}
+  h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 6px; }}
+  .cd-subnav {{ font-size: 12px; color: var(--muted); margin: 0 0 28px; }}
+  .cd-subnav a {{ color: var(--muted); text-decoration: none; }}
+  .cd-subnav a:hover {{ color: var(--ink); text-decoration: underline; }}
+  .cd-subnav .sep {{ margin: 0 6px; }}
   .cd-section {{ margin-bottom: 32px; }}
   .cd-section h2 {{
     font-size: 13px;
@@ -5960,6 +6007,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 <div class="wrap">
   <a class="cd-back" href="{back_href}">&larr; Back to {_esc(back_label)}</a>
   <h1>{_esc(company)}</h1>
+  <p class="cd-subnav">
+    <a href="#deal-details">Deal details</a><span class="sep">·</span><a href="#buyers">Buyers ({buyers_nav_count})</a><span class="sep">·</span><a href="#demand">Demand ({len(buyers)})</a>
+  </p>
   {feature_box_html}
   {your_deals_html}
   {matched_buyers_html}

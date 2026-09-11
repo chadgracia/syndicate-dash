@@ -2353,6 +2353,110 @@ check("_fmt_fees: omits missing parts, keeps relative order",
 
 
 # ======================================================================
+# SECTION: Navigation & role-sharpening pass -- counts-as-doors (My
+# Deals), urgency styling (Active Intros), company-page section nav
+# ======================================================================
+# Active Intros = triage queue, company page = deal dossier, My Deals =
+# hub. Item 1: a nonzero Buyers/Intros count on My Deals is a door to the
+# matching anchor on that company's own page. Item 2: a Stalled row on
+# Active Intros gets an amber left-border accent and the summary strip's
+# "N stalled" segment anchors to the first one. Item 3: the company page
+# gets a small section nav under the title. Items 4/5 (no new cross-
+# links to Active Intros; ref= breadcrumbs survive the new anchors) are
+# checked here too.
+
+people_nav = {"people": [
+    {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
+    {"id": 401, "first_name": "Buyer", "last_name": "One", "email": "buyer1@example.com", "custom_fields": {}},
+    {"id": 402, "first_name": "Buyer", "last_name": "Two", "email": "buyer2@example.com", "custom_fields": {}},
+]}
+deal_nav_sell = {"id": 1101, "name": "Nav Sell Deal", "company": {"name": "Nav Co"},
+                 "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                 "people": [{"id": TENANT_A_PID}], "is_archived": False, "updated_at": "2026-08-01T00:00:00Z"}
+deal_nav_intro = {"id": 1102, "name": "Nav Intro Deal", "company": {"name": "Nav Co"},
+                  "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),
+                  "people": [{"id": TENANT_A_PID}, {"id": 401}], "updated_at": "2026-08-02T00:00:00Z"}
+deal_nav_stalled = {"id": 1103, "name": "Nav Stalled Deal", "company": {"name": "Nav Co"},
+                    "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(lf.INTRO_STATUS_STALLED_ID),
+                    "people": [{"id": TENANT_A_PID}, {"id": 402}], "updated_at": "2026-08-03T00:00:00Z"}
+deal_nav_sell_zero = {"id": 1104, "name": "Zero Sell Deal", "company": {"name": "Zero Co"},
+                      "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                      "people": [{"id": TENANT_A_PID}], "is_archived": False, "updated_at": "2026-08-04T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_nav, lf.INTEREST_KEY: {"buy": {"Nav Co": [401, 402]}},
+             lf.DEALS_KEY: {"deals": [deal_nav_sell, deal_nav_intro, deal_nav_stalled, deal_nav_sell_zero]}},
+            table_items=[{"tenant": TENANT_A_EMAIL, "sk": "intro#1103", "milestones": {"NDA": 1}}])
+tenant_nav = lf._resolve_tenant(TENANT_A_EMAIL)
+assert tenant_nav is not None
+
+# --- Item 1: My Deals counts become doors ---
+sell_deals_nav = [d for d in lf.get_my_deals(TENANT_A_PID)
+                  if lf.DEAL_SIDE_SELL_ID in lf._deal_cf_option_ids(d, lf.DEAL_SIDE_FIELD)]
+page_nav_mydeals = lf.render_my_deals_page("Sella Seller", deals=sell_deals_nav, key=None, view_as=None,
+                                            edit_mode=False, person_id=TENANT_A_PID, anon_key_email=TENANT_A_EMAIL)
+buyer_href_nav = lf._company_href("Nav Co", "mydeals") + "#demand"
+intro_href_nav = lf._company_href("Nav Co", "mydeals") + "#buyers"
+check("Item 1: nonzero Buyers count (2) is a door to #demand",
+      f'<a class="mydeals-count-link" href="{buyer_href_nav}">2</a>' in page_nav_mydeals)
+check("Item 1: nonzero Intros count (2) is a door to #buyers",
+      f'<a class="mydeals-count-link" href="{intro_href_nav}">2</a>' in page_nav_mydeals)
+check("Item 1: count-link CSS reads as a plain number with only a hover affordance",
+      ".mydeals-count-link { color: inherit; text-decoration: none; }" in page_nav_mydeals
+      and ".mydeals-count-link:hover { color: var(--accent); text-decoration: underline; }" in page_nav_mydeals)
+check("Item 1: fragment is appended after the query string -- ref survives for back-link parsing",
+      intro_href_nav.split("#")[0].endswith("ref=mydeals") and intro_href_nav.endswith("#buyers"))
+
+row_zero = row_for(page_nav_mydeals, "1104")
+check("Item 1: a zero Buyers/Intros count stays plain text, not a link",
+      row_zero is not None and "mydeals-count-link" not in row_zero
+      and '<td class="num">0</td>' in row_zero and '<td class="num">—</td>' in row_zero)
+
+# --- Item 2: urgency styling on Active Intros ---
+page_nav_intros = lf.render_intros_page("Sella Seller", tenant=tenant_nav, tenant_email=TENANT_A_EMAIL,
+                                         key=None, view_as=None, edit_mode=False)
+row_1102 = row_for(page_nav_intros, "1102")
+row_1103 = row_for(page_nav_intros, "1103")
+check("Item 2: Stalled row (1103) gets an id anchor and the stalled-row class",
+      row_1103 is not None and 'id="intro-row-1103"' in row_1103 and "stalled-row" in row_1103)
+check("Item 2: healthy row (1102) is unchanged -- no stalled-row class or id anchor",
+      row_1102 is not None and "stalled-row" not in row_1102 and 'id="intro-row-1102"' not in row_1102)
+check("Item 2: amber left-border CSS rule for stalled rows",
+      "tr.stalled-row {{ box-shadow: inset 3px 0 0 #c9a227; }}" not in page_nav_intros
+      and "tr.stalled-row { box-shadow: inset 3px 0 0 #c9a227; }" in page_nav_intros)
+check("Item 2: summary strip's '1 stalled' is a same-page anchor to the first stalled row",
+      '<a href="#intro-row-1103">1 stalled</a>' in page_nav_intros)
+
+# --- Item 2 (company-page scoping): the shared row-builder must NEVER
+# apply stalled-row styling on the company page -- that's Active Intros'
+# own triage signal, not the deal dossier's.
+page_nav_company_edit = lf.render_company_page("Nav Co", "Admin", tenant_nav, "admin", "mydeals",
+                                                key=ADMIN_KEY, view_as=TENANT_A_EMAIL, edit_mode=True)
+check("Item 2: company page never gets a stalled-row class, even in admin edit mode",
+      "stalled-row" not in page_nav_company_edit)
+
+# --- Item 3: company-page section nav ---
+page_nav_company = lf.render_company_page("Nav Co", "Sella Seller", tenant_nav, TENANT_A_EMAIL, "mydeals",
+                                           key=None, view_as=None, edit_mode=False)
+check("Item 3: section nav under the title links to Deal details / Buyers (N) / Demand (M)",
+      '<p class="cd-subnav">' in page_nav_company
+      and '<a href="#deal-details">Deal details</a>' in page_nav_company
+      and '<a href="#buyers">Buyers (2)</a>' in page_nav_company
+      and '<a href="#demand">Demand (2)</a>' in page_nav_company)
+
+# --- Item 4: no new cross-links from company-page buyer rows to Active Intros ---
+buyers_section_nav = page_nav_company[page_nav_company.find('id="buyers"'):page_nav_company.find('id="demand"')]
+check("Item 4: no cross-links from the company page's Buyers rows to Active Intros",
+      "tab=intros" not in buyers_section_nav)
+
+# --- Item 5: ref= breadcrumbs still resolve given the new anchors ---
+check("Item 5: ref=mydeals back-link resolves to My Deals",
+      '<a class="cd-back" href="?tab=mydeals">&larr; Back to My Deals</a>' in page_nav_company)
+page_nav_company_ref_intros = lf.render_company_page("Nav Co", "Sella Seller", tenant_nav, TENANT_A_EMAIL, "intros",
+                                                      key=None, view_as=None, edit_mode=False)
+check("Item 5: ref=intros back-link resolves to Active Intros",
+      '<a class="cd-back" href="?tab=intros">&larr; Back to Active Intros</a>' in page_nav_company_ref_intros)
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 
