@@ -924,7 +924,13 @@ page = lf.render_intros_page("Sella Seller", tenant=tenant_rec, tenant_email=TEN
                               key=None, view_as=None, edit_mode=False)
 
 head = page[page.find("<thead>"):page.find("</thead>")]
-check("colgroup has exactly 6 columns (no Follow-up column)", page.count("<col ") == 6)
+# Scoped to the main Buyers table only: deal_passed (806, Matched stage,
+# Intro Status Passed) now correctly renders in the "Closed out" section
+# below (see the status-based-exit bug fix), which carries its own
+# second <colgroup> -- counting the whole page would see 12, not 6.
+main_table_section = (page[:page.find('<details class="closed-out-section">')]
+                       if '<details class="closed-out-section">' in page else page)
+check("colgroup has exactly 6 columns (no Follow-up column)", main_table_section.count("<col ") == 6)
 check("no Deal column header", ">Deal<" not in head)
 check("Company/Buyer/Investor Type/Size/Status/Notes header order",
       [head.find(f">{h}<") for h in ["Company", "Buyer", "Investor Type", "Size", "Status", "Notes"]]
@@ -954,6 +960,21 @@ check("TENANT_ALLOWED_STATUS_IDS is still defined and used server-side",
 
 check("notes placeholder is the fixed 'Add a note…' text", "Add a note…" in page)
 check("a Passed (dead/exit) row has no editable data-deal-id markup", 'data-deal-id="806"' not in page)
+# Bug fix regression guard: deal_passed (806) sits at STAGE_MATCHED (a
+# live, matched-or-later stage) with Intro Status explicitly Passed --
+# an exit expressed via status, not a Pipeline stage move. It must
+# render in "Closed out" (same as a stage-based Lost/Obsolete exit),
+# never nowhere and never still in Introduced with live controls.
+check("exit-via-status-on-live-stage: Delta Corp (806, Matched+Passed) is NOT in Introduced/Pending",
+      "Delta Corp" not in page[:page.find('<details class="closed-out-section">')]
+      if '<details class="closed-out-section">' in page else False)
+check("exit-via-status-on-live-stage: Delta Corp (806) DOES render, in Closed out",
+      "Delta Corp" in page and '<details class="closed-out-section">' in page
+      and "Delta Corp" in page[page.find('<details class="closed-out-section">'):])
+check("exit-via-status-on-live-stage: 806 has no milestone evidence -> anonymized (Buyer code, not 'Alice Buyer')",
+      "Alice Buyer" not in page[page.find('<details class="closed-out-section">'):])
+check("exit-via-status-on-live-stage: the Closed out chip reads 'Passed' (via _deal_exit_outcome_name's status fallback)",
+      '<span class="status-chip exit">Passed</span>' in page[page.find('<details class="closed-out-section">'):])
 
 intro_section = page[page.find(">Introduced<"):page.find("Pending introductions")
                       if "Pending introductions" in page else len(page)]
@@ -1736,6 +1757,25 @@ check("_closed_out_outcome_name: Obsolete -> Withdrawn", lf._closed_out_outcome_
 check("_closed_out_outcome_name: Matched -> None (not closed out)", lf._closed_out_outcome_name(lf.STAGE_MATCHED) is None)
 check("_closed_out_outcome_name: Won -> None", lf._closed_out_outcome_name(111802) is None)
 check("_closed_out_outcome_name: None stage -> None", lf._closed_out_outcome_name(None) is None)
+
+# _deal_exit_outcome_name: the composite resolver the bug fix adds --
+# stage-derived first, falling back to the deal's own RAW Intro Status
+# field for an exit expressed via status on an otherwise live stage.
+check("_deal_exit_outcome_name: stage-based Lost -> Passed (unchanged)",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": 111801}, "custom_fields": {}}) == "Passed")
+check("_deal_exit_outcome_name: stage-based Obsolete -> Withdrawn (unchanged)",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": lf.OBSOLETE_STAGE_ID}, "custom_fields": {}}) == "Withdrawn")
+check("_deal_exit_outcome_name: Matched stage + raw status Passed -> 'Passed' (the bug fix)",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": lf.STAGE_MATCHED},
+                                   "custom_fields": cf_status(7207585)}) == "Passed")
+check("_deal_exit_outcome_name: LOI Signed stage + raw status Withdrawn -> 'Withdrawn'",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": lf.STAGE_LOI_SIGNED},
+                                   "custom_fields": cf_status(7207586)}) == "Withdrawn")
+check("_deal_exit_outcome_name: Matched stage + raw status Stalled -> None (Stalled never a Closed-out outcome)",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": lf.STAGE_MATCHED},
+                                   "custom_fields": cf_status(7207584)}) is None)
+check("_deal_exit_outcome_name: Matched stage + no exit status at all -> None",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None)}) is None)
 check("INTRODUCED_OR_LATER_STATUS_IDS excludes Matched (7207578)", 7207578 not in lf.INTRODUCED_OR_LATER_STATUS_IDS)
 check("INTRODUCED_OR_LATER_STATUS_IDS excludes the three exit ids", not (lf.EXIT_STATUS_IDS & lf.INTRODUCED_OR_LATER_STATUS_IDS))
 check("INTRODUCED_OR_LATER_STATUS_IDS == {Introduced, NDA, VDR, Sub Docs, Wired, Closed}",
@@ -1800,8 +1840,30 @@ deal_broken = {"id": 802, "name": "Broken Deal", "company": {"name": "Broken Co"
                "custom_fields": cf_buy(7207581), "people": [{"id": TENANT_A_PID}, {"id": 4}], "updated_at": "2026-08-01T00:00:00Z"}
 deal_obsolete = {"id": 803, "name": "Obsolete Deal", "company": {"name": "Obsolete Co"}, "deal_stage": {"id": lf.OBSOLETE_STAGE_ID},
                  "custom_fields": cf_buy(), "people": [{"id": TENANT_A_PID}, {"id": 2}], "updated_at": "2026-08-01T00:00:00Z"}
-deals_list = [deal_900a, deal_live_buy, deal_lost, deal_broken, deal_obsolete]
-_, fake_table = use_fixture({lf.PEOPLE_KEY: people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_list}})
+# Bug fix fixtures: exits expressed via the Intro Status field on an
+# otherwise still-live (matched-or-later) stage -- never a Pipeline
+# stage move -- which get_my_closed_out_buy_deals (stage-only) can never
+# catch. deal_status_passed carries prior-progress evidence (a
+# milestone) so it stays disclosed, exactly like deal_lost above;
+# deal_status_withdrawn has none, exactly like deal_obsolete above.
+# deal_still_stalled is the negative case: Stalled must stay in
+# Introduced, flagged, never routed to Closed out.
+deal_status_passed = {"id": 804, "name": "Status Passed Deal", "company": {"name": "Status Passed Co"},
+                      "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_buy(7207585),
+                      "people": [{"id": TENANT_A_PID}, {"id": 3}], "updated_at": "2026-08-01T00:00:00Z"}
+deal_status_withdrawn = {"id": 805, "name": "Status Withdrawn Deal", "company": {"name": "Status Withdrawn Co"},
+                        "deal_stage": {"id": lf.STAGE_LOI_SIGNED}, "custom_fields": cf_buy(7207586),
+                        "people": [{"id": TENANT_A_PID}, {"id": 2}], "updated_at": "2026-08-01T00:00:00Z"}
+deal_still_stalled = {"id": 806, "name": "Stalled Deal", "company": {"name": "Stalled Co"},
+                      "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_buy(7207584),
+                      "people": [{"id": TENANT_A_PID}, {"id": 4}], "updated_at": "2026-08-01T00:00:00Z"}
+deals_list = [deal_900a, deal_live_buy, deal_lost, deal_broken, deal_obsolete,
+              deal_status_passed, deal_status_withdrawn, deal_still_stalled]
+_, fake_table = use_fixture({lf.PEOPLE_KEY: people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_list}},
+                             table_items=[
+                                 {"tenant": TENANT_A_EMAIL, "sk": "intro#804", "milestones": {"NDA": 1750000000}},
+                                 {"tenant": TENANT_A_EMAIL, "sk": "intro#806", "milestones": {"NDA": 1750000000}},
+                             ])
 tenant_a = lf._resolve_tenant(TENANT_A_EMAIL)
 assert tenant_a is not None
 
@@ -1812,8 +1874,8 @@ check("get_my_closed_out_buy_deals excludes the live Matched deal", 800 not in c
 
 page_intros = lf.render_intros_page("Sella Seller", tenant=tenant_a, tenant_email=TENANT_A_EMAIL,
                                      key=None, view_as=None, edit_mode=False)
-check("Active Intros: collapsed 'Closed out' section present with count (3)",
-      '<summary>Closed out <span class="count">(3)</span></summary>' in page_intros)
+check("Active Intros: collapsed 'Closed out' section present with count (5: 3 stage-based + 2 status-based)",
+      '<summary>Closed out <span class="count">(5)</span></summary>' in page_intros)
 check("Active Intros: the live Matched deal still shows under Introduced", ">Live Buy Co<" in page_intros)
 check("Active Intros: a disclosed closed-out row names the real buyer (Bob Buyer)", "Bob Buyer" in page_intros)
 check("Active Intros: a disclosed closed-out row shows the loss-reason suffix",
@@ -1825,6 +1887,29 @@ check("Active Intros: an anonymized closed-out row (Obsolete, empty status) neve
       "Buyer " in obs_row and "Alice Buyer" not in obs_row)
 check("Active Intros: an anonymized closed-out row shows the Withdrawn outcome", "Withdrawn" in obs_row)
 check("Active Intros: the Lost row shows the Passed outcome", "Passed" in page_intros)
+
+# --- Bug fix regression: exit-via-status-on-live-stage (804/805), and
+# the negative case, Stalled-stays-in-Introduced (806) ---
+closed_out_section = page_intros[page_intros.find('<details class="closed-out-section">'):]
+intros_section_only = page_intros[:page_intros.find('<details class="closed-out-section">')]
+check("exit-via-status-on-live-stage: Status Passed Co (804, Matched+Passed, has milestone) IS in Closed out",
+      "Status Passed Co" in closed_out_section and "Status Passed Co" not in intros_section_only)
+check("exit-via-status-on-live-stage: disclosed (milestone evidence) -> names the real buyer (Bob Buyer)",
+      "Bob Buyer" in closed_out_section)
+check("exit-via-status-on-live-stage: Status Withdrawn Co (805, LOI Signed+Withdrawn, no milestone) IS in Closed out",
+      "Status Withdrawn Co" in closed_out_section and "Status Withdrawn Co" not in intros_section_only)
+check("exit-via-status-on-live-stage: no milestone evidence -> anonymized (not 'Alice Buyer')",
+      "Status Withdrawn Co" in closed_out_section
+      and "Alice Buyer" not in closed_out_section[closed_out_section.find("Status Withdrawn Co"):
+                                                    closed_out_section.find("Status Withdrawn Co") + 600])
+check("exit-via-status-on-live-stage: both status-based chips read their own outcome",
+      closed_out_section.count('<span class="status-chip exit">Passed</span>') >= 1
+      and closed_out_section.count('<span class="status-chip exit">Withdrawn</span>') >= 1)
+check("Stalled-stays-in-Introduced: Stalled Co (806, Matched+Stalled) is NOT in Closed out",
+      "Stalled Co" not in closed_out_section)
+check("Stalled-stays-in-Introduced: Stalled Co IS in the main Introduced table, flagged (stalled-row)",
+      "Stalled Co" in intros_section_only
+      and 'stalled-row' in row_for(page_intros, "806"))
 
 page_company_lost = lf.render_company_page("Lost Co", "Sella Seller", tenant_a, TENANT_A_EMAIL, "intros",
                                             key=None, view_as=None, edit_mode=False)
@@ -1844,6 +1929,30 @@ page_company_admin = lf.render_company_page("Obsolete Co", "Admin", tenant_a, "a
 check("Company page (Obsolete Co, admin edit): real buyer shown regardless of disclosure",
       "Alice Buyer" in page_company_admin)
 
+# --- Company page: same status-based-exit fix, same Stalled guard ---
+page_company_status_passed = lf.render_company_page("Status Passed Co", "Sella Seller", tenant_a, TENANT_A_EMAIL,
+                                                      "intros", key=None, view_as=None, edit_mode=False)
+check("Company page (Status Passed Co): 'Closed out' section present (not stuck in the Buyers table)",
+      '<summary>Closed out <span class="count">(1)</span></summary>' in page_company_status_passed)
+check("Company page (Status Passed Co): disclosed buyer named (Bob Buyer)",
+      "Bob Buyer" in page_company_status_passed)
+check("Company page (Status Passed Co): the Buyers table's own 'Introduced' group has nothing (dead intro)",
+      "No introductions yet on this deal." in page_company_status_passed)
+
+page_company_status_withdrawn = lf.render_company_page("Status Withdrawn Co", "Sella Seller", tenant_a,
+                                                         TENANT_A_EMAIL, "intros", key=None, view_as=None,
+                                                         edit_mode=False)
+check("Company page (Status Withdrawn Co): closed-out row anonymized (no Alice Buyer name)",
+      "Alice Buyer" not in page_company_status_withdrawn)
+check("Company page (Status Withdrawn Co): Withdrawn outcome shown", "Withdrawn" in page_company_status_withdrawn)
+
+page_company_stalled = lf.render_company_page("Stalled Co", "Sella Seller", tenant_a, TENANT_A_EMAIL, "intros",
+                                               key=None, view_as=None, edit_mode=False)
+check("Stalled-stays-in-Introduced (company page): Stalled Co has NO 'Closed out' section at all",
+      '<details class="closed-out-section">' not in page_company_stalled)
+check("Stalled-stays-in-Introduced (company page): Stalled Co is in the Buyers table's Introduced group",
+      "Cara Buyer" in page_company_stalled)
+
 page_buyer_bob = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("Buyer page (Bob, disclosed closed-out deal): Lost Co appears in Track with you", "Lost Co" in page_buyer_bob)
 check("Buyer page (Bob): Passed chip + loss-reason suffix present",
@@ -1854,7 +1963,23 @@ check("Buyer page (Alice): the live Matched deal (Live Buy Co) still appears", "
 check("Buyer page (Alice): the undisclosed closed-out deal (Obsolete Co) is NOT in Track with you",
       "Obsolete Co" not in page_buyer_alice)
 
-check("rendering these closed-out rows issues no Dynamo writes", fake_table.items == [])
+# --- Buyer page parity check: Track with you already routes matched-or-
+# later deals through _resolve_intro_status directly (never filtered by
+# Intro Status the way Active Intros/company page were), so a status-
+# based exit was already showing up correctly here -- no code change
+# needed on this surface, only this regression guard confirming it.
+check("Buyer page (Bob): the status-based exit (Status Passed Co, disclosed) appears in Track with you",
+      "Status Passed Co" in page_buyer_bob)
+check("Buyer page (Bob): its chip reads 'Passed'",
+      '<span class="status-chip exit">Passed</span>' in page_buyer_bob)
+check("Buyer page (Alice): the undisclosed status-based exit (Status Withdrawn Co) is NOT in Track with you",
+      "Status Withdrawn Co" not in page_buyer_alice)
+page_buyer_cara = lf.render_buyer_page(4, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
+check("Stalled-stays-in-Introduced (buyer page): Stalled Co appears with the Stalled chip, not an exit chip",
+      "Stalled Co" in page_buyer_cara and "Stalled — needs a nudge" in page_buyer_cara)
+
+check("rendering these closed-out rows issues no Dynamo writes",
+      fake_table.updates == [] and fake_table.puts == [])
 
 
 # ======================================================================

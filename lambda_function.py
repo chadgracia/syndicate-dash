@@ -1833,6 +1833,35 @@ def _closed_out_outcome_name(stage_id):
     return CLOSED_OUT_STAGE_OUTCOMES.get(stage_id)
 
 
+def _deal_exit_outcome_name(deal):
+    """Passed/Withdrawn/None for ANY way a Buy deal can be exited, not
+    just a stage-level one: stage-derived first (_closed_out_outcome_name
+    -- Lost/Trade Broken -> "Passed", Obsolete -> "Withdrawn"), else the
+    deal's own RAW Intro Status field when it directly holds Passed or
+    Withdrawn -- the bug this exists to fix: a deal can sit at a still-
+    live stage (e.g. Matched) with Intro Status explicitly set to Passed
+    or Withdrawn (an admin/tenant flagging it dead without Pipeline's
+    stage ever moving), and that exit is just as real as a stage-level
+    one. The two sources never actually collide (_is_closed_out_buy_deal
+    and MATCHED_OR_LATER_STAGE_IDS are disjoint by construction), so
+    "stage first" is purely a short-circuit, not a precedence rule with
+    real cases to arbitrate. RAW field only, matching
+    _closed_out_disclosed's own raw-only convention for exit rows --
+    Dynamo's status_override is what already produced this raw value in
+    the first place (see _handle_update_intro: any status/flag write PUTs
+    Pipeline first), so there's no separate not-yet-synced case to
+    bridge here the way live in-progress rows need to."""
+    stage_outcome = _closed_out_outcome_name(_deal_stage_id(deal))
+    if stage_outcome is not None:
+        return stage_outcome
+    status_id = _deal_intro_status_id(deal)
+    if status_id == INTRO_STATUS_PASSED_ID:
+        return "Passed"
+    if status_id == INTRO_STATUS_WITHDRAWN_ID:
+        return "Withdrawn"
+    return None
+
+
 def _is_closed_out_buy_deal(deal):
     """A Buy-tagged deal whose RAW Pipeline stage (never override-aware --
     stage overrides are a Sell-side-only concept) is Lost, Trade Broken,
@@ -3777,12 +3806,14 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
 
 
 def _closed_out_status_chip_html(deal, loss_reason=None):
-    """The gray Passed/Withdrawn chip for a stage-derived closed-out row
-    (turn 27) — reuses _status_chip_html's existing "exit" styling
-    (status_id=None never matches INTRO_STATUS_STALLED_ID, so this always
-    renders the plain gray chip, never the amber Stalled one) plus, when a
-    loss reason is on record, a small muted "— <reason>" suffix."""
-    outcome = _closed_out_outcome_name(_deal_stage_id(deal))
+    """The gray Passed/Withdrawn chip for ANY closed-out row -- stage-
+    derived (turn 27) OR a status-based exit on an otherwise still-live
+    stage (see _deal_exit_outcome_name) — reuses _status_chip_html's
+    existing "exit" styling (status_id=None never matches
+    INTRO_STATUS_STALLED_ID, so this always renders the plain gray chip,
+    never the amber Stalled one) plus, when a loss reason is on record,
+    a small muted "— <reason>" suffix."""
+    outcome = _deal_exit_outcome_name(deal)
     chip = _status_chip_html(None, outcome)
     if loss_reason is None:
         loss_reason = _deal_loss_reason_text(deal)
@@ -4623,15 +4654,6 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 
         intro_details, dynamo_failed = get_intro_details(tenant_email) if (deals or closed_out_deals) else ({}, False)
 
-        resolved_by_deal_id = {}
-        kept_deals = []
-        for d in deals:
-            resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
-            if resolved["name"] in ("Passed", "Withdrawn"):
-                continue
-            resolved_by_deal_id[str(d.get("id"))] = resolved
-            kept_deals.append(d)
-
         # Item 3: closed-out rows use their own, simpler disclosure rule
         # (_closed_out_disclosed — raw Intro Status explicitly Introduced-
         # or-later, no milestone fallback), computed once per deal here.
@@ -4639,6 +4661,35 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         # on this page) — the admin sees the real buyer regardless.
         closed_out_disclosed_by_id = {str(d.get("id")): (edit_mode or _closed_out_disclosed(d))
                                        for d in closed_out_deals}
+
+        # Bug fix: a matched-or-later BUY deal whose Intro Status field
+        # itself is explicitly Passed/Withdrawn (an exit expressed via
+        # status rather than a Pipeline stage move -- e.g. an admin/
+        # tenant flags it dead without the deal ever leaving Matched) was
+        # being `continue`'d out of the loop below entirely -- kept out
+        # of Introduced (correctly, it's dead) but never routed anywhere
+        # else either, since get_my_closed_out_buy_deals only catches
+        # STAGE-level exits. It renders nowhere. Fixed by merging it into
+        # the SAME closed_out_deals/closed_out_disclosed_by_id this stage-
+        # based path already feeds — _closed_out_status_chip_html now
+        # derives its outcome text from _deal_exit_outcome_name, which
+        # falls back to the raw Intro Status field exactly for this case.
+        # Its disclosed flag is resolved["disclosed"] (the milestone-or-
+        # raw-Introduced-or-later carve-out _resolve_intro_status already
+        # implements for exit statuses), not _closed_out_disclosed's
+        # simpler rule — this deal WAS already correctly gated by that
+        # logic before it fell off the page; only where it renders changes.
+        resolved_by_deal_id = {}
+        kept_deals = []
+        for d in deals:
+            resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
+            if resolved["name"] in ("Passed", "Withdrawn"):
+                deal_id = str(d.get("id"))
+                closed_out_deals.append(d)
+                closed_out_disclosed_by_id[deal_id] = edit_mode or resolved["disclosed"]
+                continue
+            resolved_by_deal_id[str(d.get("id"))] = resolved
+            kept_deals.append(d)
 
         wanted_ids = set()
         for d in kept_deals:
@@ -5901,9 +5952,24 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         note_html = ('<p class="gg-note">Next steps and notes unavailable right now.</p>'
                      if dynamo_failed else "")
 
-        main_deals, pending_deals = [], []
+        # Bug fix: a matched-or-later BUY deal whose Intro Status field is
+        # explicitly Passed/Withdrawn (an exit expressed via status,
+        # never having left e.g. Matched stage) was landing in main_deals
+        # or pending_deals here based on resolved["disclosed"] alone —
+        # rendered with live milestone checkboxes/flag select instead of
+        # the muted terminal chip a dead intro should show, and not
+        # grouped with the stage-based exits (Lost/Trade Broken/Obsolete)
+        # in "Closed out" below. Routed there instead — status_exit_deals
+        # is merged into closed_out_deals/closed_out_disclosed_by_id once
+        # that section is built further down (same disjoint-by-
+        # construction merge as render_intros_page's own fix, and the
+        # same _deal_exit_outcome_name fallback renders its chip text).
+        main_deals, pending_deals, status_exit_deals = [], [], []
         for d in matched_deals:
             resolved = resolved_by_deal_id[str(d.get("id"))]
+            if resolved["name"] in ("Passed", "Withdrawn"):
+                status_exit_deals.append(d)
+                continue
             (main_deals if resolved["disclosed"] else pending_deals).append(d)
         main_deals.sort(key=lambda d: (-_intro_sort_rank(resolved_by_deal_id[str(d.get("id"))]),
                                         (_deal_title(d) or "").lower()))
@@ -5981,6 +6047,18 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         # company, keyed off get_my_closed_out_buy_deals rather than the
         # matched-or-later fetch above.
         closed_out_deals = get_my_closed_out_buy_deals(person_id, company) if person_id is not None else []
+        closed_out_disclosed_by_id = {str(d.get("id")): (edit_mode or _closed_out_disclosed(d))
+                                       for d in closed_out_deals}
+        # Merge in the status-based exits routed here above: disjoint by
+        # construction from the stage-based fetch (a deal can't be both
+        # matched-or-later and a dead stage at once), so no id can
+        # collide. Each keeps its own already-correct disclosed flag —
+        # resolved["disclosed"]'s milestone-or-raw-Introduced-or-later
+        # carve-out for these, not _closed_out_disclosed's simpler rule.
+        for d in status_exit_deals:
+            deal_id = str(d.get("id"))
+            closed_out_deals.append(d)
+            closed_out_disclosed_by_id[deal_id] = edit_mode or resolved_by_deal_id[deal_id]["disclosed"]
         closed_out_html = ""
         if closed_out_deals:
             for d in closed_out_deals:
@@ -5988,7 +6066,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
             closed_out_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
             co_rows_html = "".join(
-                _closed_out_row_html(d, edit_mode or _closed_out_disclosed(d), people_by_id, person_id,
+                _closed_out_row_html(d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id,
                                       anon_key_email, key=key, view_as=view_as, surface="company")
                 for d in closed_out_deals)
             closed_out_html = f"""<details class="closed-out-section">
