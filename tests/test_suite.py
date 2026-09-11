@@ -2633,6 +2633,66 @@ check("Dropdown cap: 'View all' link points at the My Deals tab",
 
 
 # ======================================================================
+# SECTION: Diagnostic timing instrumentation (perf report task)
+# ======================================================================
+# _perf_start/_perf_timer/_perf_count/_perf_log -- one "TIMING ..." line
+# to CloudWatch (stdout) per request, from the outer lambda_handler
+# wrapper (_lambda_handler_impl does the actual routing/rendering,
+# unchanged). Diagnostic only: nothing here reaches the HTTP response.
+import io
+import contextlib
+
+people_perf = {"people": [{"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL,
+                            "custom_fields": {}}]}
+deal_perf = {"id": 1401, "name": "Perf Deal", "company": {"name": "Perf Co"},
+             "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+             "people": [{"id": TENANT_A_PID}], "updated_at": "2026-09-01T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_perf, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": [deal_perf]}})
+lf._cold_start_seen["done"] = False  # simulate a fresh container for this section
+
+
+def _capture_timing_line(event):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        resp = lf.lambda_handler(event, None)
+    lines = [ln for ln in buf.getvalue().splitlines() if ln.startswith("TIMING ")]
+    return resp, lines
+
+
+mydeals_event = {"requestContext": {"http": {"method": "GET"}},
+                  "queryStringParameters": {"key": ADMIN_KEY, "view_as": TENANT_A_EMAIL, "tab": "mydeals"}}
+
+resp1, lines1 = _capture_timing_line(mydeals_event)
+check("TIMING: request succeeds (instrumentation is transparent)", resp1["statusCode"] == 200)
+check("TIMING: exactly one summary line logged per request", len(lines1) == 1)
+line1 = lines1[0]
+check("TIMING: page label matches the requested tab", "page=mydeals" in line1)
+check("TIMING: first request in a fresh container is cold=True", "cold=True" in line1)
+check("TIMING: reports s3_people/s3_deals/s3_interest fetch+parse timings",
+      "s3_people=" in line1 and "s3_deals=" in line1 and "s3_interest=" in line1)
+check("TIMING: reports dynamo/pipeline_api/render/total",
+      "dynamo=" in line1 and "pipeline_api=0.00s" in line1 and "render=" in line1 and "total=" in line1)
+check("TIMING: reports call counts for the named expensive functions",
+      "calls_get_my_deals=" in line1 and "calls_get_deals_list=" in line1
+      and "calls_get_my_matched_buy_deals=" in line1 and "calls_build_tenant_index=" in line1)
+check("TIMING: no Pipeline API call happens on a normal page render",
+      "calls_pipeline_api_call=" not in line1)
+
+resp2, lines2 = _capture_timing_line(mydeals_event)
+check("TIMING: second request in the same warm container is cold=False", "cold=False" in lines2[0])
+
+buyer_event = {"requestContext": {"http": {"method": "GET"}},
+               "queryStringParameters": {"key": ADMIN_KEY, "buyer": "1"}}
+_, lines_buyer = _capture_timing_line(buyer_event)
+check("TIMING: page label follows the actual route (?buyer= -> page=buyer)", "page=buyer" in lines_buyer[0])
+
+action_event = post_event({"deal_id": "1401", "notes": "x"})
+_, lines_action = _capture_timing_line(action_event)
+check("TIMING: a POST action still logs exactly one line, labeled by its action",
+      len(lines_action) == 1 and "page=action:update_intro" in lines_action[0])
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 

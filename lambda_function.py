@@ -85,6 +85,78 @@ from datetime import datetime, timezone
 import boto3
 from boto3.dynamodb.conditions import Key
 
+# ── Diagnostic timing instrumentation (perf report task -- diagnostic
+# only, nothing here is user-visible). One "TIMING ..." line to
+# CloudWatch (via print/stdout) per request. Reset in the outer
+# lambda_handler wrapper at the bottom of this file; s3_*/dynamo/
+# pipeline_api are measured directly around each actual network call
+# (see _perf_timer's call sites); render is reported as the residual
+# (total - those three) rather than instrumenting every render_* call
+# site individually -- lower risk, and still an accurate "everything
+# that isn't a measured I/O call" bucket. _cold_start_seen is a
+# separate, never-reset-mid-container flag: cold=True exactly once per
+# container, on whichever request happens to arrive first.
+_cold_start_seen = {"done": False}
+_perf = {"page": "?", "cold": True, "start": 0.0, "times": {}, "counts": {}}
+
+
+def _perf_start(page):
+    was_cold = not _cold_start_seen["done"]
+    _cold_start_seen["done"] = True
+    _perf["page"] = page
+    _perf["cold"] = was_cold
+    _perf["start"] = time.perf_counter()
+    _perf["times"] = {}
+    _perf["counts"] = {}
+
+
+def _perf_count(name):
+    """Increment a per-request call counter -- every call counts, cache
+    hits included, since a function called 15 times even though each
+    call is individually cheap (or cached) is exactly the N+1-style
+    pattern this instrumentation exists to surface."""
+    _perf["counts"][name] = _perf["counts"].get(name, 0) + 1
+
+
+class _perf_timer:
+    """with _perf_timer("s3_people"): ... -- accumulates wall time under
+    that category across every use within the current request (a second
+    people.json fetch in the same request adds to the same s3_people
+    bucket rather than overwriting it)."""
+    def __init__(self, category):
+        self.category = category
+
+    def __enter__(self):
+        self._t0 = time.perf_counter()
+        return self
+
+    def __exit__(self, *exc):
+        elapsed = time.perf_counter() - self._t0
+        _perf["times"][self.category] = _perf["times"].get(self.category, 0.0) + elapsed
+        return False
+
+
+def _perf_log():
+    times = _perf["times"]
+    total = time.perf_counter() - _perf["start"]
+    s3_total = sum(v for k, v in times.items() if k.startswith("s3_"))
+    dynamo = times.get("dynamo", 0.0)
+    pipeline_api = times.get("pipeline_api", 0.0)
+    render = max(0.0, total - s3_total - dynamo - pipeline_api)
+    parts = [f"page={_perf['page']}"]
+    for key in ("s3_people", "s3_deals", "s3_interest", "s3_companies"):
+        if key in times:
+            parts.append(f"{key}={times[key]:.2f}s")
+    parts.append(f"dynamo={dynamo:.2f}s")
+    parts.append(f"pipeline_api={pipeline_api:.2f}s")
+    parts.append(f"render={render:.2f}s")
+    for name, n in sorted(_perf["counts"].items()):
+        parts.append(f"calls_{name}={n}")
+    parts.append(f"total={total:.2f}s")
+    parts.append(f"cold={_perf['cold']}")
+    print("TIMING " + " ".join(parts))
+
+
 BUCKET = "full-pipeline-cache"
 PEOPLE_KEY = "people.json"
 INTEREST_KEY = "interest_people.json"
@@ -960,8 +1032,9 @@ def _build_firm_won_index():
     mean re-deriving it from scratch (it needs the FULL people list,
     not just the wanted ids) on every call anyway."""
     s3 = boto3.client("s3")
-    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-    people_data = json.loads(people_obj["Body"].read())
+    with _perf_timer("s3_people"):
+        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+        people_data = json.loads(people_obj["Body"].read())
     people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
     by_company_id = set()
     by_company_name = set()
@@ -1143,8 +1216,9 @@ def _build_table(s3):
     """Fetch both S3 objects fresh and compute the per-company tier table.
     All large intermediates (parsed people list, id->tier index) are local
     variables and are dropped as soon as this function returns."""
-    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-    people_data = json.loads(people_obj["Body"].read())
+    with _perf_timer("s3_people"):
+        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+        people_data = json.loads(people_obj["Body"].read())
     people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
 
     tier_by_id = {}
@@ -1155,12 +1229,14 @@ def _build_table(s3):
         cf = rec.get("custom_fields") or {}
         tier_by_id[str(pid)] = classify_person(cf)
 
-    interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
-    interest_data = json.loads(interest_obj["Body"].read())
+    with _perf_timer("s3_interest"):
+        interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
+        interest_data = json.loads(interest_obj["Body"].read())
     buy = interest_data.get("buy") or {}
 
-    deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
-    deals_data = json.loads(deals_obj["Body"].read())
+    with _perf_timer("s3_deals"):
+        deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
+        deals_data = json.loads(deals_obj["Body"].read())
     deals_list = deals_data.get("deals", []) if isinstance(deals_data, dict) else (deals_data or [])
 
     sellers_by_company = {}
@@ -1220,12 +1296,14 @@ def get_deals_list():
     head_object-version pattern as get_company_table, cached independently
     since My Deals needs the full per-deal records (for per-tenant
     filtering) rather than a precomputed aggregate."""
+    _perf_count("get_deals_list")
     s3 = boto3.client("s3")
     version = _object_version(s3, DEALS_KEY)
     if _deals_cache["version"] == version and _deals_cache["deals"] is not None:
         return _deals_cache["deals"]
-    deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
-    deals_data = json.loads(deals_obj["Body"].read())
+    with _perf_timer("s3_deals"):
+        deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
+        deals_data = json.loads(deals_obj["Body"].read())
     deals = deals_data.get("deals", []) if isinstance(deals_data, dict) else (deals_data or [])
     _deals_cache["version"] = version
     _deals_cache["deals"] = deals
@@ -1316,6 +1394,7 @@ def _raised_headline_html(edit_mode=False):
 
 def get_my_deals(person_id):
     """Deals linked to person_id, newest-updated first."""
+    _perf_count("get_my_deals")
     deals = get_deals_list()
     mine = [d for d in deals if person_id in _deal_linked_person_ids(d)]
     mine.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
@@ -1330,8 +1409,9 @@ def get_company_buyer_details(company):
     function returns; per the module docstring, it is never added to any
     module-level cache."""
     s3 = boto3.client("s3")
-    interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
-    interest_data = json.loads(interest_obj["Body"].read())
+    with _perf_timer("s3_interest"):
+        interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
+        interest_data = json.loads(interest_obj["Body"].read())
     buy = interest_data.get("buy") or {}
 
     target = company.strip().lower()
@@ -1344,8 +1424,9 @@ def get_company_buyer_details(company):
         return []
     wanted = {str(pid) for pid in person_ids}
 
-    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-    people_data = json.loads(people_obj["Body"].read())
+    with _perf_timer("s3_people"):
+        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+        people_data = json.loads(people_obj["Body"].read())
     people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
 
     out = []
@@ -1378,8 +1459,9 @@ def get_company_record(company_id, company_name):
     unverified in this sandbox (see COMPANIES_KEY)."""
     try:
         s3 = boto3.client("s3")
-        companies_obj = s3.get_object(Bucket=BUCKET, Key=COMPANIES_KEY)
-        companies_data = json.loads(companies_obj["Body"].read())
+        with _perf_timer("s3_companies"):
+            companies_obj = s3.get_object(Bucket=BUCKET, Key=COMPANIES_KEY)
+            companies_data = json.loads(companies_obj["Body"].read())
         companies_list = (companies_data.get("companies", [])
                            if isinstance(companies_data, dict) else (companies_data or []))
     except Exception:
@@ -1403,12 +1485,14 @@ def get_people_by_ids(person_ids):
     """{id: person record} for exactly the wanted ids, via a fresh
     people.json fetch. Same fetch-and-discard pattern as
     get_company_buyer_details — never cached."""
+    _perf_count("get_people_by_ids")
     wanted = {str(pid) for pid in person_ids if pid is not None}
     if not wanted:
         return {}
     s3 = boto3.client("s3")
-    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-    people_data = json.loads(people_obj["Body"].read())
+    with _perf_timer("s3_people"):
+        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+        people_data = json.loads(people_obj["Body"].read())
     people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
     out = {}
     for rec in people_list:
@@ -1482,8 +1566,10 @@ def _build_tenant_index(s3):
     (_tenant_email_for_deal, Hold/Cancel/Reactivate's deal-linkage
     checks) compares it against those same int-coerced deal-linkage
     sets."""
-    people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-    people_data = json.loads(people_obj["Body"].read())
+    _perf_count("build_tenant_index")
+    with _perf_timer("s3_people"):
+        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+        people_data = json.loads(people_obj["Body"].read())
     people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
 
     seller_person_ids = set()
@@ -1713,6 +1799,7 @@ def get_my_matched_buy_deals(person_id, company=None):
     """The tenant's BUY deals at Matched-or-later stage — every company
     (Active Intros) when company is None, else just that one (the company
     page's Matched Buyers section)."""
+    _perf_count("get_my_matched_buy_deals")
     target = company.strip().lower() if company else None
     out = []
     for d in get_my_deals(person_id):
@@ -1832,11 +1919,13 @@ def get_intro_details(tenant_email):
     ({}, True) so the caller can fall back to Pipeline-only data and show
     a small note instead of a broken page. Returns (entries,
     dynamo_failed)."""
+    _perf_count("get_intro_details")
     try:
         table = _dynamo_table()
-        resp = table.query(
-            KeyConditionExpression=Key("tenant").eq(tenant_email) & Key("sk").begins_with("intro#"),
-        )
+        with _perf_timer("dynamo"):
+            resp = table.query(
+                KeyConditionExpression=Key("tenant").eq(tenant_email) & Key("sk").begins_with("intro#"),
+            )
         out = {}
         for item in resp.get("Items", []):
             sk = item.get("sk") or ""
@@ -1896,11 +1985,13 @@ def get_feature_requests(tenant_partition, page=None):
     matches it, with a missing "page" attribute treated as "my-deals"
     (see FEATURE_PAGES above). Never raises: any failure returns
     ({"open": [], "done": []}, True)."""
+    _perf_count("get_feature_requests")
     try:
         table = _dynamo_table()
-        resp = table.query(
-            KeyConditionExpression=Key("tenant").eq(tenant_partition) & Key("sk").begins_with("feature#"),
-        )
+        with _perf_timer("dynamo"):
+            resp = table.query(
+                KeyConditionExpression=Key("tenant").eq(tenant_partition) & Key("sk").begins_with("feature#"),
+            )
         items = []
         for item in resp.get("Items", []):
             sk = item.get("sk") or ""
@@ -2292,13 +2383,15 @@ def _pipeline_update_deal_stage(deal_id, stage_id):
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
-            if not (200 <= r.status < 300):
-                return False, f"HTTP {r.status}"
-            try:
-                data = json.loads(r.read().decode("utf-8"))
-            except Exception:
-                return False, "Pipeline response was not valid JSON"
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"):
+            with urllib.request.urlopen(req, timeout=15) as r:
+                if not (200 <= r.status < 300):
+                    return False, f"HTTP {r.status}"
+                try:
+                    data = json.loads(r.read().decode("utf-8"))
+                except Exception:
+                    return False, "Pipeline response was not valid JSON"
             echoed = _deal_stage_id(data) if isinstance(data, dict) else None
             if echoed != stage_id and isinstance(data, dict) and isinstance(data.get("deal"), dict):
                 echoed = _deal_stage_id(data["deal"])
@@ -2660,7 +2753,8 @@ def _pipeline_update_deal_status(deal_id, status_id):
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
             if 200 <= r.status < 300:
                 return True, None
             return False, f"HTTP {r.status}"
@@ -2693,7 +2787,8 @@ def _pipeline_update_deal_deadline(deal_id, deadline_iso):
         headers={"Content-Type": "application/json"},
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
             if 200 <= r.status < 300:
                 return True, None
             return False, f"HTTP {r.status}"
@@ -2769,7 +2864,8 @@ def _pipeline_fetch_person_photo_url(person_id):
     qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
     req = urllib.request.Request(f"{PIPELINE_API_BASE}/people/{person_id}.json?{qs}", method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=10) as r:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=10) as r:
             if not (200 <= r.status < 300):
                 return None
             data = json.loads(r.read())
@@ -7694,7 +7790,40 @@ def _handle_update_intro(event):
 NOT_ENABLED_MESSAGE = "This dashboard is for sellers."
 
 
+def _perf_infer_page(query):
+    """A best-effort page label for the TIMING line, resolved from the raw
+    query string alone -- before any of _lambda_handler_impl's own
+    routing/auth logic runs, and without duplicating it. Doesn't need to
+    be authoritative (a 403/404 still logs a label, just possibly not
+    the one that would have rendered), only useful for grouping."""
+    if query.get("action"):
+        return f"action:{query['action']}"
+    if query.get("photo"):
+        return "photo"
+    if query.get("buyer"):
+        return "buyer"
+    if query.get("company"):
+        return "company"
+    tab = query.get("tab") or "mydeals"
+    return tab if tab in ("mydeals", "intros", "demand") else "mydeals"
+
+
 def lambda_handler(event, context):
+    """Thin timing wrapper around _lambda_handler_impl (diagnostic only --
+    see the perf instrumentation block near the top of this file). Wraps
+    the ENTIRE request, POST actions included, in a try/finally so
+    exactly one "TIMING ..." line reaches CloudWatch per invocation
+    regardless of which of _lambda_handler_impl's many return points was
+    hit -- including an exception, which still logs before propagating."""
+    query = event.get("queryStringParameters") or {}
+    _perf_start(_perf_infer_page(query))
+    try:
+        return _lambda_handler_impl(event, context)
+    finally:
+        _perf_log()
+
+
+def _lambda_handler_impl(event, context):
     method = (event.get("requestContext", {}).get("http", {}).get("method")
               or event.get("httpMethod") or "GET")
     query = event.get("queryStringParameters") or {}
