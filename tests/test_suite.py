@@ -254,6 +254,16 @@ def row_for(page, deal_id):
     return page[start:end]
 
 
+def body_only(page):
+    """Slice off <header> (the nav, including the My Deals quick-jump
+    dropdown) so a string/count/split assertion against the page body
+    below isn't confused by the dropdown legitimately repeating a
+    company name, section label ("On Hold" etc.), or that also appears
+    in the visible table."""
+    idx = page.find('<div class="wrap">')
+    return page[idx:] if idx != -1 else page
+
+
 class FakeHTTPResponse:
     def __init__(self, status=200):
         self.status = status
@@ -608,21 +618,25 @@ check("Cancelled section heading present", '<h2 class="mydeals-section-heading c
 check("Cancelled Deal row present (via its company name -- terminal rows carry no action buttons)",
       "Gamma Co" in page)
 
-hold_section = page.split("On Hold")[1].split("Cancelled")[0]
+# body_only: person_id is set, so the nav's My Deals dropdown also lists
+# an "On Hold" group for this same tenant -- slice the header off before
+# splitting on "On Hold" so these sections read the actual table.
+page_body = body_only(page)
+hold_section = page_body.split("On Hold")[1].split("Cancelled")[0]
 check("Reactivate button present in the Hold section (tenant)", 'data-target="reactivate"' in hold_section)
 check("no Hold/Cancel buttons in the Hold section", 'data-target="hold"' not in hold_section
       and 'data-target="cancel"' not in hold_section)
-active_section = page.split("On Hold")[0]
+active_section = page_body.split("On Hold")[0]
 check("Hold/Cancel buttons present in the active section", 'data-target="hold"' in active_section
       and 'data-target="cancel"' in active_section)
 
-page_admin = lf.render_my_deals_page("Admin", deals=deals, key=ADMIN_KEY, view_as=TENANT_EMAIL,
-                                      person_id=TENANT_PID, anon_key_email=TENANT_EMAIL)
+page_admin = body_only(lf.render_my_deals_page("Admin", deals=deals, key=ADMIN_KEY, view_as=TENANT_EMAIL,
+                                                person_id=TENANT_PID, anon_key_email=TENANT_EMAIL))
 hold_section_admin = page_admin.split("On Hold")[1].split("Cancelled")[0]
 check("Reactivate button present in the Hold section (admin)", 'data-target="reactivate"' in hold_section_admin)
 
-page_active_only = lf.render_my_deals_page("Sella", deals=[deal_active], key=None, view_as=None,
-                                            person_id=TENANT_PID, anon_key_email=TENANT_EMAIL)
+page_active_only = body_only(lf.render_my_deals_page("Sella", deals=[deal_active], key=None, view_as=None,
+                                                      person_id=TENANT_PID, anon_key_email=TENANT_EMAIL))
 check("On Hold section omitted entirely when empty", "On Hold" not in page_active_only)
 check("Cancelled section omitted entirely when empty (heading markup, not just the bare word)",
       'mydeals-section-heading cancelled"' not in page_active_only)
@@ -733,8 +747,11 @@ tenant_a = lf._resolve_tenant(TENANT_EMAIL)
 assert tenant_a is not None
 
 sell_deals = [d for d in lf.get_my_deals(TENANT_PID) if lf.DEAL_SIDE_SELL_ID in lf._deal_cf_option_ids(d, lf.DEAL_SIDE_FIELD)]
-page = lf.render_my_deals_page("Sella Seller", deals=sell_deals, key=None, view_as=None,
-                                edit_mode=False, person_id=TENANT_PID, anon_key_email=TENANT_EMAIL)
+# body_only: same reason as above -- the nav dropdown now also lists
+# these companies (Won Co A/B included), which would otherwise confuse
+# the page.find("Won Co A")-to-end-of-page fallback slices below.
+page = body_only(lf.render_my_deals_page("Sella Seller", deals=sell_deals, key=None, view_as=None,
+                                          edit_mode=False, person_id=TENANT_PID, anon_key_email=TENANT_EMAIL))
 
 check("'Closed' section heading present", '<h2 class="mydeals-section-heading closed">Closed' in page)
 check("Closed section count is 2 (Won Deal A + Won Deal B)",
@@ -2191,8 +2208,12 @@ colleague_rec = next(c for d, c in firm_pairs if d.get("id") == 911)
 check("get_firm_closed_sell_deals: colleague record is Marco", lf._person_display_name(colleague_rec) == "Marco Colleague")
 
 my_own_deals = [own_won_deal, live_own_deal]
-page_mydeals_firm = lf.render_my_deals_page("Sella Seller", deals=my_own_deals, key=None, view_as=None,
-                                             edit_mode=False, person_id=TENANT_A_PID, anon_key_email=TENANT_A_EMAIL)
+# body_only: the nav dropdown's own Closed group now also carries a "via
+# Marco" entry for the same firm-wide deal -- slice it off so the
+# occurrence count below reflects the actual table, not the nav.
+page_mydeals_firm = body_only(lf.render_my_deals_page("Sella Seller", deals=my_own_deals, key=None, view_as=None,
+                                                       edit_mode=False, person_id=TENANT_A_PID,
+                                                       anon_key_email=TENANT_A_EMAIL))
 check("My Deals: Closed section count includes BOTH the personal (910) and firm (911) won deals",
       '<h2 class="mydeals-section-heading closed">Closed <span class="count">(2)</span></h2>' in page_mydeals_firm)
 check("My Deals: the firm-wide row shows a 'via Marco' chip", "via Marco" in page_mydeals_firm)
@@ -2454,6 +2475,161 @@ page_nav_company_ref_intros = lf.render_company_page("Nav Co", "Sella Seller", t
                                                       key=None, view_as=None, edit_mode=False)
 check("Item 5: ref=intros back-link resolves to Active Intros",
       '<a class="cd-back" href="?tab=intros">&larr; Back to Active Intros</a>' in page_nav_company_ref_intros)
+
+
+# ======================================================================
+# SECTION: My Deals nav dropdown -- hover/click quick-jump menu
+# ======================================================================
+# The My Deals tab becomes a hover/click dropdown of the viewing tenant's
+# own Sell deals, on every page (see _nav_html's person_id param and
+# _mydeals_dropdown_entries/_mydeals_dropdown_html). The tab <a> itself
+# is untouched -- a separate caret button opens the menu -- grouped Live/
+# On Hold/Closed/Cancelled (company A-Z within each, empty groups
+# omitted), each entry a company link carrying an intro-count badge when
+# >0, firm-wide Closed rows carry a "via <colleague>" suffix, capped at
+# 40 with a trailing "View all in My Deals ->" beyond that, and omitted
+# outright for admin-without-view_as (no tenant context).
+
+people_navdrop = {"people": [
+    {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "company_id": 77,
+     "custom_fields": {}},
+    {"id": 501, "first_name": "Buyer", "last_name": "Alpha", "email": "buyer.alpha@example.com",
+     "custom_fields": {}},
+    {"id": 502, "full_name": "Marco Colleague", "email": "marco@example.com", "company_id": 77,
+     "custom_fields": {}},
+]}
+deal_nd_live = {"id": 1201, "name": "Alpha Sell", "company": {"name": "Alpha Co"},
+                "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                "people": [{"id": TENANT_A_PID}], "is_archived": False, "updated_at": "2026-08-01T00:00:00Z"}
+deal_nd_hold = {"id": 1202, "name": "Beta Sell", "company": {"name": "Beta Co"},
+                "deal_stage": {"id": lf.HOLD_STAGE_ID}, "custom_fields": cf_sell(),
+                "people": [{"id": TENANT_A_PID}], "is_archived": False, "updated_at": "2026-08-02T00:00:00Z"}
+deal_nd_cancelled = {"id": 1203, "name": "Charlie Sell", "company": {"name": "Charlie Co"},
+                     "deal_stage": {"id": 111801}, "custom_fields": cf_sell(),
+                     "people": [{"id": TENANT_A_PID}], "is_archived": True, "updated_at": "2026-08-03T00:00:00Z"}
+deal_nd_closed = {"id": 1204, "name": "Delta Sell", "company": {"name": "Delta Co"},
+                  "deal_stage": {"id": 111802}, "custom_fields": cf_sell(),
+                  "people": [{"id": TENANT_A_PID}], "is_archived": True, "updated_at": "2026-08-04T00:00:00Z"}
+deal_nd_intro = {"id": 1205, "name": "Alpha Intro", "company": {"name": "Alpha Co"},
+                 "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),
+                 "people": [{"id": TENANT_A_PID}, {"id": 501}], "updated_at": "2026-08-05T00:00:00Z"}
+deal_nd_firm_closed = {"id": 1206, "name": "Colleague Won", "company": {"name": "Echo Co"},
+                       "deal_stage": {"id": 111802}, "custom_fields": cf_sell(),
+                       "people": [{"id": 502}], "updated_at": "2026-08-06T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_navdrop, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [deal_nd_live, deal_nd_hold, deal_nd_cancelled, deal_nd_closed,
+                                       deal_nd_intro, deal_nd_firm_closed]}})
+tenant_navdrop = lf._resolve_tenant(TENANT_A_EMAIL)
+assert tenant_navdrop is not None
+
+entries_nd = lf._mydeals_dropdown_entries(TENANT_A_PID)
+check("Dropdown: one entry per company (5: Alpha/Beta/Charlie/Delta/Echo)", len(entries_nd) == 5)
+check("Dropdown: group order is Live, On Hold, Closed, Cancelled",
+      [e["group"] for e in entries_nd] == ["Live", "On Hold", "Closed", "Closed", "Cancelled"])
+check("Dropdown: Closed group sorted A-Z (Delta before Echo)",
+      [e["company"] for e in entries_nd if e["group"] == "Closed"] == ["Delta Co", "Echo Co"])
+check("Dropdown: Alpha Co (Live) carries its intro_count (1 disclosed matched buy deal)",
+      next(e for e in entries_nd if e["company"] == "Alpha Co")["intro_count"] == 1)
+check("Dropdown: Beta Co (On Hold) has intro_count 0", next(e for e in entries_nd
+      if e["company"] == "Beta Co")["intro_count"] == 0)
+check("Dropdown: Delta Co (personal Closed) carries no colleague/via text",
+      next(e for e in entries_nd if e["company"] == "Delta Co")["colleague"] is None)
+check("Dropdown: Echo Co (firm-wide Closed) carries colleague='Marco'",
+      next(e for e in entries_nd if e["company"] == "Echo Co")["colleague"] == "Marco")
+check("Dropdown entries: admin-without-view_as (person_id=None) -> no entries at all",
+      lf._mydeals_dropdown_entries(None) == [])
+check("Dropdown HTML: admin-without-view_as renders nothing (no caret, no menu)",
+      lf._mydeals_dropdown_html(None) == "")
+
+menu_html = lf._mydeals_dropdown_html(TENANT_A_PID, key=None, view_as=None)
+check("Dropdown HTML: a caret button, a separate element from the tab <a> itself",
+      '<button type="button" class="gg-mydeals-caret"' in menu_html)
+check("Dropdown HTML: keyboard-accessible caret (aria-haspopup/aria-expanded)",
+      'aria-haspopup="true"' in menu_html and 'aria-expanded="false"' in menu_html)
+check("Dropdown HTML: menu carries role=menu, entries role=menuitem",
+      'role="menu"' in menu_html and 'role="menuitem"' in menu_html)
+check("Dropdown HTML: group labels appear in Live/On Hold/Closed/Cancelled order",
+      menu_html.find(">Live<") < menu_html.find(">On Hold<") < menu_html.find(">Closed<")
+      < menu_html.find(">Cancelled<"))
+alpha_href = lf._company_href("Alpha Co", "mydeals", None, None)
+check("Dropdown HTML: entry links to ?company=<name>&ref=mydeals", f'href="{alpha_href}"' in menu_html)
+check("Dropdown HTML: Alpha Co shows its intro-count badge (1)",
+      '<span class="gg-mydeals-menu-badge">1</span>' in menu_html)
+check("Dropdown HTML: Beta Co (0 intros) shows no badge for that entry",
+      '<span class="gg-mydeals-menu-name">Beta Co</span></a>' in menu_html)
+check("Dropdown HTML: Echo Co shows 'via Marco' in muted text",
+      '<span class="gg-mydeals-menu-via">via Marco</span>' in menu_html)
+check("Dropdown HTML: no 'View all' link when under the 40-entry cap",
+      "View all in My Deals" not in menu_html)
+
+menu_html_admin = lf._mydeals_dropdown_html(TENANT_A_PID, key=ADMIN_KEY, view_as=TENANT_A_EMAIL)
+alpha_href_admin = lf._company_href("Alpha Co", "mydeals", ADMIN_KEY, TENANT_A_EMAIL)
+check("Dropdown HTML: auth params (key/view_as) carried into entry hrefs",
+      f'href="{alpha_href_admin}"' in menu_html_admin and "&key=" in alpha_href_admin)
+
+# --- Structure: the tab <a> stays a plain link to My Deals -- the
+# caret is a separate sibling element, so a click on the tab label
+# itself always navigates rather than being hijacked into opening the
+# menu. z-index clears the sticky table header (z-index:1 elsewhere); a
+# narrow-width media query keeps the menu from overflowing the nav on
+# ~400px screens.
+nav_with_dropdown = lf._nav_html("mydeals", "Sella Seller", key=None, view_as=None, person_id=TENANT_A_PID)
+check("Dropdown: the My Deals tab is still a plain, unmodified link to ?tab=mydeals",
+      '<a class="gg-tab active" href="?tab=mydeals">My Deals</a>' in nav_with_dropdown)
+check("Dropdown: the caret is a sibling of the tab <a>, not nested inside it",
+      '<a class="gg-tab active" href="?tab=mydeals">My Deals</a>\n        <button type="button" '
+      'class="gg-mydeals-caret"' in nav_with_dropdown)
+check("Dropdown CSS: menu z-index clears the sticky table header's z-index:1",
+      ".gg-mydeals-menu {" in lf.NAV_CSS and "z-index: 50;" in lf.NAV_CSS)
+check("Dropdown CSS: narrow-width (<=480px) media query repositions the menu viewport-relative",
+      "@media (max-width: 480px)" in lf.NAV_CSS and "position: fixed;" in lf.NAV_CSS)
+
+# --- Rendered on every page, not just My Deals itself ---
+page_nd_intros = lf.render_intros_page("Sella Seller", tenant=tenant_navdrop, tenant_email=TENANT_A_EMAIL,
+                                        key=None, view_as=None, edit_mode=False)
+check("Dropdown: present on Active Intros", 'class="gg-mydeals-caret"' in page_nd_intros)
+page_nd_company = lf.render_company_page("Alpha Co", "Sella Seller", tenant_navdrop, TENANT_A_EMAIL, "mydeals",
+                                          key=None, view_as=None, edit_mode=False)
+check("Dropdown: present on the company page", 'class="gg-mydeals-caret"' in page_nd_company)
+page_nd_buyer = lf.render_buyer_page(501, "Sella Seller", tenant_navdrop, TENANT_A_EMAIL,
+                                      key=None, view_as=None, edit_mode=False)
+check("Dropdown: present on the buyer page", 'class="gg-mydeals-caret"' in page_nd_buyer)
+page_nd_demand = lf.render_page(lf.get_company_table(), "Sella Seller", key=None, view_as=None,
+                                 anon_key_email=TENANT_A_EMAIL, person_id=TENANT_A_PID)
+check("Dropdown: present on the Demand Board", 'class="gg-mydeals-caret"' in page_nd_demand)
+page_nd_mydeals = lf.render_my_deals_page("Sella Seller", deals=[deal_nd_live], key=None, view_as=None,
+                                           person_id=TENANT_A_PID, anon_key_email=TENANT_A_EMAIL)
+check("Dropdown: present on My Deals itself too", 'class="gg-mydeals-caret"' in page_nd_mydeals)
+
+# --- Admin-without-view_as: omitted entirely, on every page ---
+page_nd_demand_admin = lf.render_page([], "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",
+                                       tenant_picker=True, person_id=None)
+check("Dropdown: admin-without-view_as sees no caret on the Demand Board",
+      'class="gg-mydeals-caret"' not in page_nd_demand_admin)
+page_nd_mydeals_admin = lf.render_my_deals_page("Admin", tenant_picker=True, key=ADMIN_KEY, view_as=None)
+check("Dropdown: admin-without-view_as sees no caret on My Deals either",
+      'class="gg-mydeals-caret"' not in page_nd_mydeals_admin)
+
+# --- Cap at 40 entries + trailing "View all" ---
+deals_cap = [
+    {"id": 1300 + i, "name": f"Cap Deal {i}", "company": {"name": f"Cap Co {i:03d}"},
+     "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+     "people": [{"id": TENANT_A_PID}], "updated_at": f"2026-09-{(i % 28) + 1:02d}T00:00:00Z"}
+    for i in range(45)
+]
+use_fixture({lf.PEOPLE_KEY: {"people": [{"id": TENANT_A_PID, "full_name": "Sella Seller",
+                                          "email": TENANT_A_EMAIL, "custom_fields": {}}]},
+             lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_cap}})
+entries_cap = lf._mydeals_dropdown_entries(TENANT_A_PID)
+check("Dropdown cap: 45 distinct companies -> 45 raw entries (the cap applies at HTML build, not entries)",
+      len(entries_cap) == 45)
+menu_html_cap = lf._mydeals_dropdown_html(TENANT_A_PID)
+check("Dropdown cap: HTML renders only 40 entries", menu_html_cap.count("gg-mydeals-menu-item") == 40)
+check("Dropdown cap: trailing 'View all in My Deals ->' item present beyond the cap",
+      "View all in My Deals" in menu_html_cap and "gg-mydeals-menu-viewall" in menu_html_cap)
+viewall_href = f"?tab=mydeals{lf._tab_qs_suffix(None, None)}"
+check("Dropdown cap: 'View all' link points at the My Deals tab",
+      f'href="{viewall_href}"' in menu_html_cap)
 
 
 # ======================================================================

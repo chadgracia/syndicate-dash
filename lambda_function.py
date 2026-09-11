@@ -3973,6 +3973,102 @@ NAV_CSS = """
     background: rgba(61,90,115,0.10);
     box-shadow: inset 0 -2px 0 var(--accent);
   }
+  /* My Deals nav dropdown -- the tab <a> is untouched (still a plain
+     link straight to the tab); the caret is a separate focusable button
+     so a click on the tab label itself never gets hijacked into opening
+     the menu instead of navigating. Hover opens it (.gg-mydeals-nav:hover)
+     for a mouse; the caret's own click handler toggles a .open class for
+     keyboard/touch, and Escape / an outside click close it (see the
+     inline script in _nav_html). position:absolute + a scoped z-index
+     keeps it from ever affecting the sticky table headers elsewhere on
+     the page -- it lives entirely inside <header>, with no overflow:hidden
+     on any ancestor. */
+  .gg-mydeals-nav { position: relative; display: inline-flex; align-items: center; }
+  .gg-mydeals-caret {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 10px;
+    padding: 4px 6px;
+    margin-left: -6px;
+    line-height: 1;
+  }
+  .gg-mydeals-caret:hover { color: var(--ink); }
+  .gg-mydeals-menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4px;
+    min-width: 220px;
+    max-width: min(320px, 92vw);
+    max-height: 60vh;
+    overflow-y: auto;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.16);
+    z-index: 50;
+    padding: 6px 0;
+  }
+  .gg-mydeals-nav:hover .gg-mydeals-menu,
+  .gg-mydeals-nav.open .gg-mydeals-menu { display: block; }
+  .gg-mydeals-menu-group + .gg-mydeals-menu-group {
+    border-top: 1px solid var(--line);
+    margin-top: 4px;
+    padding-top: 4px;
+  }
+  .gg-mydeals-menu-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    font-weight: 700;
+    padding: 4px 12px;
+  }
+  .gg-mydeals-menu-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 12px;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  .gg-mydeals-menu-item:hover { background: rgba(61,90,115,0.08); }
+  .gg-mydeals-menu-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gg-mydeals-menu-via { color: var(--muted); font-size: 11px; margin-left: 6px; }
+  .gg-mydeals-menu-badge { color: var(--muted); font-size: 11px; font-weight: 600; flex-shrink: 0; }
+  .gg-mydeals-menu-viewall {
+    display: block;
+    padding: 8px 12px;
+    margin-top: 4px;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 12px;
+    font-weight: 600;
+    border-top: 1px solid var(--line);
+  }
+  .gg-mydeals-menu-viewall:hover { text-decoration: underline; }
+  /* Narrow widths (~400px): anchoring the menu to the tab's own left
+     edge risks pushing it past the right edge of the viewport, which
+     (being position:absolute) would widen the page rather than just
+     clip -- exactly the "overflow the nav" this item rules out. Below
+     480px it switches to viewport-relative fixed positioning instead,
+     so its width is governed by the viewport, not by wherever the tab
+     happens to sit in the bar. */
+  @media (max-width: 480px) {
+    .gg-mydeals-menu {
+      position: fixed;
+      left: 16px;
+      right: 16px;
+      top: 64px;
+      max-width: none;
+      width: auto;
+    }
+  }
   .gg-viewer {
     color: var(--muted);
     font-size: 13px;
@@ -4112,7 +4208,128 @@ def _tab_qs_suffix(key=None, view_as=None):
     return suffix
 
 
-def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True, edit_flag=False, cef_html=""):
+def _mydeals_dropdown_entries(person_id):
+    """The My Deals nav dropdown's raw entries: one per distinct company
+    among the tenant's own Sell deals (get_my_deals, Sell-tagged only --
+    the exact same filter lambda_handler's mydeals branch applies) plus
+    the firm-wide Closed rows (get_firm_closed_sell_deals, "via
+    <colleague>"), grouped into the same four sections render_my_deals_
+    page's own row loop classifies deals into -- Live/On Hold/Closed/
+    Cancelled -- sorted company A-Z within each group, in that group
+    order. Two deals for the same company in the same group collapse to
+    one entry (the dropdown jumps to a company page, not a deal).
+
+    intro_count ignores Dynamo status overrides (unlike My Deals' own
+    Intros column) -- this menu builds on every single page load, so a
+    second Dynamo partition scan per request here would be a real cost
+    for a quick-jump badge that only needs to be approximately right;
+    the company page and My Deals table themselves stay the
+    override-aware source of truth.
+
+    Returns [] outright for person_id=None (admin with no &view_as --
+    no tenant context to build a menu from) or a tenant with nothing to
+    jump to."""
+    if person_id is None:
+        return []
+    sell_deals = [d for d in get_my_deals(person_id)
+                  if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)]
+
+    intro_count_cache = {}
+
+    def _intro_count(company_name):
+        cache_key = company_name.lower()
+        if cache_key in intro_count_cache:
+            return intro_count_cache[cache_key]
+        matched = get_my_matched_buy_deals(person_id, company_name)
+        count = sum(1 for d in matched if _resolve_intro_status(d)["disclosed"])
+        intro_count_cache[cache_key] = count
+        return count
+
+    grouped = {"Live": {}, "On Hold": {}, "Closed": {}, "Cancelled": {}}
+
+    def _add(company_name, group, colleague=None):
+        company_name = (company_name or "").strip()
+        if not company_name:
+            return
+        key = company_name.lower()
+        if key in grouped[group]:
+            return
+        grouped[group][key] = {"company": company_name, "intro_count": _intro_count(company_name),
+                                "colleague": colleague, "group": group}
+
+    for d in sell_deals:
+        stage = _resolve_deal_stage(d)
+        if stage == HOLD_STAGE_ID:
+            group = "On Hold"
+        elif _is_won_stage(stage):
+            group = "Closed"
+        elif stage == OBSOLETE_STAGE_ID or stage in LOST_STAGE_IDS:
+            group = "Cancelled"
+        else:
+            group = "Live"
+        _add(_deal_company_name(d), group)
+
+    for d, colleague in get_firm_closed_sell_deals(person_id):
+        _add(_deal_company_name(d), "Closed", colleague=_first_name(colleague))
+
+    ordered = []
+    for group in ("Live", "On Hold", "Closed", "Cancelled"):
+        ordered.extend(sorted(grouped[group].values(), key=lambda e: e["company"].lower()))
+    return ordered
+
+
+def _mydeals_dropdown_html(person_id, key=None, view_as=None):
+    """The My Deals tab's quick-jump dropdown, rendered on every page via
+    _nav_html: the caret button plus the menu itself, or "" when there's
+    nothing to show (admin-without-view_as, or a tenant with no Sell
+    deals on file at all) -- the caret only exists to open something.
+    Capped at 40 entries with a trailing "View all in My Deals ->" item
+    beyond that (entries stay in the same Live/On Hold/Closed/Cancelled,
+    A-Z order -- the cap just truncates the tail)."""
+    entries = _mydeals_dropdown_entries(person_id)
+    if not entries:
+        return ""
+    MAX_ENTRIES = 40
+    shown, overflow = entries[:MAX_ENTRIES], len(entries) > MAX_ENTRIES
+
+    groups_html = []
+    for group in ("Live", "On Hold", "Closed", "Cancelled"):
+        group_entries = [e for e in shown if e["group"] == group]
+        if not group_entries:
+            continue
+        items = []
+        for e in group_entries:
+            href = _company_href(e["company"], "mydeals", key, view_as)
+            badge_html = (f'<span class="gg-mydeals-menu-badge">{e["intro_count"]}</span>'
+                          if e["intro_count"] else "")
+            via_html = (f'<span class="gg-mydeals-menu-via">via {_esc(e["colleague"])}</span>'
+                        if e["colleague"] else "")
+            items.append(
+                f'<a class="gg-mydeals-menu-item" href="{href}" role="menuitem">'
+                f'<span class="gg-mydeals-menu-name">{_esc(e["company"])}{via_html}</span>'
+                f'{badge_html}</a>'
+            )
+        groups_html.append(
+            f'<div class="gg-mydeals-menu-group">'
+            f'<div class="gg-mydeals-menu-label">{_esc(group)}</div>{"".join(items)}</div>'
+        )
+
+    if overflow:
+        suffix = _tab_qs_suffix(key, view_as)
+        groups_html.append(
+            f'<a class="gg-mydeals-menu-viewall" href="?tab=mydeals{suffix}" role="menuitem">'
+            f'View all in My Deals &rarr;</a>'
+        )
+
+    return (
+        '<button type="button" class="gg-mydeals-caret" aria-haspopup="true" aria-expanded="false" '
+        'aria-label="My Deals quick menu">&#9662;</button>'
+        f'<div class="gg-mydeals-menu" role="menu">{"".join(groups_html)}</div>'
+    )
+
+
+def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True, edit_flag=False, cef_html="",
+              person_id=None):
     suffix = _tab_qs_suffix(key, view_as)
     mydeals_href = f"?tab=mydeals{suffix}"
     intros_href = f"?tab=intros{suffix}"
@@ -4140,11 +4357,50 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
             badge_text += f" · viewing as {view_as}"
         admin_badge_html = f'<div class="gg-admin-badge">{_esc(badge_text)}</div>'
 
+    # Nav dropdown: person_id is only ever non-None for a resolved tenant
+    # (a real session, or admin &view_as preview) -- admin-without-view_as
+    # passes None, same "no tenant context" signal every other
+    # tenant-scoped feature on this nav already gates on (see
+    # _mydeals_dropdown_html). Rendered on every page, not just My Deals
+    # itself, since _nav_html is the one place every render_* function
+    # already shares.
+    mydeals_menu_html = _mydeals_dropdown_html(person_id, key=key, view_as=view_as)
+    mydeals_script = ""
+    if mydeals_menu_html:
+        mydeals_script = """<script>
+(function() {
+  var wrap = document.querySelector('.gg-mydeals-nav');
+  var caret = wrap && wrap.querySelector('.gg-mydeals-caret');
+  if (!caret) return;
+  function closeMenu() {
+    wrap.classList.remove('open');
+    caret.setAttribute('aria-expanded', 'false');
+  }
+  function openMenu() {
+    wrap.classList.add('open');
+    caret.setAttribute('aria-expanded', 'true');
+  }
+  caret.addEventListener('click', function(e) {
+    e.preventDefault();
+    if (wrap.classList.contains('open')) { closeMenu(); } else { openMenu(); }
+  });
+  document.addEventListener('click', function(e) {
+    if (!wrap.contains(e.target)) closeMenu();
+  });
+  document.addEventListener('keydown', function(e) {
+    if (e.key === 'Escape') { closeMenu(); caret.blur(); }
+  });
+})();
+</script>"""
+
     return f"""<header class="gg-nav">
   <div class="gg-nav-inner">
     <div class="gg-brand">Gracia Group</div>
     <nav class="gg-tabs">
-      <a class="{mydeals_cls}" href="{mydeals_href}">My Deals</a>
+      <div class="gg-mydeals-nav">
+        <a class="{mydeals_cls}" href="{mydeals_href}">My Deals</a>
+        {mydeals_menu_html}
+      </div>
       <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
     </nav>
@@ -4152,7 +4408,8 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     {cef_html}
     <div class="gg-viewer">{viewer_html}</div>
   </div>
-</header>"""
+</header>
+{mydeals_script}"""
 
 
 def _group_header_row_html(label, colspan):
@@ -4244,7 +4501,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
     — never for a real tenant."""
-    nav = _nav_html("intros", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
+    nav = _nav_html("intros", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                     person_id=(tenant.get("person_id") if tenant is not None else None))
     tenant_picker = tenant is None
 
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, tenant_email or "admin", key=key,
@@ -4860,7 +5118,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     branch). person_id/anon_key_email are needed here (not just deals)
     because the Buyers/Intros/Needs-attention columns are company-level
     buy-side signals, not attributes of the Sell deal itself."""
-    nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
+    nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                     person_id=person_id)
 
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="my-deals")
@@ -5487,7 +5746,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     parity refactor: the same shared row-builder Active Intros itself
     uses, surface="company")."""
     nav = _nav_html(None, viewer_name, key=key, view_as=view_as, show_viewer=False, edit_flag=edit_mode,
-                     cef_html=cef_html)
+                     cef_html=cef_html, person_id=(tenant.get("person_id") if tenant is not None else None))
     suffix = _tab_qs_suffix(key, view_as)
     back_href = f"?tab={ref}{suffix}"
     back_label = REF_LABELS.get(ref, "My Deals")
@@ -6527,7 +6786,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     context to gate disclosure against, so that case gets the same
     picker placeholder as Active Intros/My Deals."""
     nav = _nav_html(None, viewer_name, key=key, view_as=view_as, show_viewer=False, edit_flag=edit_mode,
-                     cef_html=cef_html)
+                     cef_html=cef_html, person_id=(tenant.get("person_id") if tenant is not None else None))
 
     try:
         buyer_id = int(buyer_id_raw)
@@ -6892,7 +7151,7 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
 
 
 def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
-                 tenant_picker=False, edit_mode=False):
+                 tenant_picker=False, edit_mode=False, person_id=None):
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="demand")
     raised_headline_html = _raised_headline_html(edit_mode=edit_mode)
@@ -6906,7 +7165,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
         f'<td class="num">{r["sellers"]}</td></tr>'
         for r in table
     )
-    nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, cef_html=cef_html)
+    nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, cef_html=cef_html, person_id=person_id)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7567,7 +7826,8 @@ def lambda_handler(event, context):
     if tab == "demand":
         table = get_company_table()
         body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as, cef_html=cef_html,
-                            anon_key_email=anon_key_email, tenant_picker=(tenant is None), edit_mode=edit_mode)
+                            anon_key_email=anon_key_email, tenant_picker=(tenant is None), edit_mode=edit_mode,
+                            person_id=(tenant.get("person_id") if tenant is not None else None))
     elif tab == "mydeals":
         if tenant is None:
             body = render_my_deals_page(viewer_name, tenant_picker=True,
