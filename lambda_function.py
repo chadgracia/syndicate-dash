@@ -161,6 +161,9 @@ HOLD_STAGE_ID = STAGE_HOLD
 OBSOLETE_STAGE_ID = 2348038
 WON_STAGE_IDS = {111802, 2379321}
 LOST_STAGE_IDS = {111801, 2379322}
+# Trade Broken -- given directly (same trust basis as every other bare
+# stage id in this file), a dead-buy-side stage distinct from Lost.
+STAGE_TRADE_BROKEN = 2486672
 
 # Labels for every stage id this org's code has ever named (verbatim from
 # chadgracia/daily-brief's STAGE_LABELS). An id outside this map (e.g. a
@@ -552,6 +555,18 @@ MILESTONE_STEPS = ["NDA", "VDR", "Sub Docs", "Wired", "Closed"]
 
 # step name -> its Pipeline status id, the inverse of MILESTONE_STATUS_IDS.
 MILESTONE_STEP_STATUS_ID = {step: sid for sid, step in MILESTONE_STATUS_IDS.items()}
+
+# "Introduced-or-later" by RAW Pipeline Intro Status value (never
+# override-aware) -- the six ids that represent genuine forward progress:
+# Introduced plus the five MILESTONE_STATUS_IDS ids (NDA/VDR/Sub Docs/
+# Wired/Closed). Deliberately excludes "Matched" (7207578, a real
+# selectable option, not just the implicit empty default) and all three
+# exit ids (Stalled/Passed/Withdrawn) -- those are exits, not progress.
+# Used (turn 27) both to gate disclosure of stage-derived closed-out
+# intros and, via the raw (pre-override) status id, as one of the two
+# "status history" signals in _resolve_intro_status's own exit-status
+# disclosure check below.
+INTRODUCED_OR_LATER_STATUS_IDS = {INTRO_STATUS_INTRODUCED_ID} | set(MILESTONE_STATUS_IDS.keys())
 
 # Item 2 (turn 20): "Sub Docs" -> "Docs Sent" is a DISPLAY-only rename —
 # the internal step key stays "Sub Docs" everywhere else (Dynamo
@@ -1542,6 +1557,86 @@ def get_my_matched_buy_deals(person_id, company=None):
     return out
 
 
+# Turn 27: stage-level exits. A dead-stage BUY deal never reaches
+# MATCHED_OR_LATER_STAGE_IDS (Lost/Trade Broken/Obsolete are disjoint from
+# it by construction), so it's invisible to get_my_matched_buy_deals today
+# and simply vanishes instead of showing as a closed-out intro. This is a
+# separate fetch path built the same way, keyed off the deal's own stage
+# rather than the Intro Status field. The derived outcome name is
+# DISPLAY-ONLY -- it is never written back to Pipeline or to any Dynamo
+# intro item; only _handle_update_intro's own explicit status/flag writes
+# ever touch status_override.
+CLOSED_OUT_STAGE_OUTCOMES = {}
+for _sid in LOST_STAGE_IDS | {STAGE_TRADE_BROKEN}:
+    CLOSED_OUT_STAGE_OUTCOMES[_sid] = "Passed"
+CLOSED_OUT_STAGE_OUTCOMES[OBSOLETE_STAGE_ID] = "Withdrawn"
+del _sid
+
+
+def _closed_out_outcome_name(stage_id):
+    """Derived, display-only outcome for a dead-stage BUY deal: Lost or
+    Trade Broken -> "Passed"; Obsolete -> "Withdrawn"; any other stage
+    (including None) -> None, meaning "not a closed-out deal"."""
+    return CLOSED_OUT_STAGE_OUTCOMES.get(stage_id)
+
+
+def _is_closed_out_buy_deal(deal):
+    """A Buy-tagged deal whose RAW Pipeline stage (never override-aware --
+    stage overrides are a Sell-side-only concept) is Lost, Trade Broken,
+    or Obsolete. These three stages are disjoint from
+    MATCHED_OR_LATER_STAGE_IDS by construction, so no separate "not
+    already matched-or-later" check is needed -- a deal can never satisfy
+    both predicates at once."""
+    if _closed_out_outcome_name(_deal_stage_id(deal)) is None:
+        return False
+    return DEAL_SIDE_BUY_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+
+
+def get_my_closed_out_buy_deals(person_id, company=None):
+    """The tenant's BUY deals whose stage is a dead-stage exit (Lost/Trade
+    Broken/Obsolete) — mirrors get_my_matched_buy_deals exactly, just
+    keyed off _is_closed_out_buy_deal instead."""
+    target = company.strip().lower() if company else None
+    out = []
+    for d in get_my_deals(person_id):
+        if target is not None and (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        if _is_closed_out_buy_deal(d):
+            out.append(d)
+    return out
+
+
+def _closed_out_disclosed(deal):
+    """Item 3's first, standalone disclosure rule for closed-out rows: the
+    RAW (never override-aware) Intro Status field must explicitly hold an
+    Introduced-or-later value. No milestone fallback here (unlike
+    _resolve_intro_status's own exit-status fix) -- the instruction states
+    this rule on its own, without reference to milestones. An empty status
+    on a dead deal renders anonymized exactly like a Pending row."""
+    return _deal_intro_status_id(deal) in INTRODUCED_OR_LATER_STATUS_IDS
+
+
+def _deal_loss_reason_text(deal):
+    """Best-effort read of a brand-new, UNVERIFIED deals.json field
+    (deal_loss_reason) -- this session has no live S3 access to confirm
+    its actual shape survives the export, so this handles the two
+    plausible shapes defensively and returns None for anything else,
+    exactly like every other "might not be in the snapshot yet" field in
+    this file (see INTRO_STATUS_FIELD's own docstring). Never raises."""
+    raw = deal.get("deal_loss_reason")
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        text = raw.get("name") or raw.get("value") or raw.get("label")
+    elif isinstance(raw, list):
+        first = raw[0] if raw else None
+        text = first.get("name") if isinstance(first, dict) else first
+    else:
+        text = raw
+    text = str(text).strip() if text is not None else ""
+    return text or None
+
+
 # ── Intro status pipeline ─────────────────────────────────────────────────
 # Status source of truth is the Pipeline Intro Status deal field
 # (custom_label_4008329, above) — see _resolve_intro_status. DynamoDB
@@ -2277,20 +2372,31 @@ def _resolve_intro_status(deal, override_entry=None):
     never shadows the Pipeline field.
 
     "disclosed" is the hard privacy gate: True for every status except an
-    explicit or derived Matched. That covers the six named
-    Introduced-through-Closed ids and the three exit ids (Stalled/Passed/
-    Withdrawn) — none of those are "Matched" either. An empty/absent
-    field always derives "Matched" (see _default_intro_status) — there is
-    no other derived value, so disclosed is False whenever the field is
-    genuinely unset, regardless of any other deal attribute (is_archived
-    included). The instruction enumerated the six Introduced-through-
-    Closed ids explicitly and didn't say either way for the exit ids;
-    "not Matched" is what makes "Stalled stays, flagged" (a NAMED row)
-    consistent with a pending row's fixed "status: Matched" without the
-    two contradicting each other. Flag for confirmation if a deal marked
-    Stalled/Passed/Withdrawn before ever being Introduced should actually
-    still be anonymized."""
+    explicit or derived Matched, WITH ONE CARVE-OUT (turn 27, closing the
+    hole this docstring used to flag for confirmation): for the three
+    exit ids (Stalled/Passed/Withdrawn) specifically, "not Matched" is no
+    longer enough on its own. A deal can reach an exit status straight
+    from empty/Matched without ever having been Introduced (an admin
+    flagging it Passed, or Pipeline's own field jumping there directly),
+    and naming a row for that case would leak identity for a deal the
+    buyer was never actually shown to have been introduced on. So an exit
+    status now discloses only when there is real evidence of prior
+    progress: either the Dynamo intro item has ever recorded a milestone
+    (the "milestones" map is add-only, never erased -- see
+    MILESTONE_STATUS_IDS), or the deal's RAW (pre-override)
+    Intro Status field itself is independently Introduced-or-later (see
+    INTRODUCED_OR_LATER_STATUS_IDS) -- covering the case where an admin's
+    status_override holds the exit value but Pipeline's own field still
+    shows genuine progress. Neither signal present (status jumped from
+    empty straight to an exit) -> stays anonymized, exactly like a
+    Pending row. The six named Introduced-through-Closed ids are
+    unaffected: those still disclose simply for not being Matched, and an
+    empty/absent field always derives "Matched" (see
+    _default_intro_status) -- there is no other derived value, so
+    disclosed is False whenever the field is genuinely unset, regardless
+    of any other deal attribute (is_archived included)."""
     status_id = _deal_intro_status_id(deal)
+    raw_status_id = status_id
 
     if override_entry:
         override_id = override_entry.get("status_override")
@@ -2305,11 +2411,16 @@ def _resolve_intro_status(deal, override_entry=None):
                 status_id = override_id
 
     name = INTRO_STATUS_LABELS[status_id] if status_id is not None else _default_intro_status(deal)
+    if status_id in EXIT_STATUS_IDS:
+        has_milestone = bool((override_entry or {}).get("milestones"))
+        disclosed = has_milestone or (raw_status_id in INTRODUCED_OR_LATER_STATUS_IDS)
+    else:
+        disclosed = name != "Matched"
     return {
         "id": status_id,
         "name": name,
         "is_exit": status_id in EXIT_STATUS_IDS,
-        "disclosed": name != "Matched",
+        "disclosed": disclosed,
     }
 
 
@@ -2320,18 +2431,30 @@ def _tenant_has_disclosed_deal_with(person_id, tenant_email, buyer_id):
     deals in — not just the one deal the viewer happened to click in
     from — using the exact same _resolve_intro_status disclosure rule
     Active Intros itself already enforces per row. person_id is the
-    tenant's own person_id (never the buyer's)."""
+    tenant's own person_id (never the buyer's).
+
+    Turn 27: also true when the ONLY disclosed deal linking this buyer to
+    the tenant is a stage-derived closed-out one (Lost/Trade Broken/
+    Obsolete) — otherwise a buyer the tenant was genuinely introduced to,
+    on a deal that later died, would be gated behind the anonymized
+    fallback and _buyer_track_with_you_html's own closed-out row would
+    never be reachable at all."""
     if person_id is None or buyer_id is None:
         return False
+    intro_details = None
     deals = get_my_matched_buy_deals(person_id)
-    if not deals:
-        return False
-    intro_details, _ = get_intro_details(tenant_email)
-    for d in deals:
+    if deals:
+        intro_details, _ = get_intro_details(tenant_email)
+        for d in deals:
+            if buyer_id not in _deal_linked_person_ids(d):
+                continue
+            resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
+            if resolved["disclosed"]:
+                return True
+    for d in get_my_closed_out_buy_deals(person_id):
         if buyer_id not in _deal_linked_person_ids(d):
             continue
-        resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
-        if resolved["disclosed"]:
+        if _closed_out_disclosed(d):
             return True
     return False
 
@@ -3330,6 +3453,49 @@ def _matched_buyer_row_edit_html(deal, tenant_person_id, people_by_id, intro_det
     )
 
 
+def _closed_out_buyer_row_html(deal, tenant_person_id, people_by_id, anon_key_email, editable=False,
+                                admin_reveals=False, key=None, view_as=None):
+    """One row in the company page's Buyers "Closed out" section (turn
+    27, item 2) — same column shape as _matched_buyer_row_html (7 cols
+    tenant-facing, 8 with the extra blank when editable, matching that
+    header exactly) but Status is always the derived, muted outcome chip
+    and Next Steps/Follow-up/Buyer Notes stay blank — nothing left to
+    plan or note on a dead deal. Admin edit mode and tenant view share
+    this one renderer (unlike the live rows' edit/non-edit split) since
+    there is nothing here to make editable either way. admin_reveals=True
+    (full admin edit_mode) never anonymizes — same "the admin sees and
+    edits the real buyer regardless of pending/disclosed" convention
+    _matched_buyer_row_edit_html already follows."""
+    linked = _deal_linked_person_ids(deal) - {tenant_person_id}
+    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+    disclosed = admin_reveals or _closed_out_disclosed(deal)
+    size_text = _esc(_deal_size_text(deal))
+    status_html = _closed_out_status_chip_html(deal)
+    extra_td = "<td></td>" if editable else ""
+
+    if not disclosed:
+        buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
+        return (
+            f'<tr class="closed-out-row"><td>{buyer_cell}</td>'
+            f'<td>—</td><td></td>'
+            f'<td class="num">{size_text}</td>'
+            f'<td>{status_html}</td>'
+            f'<td></td>{extra_td}<td></td></tr>'
+        )
+
+    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True, link=True, key=key, view_as=view_as)
+    name_cell += _buyer_contact_detail_html(buyer_recs)
+    investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
+    return (
+        f'<tr class="closed-out-row"><td>{name_cell}</td>'
+        f'<td>{_esc(company_text)}</td>'
+        f'<td>{_esc(investor_type)}</td>'
+        f'<td class="num">{size_text}</td>'
+        f'<td>{status_html}</td>'
+        f'<td></td>{extra_td}<td></td></tr>'
+    )
+
+
 # ── Nav shell: header bar + tabs, shared by every authenticated page ────────
 # Palette lifted verbatim from the shared trades/portfolio-deploy design
 # (portfolio-deploy/lambda_function.py :root — --ink #16181d, --bg #f4f2ee,
@@ -3738,6 +3904,65 @@ def _pending_intro_row_html(deal, buyer_recs, anon_key_email, tenant_person_id, 
     )
 
 
+def _closed_out_status_chip_html(deal, loss_reason=None):
+    """The gray Passed/Withdrawn chip for a stage-derived closed-out row
+    (turn 27) — reuses _status_chip_html's existing "exit" styling
+    (status_id=None never matches INTRO_STATUS_STALLED_ID, so this always
+    renders the plain gray chip, never the amber Stalled one) plus, when a
+    loss reason is on record, a small muted "— <reason>" suffix."""
+    outcome = _closed_out_outcome_name(_deal_stage_id(deal))
+    chip = _status_chip_html(None, outcome)
+    if loss_reason is None:
+        loss_reason = _deal_loss_reason_text(deal)
+    if loss_reason:
+        chip += f' <span class="closed-out-reason">— {_esc(loss_reason)}</span>'
+    return chip
+
+
+def _closed_out_intro_row_html(deal, buyer_recs, disclosed, anon_key_email, tenant_person_id, firm_won_index,
+                                key=None, view_as=None, company_repeated=False):
+    """One row in Active Intros' "Closed out" section (turn 27, item 2):
+    same Company/Buyer/Investor Type/Size columns as a live row, but
+    Status always shows the derived, muted outcome chip (never the
+    milestone checkboxes or flag select — there's nothing left to edit on
+    a dead deal) and Notes stays empty. disclosed comes from
+    _closed_out_disclosed (item 3's simple, milestone-free rule) — when
+    False the buyer cell renders exactly like a Pending row's anonymized
+    code, never a name."""
+    company_name = _deal_company_name(deal)
+    if company_repeated:
+        company_cell = ""
+        row_cls = ' class="closed-out-row grouped-row"'
+    elif company_name:
+        company_cell = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
+                        f'{_esc(company_name)}</a>')
+        company_cell += _company_update_link_html(tenant_person_id, company_name)
+        row_cls = ' class="closed-out-row"'
+    else:
+        company_cell = "—"
+        row_cls = ' class="closed-out-row"'
+
+    if disclosed:
+        primary, more_count = _select_primary_buyer(deal, buyer_recs)
+        buyer_cell = _intro_buyer_cell_html(primary, more_count, firm_won_index, key=key, view_as=view_as)
+        investor_type_cell = _investor_type_cell_html(buyer_recs)
+    else:
+        buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
+        investor_type_cell = ""
+
+    size_text = _esc(_deal_size_text(deal))
+    status_html = _closed_out_status_chip_html(deal)
+
+    return (
+        f'<tr{row_cls}><td class="company">{company_cell}</td>'
+        f'<td>{buyer_cell}</td>'
+        f'<td>{investor_type_cell}</td>'
+        f'<td class="num">{size_text}</td>'
+        f'<td>{status_html}</td>'
+        f'<td class="notes-cell"></td></tr>'
+    )
+
+
 def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, firm_won_index, key=None, view_as=None,
                           company_repeated=False):
     """Admin edit-mode row for Active Intros: always the real buyer(s),
@@ -3817,8 +4042,14 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     else:
         person_id = tenant.get("person_id")
         deals = get_my_matched_buy_deals(person_id) if person_id is not None else []
+        # Turn 27, item 1: stage-level exits — a dead-stage (Lost/Trade
+        # Broken/Obsolete) BUY deal never reaches get_my_matched_buy_deals,
+        # so it simply vanished instead of showing as a closed-out intro.
+        # Fetched separately, keyed off the deal's own Pipeline stage
+        # rather than the Intro Status field — see get_my_closed_out_buy_deals.
+        closed_out_deals = get_my_closed_out_buy_deals(person_id) if person_id is not None else []
 
-        intro_details, dynamo_failed = get_intro_details(tenant_email) if deals else ({}, False)
+        intro_details, dynamo_failed = get_intro_details(tenant_email) if (deals or closed_out_deals) else ({}, False)
 
         resolved_by_deal_id = {}
         kept_deals = []
@@ -3829,8 +4060,18 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             resolved_by_deal_id[str(d.get("id"))] = resolved
             kept_deals.append(d)
 
+        # Item 3: closed-out rows use their own, simpler disclosure rule
+        # (_closed_out_disclosed — raw Intro Status explicitly Introduced-
+        # or-later, no milestone fallback), computed once per deal here.
+        # Edit mode never anonymizes (same convention as every other row
+        # on this page) — the admin sees the real buyer regardless.
+        closed_out_disclosed_by_id = {str(d.get("id")): (edit_mode or _closed_out_disclosed(d))
+                                       for d in closed_out_deals}
+
         wanted_ids = set()
         for d in kept_deals:
+            wanted_ids |= _deal_linked_person_ids(d) - {person_id}
+        for d in closed_out_deals:
             wanted_ids |= _deal_linked_person_ids(d) - {person_id}
         people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
         # Turn 23: the closed-dot needs the same person-or-firm closer
@@ -3838,7 +4079,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         # real buyer (and so the real dot) on every row, pending
         # included; a tenant only ever sees it on a disclosed row — skip
         # the extra people.json pass entirely when neither applies.
-        needs_firm_won_index = edit_mode or any(r["disclosed"] for r in resolved_by_deal_id.values())
+        needs_firm_won_index = (edit_mode or any(r["disclosed"] for r in resolved_by_deal_id.values())
+                                 or any(closed_out_disclosed_by_id.values()))
         firm_won_index = (_build_firm_won_index() if needs_firm_won_index
                            else {"by_company_id": set(), "by_company_name": set()})
 
@@ -3878,6 +4120,11 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         main_repeats = _mark_repeats(main_rows)
         pending_repeats = _mark_repeats(pending_rows)
 
+        # Closed out: company A-Z, same as Pending — there's no "how far
+        # did it get" ranking that means anything for a dead deal.
+        closed_out_rows = sorted(closed_out_deals, key=lambda d: (_deal_company_name(d) or "").lower())
+        closed_out_repeats = _mark_repeats([(d, None) for d in closed_out_rows])
+
         # tenant_edit_mode: the tenant (real session, or admin &view_as
         # preview without &edit=1) can auto-save Notes on every
         # Introduced-or-later row, and now (item 4) Status too, restricted
@@ -3912,16 +4159,56 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             '<th>Notes</th>'
         )
 
+        # Item 2: "Closed out" — a collapsed, expandable section below
+        # Pending, built regardless of whether kept_deals is empty (a
+        # tenant can have zero live intros and still have a dead one on
+        # record).
+        closed_out_html = ""
+        if closed_out_rows:
+            co_parts = []
+            for i, d in enumerate(closed_out_rows):
+                linked = _deal_linked_person_ids(d) - {person_id}
+                buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+                co_parts.append(_closed_out_intro_row_html(
+                    d, buyer_recs, closed_out_disclosed_by_id[str(d.get("id"))], tenant_email, person_id,
+                    firm_won_index, key=key, view_as=view_as, company_repeated=closed_out_repeats[i]))
+            co_rows_html = "".join(co_parts)
+            closed_out_html = f"""<details class="closed-out-section">
+      <summary>Closed out <span class="count">({len(closed_out_rows)})</span></summary>
+      <div class="card closed-out-card">
+        <table>
+          <colgroup>
+            <col style="width:13%">
+            <col style="width:24%">
+            <col style="width:11%">
+            <col style="width:7%">
+            <col style="width:18%">
+            <col style="width:27%">
+          </colgroup>
+          <thead>
+            <tr>
+              {head_row}
+            </tr>
+          </thead>
+          <tbody>{co_rows_html}</tbody>
+        </table>
+      </div>
+    </details>"""
+
         if not kept_deals:
             # Item 9: no intros anywhere for this tenant — a friendlier,
             # page-level empty state instead of a near-empty table.
             my_deals_href = f"?tab=mydeals{_tab_qs_suffix(key, view_as)}"
+            if closed_out_rows:
+                empty_note = '<p>No live introductions right now — see Closed out below for past ones.</p>'
+            else:
+                empty_note = ('<p>No introductions yet. Your live deals are being shown to buyers — '
+                               'introductions appear here as matches firm up.</p>')
             body_html = (
                 f'{note_html}<div class="gg-empty-state">'
-                f'<p>No introductions yet. Your live deals are being shown to buyers — '
-                f'introductions appear here as matches firm up.</p>'
+                f'{empty_note}'
                 f'<p><a class="gg-link" href="{my_deals_href}">View My Deals &rarr;</a></p>'
-                f'</div>'
+                f'</div>{closed_out_html}'
             )
         else:
             # "Introduced" always renders — even with zero rows — per
@@ -3986,7 +4273,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     </div>"""
 
             edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
-            body_html = f"{note_html}{table_html}{edit_script}"
+            body_html = f"{note_html}{table_html}{closed_out_html}{edit_script}"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -4117,6 +4404,22 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .tier-badge.tier-unknown {{ background: var(--muted); }}
   tr.pending-row {{ opacity: 0.85; }}
   tr.grouped-row {{ box-shadow: inset 3px 0 0 var(--line); }}
+  tr.closed-out-row {{ opacity: 0.7; }}
+  .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
+  details.closed-out-section {{ margin-top: 20px; }}
+  details.closed-out-section summary {{
+    cursor: pointer;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ink);
+    list-style: none;
+    padding: 4px 0;
+  }}
+  details.closed-out-section summary::-webkit-details-marker {{ display: none; }}
+  details.closed-out-section summary::before {{ content: "\\25B8 "; color: var(--muted); font-size: 12px; }}
+  details.closed-out-section[open] summary::before {{ content: "\\25BE "; }}
+  details.closed-out-section summary .count {{ color: var(--muted); font-weight: 500; font-size: 12px; }}
+  .closed-out-card {{ margin-top: 6px; }}
   tr.group-divider td {{
     padding: 8px 16px;
     font-size: 11px;
@@ -5003,10 +5306,50 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
       </table>
       </div>
     </div>"""
+
+        # Turn 27, item 2: the same "Closed out" collapsed treatment as
+        # Active Intros, at the bottom of Buyers — a dead-stage (Lost/
+        # Trade Broken/Obsolete) BUY deal for this company, keyed off
+        # get_my_closed_out_buy_deals rather than the matched-or-later
+        # fetch above.
+        closed_out_deals = get_my_closed_out_buy_deals(person_id, company) if person_id is not None else []
+        closed_out_html = ""
+        if closed_out_deals:
+            for d in closed_out_deals:
+                wanted_ids |= _deal_linked_person_ids(d) - {person_id}
+            people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
+            closed_out_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
+            if edit_mode or tenant_edit_mode:
+                co_rows_html = "".join(
+                    _closed_out_buyer_row_html(d, person_id, people_by_id, anon_key_email,
+                                                 editable=True, admin_reveals=edit_mode, key=key, view_as=view_as)
+                    for d in closed_out_deals)
+            else:
+                co_rows_html = "".join(
+                    _closed_out_buyer_row_html(d, person_id, people_by_id, anon_key_email,
+                                                 editable=False, key=key, view_as=view_as)
+                    for d in closed_out_deals)
+            closed_out_html = f"""<details class="closed-out-section">
+      <summary>Closed out <span class="count">({len(closed_out_deals)})</span></summary>
+      <div class="card closed-out-card">
+        <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              {head_row}
+            </tr>
+          </thead>
+          <tbody>{co_rows_html}</tbody>
+        </table>
+        </div>
+      </div>
+    </details>"""
+
         edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
         matched_buyers_html = f"""<section class="cd-section">
     <h2>Buyers</h2>
     {matched_body}
+    {closed_out_html}
     {edit_script}
   </section>"""
 
@@ -5253,6 +5596,22 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     margin: 0 0 10px;
   }}
   tr.pending-row {{ opacity: 0.85; }}
+  tr.closed-out-row {{ opacity: 0.7; }}
+  .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
+  details.closed-out-section {{ margin-top: 14px; }}
+  details.closed-out-section summary {{
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--ink);
+    list-style: none;
+    padding: 4px 0;
+  }}
+  details.closed-out-section summary::-webkit-details-marker {{ display: none; }}
+  details.closed-out-section summary::before {{ content: "\\25B8 "; color: var(--muted); font-size: 12px; }}
+  details.closed-out-section[open] summary::before {{ content: "\\25BE "; }}
+  details.closed-out-section summary .count {{ color: var(--muted); font-weight: 500; font-size: 12px; }}
+  .closed-out-card {{ margin-top: 6px; }}
   tr.group-divider td {{
     padding: 8px 16px;
     font-size: 11px;
@@ -5484,7 +5843,7 @@ def _buyer_process_signals_html(rec):
     return f'<div class="card"><h2 class="buyer-section-heading">Process signals</h2><div class="buyer-page-row">{chips}</div></div>'
 
 
-def _track_deal_row_html(deal, entry, resolved, tenant_label=None):
+def _track_deal_row_html(deal, entry, resolved, tenant_label=None, loss_reason=None):
     """One deal's row in TRACK WITH YOU: company · size · the resolved
     status as a flag chip (_status_display_html, compact — a pill for
     an in-progress status, a colored chip for Stalled/Passed/Withdrawn/
@@ -5494,13 +5853,18 @@ def _track_deal_row_html(deal, entry, resolved, tenant_label=None):
     _status_milestones_column_html also drew, since the flag chip
     alone already carries that state — one signal, not two). tenant_
     label is set only in admin edit mode (grouped-by-tenant heading
-    above each of that tenant's rows)."""
+    above each of that tenant's rows). loss_reason (turn 27): a small
+    muted "— <reason>" suffix appended after the chip, for a stage-
+    derived closed-out deal that has one on record — see
+    _deal_loss_reason_text; None for every ordinary row, unchanged."""
     deal_id = str(deal.get("id"))
     company_name = _deal_company_name(deal) or "—"
     size_text = _esc(_deal_size_text(deal))
     milestones = entry.get("milestones")
     checkboxes_html = _milestone_checkboxes_html(deal_id, milestones, disabled=True)
     flag_chip_html = _status_display_html(resolved, compact=True)
+    if loss_reason:
+        flag_chip_html += f' <span class="closed-out-reason">— {_esc(loss_reason)}</span>'
     label_html = f'<div class="track-row-tenant">{tenant_label}</div>' if tenant_label else ""
     return (
         f'<div class="track-row">{label_html}'
@@ -5508,6 +5872,22 @@ def _track_deal_row_html(deal, entry, resolved, tenant_label=None):
         f'<span class="track-row-size">{size_text}</span>{flag_chip_html}</div>'
         f'{checkboxes_html}</div>'
     )
+
+
+def _closed_out_resolved_dict(deal):
+    """A _resolve_intro_status-shaped dict for a stage-derived closed-out
+    deal (turn 27) — lets _track_deal_row_html/_status_display_html
+    render it exactly like a real Passed/Withdrawn row (is_exit=True,
+    status_id=None so the gray "exit" chip renders, never the amber
+    Stalled one) without those two deals having gone through Pipeline's
+    Intro Status field at all. "disclosed" is _closed_out_disclosed's own
+    rule, not the general exit-status one _resolve_intro_status uses."""
+    return {
+        "id": None,
+        "name": _closed_out_outcome_name(_deal_stage_id(deal)),
+        "is_exit": True,
+        "disclosed": _closed_out_disclosed(deal),
+    }
 
 
 def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
@@ -5521,14 +5901,20 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
     haven't actually been introduced on for THAT deal). Admin edit
     mode: every tenant's matched-or-later deals with this buyer,
     disclosed or not, grouped by tenant with a label above each
-    tenant's block of rows."""
+    tenant's block of rows.
+
+    Turn 27, item 2: stage-derived closed-out deals (Lost/Trade Broken/
+    Obsolete) are folded into this same list — a tenant's history with a
+    buyer includes the ones that died, not just the live ones — using
+    _closed_out_resolved_dict so they render through the exact same row
+    renderer and disclosure-gated chip as everything else here."""
     rows = []
     if edit_mode:
         tenant_index = _tenant_index()
         intro_cache = {}
         by_tenant = {}
         for d in get_deals_list():
-            if not _is_matched_or_later_buy_deal(d):
+            if not (_is_matched_or_later_buy_deal(d) or _is_closed_out_buy_deal(d)):
                 continue
             if buyer_id not in _deal_linked_person_ids(d):
                 continue
@@ -5538,14 +5924,19 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
             if owner_email not in intro_cache:
                 intro_cache[owner_email], _ = get_intro_details(owner_email)
             entry = intro_cache[owner_email].get(str(d.get("id"))) or {}
-            resolved = _resolve_intro_status(d, entry)
-            by_tenant.setdefault(owner_email, []).append((d, entry, resolved))
+            if _is_closed_out_buy_deal(d):
+                resolved = _closed_out_resolved_dict(d)
+                loss_reason = _deal_loss_reason_text(d)
+            else:
+                resolved = _resolve_intro_status(d, entry)
+                loss_reason = None
+            by_tenant.setdefault(owner_email, []).append((d, entry, resolved, loss_reason))
         for owner_email in sorted(by_tenant, key=lambda e: (tenant_index.get(e) or {}).get("name", e)):
             tenant_name = (tenant_index.get(owner_email) or {}).get("name", owner_email)
             deals_for_tenant = by_tenant[owner_email]
-            for i, (d, entry, resolved) in enumerate(deals_for_tenant):
+            for i, (d, entry, resolved, loss_reason) in enumerate(deals_for_tenant):
                 label = _esc(tenant_name) if i == 0 else None
-                rows.append(_track_deal_row_html(d, entry, resolved, tenant_label=label))
+                rows.append(_track_deal_row_html(d, entry, resolved, tenant_label=label, loss_reason=loss_reason))
     else:
         person_id = tenant.get("person_id")
         intro_details, _ = get_intro_details(anon_key_email)
@@ -5557,6 +5948,14 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
             if not resolved["disclosed"]:
                 continue
             rows.append(_track_deal_row_html(d, entry, resolved))
+        for d in get_my_closed_out_buy_deals(person_id):
+            if buyer_id not in _deal_linked_person_ids(d):
+                continue
+            resolved = _closed_out_resolved_dict(d)
+            if not resolved["disclosed"]:
+                continue
+            entry = intro_details.get(str(d.get("id"))) or {}
+            rows.append(_track_deal_row_html(d, entry, resolved, loss_reason=_deal_loss_reason_text(d)))
 
     body = "".join(rows) if rows else '<div class="gg-placeholder small">No deals with this buyer yet.</div>'
     return f'<div class="card buyer-track-card"><h2 class="buyer-section-heading">Track with you</h2>{body}</div>'
@@ -5867,6 +6266,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .track-row-head {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }}
   .track-row-company {{ font-size: 14px; font-weight: 600; }}
   .track-row-size {{ font-size: 13px; color: var(--muted); }}
+  .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
   .ledger-entry {{ margin-top: 12px; }}
   .ledger-entry:first-of-type {{ margin-top: 0; }}
   .ledger-entry-head {{
