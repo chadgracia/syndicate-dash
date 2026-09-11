@@ -815,6 +815,23 @@ def _select_primary_buyer(deal, buyer_recs):
     return primary, len(buyer_recs) - 1
 
 
+def _select_display_buyers(deal, buyer_recs):
+    """New task: up to TWO buyer names for a disclosed buyer cell --
+    _select_primary_buyer's primary, plus the next linked person in
+    deals.json order (the first buyer_recs entry that isn't the primary
+    -- buyer_recs must already be in that order, see
+    _deal_linked_person_ids_ordered). Returns (primary, secondary,
+    more_count); secondary is None when there's only one linked buyer,
+    and more_count only ever counts anyone beyond those two shown
+    names."""
+    if not buyer_recs:
+        return None, None, 0
+    primary, _ = _select_primary_buyer(deal, buyer_recs)
+    secondary = next((r for r in buyer_recs if r.get("id") != primary.get("id")), None)
+    shown = 1 if secondary is None else 2
+    return primary, secondary, max(len(buyer_recs) - shown, 0)
+
+
 def _deal_cf_number(deal, key):
     """A deal custom_field's numeric value. Mirrors daily-brief's
     _cf_number: the value may be a scalar, a one-item list, or a dict
@@ -2930,59 +2947,65 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
     </div>"""
 
 
-def _buyer_name_cell_html(buyer_recs, show_contact, link=False, key=None, view_as=None):
-    """Buyer name(s) for the Company page's Matched Buyers / Buyers
-    table, plus a contact second line (email/phone) when show_contact is
-    True. When False, no contact info is emitted anywhere in the HTML —
-    not hidden via CSS, simply never written. link=True (item 3, turn
-    18 — Introduced-or-later rows only, the caller gates this on
-    resolved["disclosed"]) wraps each name in a link to that buyer's own
-    page (_buyer_href).
+def _buyer_name_cell_html(primary, secondary, more_count, show_contact, link=False, key=None, view_as=None):
+    """Buyer name(s) for the Company page's Matched/Closed-out Buyers
+    table — up to TWO names (primary contact first, then the next
+    linked person in deals.json order — see _select_display_buyers),
+    plus a muted "+N more" beyond that, plus a contact second line
+    (email/phone) keyed to the PRIMARY ONLY when show_contact is True —
+    no wall of text for every linked buyer. When show_contact is False,
+    no contact info is emitted anywhere in the HTML — not hidden via
+    CSS, simply never written. link=True (item 3, turn 18 —
+    Introduced-or-later rows only, the caller gates this on
+    resolved["disclosed"]) wraps each shown name in a link to that
+    buyer's own page (_buyer_href); the second name is link-only, no
+    "profile →" suffix.
 
     won_deals_total (for the green "has closed with Rainmaker" dot) does
     not appear anywhere in portfolio-deploy, deal-notifier, loi-sign,
     web-bid, trades, or daily-brief — no code anywhere reads such a field
     off a person record — so the dot is never rendered here."""
-    if not buyer_recs:
+    if primary is None:
         return "—"
+    # Item 6 (turn 20): the same clear link affordance as Active
+    # Intros -- accent color, hover underline, muted "profile →"
+    # suffix (see .buyer-link/.buyer-link-suffix CSS below) on the
+    # primary name only.
     if link:
-        # Item 6 (turn 20): the same clear link affordance as Active
-        # Intros -- accent color, hover underline, muted "profile →"
-        # suffix (see .buyer-link/.buyer-link-suffix CSS below).
-        names = ", ".join(
-            f'<a class="buyer-link" href="{_buyer_href(r.get("id"), key, view_as)}">'
-            f'{_esc(_person_display_name(r) or "—")}'
-            f'<span class="buyer-link-suffix"> profile &rarr;</span></a>'
-            for r in buyer_recs
-        )
+        names = [f'<a class="buyer-link" href="{_buyer_href(primary.get("id"), key, view_as)}">'
+                  f'{_esc(_person_display_name(primary) or "—")}'
+                  f'<span class="buyer-link-suffix"> profile &rarr;</span></a>']
+        if secondary is not None:
+            names.append(f'<a class="buyer-link" href="{_buyer_href(secondary.get("id"), key, view_as)}">'
+                          f'{_esc(_person_display_name(secondary) or "—")}</a>')
     else:
-        names = ", ".join(_esc(_person_display_name(r) or "—") for r in buyer_recs)
+        names = [_esc(_person_display_name(primary) or "—")]
+        if secondary is not None:
+            names.append(_esc(_person_display_name(secondary) or "—"))
+    more_html = f' <span class="buyer-cell-more">+{more_count} more</span>' if more_count > 0 else ""
+    names_html = ", ".join(names) + more_html
     if not show_contact:
-        return f'<div>{names}</div>'
-    contact_lines = []
-    for r in buyer_recs:
-        bits = [b for b in (_person_email_text(r), _person_phone_text(r)) if b]
-        if bits:
-            contact_lines.append(" · ".join(bits))
-    contact_html = (f'<div class="buyer-contact">{_esc(", ".join(contact_lines))}</div>'
-                     if contact_lines else "")
-    return f'<div>{names}</div>{contact_html}'
+        return f'<div>{names_html}</div>'
+    bits = [b for b in (_person_email_text(primary), _person_phone_text(primary)) if b]
+    contact_html = f'<div class="buyer-contact">{_esc(" · ".join(bits))}</div>' if bits else ""
+    return f'<div>{names_html}</div>{contact_html}'
 
 
-def _buyer_contact_detail_html(buyer_recs):
-    """Compact extra line under the disclosed buyer's name/contact block:
-    country (work_country, falling back to home_country) · website
-    (linkified) · LinkedIn (linkified). Unlike email/phone above, no
-    sibling repo in this org has ever read these three native person
-    fields, so — same trust basis as _person_phone_text's own "phone"
-    field — they're read via plain .get() and simply omitted (the whole
-    line included) if absent or differently shaped; flag for confirmation
-    against a real people.json snapshot. Only ever called for a disclosed
-    buyer — the caller gates this on resolved["disclosed"], never a
-    pending/anonymous row."""
-    if not buyer_recs:
+def _buyer_contact_detail_html(primary):
+    """Compact extra line under the disclosed buyer's name/contact block,
+    keyed to the PRIMARY buyer only (see _select_display_buyers): country
+    (work_country, falling back to home_country) · website (linkified) ·
+    LinkedIn (linkified). Unlike email/phone above, no sibling repo in
+    this org has ever read these three native person fields, so — same
+    trust basis as _person_phone_text's own "phone" field — they're read
+    via plain .get() and simply omitted (the whole line included) if
+    absent or differently shaped; flag for confirmation against a real
+    people.json snapshot. Only ever called for a disclosed buyer — the
+    caller gates this on resolved["disclosed"], never a pending/
+    anonymous row."""
+    if primary is None:
         return ""
-    rec = buyer_recs[0]
+    rec = primary
     country = rec.get("work_country") or rec.get("home_country") or ""
     country = country.strip() if isinstance(country, str) else ""
     website = rec.get("website") or ""
@@ -3056,22 +3079,26 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
     return "".join(blocks)
 
 
-def _intro_buyer_cell_html(primary, more_count, firm_won_index, key=None, view_as=None):
-    """Active Intros' disclosed buyer cell (item 2/3, turn 18), three
-    lines: (1) the PRIMARY buyer's name (deal.primary_contact_id when
-    present, else first-listed — see _select_primary_buyer), linked to
-    their buyer page (item 3), plus a muted "+N more" when the deal
-    links additional buyers, plus a green dot when _closer_kind finds a
-    closer (person or firm — turn 23, same logic and tooltip text as
-    the buyer page's own closer chip, see CLOSER_CHIP_LABELS); (2)
-    muted entity company (natural-person buyers never show one) and
-    country; (3) small muted email as a mailto link, website, and
-    LinkedIn. Lines 2/3 truncate with an ellipsis via CSS — the buyer
-    page is where the untruncated detail for OTHER linked buyers lives
-    now (the old inline expand-panel is gone, replaced by that page
-    entirely). Only ever called with a resolved primary buyer from a
-    disclosed (Introduced-or-later) row; pending rows use
-    _pending_buyer_cell_html instead and never link."""
+def _intro_buyer_cell_html(primary, secondary, more_count, firm_won_index, key=None, view_as=None):
+    """Active Intros' disclosed buyer cell (item 2/3, turn 18; up to two
+    names as of the "deal team" task), lines: (1) the PRIMARY buyer's
+    name (deal.primary_contact_id when present, else first-listed — see
+    _select_primary_buyer), linked to their buyer page (item 3), plus a
+    green dot when _closer_kind finds a closer (person or firm — turn
+    23, same logic and tooltip text as the buyer page's own closer chip,
+    see CLOSER_CHIP_LABELS); (1b) the SECOND linked person in deals.json
+    order, name-link only (no dot, no "profile →" suffix, no contact
+    detail of its own — see _select_display_buyers), plus a muted "+N
+    more" when a third or later buyer is also linked; (2) muted entity
+    company (natural-person buyers never show one) and country; (3)
+    small muted email as a mailto link, website, and LinkedIn. Lines 2/3
+    stay keyed to the PRIMARY only — no wall of text for every linked
+    buyer — and truncate with an ellipsis via CSS; the buyer page is
+    where the untruncated detail for every OTHER linked buyer (and now
+    their firm colleagues — see _buyer_deal_team_html) lives. Only ever
+    called with a resolved primary buyer from a disclosed (Introduced-
+    or-later) row; pending rows use _pending_buyer_cell_html instead and
+    never link."""
     if primary is None:
         return "—"
 
@@ -3080,12 +3107,19 @@ def _intro_buyer_cell_html(primary, more_count, firm_won_index, key=None, view_a
     closer_kind = _closer_kind(primary, firm_won_index)
     dot_html = (f' <span class="closed-dot" title="{_esc(CLOSER_CHIP_LABELS[closer_kind])}"></span>'
                 if closer_kind else "")
-    more_html = f' <span class="buyer-cell-more">+{more_count} more</span>' if more_count > 0 else ""
     # Item 6 (turn 20): a clear link affordance -- accent color, hover
     # underline, a small muted "profile →" suffix inside the link (so
     # the whole thing, name and suffix alike, is one click target).
     line1 = (f'<div class="buyer-cell-name"><a class="buyer-link" href="{href}">{name}'
-             f'<span class="buyer-link-suffix"> profile &rarr;</span></a>{dot_html}{more_html}</div>')
+             f'<span class="buyer-link-suffix"> profile &rarr;</span></a>{dot_html}</div>')
+
+    secondary_html = ""
+    if secondary is not None:
+        sec_name = _esc(_person_display_name(secondary) or "—")
+        sec_href = _buyer_href(secondary.get("id"), key, view_as)
+        more_html = f' <span class="buyer-cell-more">+{more_count} more</span>' if more_count > 0 else ""
+        secondary_html = (f'<div class="buyer-cell-secondary">'
+                           f'<a class="buyer-link" href="{sec_href}">{sec_name}</a>{more_html}</div>')
 
     cf = primary.get("custom_fields") or {}
     transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
@@ -3113,7 +3147,7 @@ def _intro_buyer_cell_html(primary, more_count, firm_won_index, key=None, view_a
         line3_parts.append(f'<a href="{_esc(href_l)}" target="_blank" rel="noopener noreferrer">LinkedIn</a>')
     line3 = f'<div class="buyer-cell-links">{" · ".join(line3_parts)}</div>' if line3_parts else ""
 
-    return f'{line1}{line2}{line3}'
+    return f'{line1}{secondary_html}{line2}{line3}'
 
 
 def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details, anon_key_email, editable=False,
@@ -3127,8 +3161,8 @@ def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details,
     the 8-column editable header."""
     deal_id = str(deal.get("id"))
     entry = intro_details.get(deal_id) or {}
-    linked = _deal_linked_person_ids(deal) - {tenant_person_id}
-    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+    linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid != tenant_person_id]
+    buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
     resolved = _resolve_intro_status(deal, entry)
     size_text = _esc(_deal_size_text(deal))
 
@@ -3144,8 +3178,10 @@ def _matched_buyer_row_html(deal, tenant_person_id, people_by_id, intro_details,
             f'<td></td>{extra_td}<td></td></tr>'
         )
 
-    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True, link=True, key=key, view_as=view_as)
-    name_cell += _buyer_contact_detail_html(buyer_recs)
+    primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
+    name_cell = _buyer_name_cell_html(primary, secondary, more_count, show_contact=True, link=True,
+                                       key=key, view_as=view_as)
+    name_cell += _buyer_contact_detail_html(primary)
     investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
     status_html = _status_display_html(resolved, compact=True)
     notes_html = _esc(entry.get("notes") or "")
@@ -3428,12 +3464,13 @@ def _matched_buyer_row_edit_html(deal, tenant_person_id, people_by_id, intro_det
     entry = intro_details.get(deal_id) or {}
     resolved = _resolve_intro_status(deal, entry)
 
-    linked = _deal_linked_person_ids(deal) - {tenant_person_id}
-    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
-    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True, link=resolved["disclosed"],
-                                       key=key, view_as=view_as)
+    linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid != tenant_person_id]
+    buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
+    primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
+    name_cell = _buyer_name_cell_html(primary, secondary, more_count, show_contact=True,
+                                       link=resolved["disclosed"], key=key, view_as=view_as)
     if resolved["disclosed"]:
-        name_cell += _buyer_contact_detail_html(buyer_recs)
+        name_cell += _buyer_contact_detail_html(primary)
     investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
     size_text = _esc(_deal_size_text(deal))
     select_html = _intro_status_select_html(deal_id, resolved["id"])
@@ -3466,8 +3503,8 @@ def _closed_out_buyer_row_html(deal, tenant_person_id, people_by_id, anon_key_em
     (full admin edit_mode) never anonymizes — same "the admin sees and
     edits the real buyer regardless of pending/disclosed" convention
     _matched_buyer_row_edit_html already follows."""
-    linked = _deal_linked_person_ids(deal) - {tenant_person_id}
-    buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+    linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid != tenant_person_id]
+    buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
     disclosed = admin_reveals or _closed_out_disclosed(deal)
     size_text = _esc(_deal_size_text(deal))
     status_html = _closed_out_status_chip_html(deal)
@@ -3483,8 +3520,10 @@ def _closed_out_buyer_row_html(deal, tenant_person_id, people_by_id, anon_key_em
             f'<td></td>{extra_td}<td></td></tr>'
         )
 
-    name_cell = _buyer_name_cell_html(buyer_recs, show_contact=True, link=True, key=key, view_as=view_as)
-    name_cell += _buyer_contact_detail_html(buyer_recs)
+    primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
+    name_cell = _buyer_name_cell_html(primary, secondary, more_count, show_contact=True, link=True,
+                                       key=key, view_as=view_as)
+    name_cell += _buyer_contact_detail_html(primary)
     investor_type, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
     return (
         f'<tr class="closed-out-row"><td>{name_cell}</td>'
@@ -3844,8 +3883,8 @@ def _intro_row_html(deal, resolved, people_by_id, tenant_person_id, entry, firm_
 
     linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid != tenant_person_id]
     buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
-    primary, more_count = _select_primary_buyer(deal, buyer_recs)
-    buyer_cell = _intro_buyer_cell_html(primary, more_count, firm_won_index, key=key, view_as=view_as)
+    primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
+    buyer_cell = _intro_buyer_cell_html(primary, secondary, more_count, firm_won_index, key=key, view_as=view_as)
     investor_type_cell = _investor_type_cell_html(buyer_recs)
 
     size_text = _esc(_deal_size_text(deal))
@@ -3943,8 +3982,8 @@ def _closed_out_intro_row_html(deal, buyer_recs, disclosed, anon_key_email, tena
         row_cls = ' class="closed-out-row"'
 
     if disclosed:
-        primary, more_count = _select_primary_buyer(deal, buyer_recs)
-        buyer_cell = _intro_buyer_cell_html(primary, more_count, firm_won_index, key=key, view_as=view_as)
+        primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
+        buyer_cell = _intro_buyer_cell_html(primary, secondary, more_count, firm_won_index, key=key, view_as=view_as)
         investor_type_cell = _investor_type_cell_html(buyer_recs)
     else:
         buyer_cell = _pending_buyer_cell_html(buyer_recs, anon_key_email)
@@ -3991,8 +4030,8 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, fi
 
     linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid != tenant_person_id]
     buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
-    primary, more_count = _select_primary_buyer(deal, buyer_recs)
-    buyer_cell = _intro_buyer_cell_html(primary, more_count, firm_won_index, key=key, view_as=view_as)
+    primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
+    buyer_cell = _intro_buyer_cell_html(primary, secondary, more_count, firm_won_index, key=key, view_as=view_as)
     investor_type_cell = _investor_type_cell_html(buyer_recs)
 
     size_text = _esc(_deal_size_text(deal))
@@ -4167,8 +4206,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         if closed_out_rows:
             co_parts = []
             for i, d in enumerate(closed_out_rows):
-                linked = _deal_linked_person_ids(d) - {person_id}
-                buyer_recs = [people_by_id[pid] for pid in linked if pid in people_by_id]
+                linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(d) if pid != person_id]
+                buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
                 co_parts.append(_closed_out_intro_row_html(
                     d, buyer_recs, closed_out_disclosed_by_id[str(d.get("id"))], tenant_email, person_id,
                     firm_won_index, key=key, view_as=view_as, company_repeated=closed_out_repeats[i]))
@@ -4469,6 +4508,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .buyer-cell-name {{ font-weight: 600; }}
   .buyer-cell-name a.buyer-link {{ color: var(--accent); text-decoration: none; }}
   .buyer-cell-name a.buyer-link:hover {{ text-decoration: underline; }}
+  .buyer-cell-secondary {{ font-weight: 400; font-size: 13px; margin-top: 2px; }}
+  .buyer-cell-secondary a.buyer-link {{ color: var(--accent); text-decoration: none; }}
+  .buyer-cell-secondary a.buyer-link:hover {{ text-decoration: underline; }}
   .buyer-link-suffix {{ font-weight: 400; font-size: 11px; color: var(--muted); }}
   .buyer-cell-more {{ font-weight: 400; font-size: 12px; color: var(--muted); }}
   .buyer-cell-sub, .buyer-cell-links {{
@@ -5819,6 +5861,94 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     return f'<div class="card"><h2 class="buyer-section-heading">About {_esc(firm_name)}</h2>{"".join(rows)}</div>'
 
 
+def _deal_team_member_html(rec, key=None, view_as=None):
+    """One person's line in DEAL TEAM: name (linking to their own buyer
+    page), position/title if present (same on-trust "title" field
+    _buyer_header_html already reads), mailto email, phone."""
+    name = _esc(_person_display_name(rec) or "—")
+    href = _buyer_href(rec.get("id"), key, view_as)
+    title = (rec.get("title") or "").strip()
+    title_html = f'<div class="buyer-page-row">{_esc(title)}</div>' if title else ""
+    contact_parts = []
+    email = _person_email_text(rec)
+    if email:
+        contact_parts.append(f'<a href="mailto:{_esc(email)}">{_esc(email)}</a>')
+    phone = _person_phone_text(rec)
+    if phone:
+        contact_parts.append(_esc(phone))
+    contact_html = (f'<div class="buyer-page-row">{" &middot; ".join(contact_parts)}</div>'
+                     if contact_parts else "")
+    return (f'<div class="deal-team-member">'
+            f'<div class="buyer-page-row"><a class="buyer-link" href="{href}">{name}</a></div>'
+            f'{title_html}{contact_html}</div>')
+
+
+def _buyer_deal_team_html(buyer_id, buyer_rec, firm_name, tenant, anon_key_email, key=None, view_as=None):
+    """New section, under the header: "Deal team at <firm>" — every
+    OTHER person who (a) is linked to one of the viewing tenant's own
+    DISCLOSED deals shared with this buyer — matched-or-later per
+    _resolve_intro_status, or a stage-derived closed-out deal per
+    _closed_out_disclosed, the exact same two deal sources and
+    disclosure rules Track With You itself already applies — AND (b)
+    shares this buyer's company (company_id when the buyer's own record
+    carries one, else exact lowercased company_name — the same
+    company_id-first, company_name-fallback convention _closer_kind/
+    get_company_record already use). A colleague who never appears on a
+    disclosed deal with this tenant is not disclosed by association,
+    regardless of who else they work with. Omitted entirely when the
+    buyer has no firm (natural person, firm_name empty) or nobody
+    qualifies. tenant is always a real tenant record here — the caller
+    only reaches this after its own tenant-picker/disclosure gates have
+    already passed."""
+    if not firm_name:
+        return ""
+    person_id = tenant.get("person_id")
+    if person_id is None:
+        return ""
+    intro_details, _ = get_intro_details(anon_key_email)
+
+    candidate_ids = set()
+    for d in get_my_matched_buy_deals(person_id):
+        if buyer_id not in _deal_linked_person_ids(d):
+            continue
+        resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
+        if resolved["disclosed"]:
+            candidate_ids |= _deal_linked_person_ids(d)
+    for d in get_my_closed_out_buy_deals(person_id):
+        if buyer_id not in _deal_linked_person_ids(d):
+            continue
+        if _closed_out_disclosed(d):
+            candidate_ids |= _deal_linked_person_ids(d)
+    candidate_ids -= {buyer_id, person_id}
+    if not candidate_ids:
+        return ""
+
+    people_by_id = get_people_by_ids(candidate_ids)
+    buyer_company_id = buyer_rec.get("company_id")
+    buyer_company_name = (buyer_rec.get("company_name") or "").strip().lower()
+
+    colleagues = []
+    for pid in candidate_ids:
+        cand = people_by_id.get(pid)
+        if cand is None:
+            continue
+        if buyer_company_id is not None:
+            if cand.get("company_id") != buyer_company_id:
+                continue
+        else:
+            cand_company_name = (cand.get("company_name") or "").strip().lower()
+            if not buyer_company_name or not cand_company_name or cand_company_name != buyer_company_name:
+                continue
+        colleagues.append(cand)
+    if not colleagues:
+        return ""
+
+    colleagues.sort(key=lambda r: (_person_display_name(r) or "").lower())
+    rows = "".join(_deal_team_member_html(r, key=key, view_as=view_as) for r in colleagues)
+    return (f'<div class="card"><h2 class="buyer-section-heading">Deal team at {_esc(firm_name)}</h2>'
+            f'{rows}</div>')
+
+
 def _buyer_process_signals_html(rec):
     """Turn 23, block 5 (PROCESS SIGNALS): Accepts (custom_label_3998063,
     ACCEPTS_LABELS) as one small chip listing every accepted structure
@@ -6121,6 +6251,8 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 firm_name = (rec.get("company_name") or "").strip() if not is_natural else ""
                 company_id = rec.get("company_id")
                 company_rec = get_company_record(company_id, firm_name) if firm_name else None
+                deal_team_html = _buyer_deal_team_html(buyer_id, rec, firm_name, tenant, anon_key_email,
+                                                        key=key, view_as=view_as)
 
                 left_html = (
                     _buyer_about_firm_html(firm_name, company_rec, edit_mode)
@@ -6132,6 +6264,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 )
                 body_html = (
                     header_html
+                    + deal_team_html
                     + f'<div class="buyer-columns"><div class="buyer-col-left">{left_html}</div>'
                     + f'<div class="buyer-col-right">{right_html}</div></div>'
                 )
@@ -6178,6 +6311,11 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .buyer-page-code {{ font-size: 18px; font-weight: 600; }}
   .buyer-page-note {{ color: var(--muted); font-size: 13px; margin-top: 14px; }}
   .buyer-section-heading {{ font-size: 15px; font-weight: 600; margin: 0 0 10px; }}
+  .deal-team-member {{ margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }}
+  .deal-team-member:first-of-type {{ margin-top: 0; padding-top: 0; border-top: none; }}
+  .deal-team-member .buyer-page-row:first-child {{ margin-top: 0; font-weight: 600; }}
+  a.buyer-link {{ color: var(--accent); text-decoration: none; }}
+  a.buyer-link:hover {{ text-decoration: underline; }}
   /* Turn 24: single header card -- name, two info lines, badges
      right-aligned, then a trailing chip row for tier/ticket/transactor
      (see _buyer_header_html). */
