@@ -2209,14 +2209,15 @@ def _deal_stage_script_html():
 
 def _deal_actions_html(deal_id, deal_name, update_btn, section, key=None):
     """update_btn is the existing minted Update link, unchanged. section is
-    which of My Deals' three stacked tables this row belongs to: "active"
-    rows get Hold + Cancel; "hold" rows get Reactivate (writes stage back
+    which of My Deals' stacked tables this row belongs to: "active" rows
+    get Hold + Cancel; "hold" rows get Reactivate (writes stage back
     to Inquiry — same direct-write path, available to tenant and admin
     alike, exactly like Hold/Cancel: the data-key value is only ever a
     real ADMIN_KEY for an admin session, empty for a tenant session, and
     the server derives the tenant identity from the auth cookie either
-    way, never from this attribute); "cancelled" rows are terminal, no
-    actions."""
+    way, never from this attribute); "cancelled" and "closed" (turn 26 —
+    a won deal has nothing left to Hold/Cancel/Reactivate either) rows
+    are both terminal, no stage-change actions, Update link only."""
     key_attr = _esc(key or "")
     id_attr = _esc(deal_id)
     name_attr = _esc(deal_name)
@@ -2225,7 +2226,7 @@ def _deal_actions_html(deal_id, deal_name, update_btn, section, key=None):
                            f'data-deal-id="{id_attr}" data-deal-name="{name_attr}" '
                            f'data-target="reactivate">Reactivate</button>')
         return f'<div class="actions-stack">{update_btn}{reactivate_btn}</div>'
-    if section == "cancelled":
+    if section in ("cancelled", "closed"):
         return f'<div class="actions-stack">{update_btn}</div>'
     hold_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
                 f'data-deal-name="{name_attr}" data-target="hold">Hold</button>')
@@ -2649,9 +2650,11 @@ def _deal_pipeline_size(deal):
         return None
 
 
-# Stage-based won predicate for the My Deals summary strip's "Total
-# closed". Superseded the earlier deal.get("status")-based guess entirely
-# — stage id is the shape deals.json actually carries (see
+# Stage-based won predicate: routes a Sell deal into My Deals' own
+# "Closed" section (turn 26 — see render_my_deals_page) and, by the same
+# stroke, is what "Total closed" sums (every row in that section is won
+# by construction). Superseded the earlier deal.get("status")-based guess
+# entirely — stage id is the shape deals.json actually carries (see
 # _deal_stage_id) and WON_STAGE_IDS is given as verified. Callers pass
 # the deal's *resolved* stage (_resolve_deal_stage, override-aware)
 # rather than calling _deal_stage_id directly, so a same-session
@@ -2676,18 +2679,25 @@ def _deal_terms_complete(deal):
                for field in (MGMT_FEE_FIELD, CARRY_FIELD, SELLER_FEE_FIELD))
 
 
-def _my_deal_visibility_state(deal, cef_state, is_held):
-    """Strict state machine, first match wins (item 1): (1) ID/CEF not
-    Yes -> "id_required"; (2) Agent Agreement not Yes — In-Process counts
-    as unsigned — -> "agreement_unsigned"; (3) deal terms incomplete (see
+def _my_deal_visibility_state(deal, cef_state, is_held, is_won=False):
+    """Strict state machine, first match wins: (0, turn 26) is_won (the
+    row's resolved stage is in WON_STAGE_IDS — the caller derives this
+    from the same resolved-stage/section logic My Deals' sectioning
+    already uses) -> "sold", short-circuiting every other check outright
+    — a won deal is never "held" and never "live" regardless of its
+    CEF/Agreement/Terms state, none of which mean anything once the deal
+    has actually closed; (1) ID/CEF not Yes -> "id_required"; (2) Agent
+    Agreement not Yes — In-Process counts as unsigned — ->
+    "agreement_unsigned"; (3) deal terms incomplete (see
     _deal_terms_complete) -> "terms_incomplete"; (4) stage is Hold
-    (is_held, override-aware — the caller derives this from the same
-    resolved-stage/section logic My Deals' sectioning already uses) ->
-    "held"; (5) otherwise -> "live". Single source of truth shared by
-    the Visibility badge, the Next Steps chip, and the summary-strip
-    counts. Obsolete/Cancelled rows run through this exact same ladder
-    unchanged — their muted treatment is the Cancelled section's own
-    card styling, not a distinct visibility state."""
+    (is_held, override-aware) -> "held"; (5) otherwise -> "live". Single
+    source of truth shared by the Visibility badge, the Next Steps chip,
+    and the summary-strip counts. Obsolete/Lost ("cancelled" section)
+    rows run through this exact same ladder unchanged — their muted
+    treatment is the Cancelled section's own card styling, not a
+    distinct visibility state; only "sold" gets one."""
+    if is_won:
+        return "sold"
     if cef_state != CEF_YES_ID:
         return "id_required"
     opts = _deal_cf_option_ids(deal, AGENT_AGREEMENT_FIELD)
@@ -2700,10 +2710,13 @@ def _my_deal_visibility_state(deal, cef_state, is_held):
     return "live"
 
 
-def _my_deal_visibility_badge_html(deal, cef_state, is_held):
+def _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=False):
     """State-only — no links (item 1); Next Steps carries the actionable
-    links for these same states now (item 2)."""
-    state = _my_deal_visibility_state(deal, cef_state, is_held)
+    links for these same states now (item 2). Turn 26: "sold" is the
+    Closed section's own muted-but-positive green badge."""
+    state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
+    if state == "sold":
+        return '<span class="visibility-badge sold">Sold &#10003;</span>'
     if state == "id_required":
         return '<span class="visibility-badge id-required">Not live · ID required</span>'
     if state == "agreement_unsigned":
@@ -4227,28 +4240,42 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     )
 
     is_held = section == "hold"
-    badge_html = _my_deal_visibility_badge_html(deal, cef_state, is_held)
-    visibility_state = _my_deal_visibility_state(deal, cef_state, is_held)
+    # Turn 26: a Closed row's badge/state short-circuits to "sold" —
+    # see _my_deal_visibility_state.
+    is_won = section == "closed"
+    badge_html = _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=is_won)
+    visibility_state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
 
     buyer_text = str(buyer_count)
     intro_text = str(stats["intro_count"]) if stats["intro_count"] else "—"
 
-    is_overdue = False
-    if deadline:
-        deadline_dt = _parse_dt(deadline)
-        is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
-
-    if edit_mode:
-        deadline_css = "ei-deadline overdue-input" if is_overdue else "ei-deadline"
-        deadline_html = _ei_date_field_html(deal_id, deadline or "", css_class=deadline_css, field="deadline")
-    elif deadline:
-        deadline_cls = ' class="deadline-overdue"' if is_overdue else ""
-        deadline_html = f'<span{deadline_cls}>{_esc(_fmt_short_date(deadline) or deadline)}</span>'
+    if is_won:
+        # Item 1 (turn 26): no deadline warnings on the trophy shelf — a
+        # deal that's already won has nothing left to be overdue about.
+        # Always plain read-only text (never the edit_mode date input
+        # either — nothing left to maintain on a closed deal).
+        is_overdue = False
+        deadline_html = f'<span>{_esc(_fmt_short_date(deadline) or deadline)}</span>' if deadline else "—"
     else:
-        deadline_html = "—"
+        is_overdue = False
+        if deadline:
+            deadline_dt = _parse_dt(deadline)
+            is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
 
-    action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
-                                                  visibility_state, key=key, view_as=view_as)
+        if edit_mode:
+            deadline_css = "ei-deadline overdue-input" if is_overdue else "ei-deadline"
+            deadline_html = _ei_date_field_html(deal_id, deadline or "", css_class=deadline_css, field="deadline")
+        elif deadline:
+            deadline_cls = ' class="deadline-overdue"' if is_overdue else ""
+            deadline_html = f'<span{deadline_cls}>{_esc(_fmt_short_date(deadline) or deadline)}</span>'
+        else:
+            deadline_html = "—"
+
+    # Item 1: no Next Steps chip either on a Closed row — there's
+    # nothing left to nudge/update/sign on a deal that's already sold.
+    action_chip_html = ("" if is_won else
+                         _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
+                                                    visibility_state, key=key, view_as=view_as))
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
     actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section, key=key)
@@ -4325,7 +4352,20 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             resolved_stage = _resolve_deal_stage(d, override_entry)
             if resolved_stage == HOLD_STAGE_ID:
                 section = "hold"
-            elif resolved_stage == OBSOLETE_STAGE_ID:
+            elif _is_won_stage(resolved_stage):
+                # Item 1 (turn 26): a won deal gets its own "Closed"
+                # section — the trophy shelf — and is excluded from
+                # "active" outright, same footing as Hold/Cancelled.
+                section = "closed"
+            elif resolved_stage == OBSOLETE_STAGE_ID or resolved_stage in LOST_STAGE_IDS:
+                # Item 4: Lost (111801/2379322) sits alongside Obsolete
+                # in Cancelled -- previously Lost wasn't checked here at
+                # all, so a Lost-stage sell deal fell into the "else"
+                # branch below and rendered in the ACTIVE table exactly
+                # like a normal live deal: full visibility-state ladder
+                # (frequently landing on the "Live" badge), deadline
+                # overdue warnings, a Next Steps chip, and Hold/Cancel
+                # buttons -- all wrong for a deal that's already dead.
                 section = "cancelled"
             else:
                 section = "active"
@@ -4350,7 +4390,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         intros_total = 0
         attention_count = 0
         deadlines = []
-        section_row_htmls = {"active": [], "hold": [], "cancelled": []}
+        section_row_htmls = {"active": [], "hold": [], "cancelled": [], "closed": []}
         for r in rows:
             d = r["deal"]
             deadline = r["deadline"]
@@ -4358,8 +4398,14 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             section = r["section"]
 
             # Summary-strip counts and totals cover the active section
-            # only — Held and Cancelled deals get their own sections below
-            # and no longer contribute here (see item 2).
+            # only — Held, Cancelled, and (turn 26) Closed deals get their
+            # own sections below and no longer contribute here (see item
+            # 2). This is also what fixes "live"/"Total in pipeline"
+            # actually excluding won deals: before turn 26 a won-stage
+            # deal fell into this same "active" branch (there was no
+            # separate Closed section to route it to), so it silently
+            # counted toward live_count/pipeline_total same as any other
+            # live deal -- now it never reaches this branch at all.
             if section == "active":
                 is_overdue = False
                 if deadline:
@@ -4392,14 +4438,29 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         # deal_stage — so a same-session Hold/Cancel/Reactivate moves the
         # deal in or out of "Total in pipeline" immediately, without
         # waiting for deals.json to resync. Scoped to the active section
-        # only (see above) — Held deals no longer count here.
+        # only (see above) — Held/Cancelled/Closed deals no longer count
+        # here.
         active_rows = [r for r in rows if r["section"] == "active"]
         pipeline_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in active_rows
                                           if not r["deal"].get("is_archived"))
                               if v is not None)
-        closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in active_rows
-                                        if _is_won_stage(r["resolved_stage"]))
-                            if v is not None)
+        # Turn 26: sourced from the new "closed" section's own rows, not
+        # active_rows -- before this turn, closed_total summed won-stage
+        # deals out of active_rows because that was the only place a won
+        # deal could ever land (there was no separate Closed section).
+        # Once won-stage deals got their own section they stopped
+        # appearing in active_rows at all, so this sum would have gone
+        # silently to zero (or, worse, "Total closed" would simply never
+        # render, since it's only shown `if closed_total`) had it not
+        # been repointed here. The old _is_won_stage filter is now
+        # redundant and dropped -- every row already in "closed" is won
+        # by construction (see the section-assignment loop above) — and
+        # the size math itself was never the problem: _deal_pipeline_size
+        # already falls back from ticket min/max to the deal's own
+        # "value" field when neither custom field is set, exactly as
+        # asked to verify.
+        closed_rows = [r for r in rows if r["section"] == "closed"]
+        closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in closed_rows) if v is not None)
 
         # Each part is escaped individually rather than the joined string as
         # a whole, so the dollar totals can carry their own <span> for
@@ -4468,8 +4529,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     </table>
   </div>"""
 
-        # Three stacked sections; a section with no rows is omitted
-        # entirely (item 2) rather than rendered empty.
+        # Four stacked sections; a section with no rows is omitted
+        # entirely (item 2) rather than rendered empty. Closed (turn 26)
+        # is last, below Cancelled — the trophy shelf comes after the
+        # graveyard, not before it.
         sections_html = []
         if section_row_htmls["active"]:
             sections_html.append(_section_table_html("".join(section_row_htmls["active"])))
@@ -4483,6 +4546,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 f'<h2 class="mydeals-section-heading cancelled">Cancelled '
                 f'<span class="count">({len(section_row_htmls["cancelled"])})</span></h2>'
                 + _section_table_html("".join(section_row_htmls["cancelled"]), "section-cancelled"))
+        if section_row_htmls["closed"]:
+            sections_html.append(
+                f'<h2 class="mydeals-section-heading closed">Closed '
+                f'<span class="count">({len(section_row_htmls["closed"])})</span></h2>'
+                + _section_table_html("".join(section_row_htmls["closed"]), "section-closed"))
         body_html = "".join(sections_html)
         edit_script = _edit_script_html(key) if edit_mode else ""
 
@@ -4646,6 +4714,12 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .mydeals-section-heading.hold {{ color: var(--accredited); }}
   .card.section-cancelled {{ opacity: 0.7; }}
   .mydeals-section-heading.cancelled {{ color: var(--muted); }}
+  /* Turn 26: the Closed section is the trophy shelf, not a graveyard —
+     muted-but-positive (a soft green tint, no opacity fade unlike
+     Cancelled's washed-out look above). */
+  .card.section-closed {{ border-color: rgba(31,122,77,0.3); }}
+  .card.section-closed thead th {{ background: rgba(31,122,77,0.06); }}
+  .mydeals-section-heading.closed {{ color: var(--qp); }}
   .visibility-badge {{
     display: inline-block;
     font-size: 12px;
@@ -4656,7 +4730,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     text-decoration: none;
     white-space: normal;
   }}
-  .visibility-badge.live {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
+  .visibility-badge.live, .visibility-badge.sold {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .visibility-badge.held {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
   .visibility-badge.id-required, .visibility-badge.agreement-unsigned, .visibility-badge.terms-incomplete {{
     background: rgba(178,59,59,0.12); color: #b23b3b;
