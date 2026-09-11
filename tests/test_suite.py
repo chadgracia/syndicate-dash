@@ -1963,6 +1963,273 @@ check("Company page .wrap is left untouched (not a tab -- no top margin)", ".wra
 
 
 # ======================================================================
+# SECTION: Buyer photos (?photo=<person_id>)
+# ======================================================================
+
+check("_person_initials: first_name+last_name", lf._person_initials({"first_name": "Alice", "last_name": "Buyer"}) == "AB")
+check("_person_initials: falls back to full_name split", lf._person_initials({"full_name": "Cara Cole"}) == "CC")
+check("_person_initials: single-word name -> first two letters", lf._person_initials({"full_name": "Cher"}) == "CH")
+check("_person_initials: no name at all -> '?'", lf._person_initials({}) == "?")
+
+svg = lf._avatar_svg("AB")
+check("_avatar_svg: valid inline SVG containing the initials", svg.startswith("<svg") and ">AB<" in svg)
+check("_avatar_svg: empty initials fall back to '?'", ">?<" in lf._avatar_svg(""))
+
+people_photo = {"people": [
+    {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
+    {"id": 2, "first_name": "Alice", "last_name": "Buyer", "email": "alice@example.com",
+     "company_id": 500, "company_name": "Acme Capital", "custom_fields": {}},
+    {"id": 3, "first_name": "Bob", "last_name": "Baker", "email": "bob@example.com", "custom_fields": {}},
+    # Dana shares Alice's company_id and is linked to the same disclosed deal -- Alice's Deal team.
+    {"id": 4, "first_name": "Dana", "last_name": "Deputy", "email": "dana@example.com",
+     "company_id": 500, "company_name": "Acme Capital", "custom_fields": {}},
+]}
+deal_disclosed = {"id": 700, "company": {"name": "Photo Co"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+                   "custom_fields": cf_status(7207579), "people": [{"id": TENANT_A_PID}, {"id": 2}, {"id": 4}],
+                   "updated_at": "2026-08-01T00:00:00Z"}
+deal_pending = {"id": 701, "company": {"name": "Pending Co"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+                "custom_fields": cf_status(None), "people": [{"id": TENANT_A_PID}, {"id": 3}],
+                "updated_at": "2026-08-02T00:00:00Z"}
+own_sell_deal_photo = {"id": 799, "name": "Sella's Own Deal", "company": {"name": "Sella HoldCo"},
+                        "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                        "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_photo, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [deal_disclosed, deal_pending, own_sell_deal_photo]}})
+tenant_photo = lf._resolve_tenant(TENANT_A_EMAIL)
+assert tenant_photo is not None
+
+# Stub the live Pipeline fetch -- this sandbox can't reach api.pipelinecrm.com
+# (see CLAUDE.md) -- so the auth/caching logic can be tested in isolation
+# from the network call itself.
+_orig_fetch = lf._pipeline_fetch_person_photo_url
+_fetch_calls = []
+
+
+def _stub_fetch(person_id):
+    _fetch_calls.append(person_id)
+    return "https://cdn.pipelinecrm.example/thumb/2.jpg" if person_id == 2 else None
+
+
+lf._pipeline_fetch_person_photo_url = _stub_fetch
+lf._PHOTO_CACHE.clear()
+
+resp = lf._handle_photo_request("2", tenant_photo, TENANT_A_EMAIL, True)
+check("Photo: admin gets a 302 redirect to the real photo URL, regardless of disclosure",
+      resp["statusCode"] == 302 and resp["headers"]["Location"] == "https://cdn.pipelinecrm.example/thumb/2.jpg")
+
+lf._PHOTO_CACHE.clear()
+resp = lf._handle_photo_request("2", tenant_photo, TENANT_A_EMAIL, False)
+check("Photo: tenant with a disclosed deal linking this person gets the real photo (302)",
+      resp["statusCode"] == 302 and resp["headers"]["Location"] == "https://cdn.pipelinecrm.example/thumb/2.jpg")
+
+lf._PHOTO_CACHE.clear()
+_fetch_calls.clear()
+resp = lf._handle_photo_request("3", tenant_photo, TENANT_A_EMAIL, False)
+check("Photo: tenant WITHOUT a disclosed deal for this person gets the fallback SVG avatar (200), never a redirect",
+      resp["statusCode"] == 200 and resp["headers"]["Content-Type"] == "image/svg+xml")
+check("Photo: a denied request never calls the live Pipeline fetch at all", 3 not in _fetch_calls)
+
+lf._PHOTO_CACHE.clear()
+resp = lf._handle_photo_request("3", tenant_photo, TENANT_A_EMAIL, True)
+check("Photo: admin but no photo on file for this person (stub returns None) -> fallback SVG avatar with initials",
+      resp["statusCode"] == 200 and ">BB<" in resp["body"])
+
+resp = lf._handle_photo_request("not-a-number", tenant_photo, TENANT_A_EMAIL, True)
+check("Photo: garbage person_id -> fallback avatar, never crashes", resp["statusCode"] == 200)
+
+lf._PHOTO_CACHE.clear()
+_fetch_calls.clear()
+lf._handle_photo_request("2", tenant_photo, TENANT_A_EMAIL, True)
+lf._handle_photo_request("2", tenant_photo, TENANT_A_EMAIL, True)
+check("Photo: warm-invocation cache reused -- only ONE live fetch across two requests within the TTL",
+      _fetch_calls.count(2) == 1)
+
+lf._pipeline_fetch_person_photo_url = _orig_fetch
+lf._PHOTO_CACHE.clear()
+
+page_buyer_photo = lf.render_buyer_page(2, "Sella Seller", tenant_photo, TENANT_A_EMAIL, key=None, view_as=None,
+                                         edit_mode=False)
+check("Buyer page: circular header photo <img src=\"?photo=2\"> present",
+      'class="buyer-header-photo"' in page_buyer_photo and 'src="?photo=2"' in page_buyer_photo)
+check("Buyer page: Deal team small avatar for Dana present", 'class="deal-team-avatar"' in page_buyer_photo
+      and 'src="?photo=4"' in page_buyer_photo)
+
+
+# ======================================================================
+# SECTION: Raised headline (desk-wide, item 2)
+# ======================================================================
+
+people_raised = {"people": [{"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL,
+                              "custom_fields": {}}]}
+deals_raised = [
+    # Closed via Intro Status Closed, has a max ticket size.
+    {"id": 601, "company": {"name": "Closed Co A"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+     "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID,
+                                 {lf.TICKET_MAX_FIELD: 20_000_000, lf.TICKET_MIN_FIELD: 18_000_000}),
+     "people": [], "updated_at": "2026-08-01T00:00:00Z"},
+    # Closed via Won stage, no Intro Status set, only a min ticket size on file.
+    {"id": 602, "company": {"name": "Closed Co B"}, "deal_stage": {"id": 111802},
+     "custom_fields": cf_status(None, {lf.TICKET_MIN_FIELD: 5_000_000}),
+     "people": [], "updated_at": "2026-08-02T00:00:00Z"},
+    # Closed (Won stage) but missing BOTH ticket fields -- contributes $0; native "value" must NEVER be used.
+    {"id": 603, "company": {"name": "Closed Co C"}, "deal_stage": {"id": 111802},
+     "custom_fields": cf_status(None), "value": 999999999,
+     "people": [], "updated_at": "2026-08-03T00:00:00Z"},
+    # Live (Matched, not closed) -- must NOT count toward the total.
+    {"id": 604, "company": {"name": "Live Co"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+     "custom_fields": cf_status(7207579, {lf.TICKET_MAX_FIELD: 50_000_000}),
+     "people": [], "updated_at": "2026-08-04T00:00:00Z"},
+    # Sell-side, even a "Won"-stage one -- must NOT count (buy deals only).
+    {"id": 605, "company": {"name": "Closed Co A"}, "deal_stage": {"id": 111802},
+     "custom_fields": cf_sell({lf.TICKET_MAX_FIELD: 99_000_000}),
+     "people": [], "updated_at": "2026-08-05T00:00:00Z"},
+]
+use_fixture({lf.PEOPLE_KEY: people_raised, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_raised}})
+
+raised_stats = lf._raised_headline_stats()
+check("_raised_headline_stats: total = $20M + $5M + $0 = $25M (native 'value' never used)",
+      raised_stats["total"] == 25_000_000)
+check("_raised_headline_stats: closed_count = 3 (601, 602, 603)", raised_stats["closed_count"] == 3)
+check("_raised_headline_stats: zero_size_count = 1 (603, missing both ticket fields)",
+      raised_stats["zero_size_count"] == 1)
+check("_raised_headline_stats: companies_count = 3 (distinct companies among CLOSED buy deals only)",
+      raised_stats["companies_count"] == 3)
+
+check("_fmt_raised_headline: $25M -> '$25M+'", lf._fmt_raised_headline(25_000_000) == "$25M+")
+check("_fmt_raised_headline: rounds DOWN (25.9M -> '$25M+', not 26)", lf._fmt_raised_headline(25_900_000) == "$25M+")
+check("_fmt_raised_headline: below $1M -> suppressed (None)", lf._fmt_raised_headline(999_999) is None)
+check("_fmt_raised_headline: exactly $1M -> shown", lf._fmt_raised_headline(1_000_000) == "$1M+")
+
+page_demand_raised = lf.render_page([], "Sella Seller", key=None, view_as=None, anon_key_email=TENANT_A_EMAIL,
+                                     tenant_picker=False)
+check("Demand Board: bold raised headline shown under the title",
+      '<p class="raised-headline">$25M+ closed for sellers through this desk</p>' in page_demand_raised)
+check("Demand Board: tenant view has NO admin tooltip (no title attr)",
+      'class="raised-headline" title=' not in page_demand_raised)
+
+page_demand_admin = lf.render_page([], "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",
+                                    tenant_picker=True, edit_mode=True)
+check("Demand Board (admin edit): tooltip carries the EXACT total (not K/M-rounded) and the $0-contributing count",
+      "Exact: $25,000,000" in page_demand_admin and "1 contributing $0" in page_demand_admin)
+
+not_enabled_html = lf._message_page("Not enabled", lf.NOT_ENABLED_MESSAGE, show_sell_cta=True)
+check("Not-enabled page: raised headline shown", "$25M+ closed for sellers through this desk" in not_enabled_html)
+check("Not-enabled page: 'N companies with completed purchases' line shown",
+      "3 companies with completed purchases." in not_enabled_html)
+check("Not-enabled page: headline appears ABOVE the sell-CTA contact line",
+      not_enabled_html.find("closed for sellers through this desk") < not_enabled_html.find("Submit a sell order"))
+
+signin_html = lf._message_page("Access denied", "Sign in to view the Demand Board.", show_signin=True)
+check("Sign-in (unauthenticated) page: no raised headline at all", "closed for sellers through this desk" not in signin_html)
+
+use_fixture({lf.PEOPLE_KEY: people_raised, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": []}})
+page_demand_empty = lf.render_page([], "Sella Seller", key=None, view_as=None, anon_key_email=TENANT_A_EMAIL,
+                                    tenant_picker=False)
+check("Demand Board: no closed buys at all -> headline suppressed entirely", "closed for sellers" not in page_demand_empty)
+not_enabled_empty = lf._message_page("Not enabled", lf.NOT_ENABLED_MESSAGE, show_sell_cta=True)
+check("Not-enabled page: below $1M -> both headline and companies-count line suppressed",
+      "closed for sellers" not in not_enabled_empty and "companies with completed purchases" not in not_enabled_empty)
+
+
+# ======================================================================
+# SECTION: Item 3 -- overdue-deadline Next Steps chip reword
+# ======================================================================
+
+people_chip = {"people": [{"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL,
+                            "custom_fields": {}}]}
+overdue_deal = {"id": 620, "name": "Overdue Deal", "company": {"name": "Overdue Co"},
+                 "deal_stage": {"id": lf.STAGE_FIRM},
+                 "custom_fields": cf_sell({lf.DEADLINE_FIELD: "2020/01/01"}),
+                 "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_chip, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": [overdue_deal]}})
+tenant_chip = lf._resolve_tenant(TENANT_A_EMAIL)
+assert tenant_chip is not None
+page_mydeals_chip = lf.render_my_deals_page("Sella Seller", deals=[overdue_deal], key=None, view_as=None,
+                                             edit_mode=False, person_id=TENANT_A_PID, anon_key_email=TENANT_A_EMAIL)
+check("My Deals: overdue-deadline chip now reads 'Update deadline or cancel ->'",
+      "Update deadline or cancel" in page_mydeals_chip)
+
+
+# ======================================================================
+# SECTION: Firm-wide Closed section (item 4) + Net per-share (item 5)
+# ======================================================================
+
+people_firm = {"people": [
+    {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "company_id": 700,
+     "custom_fields": {}},
+    # Colleague sharing company_id 700, linked to a won Sell deal that isn't the tenant's own.
+    {"id": 20, "first_name": "Marco", "last_name": "Colleague", "email": "marco@example.com",
+     "company_id": 700, "custom_fields": {}},
+    # A different-firm person, also on a won Sell deal -- must NOT show up as "firm-wide."
+    {"id": 21, "first_name": "Other", "last_name": "Person", "email": "other@example.com",
+     "company_id": 999, "custom_fields": {}},
+]}
+own_won_deal = {"id": 910, "name": "Own Won Deal", "company": {"name": "Own Co"}, "deal_stage": {"id": 111802},
+                 "custom_fields": cf_sell({lf.TICKET_MAX_FIELD: 3_000_000, lf.NUM_SHARES_FIELD: 9524,
+                                            lf.NET_FIELD: 20.0}),
+                 "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+colleague_won_deal = {"id": 911, "name": "Colleague Won Deal", "company": {"name": "Colleague Co"},
+                       "deal_stage": {"id": 111802}, "custom_fields": cf_sell({lf.TICKET_MAX_FIELD: 4_000_000}),
+                       "people": [{"id": 20}], "updated_at": "2026-08-02T00:00:00Z"}
+other_firm_won_deal = {"id": 912, "name": "Other Firm Won Deal", "company": {"name": "Other Co"},
+                        "deal_stage": {"id": 111802}, "custom_fields": cf_sell({lf.TICKET_MAX_FIELD: 9_000_000}),
+                        "people": [{"id": 21}], "updated_at": "2026-08-03T00:00:00Z"}
+live_own_deal = {"id": 913, "name": "Live Deal", "company": {"name": "Own Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+                  "custom_fields": cf_sell(), "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-04T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_firm, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [own_won_deal, colleague_won_deal, other_firm_won_deal, live_own_deal]}})
+tenant_firm = lf._resolve_tenant(TENANT_A_EMAIL)
+assert tenant_firm is not None
+
+firm_pairs = lf.get_firm_closed_sell_deals(TENANT_A_PID)
+firm_ids = {d.get("id") for d, _ in firm_pairs}
+check("get_firm_closed_sell_deals: colleague's won deal (911) included", 911 in firm_ids)
+check("get_firm_closed_sell_deals: other firm's won deal (912) excluded", 912 not in firm_ids)
+check("get_firm_closed_sell_deals: the viewer's OWN won deal (910) excluded (already personal)", 910 not in firm_ids)
+colleague_rec = next(c for d, c in firm_pairs if d.get("id") == 911)
+check("get_firm_closed_sell_deals: colleague record is Marco", lf._person_display_name(colleague_rec) == "Marco Colleague")
+
+my_own_deals = [own_won_deal, live_own_deal]
+page_mydeals_firm = lf.render_my_deals_page("Sella Seller", deals=my_own_deals, key=None, view_as=None,
+                                             edit_mode=False, person_id=TENANT_A_PID, anon_key_email=TENANT_A_EMAIL)
+check("My Deals: Closed section count includes BOTH the personal (910) and firm (911) won deals",
+      '<h2 class="mydeals-section-heading closed">Closed <span class="count">(2)</span></h2>' in page_mydeals_firm)
+check("My Deals: the firm-wide row shows a 'via Marco' chip", "via Marco" in page_mydeals_firm)
+check("My Deals: exactly one via-chip (only the firm row gets one, not the personal row)",
+      page_mydeals_firm.count("via Marco") == 1)
+check("My Deals: 'Total closed' stays personal-scoped ($3M, not inflated by the firm row's $4M)",
+      "$3M" in page_mydeals_firm.split("Total closed")[1][:80])
+check("My Deals: 'Firm total closed' segment shown ($7M = $3M personal + $4M colleague)",
+      "Firm total closed" in page_mydeals_firm and "$7M" in page_mydeals_firm.split("Firm total closed")[1][:80])
+check("My Deals: net-per-share line on the personal Closed row ('9,524 sh @ $20.00 net')",
+      "9,524 sh @ $20.00 net" in page_mydeals_firm)
+check("My Deals: no per-share line for the firm row (neither field set on that deal)",
+      lf._deal_per_share_text(colleague_won_deal) is None)
+
+page_company_won = lf.render_company_page("Own Co", "Sella Seller", tenant_firm, TENANT_A_EMAIL, "mydeals",
+                                           key=None, view_as=None, edit_mode=False)
+check("Company page: a won deal's Deal Details card shows the net-per-share line",
+      "9,524 sh @ $20.00 net" in page_company_won)
+
+live_deal_only_co = {"id": 914, "name": "Live Only Deal", "company": {"name": "Live Only Co"},
+                      "deal_stage": {"id": lf.STAGE_FIRM},
+                      "custom_fields": cf_sell({lf.NUM_SHARES_FIELD: 500, lf.NET_FIELD: 10.0}),
+                      "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-05T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_firm, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": [live_deal_only_co]}})
+tenant_live_only = lf._resolve_tenant(TENANT_A_EMAIL)
+page_company_live = lf.render_company_page("Live Only Co", "Sella Seller", tenant_live_only, TENANT_A_EMAIL,
+                                            "mydeals", key=None, view_as=None, edit_mode=False)
+check("Company page: a LIVE (non-won) deal's card never shows the per-share line even with both fields set",
+      "500 sh" not in page_company_live)
+
+check("_deal_per_share_text: shares only (net absent)",
+      lf._deal_per_share_text({"custom_fields": {lf.NUM_SHARES_FIELD: 100}}) == "100 sh")
+check("_deal_per_share_text: net only (shares absent), two decimals",
+      lf._deal_per_share_text({"custom_fields": {lf.NET_FIELD: 15.5}}) == "@ $15.50 net")
+check("_deal_per_share_text: both missing -> None", lf._deal_per_share_text({}) is None)
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 

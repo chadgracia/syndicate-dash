@@ -192,6 +192,7 @@ TICKET_MIN_FIELD = "custom_label_3065488"
 TICKET_MAX_FIELD = "custom_label_3064645"
 GROSS_FIELD = "custom_label_3064339"
 NET_FIELD = "custom_label_3064369"  # verified verbatim as CF_NET in chadgracia/daily-brief
+NUM_SHARES_FIELD = "custom_label_3070843"  # "# Shares" -- given directly, same trust basis as every other bare field id in this file
 STRUCTURE_FIELD = "custom_label_3064360"
 LAYERS_FIELD = "custom_label_3938743"
 
@@ -274,7 +275,7 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibi
     if is_overdue:
         update_url = _deal_update_form_url(deal_id)
         if update_url:
-            candidates.append(("update deadline", "overdue", "Update deadline &rarr;", update_url, True))
+            candidates.append(("update deadline", "overdue", "Update deadline or cancel &rarr;", update_url, True))
     if visibility_state == "terms_incomplete":
         update_url = _deal_update_form_url(deal_id)
         if update_url:
@@ -1231,6 +1232,88 @@ def get_deals_list():
     return deals
 
 
+_raised_cache = {"version": None, "total": None, "closed_count": None,
+                  "zero_size_count": None, "companies_count": None}
+
+
+def _raised_headline_stats():
+    """Desk-wide (item 2), computed across ALL buy deals in deals.json --
+    never tenant-scoped, unlike every other aggregate in this file.
+    closed = Intro Status Closed (7207587) OR stage in WON_STAGE_IDS --
+    either signal alone is enough (a deal can be Won-stage without ever
+    having its Intro Status field set to Closed, and vice versa via an
+    admin override). amount = max ticket size (TICKET_MAX_FIELD) else min
+    (TICKET_MIN_FIELD) else 0 -- NEVER the deal's own "value" field,
+    which is our commission, not the purchase amount (on a won deal,
+    ticket min==max==the actual purchase amount per instruction).
+    Cached against the same deals.json S3 object version get_deals_list
+    already checks -- a fresh snapshot recomputes this automatically; a
+    warm invocation against an unchanged snapshot reuses it for free."""
+    s3 = boto3.client("s3")
+    version = _object_version(s3, DEALS_KEY)
+    if _raised_cache["version"] == version and _raised_cache["total"] is not None:
+        return _raised_cache
+    total = 0.0
+    closed_count = 0
+    zero_size_count = 0
+    companies = set()
+    for d in get_deals_list():
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            continue
+        is_closed = (_deal_intro_status_id(d) == INTRO_STATUS_CLOSED_ID
+                     or _deal_stage_id(d) in WON_STAGE_IDS)
+        if not is_closed:
+            continue
+        closed_count += 1
+        max_v = _deal_cf_number(d, TICKET_MAX_FIELD)
+        min_v = _deal_cf_number(d, TICKET_MIN_FIELD)
+        amount = max_v if max_v is not None else (min_v if min_v is not None else 0)
+        total += amount
+        if amount == 0:
+            zero_size_count += 1
+        company_name = (_deal_company_name(d) or "").strip().lower()
+        if company_name:
+            companies.add(company_name)
+    _raised_cache["version"] = version
+    _raised_cache["total"] = total
+    _raised_cache["closed_count"] = closed_count
+    _raised_cache["zero_size_count"] = zero_size_count
+    _raised_cache["companies_count"] = len(companies)
+    return _raised_cache
+
+
+def _fmt_raised_headline(total):
+    """'$XX M+' rounded DOWN to a whole number of millions; None (line
+    suppressed entirely) below $1M -- there's no "M+" worth bragging
+    about under a million."""
+    if total is None or total < 1_000_000:
+        return None
+    return f"${int(total // 1_000_000)}M+"
+
+
+def _raised_headline_html(edit_mode=False):
+    """Bold headline HTML for the Demand Board / not-enabled page, or ""
+    when the desk-wide total is below $1M (see _fmt_raised_headline).
+    edit_mode (admin only) adds a title-attr tooltip with the exact
+    total and how many closed buys contributed $0 toward it for a
+    missing ticket size -- never shown to a tenant."""
+    stats = _raised_headline_stats()
+    headline_text = _fmt_raised_headline(stats["total"])
+    if not headline_text:
+        return ""
+    title_attr = ""
+    if edit_mode:
+        # A precise comma-formatted dollar figure here, deliberately NOT
+        # _fmt_money -- its K/M rounding is exactly what the headline
+        # itself already shows; the tooltip's whole point is the EXACT
+        # total underneath that rounded-down figure.
+        tooltip = f"Exact: ${stats['total']:,.0f} across {stats['closed_count']} closed buys"
+        if stats["zero_size_count"]:
+            tooltip += f" ({stats['zero_size_count']} contributing $0 for missing size)"
+        title_attr = f' title="{_esc(tooltip)}"'
+    return f'<p class="raised-headline"{title_attr}>{_esc(headline_text)} closed for sellers through this desk</p>'
+
+
 def get_my_deals(person_id):
     """Deals linked to person_id, newest-updated first."""
     deals = get_deals_list()
@@ -1501,6 +1584,19 @@ def _person_display_name(rec):
     return " ".join(p for p in parts if p).strip()
 
 
+def _first_name(rec):
+    """First name only -- item 4's "via <colleague first name>" chip.
+    first_name when present, else the first word of _person_display_name,
+    else ""."""
+    if not isinstance(rec, dict):
+        return ""
+    first = (rec.get("first_name") or "").strip()
+    if first:
+        return first
+    full = _person_display_name(rec)
+    return full.split()[0] if full else ""
+
+
 def _person_email_text(rec):
     """Ported verbatim from chadgracia/daily-brief's _person_email: a
     scalar "email", falling back to the first entry of an "emails" list
@@ -1547,6 +1643,59 @@ def get_my_sell_deals(person_id, company):
             continue
         if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
             out.append(d)
+    return out
+
+
+def get_firm_closed_sell_deals(person_id):
+    """Item 4: won SELL deals linked to a FIRM colleague — any OTHER
+    person sharing the viewing tenant's own company (company_id when the
+    tenant's own record carries one, else exact lowercased company_name
+    — same company_id-first, company_name-fallback convention _closer_
+    kind/get_company_record already use) — never the tenant's own
+    personal won deals (those already come from `deals`/get_my_deals in
+    render_my_deals_page; a deal linked to person_id is skipped here to
+    avoid double-listing it). Returns [(deal, colleague_rec)] where
+    colleague_rec is the first OTHER linked person (deals.json order)
+    who actually shares the tenant's company — the "via <colleague>"
+    chip's subject. Batches its people.json lookups (one call for every
+    linked person across every won Sell deal) rather than doing one S3
+    round trip per person."""
+    tenant_rec = get_people_by_ids({person_id}).get(person_id) if person_id is not None else None
+    if tenant_rec is None:
+        return []
+    company_id = tenant_rec.get("company_id")
+    company_name = (tenant_rec.get("company_name") or "").strip().lower()
+    if company_id is None and not company_name:
+        return []
+
+    won_sell_deals = [d for d in get_deals_list()
+                       if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)
+                       and _is_won_stage(_deal_stage_id(d))]
+    if not won_sell_deals:
+        return []
+    all_linked_ids = set()
+    for d in won_sell_deals:
+        all_linked_ids |= _deal_linked_person_ids(d)
+    people_by_id = get_people_by_ids(all_linked_ids)
+
+    def _shares_company(rec):
+        if rec is None:
+            return False
+        if company_id is not None:
+            return rec.get("company_id") == company_id
+        cand_name = (rec.get("company_name") or "").strip().lower()
+        return bool(cand_name) and cand_name == company_name
+
+    out = []
+    for d in won_sell_deals:
+        linked_ordered = _deal_linked_person_ids_ordered(d)
+        if person_id in linked_ordered:
+            continue
+        colleague = next((people_by_id.get(pid) for pid in linked_ordered
+                           if _shares_company(people_by_id.get(pid))), None)
+        if colleague is None:
+            continue
+        out.append((d, colleague))
     return out
 
 
@@ -2554,6 +2703,149 @@ def _pipeline_update_deal_deadline(deal_id, deadline_iso):
         return False, f"{type(e).__name__}: {e}"
 
 
+# ── Buyer photos (?photo=<person_id>) ────────────────────────────────────────
+# Warm-invocation-only cache, same lifetime/reset semantics as every other
+# module-level cache in this file: {person_id: (image_url or None, fetched_at
+# epoch seconds)}. A ~30 min TTL comfortably undercuts Pipeline's own
+# signed-thumb-URL expiry (~40-60 min per instruction) so a cached URL is
+# never handed out after it's gone stale, while still sparing a live
+# Pipeline round trip on every single photo request within one warm
+# container.
+_PHOTO_CACHE = {}
+PHOTO_CACHE_TTL_SECONDS = 30 * 60
+
+AVATAR_COLORS = ["#3d5a73", "#8a6d1f", "#1f7a4d", "#6b4e9e", "#b2542f", "#3b6e8f"]
+
+
+def _person_initials(rec):
+    """Up to two letters for the fallback avatar: first_name+last_name
+    initials when present, else split _person_display_name, else "?" —
+    never empty."""
+    if not isinstance(rec, dict):
+        return "?"
+    first = (rec.get("first_name") or "").strip()
+    last = (rec.get("last_name") or "").strip()
+    if first or last:
+        initials = f"{first[:1]}{last[:1]}".upper()
+        return initials or "?"
+    parts = (_person_display_name(rec) or "").split()
+    if len(parts) >= 2:
+        return (parts[0][:1] + parts[-1][:1]).upper()
+    if parts:
+        return parts[0][:2].upper()
+    return "?"
+
+
+def _avatar_svg(initials):
+    """Inline SVG initials avatar — the universal fallback (no photo on
+    file, a live-fetch error, or a denied request all render this
+    instead), so an <img src="?photo=..."> tag here never breaks.
+    Deterministic background color from the initials themselves, so the
+    same person always gets the same color across renders/viewers."""
+    initials = (initials or "?").strip()[:2].upper() or "?"
+    color = AVATAR_COLORS[sum(ord(c) for c in initials) % len(AVATAR_COLORS)]
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">'
+        f'<circle cx="48" cy="48" r="48" fill="{color}"/>'
+        '<text x="48" y="48" text-anchor="middle" dominant-baseline="central" '
+        'font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif" '
+        f'font-size="38" font-weight="600" fill="#ffffff">{_esc(initials)}</text></svg>'
+    )
+
+
+def _pipeline_fetch_person_photo_url(person_id):
+    """Live GET to Pipeline for this person's image_thumb_url — the only
+    field this route ever reads off that response. This sandbox cannot
+    reach api.pipelinecrm.com (see CLAUDE.md); the deployed Lambda can.
+    Returns the url string, or None on any missing credential, missing/
+    empty field, non-2xx response, or other failure — never raises,
+    since a fallback avatar must always be available regardless. The
+    response's own nesting (a top-level "person" object vs. the person
+    fields directly at the top level) is unverified against a live
+    response — both shapes are checked, on the same trust basis as every
+    other unverified API-response field in this file."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return None
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(f"{PIPELINE_API_BASE}/people/{person_id}.json?{qs}", method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            if not (200 <= r.status < 300):
+                return None
+            data = json.loads(r.read())
+    except Exception:
+        return None
+    person = data.get("person") if isinstance(data, dict) and isinstance(data.get("person"), dict) else data
+    url = person.get("image_thumb_url") if isinstance(person, dict) else None
+    return url.strip() if isinstance(url, str) and url.strip() else None
+
+
+def _photo_url_for(person_id):
+    """The cached (or freshly fetched) Pipeline photo URL for person_id,
+    or None. See _PHOTO_CACHE/PHOTO_CACHE_TTL_SECONDS."""
+    now = time.time()
+    cached = _PHOTO_CACHE.get(person_id)
+    if cached is not None and (now - cached[1]) < PHOTO_CACHE_TTL_SECONDS:
+        return cached[0]
+    url = _pipeline_fetch_person_photo_url(person_id)
+    _PHOTO_CACHE[person_id] = (url, now)
+    return url
+
+
+def _photo_href(person_id, key=None, view_as=None):
+    """?photo=<person_id> — same key/view_as passthrough convention as
+    _buyer_href/_company_href, so the photo request resolves the exact
+    same admin/tenant auth context as the page it's embedded in."""
+    suffix = _tab_qs_suffix(key, view_as)
+    return f"?photo={person_id}{suffix}"
+
+
+def _svg_response(svg):
+    return {
+        "statusCode": 200,
+        "headers": {"Content-Type": "image/svg+xml", "Cache-Control": "no-store"},
+        "body": svg,
+    }
+
+
+def _photo_redirect_response(url):
+    return {
+        "statusCode": 302,
+        "headers": {"Location": url, "Cache-Control": "no-store"},
+        "body": "",
+    }
+
+
+def _handle_photo_request(person_id_raw, tenant, anon_key_email, is_admin_key):
+    """?photo=<person_id> (item 1): admin (is_admin_key, unconditionally —
+    the same "admin always sees the real thing" convention edit_mode
+    follows elsewhere), OR a real signed-in tenant session passing the
+    EXACT buyer-page disclosure gate for that specific person
+    (_tenant_has_disclosed_deal_with) — anyone else gets the fallback
+    avatar, never the real photo, and a photo is never looked up at all
+    for a denied request. 302 to Pipeline's own signed thumb URL when one
+    is on file; an inline SVG initials avatar (200, image/svg+xml)
+    otherwise — an <img> tag pointed at this route never breaks."""
+    try:
+        person_id = int(person_id_raw)
+    except (TypeError, ValueError):
+        return _svg_response(_avatar_svg("?"))
+
+    allowed = is_admin_key
+    if not allowed and tenant is not None:
+        allowed = _tenant_has_disclosed_deal_with(tenant.get("person_id"), anon_key_email, person_id)
+
+    if not allowed:
+        rec = get_people_by_ids({person_id}).get(person_id)
+        return _svg_response(_avatar_svg(_person_initials(rec)))
+
+    url = _photo_url_for(person_id)
+    if url:
+        return _photo_redirect_response(url)
+    rec = get_people_by_ids({person_id}).get(person_id)
+    return _svg_response(_avatar_svg(_person_initials(rec)))
+
+
 def _tenant_email_for_deal(deal):
     """The auto-enrolled tenant email whose person_id is linked to this
     deal, or None if no tenant maps to it — writes are rejected outright
@@ -2804,6 +3096,25 @@ def _is_won_stage(stage_id):
     return stage_id in WON_STAGE_IDS
 
 
+def _deal_per_share_text(deal):
+    """Item 5: '9,524 sh @ $20.00 net' from # Shares (NUM_SHARES_FIELD)
+    and Net (NET_FIELD) -- commission-derived math (gross, fees) never
+    appears here. Omits whichever half is missing; None (line omitted
+    entirely) when both are."""
+    shares = _deal_cf_number(deal, NUM_SHARES_FIELD)
+    net = _deal_cf_number(deal, NET_FIELD)
+    parts = []
+    if shares is not None:
+        parts.append(f"{shares:,.0f} sh")
+    if net is not None:
+        # Always two decimals here (a per-share price, e.g. $20.00) --
+        # deliberately NOT _fmt_money, whose K/M rounding is built for
+        # large deal totals and would render this as the wrong-looking
+        # "$20" instead.
+        parts.append(f"@ ${net:,.2f} net")
+    return " ".join(parts) if parts else None
+
+
 def _deal_terms_complete(deal):
     """State 3's "terms incomplete" gate: a ticket-size bound (min OR max)
     present, AND each of Mgmt Fee/Carry/Seller Fee individually carries a
@@ -2881,6 +3192,13 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
     stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
     size_text = _esc(_deal_size_text(deal))
     net_text = _esc(_fmt_money(_deal_cf_number(deal, NET_FIELD)))
+    # Item 5: net per-share, won deals only -- a subtle line, never shown
+    # for a still-live deal (nothing to report per-share on until it's
+    # actually closed).
+    per_share_html = ""
+    if _is_won_stage(sid):
+        per_share_text = _deal_per_share_text(deal)
+        per_share_html = f'<div class="dc-line dc-per-share">{_esc(per_share_text)}</div>' if per_share_text else ""
 
     struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
     layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
@@ -2940,6 +3258,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
         <div><span class="dc-label">Net</span><span class="dc-value">{net_text}</span></div>
         <div><span class="dc-label">Structure</span><span class="dc-value">{structure_text}</span></div>
       </div>
+      {per_share_html}
       {deadline_html}
       {exemption_html}
       {fees_html}
@@ -4567,7 +4886,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 
 
 def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section,
-                       key=None, view_as=None, edit_mode=False):
+                       key=None, view_as=None, edit_mode=False, colleague_name=None):
     deal_id = str(deal.get("id"))
     if company_name:
         company_link = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
@@ -4583,6 +4902,10 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         f'<a href="{public_url}" target="_blank" rel="noopener noreferrer">#{deal_id}</a>'
         f'{_copy_id_button_html(public_url)}</div>'
     )
+    # Item 4: a firm-wide Closed row not personally linked to the viewer
+    # carries a muted "via <colleague>" chip so it reads as theirs, not
+    # a phantom deal on the viewer's own shelf.
+    via_html = f'<span class="via-colleague-chip">via {_esc(colleague_name)}</span>' if colleague_name else ""
 
     is_held = section == "hold"
     # Turn 26: a Closed row's badge/state short-circuits to "sold" —
@@ -4590,6 +4913,13 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     is_won = section == "closed"
     badge_html = _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=is_won)
     visibility_state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
+    # Item 5: net per-share, Closed rows only -- a subtle line under the
+    # Visibility badge.
+    per_share_html = ""
+    if is_won:
+        per_share_text = _deal_per_share_text(deal)
+        per_share_html = (f'<div class="mydeals-per-share">{_esc(per_share_text)}</div>'
+                           if per_share_text else "")
 
     buyer_text = str(buyer_count)
     intro_text = str(stats["intro_count"]) if stats["intro_count"] else "—"
@@ -4626,8 +4956,8 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section, key=key)
 
     return (
-        f'<tr><td class="company">{company_link}{deal_id_sub}</td>'
-        f'<td>{badge_html}</td>'
+        f'<tr><td class="company">{company_link}{deal_id_sub}{via_html}</td>'
+        f'<td>{badge_html}{per_share_html}</td>'
         f'<td class="num">{buyer_text}</td>'
         f'<td class="num">{intro_text}</td>'
         f'<td>{deadline_html}</td>'
@@ -4807,6 +5137,27 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         closed_rows = [r for r in rows if r["section"] == "closed"]
         closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in closed_rows) if v is not None)
 
+        # Item 4: firm-wide Closed — won Sell deals linked to a colleague
+        # sharing the viewer's own company, appended to the SAME "closed"
+        # section (so the section heading's own count already includes
+        # them) but never counted toward closed_total/pipeline math above
+        # — that stays scoped to the viewer's own personal deals (rows),
+        # exactly as instructed. firm_total_closed is a SEPARATE summary
+        # figure that includes both.
+        firm_total_closed = closed_total
+        if person_id is not None:
+            for d, colleague in get_firm_closed_sell_deals(person_id):
+                firm_company_name = _deal_company_name(d)
+                firm_deadline = _resolve_deal_deadline(d, {})
+                firm_size = _deal_pipeline_size(d)
+                if firm_size is not None:
+                    firm_total_closed += firm_size
+                section_row_htmls["closed"].append(
+                    _my_deal_row_html(d, firm_company_name, firm_deadline, _company_stats(firm_company_name),
+                                       buyer_counts.get((firm_company_name or "").strip().lower(), 0), cef_state,
+                                       "closed", key=key, view_as=view_as, edit_mode=edit_mode,
+                                       colleague_name=_first_name(colleague)))
+
         # Each part is escaped individually rather than the joined string as
         # a whole, so the dollar totals can carry their own <span> for
         # medium-weight emphasis (item 4) without that markup being
@@ -4828,6 +5179,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         if closed_total:
             summary_parts.append(f'Total closed: <span class="mydeals-total">'
                                   f'{_esc(_fmt_money(closed_total))}</span>')
+        if firm_total_closed > closed_total:
+            summary_parts.append(f'Firm total closed: <span class="mydeals-total">'
+                                  f'{_esc(_fmt_money(firm_total_closed))}</span>')
         if future_deadlines:
             next_deadline = min(future_deadlines)
             summary_parts.append(f"next deadline {_esc(_fmt_short_date(next_deadline) or next_deadline)}")
@@ -4989,6 +5343,17 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   }}
   .deal-id-sub a {{ color: var(--muted); text-decoration: none; }}
   .deal-id-sub a:hover {{ color: var(--accent); text-decoration: underline; }}
+  .via-colleague-chip {{
+    display: inline-block;
+    margin-top: 6px;
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+    background: rgba(22,24,29,0.06);
+    border-radius: 999px;
+    padding: 2px 8px;
+  }}
+  .mydeals-per-share {{ margin-top: 4px; font-size: 12px; color: var(--muted); }}
   .copy-id {{
     display: inline-flex;
     align-items: center;
@@ -5726,24 +6091,29 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 </html>"""
 
 
-def _buyer_header_html(rec, closer_kind):
+def _buyer_header_html(rec, closer_kind, key=None, view_as=None):
     """Turn 24: the buyer page's single header card, merging what used
     to be two separate blocks (IDENTITY + CAPACITY, turn 23) into one —
-    name large; one line beneath it joining title (if present) · firm
-    name · city/country (work_* falling back to home_*); a second line
-    of mailto/LinkedIn/website links; the closer chip and ID-verified
-    chip (custom_label_3796440, the Client Engagement Form field, Yes
-    only -- every other state omitted, no red/amber states on a page
-    the TENANT reads about someone else) right-aligned; and a trailing
-    chip row for tier badge / ticket range (custom_label_3052210 map) /
-    transactor type label (custom_label_3759163 map) -- the old
-    separate near-empty "Capacity" card is gone. Every field renders
-    only when present. title/city are implemented on trust the same
-    way phone was (_person_phone_text): no repo in this org reads a
-    person record's "title"/"work_city"/"home_city", but they follow
-    the exact naming convention work_country/home_country already
-    verified working in production. Person-record fields only; nothing
-    about any company, deal, or interest is read or shown here."""
+    a circular photo (item 1: ?photo=<id>, same key/view_as context as
+    the page itself — a fallback initials avatar when there's no photo
+    or the request is somehow denied); name large; one line beneath it
+    joining title (if present) · firm name · city/country (work_*
+    falling back to home_*); a second line of mailto/LinkedIn/website
+    links; the closer chip and ID-verified chip (custom_label_3796440,
+    the Client Engagement Form field, Yes only -- every other state
+    omitted, no red/amber states on a page the TENANT reads about
+    someone else) right-aligned; and a trailing chip row for tier badge
+    / ticket range (custom_label_3052210 map) / transactor type label
+    (custom_label_3759163 map) -- the old separate near-empty "Capacity"
+    card is gone. Every field renders only when present. title/city are
+    implemented on trust the same way phone was (_person_phone_text):
+    no repo in this org reads a person record's "title"/"work_city"/
+    "home_city", but they follow the exact naming convention
+    work_country/home_country already verified working in production.
+    Person-record fields only; nothing about any company, deal, or
+    interest is read or shown here."""
+    photo_html = (f'<img class="buyer-header-photo" src="{_photo_href(rec.get("id"), key, view_as)}" '
+                  f'alt="" width="64" height="64">')
     name = _esc(_person_display_name(rec) or "—")
     title = (rec.get("title") or "").strip()
     cf = rec.get("custom_fields") or {}
@@ -5790,7 +6160,8 @@ def _buyer_header_html(rec, closer_kind):
 
     return (
         f'<div class="card buyer-header"><div class="buyer-header-top">'
-        f'<div><div class="buyer-page-name">{name}</div>{line1_html}{line2_html}</div>'
+        f'<div class="buyer-header-identity">{photo_html}'
+        f'<div><div class="buyer-page-name">{name}</div>{line1_html}{line2_html}</div></div>'
         f'{badges_html}</div>{chip_row_html}</div>'
     )
 
@@ -5862,11 +6233,14 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
 
 
 def _deal_team_member_html(rec, key=None, view_as=None):
-    """One person's line in DEAL TEAM: name (linking to their own buyer
+    """One person's line in DEAL TEAM: a small avatar (item 1: ?photo=
+    <id>, fallback initials otherwise), name (linking to their own buyer
     page), position/title if present (same on-trust "title" field
     _buyer_header_html already reads), mailto email, phone."""
     name = _esc(_person_display_name(rec) or "—")
     href = _buyer_href(rec.get("id"), key, view_as)
+    photo_html = (f'<img class="deal-team-avatar" src="{_photo_href(rec.get("id"), key, view_as)}" '
+                  f'alt="" width="28" height="28">')
     title = (rec.get("title") or "").strip()
     title_html = f'<div class="buyer-page-row">{_esc(title)}</div>' if title else ""
     contact_parts = []
@@ -5879,7 +6253,8 @@ def _deal_team_member_html(rec, key=None, view_as=None):
     contact_html = (f'<div class="buyer-page-row">{" &middot; ".join(contact_parts)}</div>'
                      if contact_parts else "")
     return (f'<div class="deal-team-member">'
-            f'<div class="buyer-page-row"><a class="buyer-link" href="{href}">{name}</a></div>'
+            f'<div class="buyer-page-row deal-team-name-row">{photo_html}'
+            f'<a class="buyer-link" href="{href}">{name}</a></div>'
             f'{title_html}{contact_html}</div>')
 
 
@@ -6238,7 +6613,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
             full_access = edit_mode or _tenant_has_disclosed_deal_with(person_id, anon_key_email, buyer_id)
             if full_access:
                 closer_kind = _closer_kind(rec, _build_firm_won_index())
-                header_html = _buyer_header_html(rec, closer_kind)
+                header_html = _buyer_header_html(rec, closer_kind, key=key, view_as=view_as)
 
                 # About-the-firm: only ever looked up for an entity buyer
                 # (a natural person has no firm to look up) and only when
@@ -6314,12 +6689,16 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .deal-team-member {{ margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }}
   .deal-team-member:first-of-type {{ margin-top: 0; padding-top: 0; border-top: none; }}
   .deal-team-member .buyer-page-row:first-child {{ margin-top: 0; font-weight: 600; }}
+  .deal-team-name-row {{ display: flex; align-items: center; gap: 8px; }}
+  .deal-team-avatar {{ width: 28px; height: 28px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }}
   a.buyer-link {{ color: var(--accent); text-decoration: none; }}
   a.buyer-link:hover {{ text-decoration: underline; }}
   /* Turn 24: single header card -- name, two info lines, badges
      right-aligned, then a trailing chip row for tier/ticket/transactor
      (see _buyer_header_html). */
   .buyer-header-top {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }}
+  .buyer-header-identity {{ display: flex; align-items: center; gap: 14px; }}
+  .buyer-header-photo {{ width: 64px; height: 64px; border-radius: 50%; object-fit: cover; flex-shrink: 0; }}
   .buyer-header-line {{ font-size: 13px; color: var(--muted); margin-top: 4px; }}
   .buyer-header-line a {{ color: var(--accent); text-decoration: none; }}
   .buyer-header-line a:hover {{ text-decoration: underline; }}
@@ -6509,6 +6888,20 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
             f'<p><a class="gg-link" href="{SIGNIN_URL}">'
             "Sign in via trades.graciagroup.com</a></p>"
         )
+    # Item 2: the same desk-wide headline as the Demand Board, plus a
+    # companies-count line -- both only when there's a real headline to
+    # show (see _fmt_raised_headline's $1M floor); neither ever appears
+    # on the sign-in (show_signin) variant of this page, only the
+    # authenticated-but-not-a-seller one.
+    raised_html = ""
+    if show_sell_cta:
+        stats = _raised_headline_stats()
+        headline_text = _fmt_raised_headline(stats["total"])
+        if headline_text:
+            companies_html = (f'<p class="raised-companies">{stats["companies_count"]} '
+                               f'companies with completed purchases.</p>'
+                               if stats["companies_count"] else "")
+            raised_html = f'<p class="raised-headline">{_esc(headline_text)} closed for sellers through this desk</p>{companies_html}'
     sell_cta_html = ""
     if show_sell_cta:
         sell_cta_html = (
@@ -6544,12 +6937,15 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
   .gg-card h1 {{ font-size: 18px; margin: 0 0 12px; }}
   .gg-card p {{ color: #6b7280; font-size: 14px; line-height: 1.5; margin: 0 0 8px; }}
   .gg-link {{ color: #3d5a73; text-decoration: none; font-weight: 600; }}
+  .raised-headline {{ font-size: 15px; font-weight: 700; color: #1f7a4d; }}
+  .raised-companies {{ font-size: 13px; }}
 </style>
 </head>
 <body>
   <div class="gg-card">
     <h1>{_esc(title)}</h1>
     <p>{_esc(message)}</p>
+    {raised_html}
     {sell_cta_html}
     {signin_html}
   </div>
@@ -6558,9 +6954,10 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
 
 
 def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
-                 tenant_picker=False):
+                 tenant_picker=False, edit_mode=False):
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="demand")
+    raised_headline_html = _raised_headline_html(edit_mode=edit_mode)
     rows_html = "".join(
         f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
         f'{_esc(r["company"])}</a></td>'
@@ -6609,6 +7006,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     gap: 16px;
   }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
+  .raised-headline {{ font-size: 15px; font-weight: 700; color: var(--qp); margin: 0 0 6px; }}
   .sub {{ color: var(--muted); font-size: 13px; margin: 0 0 24px; }}
   .toolbar {{ display: flex; gap: 12px; margin-bottom: 16px; }}
   #search {{
@@ -6693,6 +7091,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
   <div class="header-row">
     <div>
       <h1>Demand Board</h1>
+      {raised_headline_html}
       <p class="sub">{len(table)} companies with interested buyers</p>
     </div>
   </div>
@@ -7218,10 +7617,18 @@ def lambda_handler(event, context):
                                   key=nav_key, view_as=nav_view_as, edit_mode=edit_mode, cef_html=cef_html)
         return _html_response(body)
 
+    # Buyer photo (item 1): not an HTML page -- a 302 to Pipeline's signed
+    # thumb URL, or an inline SVG fallback avatar. Auth is resolved from
+    # the exact same tenant/is_admin_key context every other route above
+    # already established.
+    photo_param = query.get("photo")
+    if photo_param:
+        return _handle_photo_request(photo_param, tenant, anon_key_email, is_admin_key)
+
     if tab == "demand":
         table = get_company_table()
         body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as, cef_html=cef_html,
-                            anon_key_email=anon_key_email, tenant_picker=(tenant is None))
+                            anon_key_email=anon_key_email, tenant_picker=(tenant is None), edit_mode=edit_mode)
     elif tab == "mydeals":
         if tenant is None:
             body = render_my_deals_page(viewer_name, tenant_picker=True,
