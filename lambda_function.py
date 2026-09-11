@@ -99,6 +99,36 @@ from boto3.dynamodb.conditions import Key
 _cold_start_seen = {"done": False}
 _perf = {"page": "?", "cold": True, "start": 0.0, "times": {}, "counts": {}}
 
+# ── Request-scoped data cache (perf fixes 1-4). Reset alongside _perf on
+# every invocation (see _perf_start below) -- this is NOT a warm-
+# invocation cache like _cache/_deals_cache/_tenant_cache further down
+# (those already persist correctly-invalidated data ACROSS invocations
+# via an S3 head_object version check); this is a much thinner layer
+# UNDERNEATH those, memoizing "have I already resolved this within the
+# CURRENT request" so the same page render doesn't redundantly re-derive
+# (or re-HEAD-check, or re-scan) the same thing 20+ times just because
+# 20+ different companies each ask for it. See _people_list/
+# _interest_buy_map/_companies_list/_cached_object_version (near
+# _object_version) and get_my_deals/get_my_matched_buy_deals/
+# _company_buy_stats for the actual consumers.
+_req_cache = {
+    "deals": None, "people": None, "interest": None, "companies": None,
+    "object_version": {}, "object_size": {},
+    "my_deals": {}, "matched_buy_deals": {}, "company_stats": {},
+}
+
+
+def _req_cache_reset():
+    _req_cache["deals"] = None
+    _req_cache["people"] = None
+    _req_cache["interest"] = None
+    _req_cache["companies"] = None
+    _req_cache["object_version"] = {}
+    _req_cache["object_size"] = {}
+    _req_cache["my_deals"] = {}
+    _req_cache["matched_buy_deals"] = {}
+    _req_cache["company_stats"] = {}
+
 
 def _perf_start(page):
     was_cold = not _cold_start_seen["done"]
@@ -108,6 +138,7 @@ def _perf_start(page):
     _perf["start"] = time.perf_counter()
     _perf["times"] = {}
     _perf["counts"] = {}
+    _req_cache_reset()
 
 
 def _perf_count(name):
@@ -154,6 +185,21 @@ def _perf_log():
         parts.append(f"calls_{name}={n}")
     parts.append(f"total={total:.2f}s")
     parts.append(f"cold={_perf['cold']}")
+    # Perf report item 6: this sandbox has no live S3 access to report
+    # real snapshot byte sizes directly (see CLAUDE.md), so the sizes
+    # are logged here instead -- ContentLength off whichever S3
+    # get_object responses this request actually made (_people_list/
+    # get_deals_list/_interest_buy_map/_companies_list each stash it,
+    # opportunistically -- no extra HEAD call spent just to report a
+    # size), readable straight from CloudWatch once deployed. A key
+    # never fetched this request (e.g. companies.json on a page with no
+    # buyer-page "About the firm" card) is simply omitted.
+    size_labels = (("bytes_people", PEOPLE_KEY), ("bytes_deals", DEALS_KEY),
+                   ("bytes_interest", INTEREST_KEY), ("bytes_companies", COMPANIES_KEY))
+    for label, key in size_labels:
+        size = _req_cache["object_size"].get(key)
+        if size is not None:
+            parts.append(f"{label}={size}")
     print("TIMING " + " ".join(parts))
 
 
@@ -1026,16 +1072,13 @@ def _build_firm_won_index():
     are kept from
     this scan -- only the two membership sets, so nothing about who
     else won or how much can leak through _closer_kind's boolean
-    result. Own fresh S3 fetch (same discard-after-use pattern as
-    get_company_buyer_details) — not merged into get_people_by_ids
-    since most of its callers have no use for this index and it would
-    mean re-deriving it from scratch (it needs the FULL people list,
-    not just the wanted ids) on every call anyway."""
-    s3 = boto3.client("s3")
-    with _perf_timer("s3_people"):
-        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-        people_data = json.loads(people_obj["Body"].read())
-    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+    result. Pulls the request-scoped shared people list (perf fix 4 --
+    _people_list) rather than its own independent fetch — not merged
+    into get_people_by_ids's OWN return shape since most of its callers
+    have no use for this index and it would mean re-deriving it from
+    scratch (it needs the FULL people list, not just the wanted ids) on
+    every call anyway."""
+    people_list = _people_list()
     by_company_id = set()
     by_company_name = set()
     for rec in people_list:
@@ -1207,19 +1250,111 @@ def _verify_sso_handoff(token):
         return None
 
 
+# Perf fix 5: one boto3 S3 client (and, below, one Dynamo Table binding)
+# reused across every call in the container's lifetime, instead of a
+# fresh boto3.client("s3")/boto3.resource("dynamodb") construction per
+# function call -- constructing a client isn't free (connection pool
+# setup), and this file called it in nearly every data-access function.
+# Lazy singletons rather than module-load-time construction, so a
+# missing IAM/env issue still only breaks the first actual call, not
+# import. NOTE for tests: the test suite's own reset_caches() (called
+# by use_fixture on every fixture swap) must clear these two too, or a
+# later fixture's FakeS3/FakeDynamoTable would never be picked up --
+# see tests/test_suite.py.
+_s3_client_singleton = {"client": None}
+_dynamo_table_singleton = {"table": None}
+
+
+def _s3_client():
+    if _s3_client_singleton["client"] is None:
+        _s3_client_singleton["client"] = boto3.client("s3")
+    return _s3_client_singleton["client"]
+
+
 def _object_version(s3, key):
     head = s3.head_object(Bucket=BUCKET, Key=key)
     return head["LastModified"].isoformat()
 
 
-def _build_table(s3):
-    """Fetch both S3 objects fresh and compute the per-company tier table.
-    All large intermediates (parsed people list, id->tier index) are local
-    variables and are dropped as soon as this function returns."""
+def _cached_object_version(s3, key):
+    """_object_version, memoized per S3 key for the lifetime of the
+    current request (perf fix 2, generalized beyond just deals.json --
+    the same redundancy shows up for people.json, checked separately by
+    _tenant_index and get_company_table, and for deals.json, checked
+    separately by get_deals_list, _raised_headline_stats, and
+    get_company_table). A HEAD result cannot change mid-invocation, so
+    reusing the first one is always safe."""
+    versions = _req_cache["object_version"]
+    if key in versions:
+        return versions[key]
+    version = _object_version(s3, key)
+    versions[key] = version
+    return version
+
+
+def _people_list():
+    """The full parsed people.json list, fetched at most once per
+    request and shared by every function that needs the complete list
+    -- perf fix 4. Previously _build_tenant_index, get_people_by_ids,
+    get_company_buyer_details, _build_firm_won_index, and _build_table
+    each did their own independent S3 get_object+json.loads, so a
+    single request touching several of them (routine: auth resolution
+    needs _build_tenant_index, then the render itself needs
+    get_people_by_ids for linked buyers) paid for the same multi-MB
+    fetch+parse repeatedly."""
+    if _req_cache["people"] is not None:
+        return _req_cache["people"]
+    s3 = _s3_client()
     with _perf_timer("s3_people"):
         people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+        _req_cache["object_size"][PEOPLE_KEY] = people_obj.get("ContentLength")
         people_data = json.loads(people_obj["Body"].read())
     people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+    _req_cache["people"] = people_list
+    return people_list
+
+
+def _interest_buy_map():
+    """interest_people.json's "buy" mapping (company name -> [person_id,
+    ...]), fetched at most once per request and shared by _build_table
+    and get_company_buyer_details (perf fix 4)."""
+    if _req_cache["interest"] is not None:
+        return _req_cache["interest"]
+    s3 = _s3_client()
+    with _perf_timer("s3_interest"):
+        interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
+        _req_cache["object_size"][INTEREST_KEY] = interest_obj.get("ContentLength")
+        interest_data = json.loads(interest_obj["Body"].read())
+    buy = interest_data.get("buy") or {}
+    _req_cache["interest"] = buy
+    return buy
+
+
+def _companies_list():
+    """The full parsed companies.json list, fetched at most once per
+    request (perf fix 4). Raises on any failure -- callers (currently
+    only get_company_record) keep their own try/except around this,
+    exactly as they already wrapped the raw fetch, so a missing file or
+    unexpected shape still fails soft rather than erroring the page."""
+    if _req_cache["companies"] is not None:
+        return _req_cache["companies"]
+    s3 = _s3_client()
+    with _perf_timer("s3_companies"):
+        companies_obj = s3.get_object(Bucket=BUCKET, Key=COMPANIES_KEY)
+        _req_cache["object_size"][COMPANIES_KEY] = companies_obj.get("ContentLength")
+        companies_data = json.loads(companies_obj["Body"].read())
+    companies_list = (companies_data.get("companies", [])
+                       if isinstance(companies_data, dict) else (companies_data or []))
+    _req_cache["companies"] = companies_list
+    return companies_list
+
+
+def _build_table():
+    """Compute the per-company tier table from the shared, request-scoped
+    people/interest/deals lists (perf fix 4) -- previously did its own
+    independent fetch of all three, even when another function in the
+    same request had already fetched the identical S3 object."""
+    people_list = _people_list()
 
     tier_by_id = {}
     for rec in people_list:
@@ -1229,15 +1364,8 @@ def _build_table(s3):
         cf = rec.get("custom_fields") or {}
         tier_by_id[str(pid)] = classify_person(cf)
 
-    with _perf_timer("s3_interest"):
-        interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
-        interest_data = json.loads(interest_obj["Body"].read())
-    buy = interest_data.get("buy") or {}
-
-    with _perf_timer("s3_deals"):
-        deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
-        deals_data = json.loads(deals_obj["Body"].read())
-    deals_list = deals_data.get("deals", []) if isinstance(deals_data, dict) else (deals_data or [])
+    buy = _interest_buy_map()
+    deals_list = get_deals_list()
 
     sellers_by_company = {}
     for deal in deals_list:
@@ -1270,15 +1398,15 @@ def _build_table(s3):
 
 
 def get_company_table():
-    s3 = boto3.client("s3")
+    s3 = _s3_client()
     version = (
-        _object_version(s3, PEOPLE_KEY),
-        _object_version(s3, INTEREST_KEY),
-        _object_version(s3, DEALS_KEY),
+        _cached_object_version(s3, PEOPLE_KEY),
+        _cached_object_version(s3, INTEREST_KEY),
+        _cached_object_version(s3, DEALS_KEY),
     )
     if _cache["version"] == version and _cache["table"] is not None:
         return _cache["table"]
-    table = _build_table(s3)
+    table = _build_table()
     _cache["version"] = version
     _cache["table"] = table
     return table
@@ -1295,18 +1423,30 @@ def get_deals_list():
     """Raw deals.json deals, fresh-checked via the same cheap
     head_object-version pattern as get_company_table, cached independently
     since My Deals needs the full per-deal records (for per-tenant
-    filtering) rather than a precomputed aggregate."""
+    filtering) rather than a precomputed aggregate.
+
+    Perf fix 2: the snapshot version is validated (head_object) at most
+    ONCE per request -- _cached_object_version memoizes it -- and the
+    resolved list itself is stashed in _req_cache so every subsequent
+    call in the same request (get_my_deals alone can call this 20+
+    times across as many companies) is a plain dict lookup, no S3 call
+    of any kind, not even a HEAD."""
     _perf_count("get_deals_list")
-    s3 = boto3.client("s3")
-    version = _object_version(s3, DEALS_KEY)
+    if _req_cache["deals"] is not None:
+        return _req_cache["deals"]
+    s3 = _s3_client()
+    version = _cached_object_version(s3, DEALS_KEY)
     if _deals_cache["version"] == version and _deals_cache["deals"] is not None:
-        return _deals_cache["deals"]
-    with _perf_timer("s3_deals"):
-        deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
-        deals_data = json.loads(deals_obj["Body"].read())
-    deals = deals_data.get("deals", []) if isinstance(deals_data, dict) else (deals_data or [])
-    _deals_cache["version"] = version
-    _deals_cache["deals"] = deals
+        deals = _deals_cache["deals"]
+    else:
+        with _perf_timer("s3_deals"):
+            deals_obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
+            _req_cache["object_size"][DEALS_KEY] = deals_obj.get("ContentLength")
+            deals_data = json.loads(deals_obj["Body"].read())
+        deals = deals_data.get("deals", []) if isinstance(deals_data, dict) else (deals_data or [])
+        _deals_cache["version"] = version
+        _deals_cache["deals"] = deals
+    _req_cache["deals"] = deals
     return deals
 
 
@@ -1327,8 +1467,8 @@ def _raised_headline_stats():
     Cached against the same deals.json S3 object version get_deals_list
     already checks -- a fresh snapshot recomputes this automatically; a
     warm invocation against an unchanged snapshot reuses it for free."""
-    s3 = boto3.client("s3")
-    version = _object_version(s3, DEALS_KEY)
+    s3 = _s3_client()
+    version = _cached_object_version(s3, DEALS_KEY)
     if _raised_cache["version"] == version and _raised_cache["total"] is not None:
         return _raised_cache
     total = 0.0
@@ -1393,26 +1533,33 @@ def _raised_headline_html(edit_mode=False):
 
 
 def get_my_deals(person_id):
-    """Deals linked to person_id, newest-updated first."""
+    """Deals linked to person_id, newest-updated first.
+
+    Perf fix 1: request-scoped memoized by person_id -- previously
+    re-scanned and re-sorted the ENTIRE deals list from scratch on
+    every single call, and get_my_matched_buy_deals (itself called once
+    per company by both the nav dropdown and the page body) calls this
+    on every invocation. Returned lists are never mutated by any caller
+    (only iterated or filtered into a new list — verified), so sharing
+    the same list object across calls within a request is safe."""
     _perf_count("get_my_deals")
+    if person_id in _req_cache["my_deals"]:
+        return _req_cache["my_deals"][person_id]
     deals = get_deals_list()
     mine = [d for d in deals if person_id in _deal_linked_person_ids(d)]
     mine.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
+    _req_cache["my_deals"][person_id] = mine
     return mine
 
 
 def get_company_buyer_details(company):
     """Tier/ticket-range/updated_at for every person with Buy Interest in
-    one company, per interest_people.json + people.json. Fresh S3 fetch on
-    every call, same as _build_table's own fetch of these two files — the
-    parsed people list is a local variable here and is dropped when this
-    function returns; per the module docstring, it is never added to any
-    module-level cache."""
-    s3 = boto3.client("s3")
-    with _perf_timer("s3_interest"):
-        interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
-        interest_data = json.loads(interest_obj["Body"].read())
-    buy = interest_data.get("buy") or {}
+    one company, per interest_people.json + people.json. Pulls both from
+    the shared, request-scoped caches (perf fix 4 -- _interest_buy_map/
+    _people_list) instead of its own independent fetch of each; the
+    parsed people list is still never itself added to any cross-
+    invocation cache, per the module docstring."""
+    buy = _interest_buy_map()
 
     target = company.strip().lower()
     person_ids = []
@@ -1424,10 +1571,7 @@ def get_company_buyer_details(company):
         return []
     wanted = {str(pid) for pid in person_ids}
 
-    with _perf_timer("s3_people"):
-        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-        people_data = json.loads(people_obj["Body"].read())
-    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+    people_list = _people_list()
 
     out = []
     for rec in people_list:
@@ -1458,12 +1602,7 @@ def get_company_record(company_id, company_name):
     itself rather than showing something wrong; this file's shape is
     unverified in this sandbox (see COMPANIES_KEY)."""
     try:
-        s3 = boto3.client("s3")
-        with _perf_timer("s3_companies"):
-            companies_obj = s3.get_object(Bucket=BUCKET, Key=COMPANIES_KEY)
-            companies_data = json.loads(companies_obj["Body"].read())
-        companies_list = (companies_data.get("companies", [])
-                           if isinstance(companies_data, dict) else (companies_data or []))
+        companies_list = _companies_list()
     except Exception:
         return None
     if not isinstance(companies_list, list):
@@ -1482,18 +1621,14 @@ def get_company_record(company_id, company_name):
 
 
 def get_people_by_ids(person_ids):
-    """{id: person record} for exactly the wanted ids, via a fresh
-    people.json fetch. Same fetch-and-discard pattern as
-    get_company_buyer_details — never cached."""
+    """{id: person record} for exactly the wanted ids, via the shared,
+    request-scoped people list (perf fix 4 -- _people_list) rather than
+    its own independent fetch."""
     _perf_count("get_people_by_ids")
     wanted = {str(pid) for pid in person_ids if pid is not None}
     if not wanted:
         return {}
-    s3 = boto3.client("s3")
-    with _perf_timer("s3_people"):
-        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-        people_data = json.loads(people_obj["Body"].read())
-    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+    people_list = _people_list()
     out = {}
     for rec in people_list:
         pid = rec.get("id")
@@ -1540,7 +1675,7 @@ def _person_all_emails(rec):
     return out
 
 
-def _build_tenant_index(s3):
+def _build_tenant_index():
     """email (lowercased) -> {"name", "person_id"} for every auto-
     enrolled tenant: a people.json person linked to >=1 deal tagged Sell
     Order (DEAL_SIDE_FIELD contains DEAL_SIDE_SELL_ID), any stage —
@@ -1567,10 +1702,7 @@ def _build_tenant_index(s3):
     checks) compares it against those same int-coerced deal-linkage
     sets."""
     _perf_count("build_tenant_index")
-    with _perf_timer("s3_people"):
-        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-        people_data = json.loads(people_obj["Body"].read())
-    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
+    people_list = _people_list()
 
     seller_person_ids = set()
     for deal in get_deals_list():
@@ -1597,11 +1729,21 @@ def _build_tenant_index(s3):
 
 
 def _tenant_index():
-    s3 = boto3.client("s3")
+    # Deliberately plain _object_version here, NOT _cached_object_version
+    # -- this is the one cross-invocation cache (_tenant_cache) whose
+    # invalidate-on-a-newer-snapshot behavior is exercised directly (see
+    # tests/test_suite.py, which bumps people.json's LastModified and
+    # expects the very next call to re-check it); request-scoping this
+    # particular HEAD would make that check stale within a single test
+    # run's sequence of direct calls, which never resets _req_cache the
+    # way a real request boundary (_perf_start) does. Auth resolution
+    # calls this at most once per real request anyway, so there is no
+    # redundant-HEAD win being left on the table here in practice.
+    s3 = _s3_client()
     version = _object_version(s3, PEOPLE_KEY)
     if _tenant_cache["version"] == version and _tenant_cache["by_email"] is not None:
         return _tenant_cache["by_email"]
-    by_email = _build_tenant_index(s3)
+    by_email = _build_tenant_index()
     _tenant_cache["version"] = version
     _tenant_cache["by_email"] = by_email
     return by_email
@@ -1798,16 +1940,69 @@ def _is_matched_or_later_buy_deal(deal):
 def get_my_matched_buy_deals(person_id, company=None):
     """The tenant's BUY deals at Matched-or-later stage — every company
     (Active Intros) when company is None, else just that one (the company
-    page's Matched Buyers section)."""
+    page's Matched Buyers section).
+
+    Perf fix 1: request-scoped memoized by (person_id, company) -- the
+    nav dropdown and the page body both ask for this once per company,
+    and on a page with N companies that was N+N calls each re-deriving
+    get_my_deals's own result. Returned lists are never mutated by any
+    caller (only iterated or filtered into a new list — verified), so
+    sharing the same list object across calls within a request is safe."""
     _perf_count("get_my_matched_buy_deals")
     target = company.strip().lower() if company else None
+    cache_key = (person_id, target)
+    if cache_key in _req_cache["matched_buy_deals"]:
+        return _req_cache["matched_buy_deals"][cache_key]
     out = []
     for d in get_my_deals(person_id):
         if target is not None and (_deal_company_name(d) or "").strip().lower() != target:
             continue
         if _is_matched_or_later_buy_deal(d):
             out.append(d)
+    _req_cache["matched_buy_deals"][cache_key] = out
     return out
+
+
+def _company_buy_stats(person_id, company_name, intro_details=None):
+    """Per-company Buy-side stats (intro_count, stalled) — perf fix 3:
+    request-scoped and shared by BOTH render_my_deals_page's own
+    Buyers/Intros column AND the nav dropdown's badge
+    (_mydeals_dropdown_entries), so a company touched by both computes
+    once per (person_id, company, override-aware-or-not) per request
+    instead of running two independent local-closure loops that don't
+    know about each other.
+
+    intro_details=None (the nav dropdown's call, on every page) computes
+    the RAW-only count deliberately — unchanged from before this fix: a
+    second Dynamo partition scan on every single page load isn't worth
+    it for a quick-jump badge. intro_details={...} (render_my_deals_
+    page's own call, already holding the fetch it needs for Notes/
+    status anyway) is override-aware — also unchanged. The two are
+    cached under different keys because they are legitimately different
+    numbers by design (an override not yet reflected in the raw
+    snapshot), not duplicate work to collapse into one — doing so would
+    make one of the two surfaces show a different number than it does
+    today, which the zero-user-visible-change constraint on this pass
+    rules out."""
+    if person_id is None or not company_name:
+        return {"intro_count": 0, "stalled": False}
+    cache_key = (person_id, company_name.strip().lower(), intro_details is not None)
+    cached = _req_cache["company_stats"].get(cache_key)
+    if cached is not None:
+        return cached
+    matched = get_my_matched_buy_deals(person_id, company_name)
+    intro_count = 0
+    stalled = False
+    for d in matched:
+        entry = (intro_details.get(str(d.get("id"))) or {}) if intro_details is not None else None
+        resolved = _resolve_intro_status(d, entry)
+        if resolved["disclosed"]:
+            intro_count += 1
+        if resolved["id"] == INTRO_STATUS_STALLED_ID:
+            stalled = True
+    stats = {"intro_count": intro_count, "stalled": stalled}
+    _req_cache["company_stats"][cache_key] = stats
+    return stats
 
 
 # Turn 27: stage-level exits. A dead-stage BUY deal never reaches
@@ -1936,7 +2131,14 @@ STATUS_INDEX = {name: i for i, name in enumerate(STATUS_STEPS)}
 
 
 def _dynamo_table():
-    return boto3.resource("dynamodb", region_name=INTRO_REGION).Table(INTRO_TABLE)
+    """Perf fix 5: one Dynamo Table binding reused across every call in
+    the container's lifetime, instead of a fresh boto3.resource(...)
+    construction (and .Table(...) lookup) per call -- see
+    _s3_client_singleton's own docstring for the matching S3 fix and
+    the test-suite note about resetting these on fixture swaps."""
+    if _dynamo_table_singleton["table"] is None:
+        _dynamo_table_singleton["table"] = boto3.resource("dynamodb", region_name=INTRO_REGION).Table(INTRO_TABLE)
+    return _dynamo_table_singleton["table"]
 
 
 def get_intro_details(tenant_email):
@@ -4361,16 +4563,11 @@ def _mydeals_dropdown_entries(person_id):
     sell_deals = [d for d in get_my_deals(person_id)
                   if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)]
 
-    intro_count_cache = {}
-
     def _intro_count(company_name):
-        cache_key = company_name.lower()
-        if cache_key in intro_count_cache:
-            return intro_count_cache[cache_key]
-        matched = get_my_matched_buy_deals(person_id, company_name)
-        count = sum(1 for d in matched if _resolve_intro_status(d)["disclosed"])
-        intro_count_cache[cache_key] = count
-        return count
+        # Perf fix 3: shares _company_buy_stats' request-scoped cache
+        # with render_my_deals_page's own Buyers/Intros column instead
+        # of keeping a second, independent local cache/loop.
+        return _company_buy_stats(person_id, company_name)["intro_count"]
 
     grouped = {"Live": {}, "On Hold": {}, "Closed": {}, "Cancelled": {}}
 
@@ -5288,30 +5485,14 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
         cef_state = _tenant_cef_state(person_id)
 
-        # Per-company buy-side aggregation (Intros count, Stalled flag),
-        # memoized per distinct company so two Sell deals for the same
-        # company don't redo the same get_my_matched_buy_deals scan.
+        # Per-company buy-side aggregation (Intros count, Stalled flag).
         # Turn 22: follow_up is no longer read here — see _my_deal_action_chip_html.
-        company_stats_cache = {}
-
+        # Perf fix 3: _company_buy_stats' own request-scoped cache is
+        # shared with the nav dropdown's badge computation, so a company
+        # touched by both (routine -- the dropdown renders on this same
+        # page too) computes once, not via two independent local caches.
         def _company_stats(company_name):
-            cache_key = (company_name or "").strip().lower()
-            if cache_key in company_stats_cache:
-                return company_stats_cache[cache_key]
-            matched = (get_my_matched_buy_deals(person_id, company_name)
-                       if person_id is not None and company_name else [])
-            intro_count = 0
-            stalled = False
-            for d in matched:
-                entry = intro_details.get(str(d.get("id"))) or {}
-                resolved = _resolve_intro_status(d, entry)
-                if resolved["disclosed"]:
-                    intro_count += 1
-                if resolved["id"] == INTRO_STATUS_STALLED_ID:
-                    stalled = True
-            stats = {"intro_count": intro_count, "stalled": stalled}
-            company_stats_cache[cache_key] = stats
-            return stats
+            return _company_buy_stats(person_id, company_name, intro_details)
 
         rows = []
         for d in deals:

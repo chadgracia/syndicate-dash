@@ -60,6 +60,20 @@ def reset_caches():
     lf._deals_cache["deals"] = None
     lf._cache["version"] = None
     lf._cache["table"] = None
+    lf._raised_cache["version"] = None
+    lf._raised_cache["total"] = None
+    # Perf fixes 1-5: the request-scoped cache (memoized deals/people/
+    # interest/companies lists, get_my_deals/get_my_matched_buy_deals/
+    # company-stats results, per-key HEAD versions) and the singleton S3
+    # client / Dynamo table binding all need to be cleared on every
+    # fixture swap too -- otherwise a later use_fixture()'s fresh
+    # FakeS3/FakeDynamoTable would never actually get exercised (the
+    # singletons would still point at the PREVIOUS fixture's fakes, and
+    # the request cache would still hold the previous fixture's parsed
+    # data/results).
+    lf._req_cache_reset()
+    lf._s3_client_singleton["client"] = None
+    lf._dynamo_table_singleton["table"] = None
 
 
 class FakeBody:
@@ -80,7 +94,10 @@ class FakeS3:
         self.last_modified = last_modified or {}
 
     def get_object(self, Bucket, Key):
-        return {"Body": FakeBody(self.objs[Key])}
+        # ContentLength included (real S3 always returns it) so the
+        # perf report's byte-size logging (TIMING line, item 6) has
+        # something real to read in tests.
+        return {"Body": FakeBody(self.objs[Key]), "ContentLength": len(json.dumps(self.objs[Key]))}
 
     def head_object(self, Bucket, Key):
         return {"LastModified": self.last_modified.get(Key, datetime.now(timezone.utc))}
@@ -369,6 +386,14 @@ lf._tenant_index()
 lf._tenant_index()
 check("tenant index stays cached across calls (same people.json version)", call_count["n"] == 0)
 lm["people.json"] = datetime(2026, 1, 2, tzinfo=timezone.utc)
+# Perf fixes 1-4 added a request-scoped cache (_req_cache) sitting
+# UNDER _tenant_cache, reset once per real request via _perf_start (the
+# lambda_handler wrapper) -- simulate that same request boundary here,
+# since this test calls _tenant_index() directly rather than through
+# lambda_handler, and otherwise the already-cached parsed people list
+# from the earlier calls above would mask the very re-fetch this check
+# exists to verify.
+lf._req_cache_reset()
 lf._tenant_index()
 check("tenant index recomputed once people.json's version changes", call_count["n"] == 1)
 fake_s3.get_object = orig_get_object
@@ -2815,6 +2840,149 @@ action_event = post_event({"deal_id": "1401", "notes": "x"})
 _, lines_action = _capture_timing_line(action_event)
 check("TIMING: a POST action still logs exactly one line, labeled by its action",
       len(lines_action) == 1 and "page=action:update_intro" in lines_action[0])
+
+check("TIMING: byte sizes are reported for whichever S3 keys this request actually fetched",
+      "bytes_people=" in line1 and "bytes_deals=" in line1 and "bytes_interest=" in line1)
+
+
+# ======================================================================
+# SECTION: Perf fixes 1-5 -- request-scoped caching, zero behavior change
+# ======================================================================
+# Fixes 1-5 from the perf diagnostic: memoize get_my_deals/
+# get_my_matched_buy_deals per request (1); validate deals.json's
+# snapshot version at most once per request (2); the nav dropdown's
+# per-company stats share render_my_deals_page's own cache instead of
+# an independent loop (3); one parsed people/deals/interest/companies
+# list per request, shared across every function that needs the full
+# list (4); one S3 client / Dynamo table binding reused across calls (5).
+# The whole existing suite above (668 checks) already re-verifies every
+# page's rendered output is unchanged under these fixes -- this section
+# adds the fixes' OWN regression coverage: the call-count reduction
+# itself, and the specific "did the shared cache accidentally change
+# what's disclosed" risk fix 3 raised during design.
+
+people_perf12 = {"people": [
+    {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
+    {"id": 9000, "first_name": "Buyer", "last_name": "Zero", "email": "b0@example.com", "custom_fields": {}},
+]}
+deals_perf12 = []
+for i in range(12):
+    deals_perf12.append({"id": 7000 + i, "name": f"Sell {i}", "company": {"name": f"Perf Co {i:02d}"},
+                         "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                         "people": [{"id": TENANT_A_PID}], "updated_at": f"2026-08-{(i % 28) + 1:02d}T00:00:00Z"})
+for i in range(0, 12, 3):
+    deals_perf12.append({"id": 8000 + i, "name": f"Buy {i}", "company": {"name": f"Perf Co {i:02d}"},
+                         "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),
+                         "people": [{"id": TENANT_A_PID}, {"id": 9000 + i}],
+                         "updated_at": f"2026-08-{(i % 28) + 1:02d}T00:00:00Z"})
+fake_s3_p12, _ = use_fixture({lf.PEOPLE_KEY: people_perf12, lf.INTEREST_KEY: {"buy": {}},
+                               lf.DEALS_KEY: {"deals": deals_perf12}})
+lf._cold_start_seen["done"] = False
+
+mydeals12_event = {"requestContext": {"http": {"method": "GET"}},
+                    "queryStringParameters": {"key": ADMIN_KEY, "view_as": TENANT_A_EMAIL, "tab": "mydeals"}}
+resp_p12, lines_p12 = _capture_timing_line(mydeals12_event)
+check("Perf fixes: 12-company My Deals page still renders successfully", resp_p12["statusCode"] == 200)
+line_p12 = lines_p12[0]
+
+# Before these fixes (see the diagnostic report): calls_get_my_matched_
+# buy_deals=24, calls_get_my_deals=26, calls_get_deals_list=26 (cold),
+# for this same 12-company shape.
+check("Perf fix 2: get_deals_list's own call count collapses 26 -> 3 "
+      "(only the head_object-and-parse path is entered more than once; see below for real fetch count)",
+      "calls_get_deals_list=3" in line_p12)
+check("Perf fix 1: get_my_deals's call count drops 26 -> 14 (get_my_matched_buy_deals' OWN "
+      "second set of 12 per-company calls now hit ITS cache before ever reaching get_my_deals)",
+      "calls_get_my_deals=14" in line_p12)
+check("get_my_matched_buy_deals is still asked for once per company by both the dropdown "
+      "and the page body (24, unchanged) -- two genuine callers, not a bug -- but each of "
+      "those 24 asks is now an O(1) cache lookup instead of an O(deals) rescan (see below)",
+      "calls_get_my_matched_buy_deals=24" in line_p12)
+
+# The real win get_deals_list's call count alone doesn't show: only the
+# FIRST of its 3 logical entries this request ever reaches the actual
+# S3 fetch -- the other 2 short-circuit on _req_cache["deals"] before
+# even a head_object call. Verify directly against the fake S3's own
+# call log rather than trusting the derived call-count metric.
+s3_get_calls = {"n": 0}
+orig_get_object_p12 = fake_s3_p12.get_object
+def _counting_get_object_p12(Bucket, Key):
+    if Key == lf.DEALS_KEY:
+        s3_get_calls["n"] += 1
+    return orig_get_object_p12(Bucket, Key)
+fake_s3_p12.get_object = _counting_get_object_p12
+lf._req_cache_reset()
+with contextlib.redirect_stdout(io.StringIO()):
+    lf.lambda_handler(mydeals12_event, None)
+check("Perf fix 2: deals.json is actually GET-fetched from S3 exactly once for this request "
+      "(not 3x, and nowhere near the pre-fix 26x)", s3_get_calls["n"] == 1)
+fake_s3_p12.get_object = orig_get_object_p12
+
+# Perf fix 5: the S3 client (and Dynamo table) are constructed once and
+# reused -- verify identity stays constant across repeat requests in
+# this same container, not just "a client exists".
+client_before = lf._s3_client_singleton["client"]
+table_before = lf._dynamo_table_singleton["table"]
+check("Perf fix 5: S3 client and Dynamo table singletons are populated after a request",
+      client_before is not None and table_before is not None)
+_capture_timing_line(mydeals12_event)
+check("Perf fix 5: the SAME S3 client object is reused across requests in this container",
+      lf._s3_client_singleton["client"] is client_before)
+check("Perf fix 5: the SAME Dynamo table object is reused across requests in this container",
+      lf._dynamo_table_singleton["table"] is table_before)
+
+# Perf fix 1 correctness: memoized results are still the RIGHT results
+# -- same object back for a repeated (person_id, company) key, genuinely
+# different lists for different companies, and get_my_deals itself
+# returns identically-shaped data to a fresh (unmemoized) computation.
+lf._req_cache_reset()
+first_call = lf.get_my_matched_buy_deals(TENANT_A_PID, "Perf Co 00")
+second_call = lf.get_my_matched_buy_deals(TENANT_A_PID, "Perf Co 00")
+other_company = lf.get_my_matched_buy_deals(TENANT_A_PID, "Perf Co 03")
+check("Perf fix 1: a repeated (person_id, company) call returns the cached list",
+      first_call is second_call and len(first_call) == 1 and first_call[0]["id"] == 8000)
+check("Perf fix 1: a different company is NOT served the wrong cache entry",
+      other_company is not first_call and other_company[0]["id"] == 8003)
+my_deals_first = lf.get_my_deals(TENANT_A_PID)
+my_deals_second = lf.get_my_deals(TENANT_A_PID)
+check("Perf fix 1: get_my_deals is memoized (same object) and still has all 16 of this "
+      "tenant's deals (12 sell + 4 buy: i in 0,3,6,9)",
+      my_deals_first is my_deals_second and len(my_deals_first) == 16)
+
+# --- Perf fix 3 safety: the shared cache must NOT unify the dropdown's
+# raw-only count with render_my_deals_page's own override-aware one --
+# a Dynamo status_override that changes disclosure must show up in the
+# page's own Intros column WITHOUT leaking into the nav dropdown's
+# badge (unchanged from pre-fix behavior on both counts). ---
+people_override = {"people": [
+    {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
+    {"id": 501, "first_name": "Ovi", "last_name": "Buyer", "email": "ovi@example.com", "custom_fields": {}},
+]}
+deal_override_sell = {"id": 9101, "name": "Override Sell", "company": {"name": "Override Co"},
+                      "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                      "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+deal_override_buy = {"id": 9102, "name": "Override Buy", "company": {"name": "Override Co"},
+                     "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None),
+                     "people": [{"id": TENANT_A_PID}, {"id": 501}], "updated_at": "2026-01-01T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_override, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [deal_override_sell, deal_override_buy]}},
+            table_items=[{"tenant": TENANT_A_EMAIL, "sk": "intro#9102",
+                          "status_override": 7207579, "override_at": "2100000000"}])
+tenant_override = lf._resolve_tenant(TENANT_A_EMAIL)
+assert tenant_override is not None
+
+page_override = lf.render_my_deals_page(
+    "Sella Seller", deals=[deal_override_sell], key=None, view_as=None,
+    person_id=TENANT_A_PID, anon_key_email=TENANT_A_EMAIL)
+row_override = row_for(page_override, "9101")
+check("Perf fix 3 safety: render_my_deals_page's OWN Intros column IS override-aware "
+      "(raw status is empty/Matched, but the Dynamo override says Introduced -> counts as 1, "
+      "rendered as a count-link since it's nonzero)",
+      row_override is not None and 'class="mydeals-count-link"' in row_override
+      and ">1</a>" in row_override)
+check("Perf fix 3 safety: the SAME page's nav dropdown badge stays RAW-only "
+      "(no badge for Override Co -- the override must not leak into the dropdown's count)",
+      '<span class="gg-mydeals-menu-name">Override Co</span></a>' in page_override)
 
 
 # ======================================================================
