@@ -1159,20 +1159,24 @@ check("803 (Wired, only NDA explicitly stored): ONLY NDA checked -- proves no ba
       states803 == {"NDA": True, "VDR": False, "Sub Docs": False, "Wired": False})
 check("803 shows the Wired-not-Closed 'awaiting confirmation' note", "Awaiting our confirmation" in row803)
 
-row804_tenant = row_for(page_tenant, "804")
-states804 = checkbox_states(row804_tenant)
-check("804 (Closed, full history): all four boxes checked", all(states804.values()))
-check("804 tenant: checkboxes disabled", row804_tenant.count("disabled") >= 4)
-check("804 tenant: flag select disabled", '<select class="ei-flag" data-deal-id="804" disabled>' in row804_tenant)
-check("804 tenant: flag shows Closed as current even though not settable",
-      '<option value="closed" selected>Closed</option>' in row804_tenant)
-check("804 tenant: Closed status-chip rendered", 'class="status-chip closed">Closed<' in row804_tenant)
-
-row804_admin = row_for(page_admin, "804")
-check("804 admin: checkboxes NOT disabled",
-      'class="ei-milestone" data-deal-id="804" value="NDA" checked disabled' not in row804_admin)
-check("804 admin: flag select NOT disabled", '<select class="ei-flag" data-deal-id="804">' in row804_admin)
-check("804 admin: flag select includes Withdrawn/Closed options", "Withdrawn" in row804_admin and ">Closed<" in row804_admin)
+# Bug fix (Closed intros render in "Closed out", not locked in place in
+# Introduced): 804 (Gamma Co, Intro Status Closed) no longer carries any
+# data-deal-id markup in the normal table at all -- same convention as a
+# Passed/Withdrawn row -- it's in the Closed out section instead, named
+# (disclosed -- Closed is never Matched) with the positive green chip,
+# nothing left to edit for tenant OR admin.
+check("804 no longer has milestone checkbox markup in the normal table (tenant)",
+      'class="ei-milestone" data-deal-id="804"' not in page_tenant)
+check("804 no longer has milestone checkbox markup in the normal table (admin)",
+      'class="ei-milestone" data-deal-id="804"' not in page_admin)
+closed_out_tenant = page_tenant[page_tenant.find('<details class="closed-out-section">'):]
+closed_out_admin = page_admin[page_admin.find('<details class="closed-out-section">'):]
+check("804 (Closed) IS in Closed out (tenant), named since Closed is always disclosed",
+      "Gamma Co" in closed_out_tenant and "Alice Buyer" in closed_out_tenant)
+check("804's Closed out chip is the positive green one, not the gray Passed/Withdrawn styling",
+      '<span class="status-chip closed">Closed</span>' in closed_out_tenant)
+check("804 (Closed) IS in Closed out (admin edit mode too)",
+      "Gamma Co" in closed_out_admin and '<span class="status-chip closed">Closed</span>' in closed_out_admin)
 
 check("805 (Matched/pending) has no checkbox markup", 'class="ei-milestone" data-deal-id="805"' not in page_tenant)
 check("805 is listed in the Pending introductions section", "Pending introductions" in page_tenant)
@@ -1746,6 +1750,17 @@ for label, (deal_id, stage_id, _) in STAGE_DEALS.items():
                         "people": [{"id": TENANT_A_PID}, {"id": 2}], "updated_at": "2026-08-01T00:00:00Z"})
 people = {"people": [{"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
                       {"id": 2, "name": "Alice Buyer", "email": "alice@example.com", "custom_fields": {}}]}
+# Bug fix fixture: Intro Status Closed at a totally unmapped/unrecognized
+# stage id (not in MATCHED_OR_LATER_STAGE_IDS, not a dead stage either) --
+# the actual hypothesized real-world trigger (Panthalassa): a deal whose
+# stage never lands on one of the two ids this file recognizes as Won,
+# but whose Intro Status field IS explicitly Closed. Before the fix this
+# was invisible to get_my_matched_buy_deals (and everywhere downstream of
+# it) while still correctly counting toward the desk-wide Raised total.
+deals_list.append({"id": 718, "name": "Unmapped stage + Closed status (kept, bug fix)",
+                    "company": {"name": "Co 718"}, "deal_stage": {"id": 9999999, "name": "whatever"},
+                    "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID),
+                    "people": [{"id": TENANT_A_PID}, {"id": 2}], "updated_at": "2026-08-01T00:00:00Z"})
 use_fixture({lf.PEOPLE_KEY: people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_list}})
 tenant_a = lf._resolve_tenant(TENANT_A_EMAIL)
 assert tenant_a is not None
@@ -1755,15 +1770,37 @@ matched_ids = {d["id"] for d in matched}
 for label, (deal_id, stage_id, should_be_included) in STAGE_DEALS.items():
     check(f"get_my_matched_buy_deals: {label} -> {'included' if should_be_included else 'excluded'}",
           (deal_id in matched_ids) == should_be_included)
+check("get_my_matched_buy_deals: Closed status at an unmapped stage id -> included (the bug fix)",
+      718 in matched_ids)
 
 page_intros = lf.render_intros_page("Sella Seller", tenant=tenant_a, tenant_email=TENANT_A_EMAIL,
                                      key=None, view_as=None, edit_mode=False)
 check("Active Intros: a Firm-stage deal (702) never appears at all", ">Co 702<" not in page_intros)
 check("Active Intros: an Invoiced-stage deal (707) does appear", ">Co 707<" in page_intros)
+check("Active Intros: the unmapped-stage Closed deal (718) appears, named (Closed is always disclosed)",
+      "Co 718" in page_intros and "Alice Buyer" in page_intros)
 
 page_buyer = lf.render_buyer_page(2, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("Buyer page Track With You: Firm-stage deal excluded", ">Co 702<" not in page_buyer)
 check("Buyer page Track With You: Won-stage deal (711) included", ">Co 711<" in page_buyer)
+check("Buyer page Track With You: unmapped-stage Closed deal (718) included", ">Co 718<" in page_buyer)
+
+# --- Direct unit tests for the predicate itself ---
+check("_is_matched_or_later_buy_deal: Closed status at an ordinary Matched stage -> True (unchanged)",
+      lf._is_matched_or_later_buy_deal({"deal_stage": {"id": lf.STAGE_MATCHED},
+                                         "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}))
+check("_is_matched_or_later_buy_deal: Closed status at a totally unmapped/unrecognized stage id -> True (the bug fix)",
+      lf._is_matched_or_later_buy_deal({"deal_stage": {"id": 9999999},
+                                         "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}))
+check("_is_matched_or_later_buy_deal: Closed status even at a dead stage (Lost) -> True (Closed status wins)",
+      lf._is_matched_or_later_buy_deal({"deal_stage": {"id": 111801},
+                                         "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}))
+check("_is_matched_or_later_buy_deal: Closed status but Sell-tagged -> False (side gate still applies)",
+      not lf._is_matched_or_later_buy_deal({"deal_stage": {"id": 9999999},
+                                             "custom_fields": {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_SELL_ID],
+                                                                lf.INTRO_STATUS_FIELD: [lf.INTRO_STATUS_CLOSED_ID]}}))
+check("_is_matched_or_later_buy_deal: no Closed status, unmapped stage -> False (unchanged)",
+      not lf._is_matched_or_later_buy_deal({"deal_stage": {"id": 9999999}, "custom_fields": cf_status(7207579)}))
 
 
 # ======================================================================
@@ -1801,6 +1838,19 @@ check("_deal_exit_outcome_name: Matched stage + raw status Stalled -> None (Stal
                                    "custom_fields": cf_status(7207584)}) is None)
 check("_deal_exit_outcome_name: Matched stage + no exit status at all -> None",
       lf._deal_exit_outcome_name({"deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None)}) is None)
+# Bug fix: Intro Status Closed is a positive/won outcome, checked FIRST --
+# ahead of stage-derived AND ahead of the Passed/Withdrawn status fallback
+# -- so it's never mistaken for a stage-based loss even in the edge case
+# where Pipeline's stage field still shows Lost/Obsolete.
+check("_deal_exit_outcome_name: Closed status at an ordinary Matched stage -> 'Closed'",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": lf.STAGE_MATCHED},
+                                   "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}) == "Closed")
+check("_deal_exit_outcome_name: Closed status even when stage is ALSO Lost -> 'Closed' (status wins, not 'Passed')",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": 111801},
+                                   "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}) == "Closed")
+check("_deal_exit_outcome_name: Closed status even when stage is ALSO Obsolete -> 'Closed' (status wins, not 'Withdrawn')",
+      lf._deal_exit_outcome_name({"deal_stage": {"id": lf.OBSOLETE_STAGE_ID},
+                                   "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}) == "Closed")
 check("INTRODUCED_OR_LATER_STATUS_IDS excludes Matched (7207578)", 7207578 not in lf.INTRODUCED_OR_LATER_STATUS_IDS)
 check("INTRODUCED_OR_LATER_STATUS_IDS excludes the three exit ids", not (lf.EXIT_STATUS_IDS & lf.INTRODUCED_OR_LATER_STATUS_IDS))
 check("INTRODUCED_OR_LATER_STATUS_IDS == {Introduced, NDA, VDR, Sub Docs, Wired, Closed}",
@@ -1814,6 +1864,19 @@ check("_is_closed_out_buy_deal: Buy + Matched -> False (live stage, not dead)",
       not lf._is_closed_out_buy_deal({"deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_buy()}))
 check("_is_closed_out_buy_deal is never true for a MATCHED_OR_LATER stage (disjoint by construction)",
       not any(lf._closed_out_outcome_name(sid) is not None for sid in lf.MATCHED_OR_LATER_STAGE_IDS))
+# Bug fix guard: a Closed-status deal is NEVER claimed by the stage-based
+# dead-exit predicate, even in the edge case where its Pipeline stage
+# happens to ALSO be Lost/Trade Broken/Obsolete -- it always routes
+# through _is_matched_or_later_buy_deal's own Closed-status check instead.
+check("_is_closed_out_buy_deal: Closed status even at a dead stage (Lost) -> False (mutual-exclusivity guard)",
+      not lf._is_closed_out_buy_deal({"deal_stage": {"id": 111801},
+                                       "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}))
+check("_is_closed_out_buy_deal: Closed status even at Trade Broken -> False",
+      not lf._is_closed_out_buy_deal({"deal_stage": {"id": lf.STAGE_TRADE_BROKEN},
+                                       "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}))
+check("_is_closed_out_buy_deal: Closed status even at Obsolete -> False",
+      not lf._is_closed_out_buy_deal({"deal_stage": {"id": lf.OBSOLETE_STAGE_ID},
+                                       "custom_fields": cf_status(lf.INTRO_STATUS_CLOSED_ID)}))
 
 check("_closed_out_disclosed: raw status Introduced -> True", lf._closed_out_disclosed({"custom_fields": cf_buy(7207579)}))
 check("_closed_out_disclosed: raw status NDA Signed -> True", lf._closed_out_disclosed({"custom_fields": cf_buy(7207580)}))
@@ -1882,8 +1945,16 @@ deal_status_withdrawn = {"id": 805, "name": "Status Withdrawn Deal", "company": 
 deal_still_stalled = {"id": 806, "name": "Stalled Deal", "company": {"name": "Stalled Co"},
                       "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_buy(7207584),
                       "people": [{"id": TENANT_A_PID}, {"id": 4}], "updated_at": "2026-08-01T00:00:00Z"}
+# Bug fix fixture: RAW Intro Status Closed on an otherwise-live (Matched)
+# stage -- a positive/won outcome, must land in Closed out styled green,
+# never lumped in with the gray Passed/Withdrawn rows above, and must
+# NEVER be claimed by get_my_closed_out_buy_deals (stage-based, dead
+# exits only) since Closed is not a dead outcome.
+deal_status_closed = {"id": 807, "name": "Status Closed Deal", "company": {"name": "Status Closed Co"},
+                      "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_buy(lf.INTRO_STATUS_CLOSED_ID),
+                      "people": [{"id": TENANT_A_PID}, {"id": 2}], "updated_at": "2026-08-01T00:00:00Z"}
 deals_list = [deal_900a, deal_live_buy, deal_lost, deal_broken, deal_obsolete,
-              deal_status_passed, deal_status_withdrawn, deal_still_stalled]
+              deal_status_passed, deal_status_withdrawn, deal_still_stalled, deal_status_closed]
 _, fake_table = use_fixture({lf.PEOPLE_KEY: people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_list}},
                              table_items=[
                                  {"tenant": TENANT_A_EMAIL, "sk": "intro#804", "milestones": {"NDA": 1750000000}},
@@ -1896,11 +1967,13 @@ closed_out = lf.get_my_closed_out_buy_deals(TENANT_A_PID)
 closed_out_ids = {d["id"] for d in closed_out}
 check("get_my_closed_out_buy_deals finds Lost/Trade Broken/Obsolete (3 deals)", closed_out_ids == {801, 802, 803})
 check("get_my_closed_out_buy_deals excludes the live Matched deal", 800 not in closed_out_ids)
+check("get_my_closed_out_buy_deals excludes the Closed-status deal (807, not a dead/stage-based exit)",
+      807 not in closed_out_ids)
 
 page_intros = lf.render_intros_page("Sella Seller", tenant=tenant_a, tenant_email=TENANT_A_EMAIL,
                                      key=None, view_as=None, edit_mode=False)
-check("Active Intros: collapsed 'Closed out' section present with count (5: 3 stage-based + 2 status-based)",
-      '<summary>Closed out <span class="count">(5)</span></summary>' in page_intros)
+check("Active Intros: collapsed 'Closed out' section present with count (6: 3 stage-based + 2 status-based exits + 1 status-based Closed)",
+      '<summary>Closed out <span class="count">(6)</span></summary>' in page_intros)
 check("Active Intros: the live Matched deal still shows under Introduced", ">Live Buy Co<" in page_intros)
 check("Active Intros: a disclosed closed-out row names the real buyer (Bob Buyer)", "Bob Buyer" in page_intros)
 check("Active Intros: a disclosed closed-out row shows the loss-reason suffix",
@@ -1935,6 +2008,23 @@ check("Stalled-stays-in-Introduced: Stalled Co (806, Matched+Stalled) is NOT in 
 check("Stalled-stays-in-Introduced: Stalled Co IS in the main Introduced table, flagged (stalled-row)",
       "Stalled Co" in intros_section_only
       and 'stalled-row' in row_for(page_intros, "806"))
+
+# --- Bug fix regression: RAW Intro Status Closed on a live stage (807) --
+# in Closed out, styled positively, distinct from the gray Passed/
+# Withdrawn chips in the very same section ---
+check("Closed-status-on-live-stage: Status Closed Co (807, Matched+Closed) IS in Closed out",
+      "Status Closed Co" in closed_out_section and "Status Closed Co" not in intros_section_only)
+check("Closed-status-on-live-stage: always disclosed (Closed is never anonymized) -> names the real buyer (Alice Buyer)",
+      "Status Closed Co" in closed_out_section
+      and "Alice Buyer" in closed_out_section[closed_out_section.find("Status Closed Co"):
+                                               closed_out_section.find("Status Closed Co") + 600])
+check("Closed-status-on-live-stage: rendered with the positive GREEN chip, not the gray Passed/Withdrawn one",
+      '<span class="status-chip closed">Closed</span>' in closed_out_section)
+check("Closed-status-on-live-stage: the green chip and the gray exit chips both appear in the same section "
+      "(visually distinct outcomes coexist)",
+      '<span class="status-chip closed">Closed</span>' in closed_out_section
+      and '<span class="status-chip exit">Passed</span>' in closed_out_section
+      and '<span class="status-chip exit">Withdrawn</span>' in closed_out_section)
 
 page_company_lost = lf.render_company_page("Lost Co", "Sella Seller", tenant_a, TENANT_A_EMAIL, "intros",
                                             key=None, view_as=None, edit_mode=False)
@@ -1971,6 +2061,16 @@ check("Company page (Status Withdrawn Co): closed-out row anonymized (no Alice B
       "Alice Buyer" not in page_company_status_withdrawn)
 check("Company page (Status Withdrawn Co): Withdrawn outcome shown", "Withdrawn" in page_company_status_withdrawn)
 
+# --- Company page: same Closed-status routing, same positive-green chip ---
+page_company_status_closed = lf.render_company_page("Status Closed Co", "Sella Seller", tenant_a, TENANT_A_EMAIL,
+                                                      "intros", key=None, view_as=None, edit_mode=False)
+check("Company page (Status Closed Co): 'Closed out' section present (not stuck in the Buyers table)",
+      '<details class="closed-out-section">' in page_company_status_closed)
+check("Company page (Status Closed Co): always-disclosed buyer named (Alice Buyer)",
+      "Alice Buyer" in page_company_status_closed)
+check("Company page (Status Closed Co): positive green chip, not the gray Passed/Withdrawn styling",
+      '<span class="status-chip closed">Closed</span>' in page_company_status_closed)
+
 page_company_stalled = lf.render_company_page("Stalled Co", "Sella Seller", tenant_a, TENANT_A_EMAIL, "intros",
                                                key=None, view_as=None, edit_mode=False)
 check("Stalled-stays-in-Introduced (company page): Stalled Co has NO 'Closed out' section at all",
@@ -1999,6 +2099,13 @@ check("Buyer page (Bob): its chip reads 'Passed'",
       '<span class="status-chip exit">Passed</span>' in page_buyer_bob)
 check("Buyer page (Alice): the undisclosed status-based exit (Status Withdrawn Co) is NOT in Track with you",
       "Status Withdrawn Co" not in page_buyer_alice)
+check("Buyer page (Alice): the Closed-status deal (Status Closed Co, always disclosed) appears in Track with you",
+      "Status Closed Co" in page_buyer_alice)
+check("Buyer page (Alice): Closed is not is_exit, so it renders as a plain status pill here -- never the gray "
+      "'status-chip exit' styling used for a real Passed/Withdrawn exit (this surface is unaffected by the fix; "
+      "Track with you already routed matched-or-later deals by stage/resolved-status directly)",
+      '<span class="status-pill">Closed</span>' in page_buyer_alice
+      and '<span class="status-chip exit">Closed</span>' not in page_buyer_alice)
 page_buyer_cara = lf.render_buyer_page(4, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("Stalled-stays-in-Introduced (buyer page): Stalled Co appears with the Stalled chip, not an exit chip",
       "Stalled Co" in page_buyer_cara and "Stalled — needs a nudge" in page_buyer_cara)
@@ -2262,6 +2369,13 @@ check("_raised_headline_stats: zero_size_count = 1 (603, missing both ticket fie
       raised_stats["zero_size_count"] == 1)
 check("_raised_headline_stats: companies_count = 3 (distinct companies among CLOSED buy deals only)",
       raised_stats["companies_count"] == 3)
+# Confirming test (no code change needed here -- _raised_headline_stats
+# already used this OR-logic before the fix): the same Intro-Status-Closed
+# deal (601) this desk-wide total already counted is now ALSO recognized
+# by _is_matched_or_later_buy_deal, so a tenant-scoped view of this exact
+# deal would no longer have been the invisible case the bug fix targets.
+check("_is_matched_or_later_buy_deal also recognizes deal 601 (parity with _raised_headline_stats' own rule)",
+      lf._is_matched_or_later_buy_deal(deals_raised[0]))
 
 check("_fmt_raised_headline: $25M -> '$25M+'", lf._fmt_raised_headline(25_000_000) == "$25M+")
 check("_fmt_raised_headline: rounds DOWN (25.9M -> '$25M+', not 26)", lf._fmt_raised_headline(25_900_000) == "$25M+")

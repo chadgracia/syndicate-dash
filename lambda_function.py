@@ -1931,7 +1931,26 @@ def _is_matched_or_later_buy_deal(deal):
     """The one shared predicate for "matched-or-later buy deal": used by
     both the company page's Matched Buyers section and the Active Intros
     tab, so the stage/side rules can never drift between them. is_archived
-    is intentionally not checked — see MATCHED_OR_LATER_STAGE_IDS."""
+    is intentionally not checked — see MATCHED_OR_LATER_STAGE_IDS.
+
+    Bug fix: also true when the deal's RAW Intro Status is explicitly
+    Closed (7207587), regardless of its Pipeline stage -- mirrors
+    _raised_headline_stats' own "closed = Intro Status Closed OR stage
+    in WON_STAGE_IDS" rule (its docstring: "either signal alone is
+    enough -- a deal can be Won-stage without ever having its Intro
+    Status field set to Closed, and vice versa"). Before this fix, a
+    buy deal that reached Closed status without its Pipeline stage
+    field ever landing on one of the two ids this file recognizes as
+    Won vanished from every tenant-scoped view (get_my_matched_buy_deals,
+    My Deals' Intros column, Active Intros) while still correctly
+    counting toward the desk-wide Raised total, which never depended
+    on this predicate. Checked first and independently of stage, so a
+    stage that's ALSO one of Lost/Trade Broken/Obsolete never matters
+    here -- see _is_closed_out_buy_deal's matching exclusion, which
+    keeps a Closed-status deal from ever being claimed by both
+    predicates at once."""
+    if _deal_intro_status_id(deal) == INTRO_STATUS_CLOSED_ID:
+        return DEAL_SIDE_BUY_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
     if _deal_stage_id(deal) not in MATCHED_OR_LATER_STAGE_IDS:
         return False
     return DEAL_SIDE_BUY_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
@@ -2029,27 +2048,29 @@ def _closed_out_outcome_name(stage_id):
 
 
 def _deal_exit_outcome_name(deal):
-    """Passed/Withdrawn/None for ANY way a Buy deal can be exited, not
-    just a stage-level one: stage-derived first (_closed_out_outcome_name
-    -- Lost/Trade Broken -> "Passed", Obsolete -> "Withdrawn"), else the
-    deal's own RAW Intro Status field when it directly holds Passed or
-    Withdrawn -- the bug this exists to fix: a deal can sit at a still-
-    live stage (e.g. Matched) with Intro Status explicitly set to Passed
-    or Withdrawn (an admin/tenant flagging it dead without Pipeline's
-    stage ever moving), and that exit is just as real as a stage-level
-    one. The two sources never actually collide (_is_closed_out_buy_deal
-    and MATCHED_OR_LATER_STAGE_IDS are disjoint by construction), so
-    "stage first" is purely a short-circuit, not a precedence rule with
-    real cases to arbitrate. RAW field only, matching
-    _closed_out_disclosed's own raw-only convention for exit rows --
-    Dynamo's status_override is what already produced this raw value in
-    the first place (see _handle_update_intro: any status/flag write PUTs
-    Pipeline first), so there's no separate not-yet-synced case to
-    bridge here the way live in-progress rows need to."""
+    """"Closed"/Passed/Withdrawn/None for ANY terminal outcome a Buy deal
+    can reach: RAW Intro Status Closed FIRST (a positive/won outcome --
+    checked ahead of everything else so a Closed-status deal is never
+    mistaken for a stage-based Lost/Obsolete exit even in the edge case
+    where Pipeline's stage field still shows one), else stage-derived
+    (_closed_out_outcome_name -- Lost/Trade Broken -> "Passed", Obsolete
+    -> "Withdrawn"), else the deal's own RAW Intro Status field when it
+    directly holds Passed or Withdrawn -- the bug this last fallback
+    exists to fix: a deal can sit at a still-live stage (e.g. Matched)
+    with Intro Status explicitly set to Passed or Withdrawn (an admin/
+    tenant flagging it dead without Pipeline's stage ever moving), and
+    that exit is just as real as a stage-level one. RAW field only,
+    matching _closed_out_disclosed's own raw-only convention for these
+    rows -- Dynamo's status_override is what already produced this raw
+    value in the first place (see _handle_update_intro: any status/flag
+    write PUTs Pipeline first), so there's no separate not-yet-synced
+    case to bridge here the way live in-progress rows need to."""
+    status_id = _deal_intro_status_id(deal)
+    if status_id == INTRO_STATUS_CLOSED_ID:
+        return "Closed"
     stage_outcome = _closed_out_outcome_name(_deal_stage_id(deal))
     if stage_outcome is not None:
         return stage_outcome
-    status_id = _deal_intro_status_id(deal)
     if status_id == INTRO_STATUS_PASSED_ID:
         return "Passed"
     if status_id == INTRO_STATUS_WITHDRAWN_ID:
@@ -2061,9 +2082,15 @@ def _is_closed_out_buy_deal(deal):
     """A Buy-tagged deal whose RAW Pipeline stage (never override-aware --
     stage overrides are a Sell-side-only concept) is Lost, Trade Broken,
     or Obsolete. These three stages are disjoint from
-    MATCHED_OR_LATER_STAGE_IDS by construction, so no separate "not
-    already matched-or-later" check is needed -- a deal can never satisfy
-    both predicates at once."""
+    MATCHED_OR_LATER_STAGE_IDS by construction, so ordinarily a deal can
+    never satisfy both predicates at once -- EXCEPT a Closed-status deal
+    whose stage happens to ALSO be one of the three dead ones (a genuine
+    Pipeline data inconsistency, not something this file can rule out),
+    which is why Closed status is excluded here explicitly: it always
+    routes through _is_matched_or_later_buy_deal's own Closed-status
+    check instead, a positive/won outcome, never a stage-based loss."""
+    if _deal_intro_status_id(deal) == INTRO_STATUS_CLOSED_ID:
+        return False
     if _closed_out_outcome_name(_deal_stage_id(deal)) is None:
         return False
     return DEAL_SIDE_BUY_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
@@ -4008,15 +4035,24 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
 
 
 def _closed_out_status_chip_html(deal, loss_reason=None):
-    """The gray Passed/Withdrawn chip for ANY closed-out row -- stage-
-    derived (turn 27) OR a status-based exit on an otherwise still-live
-    stage (see _deal_exit_outcome_name) — reuses _status_chip_html's
-    existing "exit" styling (status_id=None never matches
-    INTRO_STATUS_STALLED_ID, so this always renders the plain gray chip,
-    never the amber Stalled one) plus, when a loss reason is on record,
-    a small muted "— <reason>" suffix."""
+    """The status chip for ANY closed-out row: gray for Passed/Withdrawn
+    (stage-derived, turn 27, OR a status-based exit on an otherwise
+    still-live stage -- see _deal_exit_outcome_name) — reuses
+    _status_chip_html's existing "exit" styling (status_id=None never
+    matches INTRO_STATUS_STALLED_ID, so this always renders the plain
+    gray chip, never the amber Stalled one) — versus GREEN for a
+    genuinely Closed/won deal (bug fix: same ".status-chip.closed"
+    class/copy the normal Introduced-table row already used for a
+    tenant viewing a Closed-locked row -- see _status_milestones_
+    column_html -- so a won outcome always reads as a win, never lumped
+    in with the gray Passed/Withdrawn styling). Either way, a loss
+    reason on record (never applicable to a Closed outcome in practice)
+    appends a small muted "— <reason>" suffix."""
     outcome = _deal_exit_outcome_name(deal)
-    chip = _status_chip_html(None, outcome)
+    if outcome == "Closed":
+        chip = '<span class="status-chip closed">Closed</span>'
+    else:
+        chip = _status_chip_html(None, outcome)
     if loss_reason is None:
         loss_reason = _deal_loss_reason_text(deal)
     if loss_reason:
@@ -4860,27 +4896,31 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                                        for d in closed_out_deals}
 
         # Bug fix: a matched-or-later BUY deal whose Intro Status field
-        # itself is explicitly Passed/Withdrawn (an exit expressed via
-        # status rather than a Pipeline stage move -- e.g. an admin/
-        # tenant flags it dead without the deal ever leaving Matched) was
-        # being `continue`'d out of the loop below entirely -- kept out
-        # of Introduced (correctly, it's dead) but never routed anywhere
-        # else either, since get_my_closed_out_buy_deals only catches
-        # STAGE-level exits. It renders nowhere. Fixed by merging it into
-        # the SAME closed_out_deals/closed_out_disclosed_by_id this stage-
-        # based path already feeds — _closed_out_status_chip_html now
-        # derives its outcome text from _deal_exit_outcome_name, which
-        # falls back to the raw Intro Status field exactly for this case.
-        # Its disclosed flag is resolved["disclosed"] (the milestone-or-
-        # raw-Introduced-or-later carve-out _resolve_intro_status already
-        # implements for exit statuses), not _closed_out_disclosed's
-        # simpler rule — this deal WAS already correctly gated by that
-        # logic before it fell off the page; only where it renders changes.
+        # itself is explicitly Passed/Withdrawn/Closed (an exit or a win
+        # expressed via status rather than a Pipeline stage move -- e.g.
+        # an admin/tenant flags it dead, or closes it, without the deal
+        # ever leaving Matched) was being `continue`'d out of the loop
+        # below entirely -- kept out of Introduced (correctly, it's
+        # terminal) but never routed anywhere else either, since
+        # get_my_closed_out_buy_deals only catches STAGE-level exits and
+        # a Closed deal isn't a "closed-out" stage at all. It rendered
+        # nowhere. Fixed by merging it into the SAME closed_out_deals/
+        # closed_out_disclosed_by_id the stage-based path already feeds
+        # -- _closed_out_status_chip_html derives its outcome text (and,
+        # for Closed specifically, its positive green styling instead of
+        # the gray Passed/Withdrawn one) from _deal_exit_outcome_name,
+        # which now checks the raw Intro Status field for exactly these
+        # cases. Each row's disclosed flag is resolved["disclosed"] (the
+        # milestone-or-raw-Introduced-or-later carve-out
+        # _resolve_intro_status already implements for exit statuses,
+        # and simply "not Matched" -> always True for Closed) — this
+        # deal WAS already correctly gated by that logic before it fell
+        # off the page; only where it renders changes.
         resolved_by_deal_id = {}
         kept_deals = []
         for d in deals:
             resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
-            if resolved["name"] in ("Passed", "Withdrawn"):
+            if resolved["name"] in ("Passed", "Withdrawn", "Closed"):
                 deal_id = str(d.get("id"))
                 closed_out_deals.append(d)
                 closed_out_disclosed_by_id[deal_id] = edit_mode or resolved["disclosed"]
@@ -6134,21 +6174,22 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                      if dynamo_failed else "")
 
         # Bug fix: a matched-or-later BUY deal whose Intro Status field is
-        # explicitly Passed/Withdrawn (an exit expressed via status,
-        # never having left e.g. Matched stage) was landing in main_deals
-        # or pending_deals here based on resolved["disclosed"] alone —
-        # rendered with live milestone checkboxes/flag select instead of
-        # the muted terminal chip a dead intro should show, and not
-        # grouped with the stage-based exits (Lost/Trade Broken/Obsolete)
-        # in "Closed out" below. Routed there instead — status_exit_deals
-        # is merged into closed_out_deals/closed_out_disclosed_by_id once
-        # that section is built further down (same disjoint-by-
-        # construction merge as render_intros_page's own fix, and the
-        # same _deal_exit_outcome_name fallback renders its chip text).
+        # explicitly Passed/Withdrawn/Closed (an exit or a win expressed
+        # via status, never having left e.g. Matched stage) was landing
+        # in main_deals or pending_deals here based on resolved["disclosed"]
+        # alone — rendered with live milestone checkboxes/flag select
+        # instead of the muted terminal chip a terminal intro should
+        # show, and not grouped with the stage-based exits (Lost/Trade
+        # Broken/Obsolete) in "Closed out" below. Routed there instead —
+        # status_exit_deals is merged into closed_out_deals/closed_out_
+        # disclosed_by_id once that section is built further down (same
+        # disjoint-by-construction merge as render_intros_page's own fix,
+        # and the same _deal_exit_outcome_name fallback renders its chip
+        # text — positively/green for Closed, gray for Passed/Withdrawn).
         main_deals, pending_deals, status_exit_deals = [], [], []
         for d in matched_deals:
             resolved = resolved_by_deal_id[str(d.get("id"))]
-            if resolved["name"] in ("Passed", "Withdrawn"):
+            if resolved["name"] in ("Passed", "Withdrawn", "Closed"):
                 status_exit_deals.append(d)
                 continue
             (main_deals if resolved["disclosed"] else pending_deals).append(d)
