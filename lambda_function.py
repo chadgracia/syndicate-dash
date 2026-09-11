@@ -435,24 +435,62 @@ ACCEPTS_LABELS = {
 # option/field id supplied this way in this file).
 COMPANY_PITCHBOOK_FIELD = "custom_label_3320818"
 
+# Turn 25: three more stage ids, given directly as "verified from the live
+# deal_stages API" (same trust basis as every other bare id supplied this
+# way in this file — this sandbox has no live Pipeline access of its own to
+# re-confirm them). WON_STAGE_IDS (111802 Won Deal, 2379321 Won) already
+# existed above for My Deals' "Total closed" sum — reused here rather than
+# re-declared.
+STAGE_INVOICED = 2456153
+STAGE_ROFR = 2426790
+STAGE_BLOCKED = 2447751
+
 # "Matched or later" buy-side stages, shared verbatim by the Matched Buyers
-# section and the Active Intros tab: every known stage id (STAGE_LABELS,
-# above) except Inquiry and Hold, per instruction to include
-# matched/firm/transfer-notice/SPA-style stages and exclude
-# inquiry/hold/lost/dead. Confirm/LOI Signed sit later than Matched in this
-# org's own stage progression (see chadgracia/daily-brief's
-# TO_CLOSE_ALL_STAGES / TO_CLOSE_AGED_STAGE ordering), so they're included
-# too. Deliberately NOT excluding is_archived here (unlike the Sellers
-# column) — an archived deal can still carry a real Intro Status value
-# (including an explicit "Closed", id 7207587) and needs to stay visible
-# to show it. An archived deal with no Intro Status value set derives
-# "Matched" like any other empty one (see _default_intro_status) and
-# lands in Pending introductions, not "Closed" — is_archived is never
-# treated as a status signal.
+# section, the Active Intros tab, and the My Deals Intros counts (every
+# consumer goes through get_my_matched_buy_deals / _is_matched_or_later_
+# buy_deal, which key on this one set — see MATCHED_OR_LATER_STAGE_IDS's
+# only two callers).
+#
+# Turn 25 replaced the old inferred set (every LIVE_SELL_STAGE_IDS entry
+# except Inquiry/Hold — Matched, Firm, Confirm, LOI Signed, Transfer
+# Notice, SPA Signed) with this explicit one, given directly as "verified
+# from the live deal_stages API": Matched, LOI Signed, Transfer Notice, SPA
+# Signed, Confirm, Invoiced, ROFR'd, Blocked, Won Deal, Won. Two changes
+# from the old set: FIRM (111800) is now excluded outright (it was
+# previously included solely as "everything in LIVE_SELL_STAGE_IDS except
+# Inquiry/Hold" — an inference, never itself independently verified), and
+# five later-pipeline/closed-won stages are newly included: Invoiced,
+# ROFR'd, Blocked, Won Deal, Won — none of which existed in the old
+# inferred set at all, since it only ever drew from LIVE_SELL_STAGE_IDS
+# (itself a live-pre-close whitelist that was never going to contain a
+# closed-won id). Deliberately excluded (unchanged reasoning from the old
+# set): Inquiry (2109142), Hold (2094373), Trade Broken (2486672), Obsolete
+# (2348038), Lost (111801/2379322).
+#
+# Deal-stage shape: deals.json's own documented shape (module docstring,
+# above — "deal_stage": {...} — verified against chadgracia/daily-brief,
+# which reads this exact structure) carries deal_stage as a NESTED OBJECT,
+# not a bare name/id scalar; the numeric stage id lives at deal_stage.id.
+# _deal_stage_id (below) already keys on that id — stage.get("id") first,
+# falling back to a flat deal_stage_id scalar only as a defensive
+# secondary path that's never been the primary shape. This file has no
+# live S3 access in this sandbox to re-fetch a fresh deals.json snapshot
+# and eyeball a raw row, so this is reported from the already-documented,
+# already-verified shape every other stage predicate in this file (Live
+# Sell, Hold, Obsolete, Won/Lost) already relies on — not a fresh spot
+# check of live data.
+#
+# Deliberately NOT excluding is_archived here (unlike the Sellers column)
+# — an archived deal can still carry a real Intro Status value (including
+# an explicit "Closed", id 7207587) and needs to stay visible to show it.
+# An archived deal with no Intro Status value set derives "Matched" like
+# any other empty one (see _default_intro_status) and lands in Pending
+# introductions, not "Closed" — is_archived is never treated as a status
+# signal.
 MATCHED_OR_LATER_STAGE_IDS = {
-    STAGE_MATCHED, STAGE_FIRM, STAGE_CONFIRM,
-    STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
-}
+    STAGE_MATCHED, STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
+    STAGE_CONFIRM, STAGE_INVOICED, STAGE_ROFR, STAGE_BLOCKED,
+} | WON_STAGE_IDS
 
 # Intro Status: a brand-new deal dropdown (custom_label_4008329), created
 # the same day this was written, so no repo's code can possibly reference
