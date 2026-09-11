@@ -923,16 +923,17 @@ check("summary hint line present", "Update statuses as buyers progress" in page)
 check("feature box present", "feature" in page.lower())
 check("Feature requests heading present", "Feature requests" in page)
 
-opts_tenant = lf._intro_status_select_html("802", 7207579, allowed_ids=lf.TENANT_ALLOWED_STATUS_IDS)
-check("tenant status select omits Matched (7207578)", 'value="7207578"' not in opts_tenant)
-check("tenant status select keeps the CURRENT option even if it'd otherwise be excluded",
-      'value="7207579" selected' in opts_tenant)
-check("tenant status select omits Withdrawn (7207586)", 'value="7207586"' not in opts_tenant)
-check("tenant status select omits Closed (7207587)", 'value="7207587"' not in opts_tenant)
-check("tenant status select includes NDA Signed (7207580)", 'value="7207580"' in opts_tenant)
-check("tenant status select includes Stalled (7207584)", 'value="7207584"' in opts_tenant)
-opts_admin = lf._intro_status_select_html("802", 7207579, allowed_ids=None)
-check("admin status select has all ten options", opts_admin.count("<option") == 10)
+# _intro_status_select_html (the old 10-option dropdown) was retired by
+# the company-page parity refactor -- its one remaining caller
+# (_matched_buyer_row_edit_html) is gone, replaced by the same milestone
+# checkboxes + flags-only select Active Intros always used. Tenant-vs-
+# admin status control is now purely _flag_select_html's admin_controls
+# bool; TENANT_ALLOWED_STATUS_IDS itself is still live server-side (see
+# _handle_update_intro's status-field validation, kept for API
+# completeness) -- see the tenant-flag-options checks elsewhere in this
+# suite for its client-facing equivalent.
+check("TENANT_ALLOWED_STATUS_IDS is still defined and used server-side",
+      hasattr(lf, "TENANT_ALLOWED_STATUS_IDS") and 7207578 not in lf.TENANT_ALLOWED_STATUS_IDS)
 
 check("notes placeholder is the fixed 'Add a note…' text", "Add a note…" in page)
 check("a Passed (dead/exit) row has no editable data-deal-id markup", 'data-deal-id="806"' not in page)
@@ -2227,6 +2228,128 @@ check("_deal_per_share_text: shares only (net absent)",
 check("_deal_per_share_text: net only (shares absent), two decimals",
       lf._deal_per_share_text({"custom_fields": {lf.NET_FIELD: 15.5}}) == "@ $15.50 net")
 check("_deal_per_share_text: both missing -> None", lf._deal_per_share_text({}) is None)
+
+
+# ======================================================================
+# SECTION: Company-page parity refactor -- shared row-builder
+# ======================================================================
+# The company page's Buyers table now renders through the SAME shared
+# row-builders Active Intros uses (_buy_deal_row_html/_edit_html/
+# _pending_buy_deal_row_html/_closed_out_row_html, surface="company"):
+# milestone checkboxes + flags-only select (not the old 10-option
+# dropdown), a single auto-saving Notes textarea (Next Steps/Follow-up
+# retired), a tier badge under Investor Type, up to two buyer names +
+# "+N more", centered Size, a colgroup (no horizontal bleed), and the
+# same Closed-out collapsed section -- one 6-column shape regardless of
+# edit_mode. Deal Details' Size is now a min-max RANGE and Fees now
+# lists seller fee first.
+
+people_parity = {"people": [
+    {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
+    {"id": 30, "first_name": "Nina", "last_name": "Novak", "email": "nina@example.com", "custom_fields": {}},
+    {"id": 31, "first_name": "Omar", "last_name": "Ortiz", "email": "omar@example.com",
+     "custom_fields": {lf.INVESTOR_LEVEL_FIELD: [lf.QP_ID]}},
+    {"id": 32, "first_name": "Priya", "last_name": "Patel", "email": "priya@example.com", "custom_fields": {}},
+    {"id": 33, "first_name": "Quinn", "last_name": "Quill", "email": "quinn@example.com", "custom_fields": {}},
+]}
+deal_parity_disclosed = {"id": 951, "name": "Parity Deal", "company": {"name": "Parity Co"},
+                          "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),
+                          "people": [{"id": TENANT_A_PID}, {"id": 31}, {"id": 32}, {"id": 33}],
+                          "updated_at": "2026-08-01T00:00:00Z"}
+deal_parity_pending = {"id": 952, "name": "Parity Pending Deal", "company": {"name": "Parity Co"},
+                        "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None),
+                        "people": [{"id": TENANT_A_PID}, {"id": 30}], "updated_at": "2026-08-02T00:00:00Z"}
+deal_parity_closed_out = {"id": 953, "name": "Parity Closed Out Deal", "company": {"name": "Parity Co"},
+                          "deal_stage": {"id": 111801}, "custom_fields": cf_status(7207579),
+                          "people": [{"id": TENANT_A_PID}, {"id": 30}], "updated_at": "2026-08-03T00:00:00Z"}
+deal_parity_sell_range = {"id": 954, "name": "Parity Sell Deal", "company": {"name": "Parity Co"},
+                          "deal_stage": {"id": lf.STAGE_FIRM},
+                          "custom_fields": cf_sell({lf.TICKET_MIN_FIELD: 500_000, lf.TICKET_MAX_FIELD: 25_000_000,
+                                                     lf.SELLER_FEE_FIELD: 7, lf.MGMT_FEE_FIELD: 2, lf.CARRY_FIELD: 20}),
+                          "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-04T00:00:00Z"}
+deal_parity_sell_single = {"id": 955, "name": "Parity Sell Single", "company": {"name": "Parity Single Co"},
+                           "deal_stage": {"id": lf.STAGE_FIRM},
+                           "custom_fields": cf_sell({lf.TICKET_MIN_FIELD: 1_000_000, lf.TICKET_MAX_FIELD: 1_000_000}),
+                           "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-05T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_parity, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [deal_parity_disclosed, deal_parity_pending, deal_parity_closed_out,
+                                       deal_parity_sell_range, deal_parity_sell_single]}},
+            table_items=[{"tenant": TENANT_A_EMAIL, "sk": "intro#951", "notes": "Chasing docs",
+                          "milestones": {"NDA": 1, "VDR": 1}}])
+tenant_parity = lf._resolve_tenant(TENANT_A_EMAIL)
+assert tenant_parity is not None
+
+page_parity = lf.render_company_page("Parity Co", "Sella Seller", tenant_parity, TENANT_A_EMAIL, "mydeals",
+                                      key=None, view_as=None, edit_mode=False)
+
+check("Parity: milestone checkboxes present on the Buyers table", 'class="ei-milestone"' in page_parity)
+check("Parity: NDA/VDR checked from Dynamo milestones",
+      re.search(r'value="NDA"[^>]*checked', page_parity) and re.search(r'value="VDR"[^>]*checked', page_parity))
+check("Parity: flags-only select present (not the old 10-option status dropdown)",
+      'class="ei-flag"' in page_parity and 'class="ei-status"' not in page_parity)
+check("Parity: single Notes column is a 2-line auto-saving textarea",
+      '<textarea class="ei-notes"' in page_parity and "Chasing docs" in page_parity)
+check("Parity: no Next Steps / Follow-up columns anywhere", ">Next Steps<" not in page_parity
+      and ">Follow-up<" not in page_parity and 'class="ei-next-steps"' not in page_parity
+      and 'class="ei-follow-up"' not in page_parity)
+check("Parity: 'Buyer Notes' header retired in favor of plain 'Notes'",
+      ">Buyer Notes<" not in page_parity and ">Notes<" in page_parity)
+check("Parity: tier badge shown under Investor Type (Omar is QP)", 'class="tier-badge tier-qp"' in page_parity)
+check("Parity: up to two buyer names shown (Omar + Priya, deals.json order) plus '+1 more' (Quinn)",
+      "Omar Ortiz" in page_parity and "Priya Patel" in page_parity and "+1 more" in page_parity
+      and "Quinn Quill" not in page_parity)
+check("Parity: colgroup present (6 columns, matches Active Intros)",
+      page_parity[page_parity.find("<colgroup>"):page_parity.find("</colgroup>")].count("<col ") == 6)
+check("Parity: table-layout:fixed (no horizontal bleed)", "table-layout: fixed;" in page_parity)
+check("Parity: Size column centered via .num", "text-align: center;" in page_parity)
+check("Parity: Closed-out collapsed section present", '<summary>Closed out <span class="count">(1)</span></summary>'
+      in page_parity)
+parity_head = page_parity[page_parity.find("<thead>"):page_parity.find("</thead>")]
+check("Parity: head_row is unconditionally 6 columns (Buyer name/Company/Investor Type/Size/Status/Notes)",
+      [parity_head.find(f">{h}<") for h in ["Buyer name", "Company", "Investor Type", "Size", "Status", "Notes"]]
+      == sorted(parity_head.find(f">{h}<")
+                for h in ["Buyer name", "Company", "Investor Type", "Size", "Status", "Notes"]))
+
+page_parity_pending_section = page_parity[page_parity.find("Pending introductions"):]
+check("Parity: pending row shows the anonymized buyer code, not Nina's real name",
+      "Nina Novak" not in page_parity_pending_section.split("</table>")[0]
+      if "Pending introductions" in page_parity else True)
+
+page_parity_admin = lf.render_company_page("Parity Co", "Admin", tenant_parity, "admin", "demand",
+                                            key=ADMIN_KEY, view_as=TENANT_A_EMAIL, edit_mode=True)
+check("Parity (admin edit): milestone checkboxes + flag select, still no old status dropdown",
+      'class="ei-milestone"' in page_parity_admin and 'class="ei-flag"' in page_parity_admin
+      and 'class="ei-status"' not in page_parity_admin)
+check("Parity (admin edit): Notes textarea auto-saves (ei-notes class), not a single-line input",
+      '<textarea class="ei-notes"' in page_parity_admin)
+check("Parity (admin edit): pending buyer (Nina) IS named -- edit mode never anonymizes",
+      "Nina Novak" in page_parity_admin)
+
+# Deal Details: Size as a min-max RANGE, and Fees reordered (seller first).
+page_parity_range = lf.render_company_page("Parity Co", "Sella Seller", tenant_parity, TENANT_A_EMAIL, "mydeals",
+                                            key=None, view_as=None, edit_mode=False)
+check("Deal Details: Size shows a min-max range ('$500K – $25M')", "$500K – $25M" in page_parity_range)
+check("Deal Details: Fees line lists seller fee FIRST, then mgmt, then carry",
+      "7% seller fee · 2% mgmt · 20% carry" in page_parity_range)
+
+page_parity_single = lf.render_company_page("Parity Single Co", "Sella Seller", tenant_parity, TENANT_A_EMAIL,
+                                             "mydeals", key=None, view_as=None, edit_mode=False)
+check("Deal Details: min==max collapses to a single figure, not '$1M – $1M'", "$1M – $1M" not in page_parity_single
+      and "$1M" in page_parity_single)
+
+check("_deal_size_range_text: min-only -> single figure",
+      lf._deal_size_range_text({"custom_fields": {lf.TICKET_MIN_FIELD: 2_000_000}}) == "$2M")
+check("_deal_size_range_text: max-only -> single figure",
+      lf._deal_size_range_text({"custom_fields": {lf.TICKET_MAX_FIELD: 3_000_000}}) == "$3M")
+check("_deal_size_range_text: neither field, falls back to 'value'",
+      lf._deal_size_range_text({"custom_fields": {}, "value": 4_000_000}) == "$4M")
+check("_deal_size_range_text: nothing at all -> '—'", lf._deal_size_range_text({}) == "—")
+
+check("_fmt_fees: seller/mgmt/carry order",
+      lf._fmt_fees({"custom_fields": {lf.SELLER_FEE_FIELD: 4, lf.MGMT_FEE_FIELD: 2, lf.CARRY_FIELD: 20}})
+      == "4% seller fee · 2% mgmt · 20% carry")
+check("_fmt_fees: omits missing parts, keeps relative order",
+      lf._fmt_fees({"custom_fields": {lf.CARRY_FIELD: 20}}) == "20% carry")
 
 
 # ======================================================================
