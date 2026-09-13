@@ -2230,6 +2230,192 @@ check("_deal_per_share_text: both missing -> None", lf._deal_per_share_text({}) 
 
 
 # ======================================================================
+# SECTION: My Deals nav dropdown — grouping, intro-count badges,
+# via-colleague chips, the 40-entry cap, and _nav_html's caret wrapper
+# ======================================================================
+
+def _entry_block(html, company):
+    """The full <a class="gg-menu-item">...</a> block for one company, so
+    a check can look inside just that entry (badge/via chip) instead of
+    accidentally matching a later entry's markup."""
+    marker = f">{company}<"
+    pos = html.find(marker)
+    assert pos != -1, f"{company!r} not found in menu html"
+    tag_start = html.rfind('<a class="gg-menu-item"', 0, pos)
+    tag_end = html.find("</a>", pos)
+    return html[tag_start:tag_end]
+
+
+NAV_PID = 601
+NAV_EMAIL = "navseller@example.com"
+people_nav = {"people": [
+    {"id": NAV_PID, "full_name": "Nav Seller", "email": NAV_EMAIL, "company_id": 800, "custom_fields": {}},
+    {"id": 602, "first_name": "Cody", "last_name": "Colleague", "email": "cody@example.com",
+     "company_id": 800, "custom_fields": {}},
+    {"id": 603, "name": "Barry Buyer", "email": "barry@example.com", "custom_fields": {}},
+]}
+nav_deal_live = {"id": 1001, "name": "Nav Live Deal", "company": {"name": "Nav Live Co"},
+                  "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                  "people": [{"id": NAV_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+nav_deal_hold = {"id": 1002, "name": "Nav Hold Deal", "company": {"name": "Nav Hold Co"},
+                  "deal_stage": {"id": lf.STAGE_HOLD}, "custom_fields": cf_sell(),
+                  "people": [{"id": NAV_PID}], "updated_at": "2026-08-02T00:00:00Z"}
+# Raw stage stays live (STAGE_MATCHED); the Cancelled resolution comes
+# from a Dynamo stage_override, same convention the existing Hold/Cancel
+# section above uses.
+nav_deal_cancelled = {"id": 1003, "name": "Nav Cancel Deal", "company": {"name": "Nav Cancel Co"},
+                       "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_sell(),
+                       "people": [{"id": NAV_PID}], "updated_at": "2026-08-03T00:00:00Z"}
+nav_deal_closed_own = {"id": 1004, "name": "Nav Own Closed", "company": {"name": "Zeta Closed Co"},
+                        "deal_stage": {"id": 111802}, "custom_fields": cf_sell(),
+                        "people": [{"id": NAV_PID}], "updated_at": "2026-08-04T00:00:00Z"}
+# Colleague's own won Sell deal (shares company_id 800, not linked to
+# NAV_PID) -- the firm-wide "via Cody" row. Company name (Alpha...) is
+# chosen to sort BEFORE the tenant's own Zeta Closed Co despite being
+# appended to the group second, to actually exercise the A-Z sort.
+nav_deal_closed_colleague = {"id": 1005, "name": "Nav Colleague Closed", "company": {"name": "Alpha Closed Co"},
+                              "deal_stage": {"id": 111802}, "custom_fields": cf_sell(),
+                              "people": [{"id": 602}], "updated_at": "2026-08-05T00:00:00Z"}
+# One disclosed (Introduced) matched buy deal for Nav Live Co -> intro
+# count 1 there; one Matched-only (undisclosed) buy deal for Nav Hold Co
+# -> intro count 0 there, and no badge.
+nav_buy_introduced = {"id": 1006, "name": "Nav Buy Introduced", "company": {"name": "Nav Live Co"},
+                       "deal_stage": {"id": lf.STAGE_MATCHED},
+                       "custom_fields": cf_status(lf.INTRO_STATUS_INTRODUCED_ID),
+                       "people": [{"id": NAV_PID}, {"id": 603}], "updated_at": "2026-08-06T00:00:00Z"}
+nav_buy_matched_only = {"id": 1007, "name": "Nav Buy Matched Only", "company": {"name": "Nav Hold Co"},
+                         "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207578),
+                         "people": [{"id": NAV_PID}, {"id": 603}], "updated_at": "2026-08-07T00:00:00Z"}
+nav_deals_list = [nav_deal_live, nav_deal_hold, nav_deal_cancelled, nav_deal_closed_own,
+                  nav_deal_closed_colleague, nav_buy_introduced, nav_buy_matched_only]
+use_fixture({lf.PEOPLE_KEY: people_nav, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": nav_deals_list}},
+            table_items=[
+                {"tenant": NAV_EMAIL, "sk": "intro#1003", "stage_override": lf.OBSOLETE_STAGE_ID,
+                 "stage_override_at": time.time()},
+            ])
+nav_tenant = lf._resolve_tenant(NAV_EMAIL)
+assert nav_tenant is not None
+
+nav_groups = lf._my_deals_nav_groups(NAV_PID, NAV_EMAIL)
+nav_group_labels = [g[0] for g in nav_groups]
+check("nav groups: fixed order Live/On Hold/Closed/Cancelled, none empty here",
+      nav_group_labels == ["Live", "On Hold", "Closed", "Cancelled"])
+
+nav_live_rows = {r["company"]: r for r in nav_groups[0][1]}
+check("nav groups: Live has Nav Live Co with intro_count 1 (one disclosed matched buy deal)",
+      nav_live_rows.get("Nav Live Co", {}).get("intro_count") == 1)
+
+nav_hold_rows = {r["company"]: r for r in nav_groups[1][1]}
+check("nav groups: On Hold has Nav Hold Co with intro_count 0 (Matched-only buy deal stays undisclosed)",
+      nav_hold_rows.get("Nav Hold Co", {}).get("intro_count") == 0)
+
+nav_closed_companies = [r["company"] for r in nav_groups[2][1]]
+check("nav groups: Closed sorted A-Z despite insertion order (own added before colleague)",
+      nav_closed_companies == ["Alpha Closed Co", "Zeta Closed Co"])
+nav_closed_by_company = {r["company"]: r for r in nav_groups[2][1]}
+check("nav groups: colleague's Closed entry carries the 'Cody' via-tag",
+      nav_closed_by_company["Alpha Closed Co"]["colleague"] == "Cody")
+check("nav groups: the tenant's own Closed entry carries no via-tag",
+      nav_closed_by_company["Zeta Closed Co"]["colleague"] is None)
+
+nav_cancelled_companies = [r["company"] for r in nav_groups[3][1]]
+check("nav groups: Cancelled has Nav Cancel Co (stage_override to Obsolete)",
+      nav_cancelled_companies == ["Nav Cancel Co"])
+
+check("admin without view_as: nav groups empty (no tenant context)",
+      lf._my_deals_nav_groups(None, "admin") == [])
+
+nav_menu_html = lf._my_deals_dropdown_html(NAV_PID, NAV_EMAIL, key=None, view_as=None)
+check("dropdown HTML: group labels present, in order",
+      (nav_menu_html.find(">Live<") < nav_menu_html.find(">On Hold<")
+       < nav_menu_html.find(">Closed<") < nav_menu_html.find(">Cancelled<")))
+check("dropdown HTML: entry links to ?company=<name>&ref=mydeals",
+      f'?company={lf.urllib.parse.quote("Nav Live Co", safe="")}&ref=mydeals' in nav_menu_html)
+check("dropdown HTML: intro-count badge shown for Nav Live Co (count > 0)",
+      '<span class="gg-menu-badge">1</span>' in _entry_block(nav_menu_html, "Nav Live Co"))
+check("dropdown HTML: no badge on a zero-intro entry (Nav Hold Co)",
+      "gg-menu-badge" not in _entry_block(nav_menu_html, "Nav Hold Co"))
+check("dropdown HTML: via-colleague chip rendered on the firm-wide Closed entry",
+      "via Cody" in _entry_block(nav_menu_html, "Alpha Closed Co"))
+check("dropdown HTML: no via chip on the tenant's own Closed entry",
+      "via" not in _entry_block(nav_menu_html, "Zeta Closed Co"))
+
+nav_menu_admin = lf._my_deals_dropdown_html(NAV_PID, NAV_EMAIL, key=ADMIN_KEY, view_as=NAV_EMAIL)
+check("dropdown HTML: admin key + view_as carried through on entry links",
+      f"key={ADMIN_KEY}" in nav_menu_admin and f"view_as={lf.urllib.parse.quote(NAV_EMAIL, safe='')}" in nav_menu_admin)
+
+check("dropdown omitted for admin without view_as (no tenant context)",
+      lf._my_deals_dropdown_html(None, "admin") == "")
+check("dropdown omitted for a tenant with zero Sell deals",
+      lf._my_deals_dropdown_html(999999, NAV_EMAIL) == "")
+
+# _nav_html: the caret/menu wrapper only appears when there's something
+# to show it; clicking the label itself always goes straight to the tab.
+nav_html_with = lf._nav_html("mydeals", "Nav Seller", key=None, view_as=None, mydeals_dropdown_html=nav_menu_html)
+check('_nav_html: dropdown wrapper present when mydeals_dropdown_html is non-empty',
+      'class="gg-tab-dropdown"' in nav_html_with and 'role="menu"' in nav_html_with)
+check('_nav_html: My Deals label link still points straight at the plain tab URL',
+      '<a class="gg-tab active" href="?tab=mydeals">My Deals</a>' in nav_html_with)
+check('_nav_html: caret is a focusable, keyboard-accessible control',
+      '<button type="button" class="gg-tab-caret"' in nav_html_with and 'aria-haspopup="true"' in nav_html_with)
+check('_nav_html: Esc-close wired into the inline toggle script',
+      "Escape" in nav_html_with and "closeMenu" in nav_html_with)
+
+nav_html_without = lf._nav_html("mydeals", "Admin", key=ADMIN_KEY, view_as=None, mydeals_dropdown_html="")
+check('_nav_html: no dropdown wrapper when mydeals_dropdown_html is empty (admin, no view_as)',
+      'gg-tab-dropdown' not in nav_html_without and 'gg-tab-caret' not in nav_html_without)
+check('_nav_html: label link still renders as a plain anchor',
+      f'<a class="gg-tab active" href="?tab=mydeals&key={ADMIN_KEY}">My Deals</a>' in nav_html_without)
+
+# End-to-end through lambda_handler (NAV_EMAIL's fixture is still the
+# active one here): the dropdown renders on a non-My-Deals page too
+# (every page, not just My Deals itself), and is correctly absent for
+# admin-without-view_as.
+nav_cookie = lf._make_identity_cookie(NAV_EMAIL).split(";")[0]
+resp_demand = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}},
+                                  "queryStringParameters": {"tab": "demand"},
+                                  "cookies": [nav_cookie]}, None)
+check("lambda_handler: My Deals dropdown renders on the Demand Board for a real tenant",
+      'class="gg-tab-dropdown"' in resp_demand["body"] and "Nav Live Co" in resp_demand["body"])
+
+resp_mydeals = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}},
+                                   "queryStringParameters": {"tab": "mydeals"},
+                                   "cookies": [nav_cookie]}, None)
+check("lambda_handler: My Deals dropdown also renders on the My Deals page itself",
+      'class="gg-tab-dropdown"' in resp_mydeals["body"])
+
+resp_admin_demand = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}},
+                                        "queryStringParameters": {"tab": "demand", "key": ADMIN_KEY},
+                                        "cookies": []}, None)
+check("lambda_handler: admin without view_as gets no dropdown on the Demand Board (no tenant context)",
+      'class="gg-tab-dropdown"' not in resp_admin_demand["body"])
+
+# 40-entry cap: 45 distinct Live companies for one tenant -> exactly 40
+# entries render, in A-Z order, plus a final "View all in My Deals" link.
+CAP_PID = 611
+CAP_EMAIL = "capseller@example.com"
+people_cap = {"people": [{"id": CAP_PID, "full_name": "Cap Seller", "email": CAP_EMAIL, "custom_fields": {}}]}
+cap_deals = [
+    {"id": 2000 + i, "name": f"Cap Deal {i}", "company": {"name": f"Cap Co {i:02d}"},
+     "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+     "people": [{"id": CAP_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+    for i in range(1, 46)
+]
+use_fixture({lf.PEOPLE_KEY: people_cap, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": cap_deals}})
+cap_tenant = lf._resolve_tenant(CAP_EMAIL)
+assert cap_tenant is not None
+
+cap_menu_html = lf._my_deals_dropdown_html(CAP_PID, CAP_EMAIL, key=None, view_as=None)
+check("dropdown cap: exactly 40 entries rendered when 45 exist",
+      cap_menu_html.count('class="gg-menu-item"') == 40)
+check("dropdown cap: 'View all in My Deals' link appended", "View all in My Deals" in cap_menu_html)
+check("dropdown cap: the 40th company (Cap Co 40) present, the 41st (Cap Co 41) is not",
+      "Cap Co 40" in cap_menu_html and "Cap Co 41" not in cap_menu_html)
+check("dropdown cap: 'View all' link targets the plain My Deals tab",
+      '?tab=mydeals' in cap_menu_html.split("View all in My Deals")[0][-80:])
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 

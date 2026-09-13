@@ -1699,6 +1699,129 @@ def get_firm_closed_sell_deals(person_id):
     return out
 
 
+def _my_deals_nav_groups(person_id, anon_key_email):
+    """Data for the My Deals nav dropdown (every page, item: nav dropdown
+    pass). Same section predicates and override-aware stage resolution
+    render_my_deals_page's own table uses (Hold -> "On Hold", won ->
+    "Closed", Obsolete/Lost -> "Cancelled", else "Live"), plus firm-wide
+    won Sell deals from a colleague sharing the tenant's company
+    (get_firm_closed_sell_deals) appended to "Closed" with a "via
+    <colleague>" tag — mirroring that page's own trophy-shelf treatment
+    (personal rows first, firm-wide appended after). Not deduped against
+    a same-company personal row: each is its own deal, exactly as the My
+    Deals table itself renders them as separate rows. Each entry also
+    carries that company's disclosed buy-side Intros count
+    (get_my_matched_buy_deals + the same _resolve_intro_status
+    "disclosed" gate render_my_deals_page's own _company_stats uses),
+    memoized per company since one tenant can have more than one Sell
+    deal for the same company. Returns [] when person_id is None (admin
+    without view_as — no tenant context; the caller omits the dropdown
+    entirely in that case). Groups are returned in a fixed order (Live,
+    On Hold, Closed, Cancelled) with empty groups dropped, each group's
+    rows sorted by company A-Z."""
+    if person_id is None:
+        return []
+    deals = [d for d in get_my_deals(person_id)
+             if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)]
+    intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
+
+    intro_count_cache = {}
+
+    def _intro_count(company_name):
+        cache_key = (company_name or "").strip().lower()
+        if cache_key in intro_count_cache:
+            return intro_count_cache[cache_key]
+        count = 0
+        if company_name:
+            for buy_deal in get_my_matched_buy_deals(person_id, company_name):
+                override_entry = intro_details.get(str(buy_deal.get("id"))) or {}
+                if _resolve_intro_status(buy_deal, override_entry)["disclosed"]:
+                    count += 1
+        intro_count_cache[cache_key] = count
+        return count
+
+    groups = {"Live": [], "On Hold": [], "Closed": [], "Cancelled": []}
+    for d in deals:
+        company_name = (_deal_company_name(d) or "").strip()
+        if not company_name:
+            continue
+        override_entry = intro_details.get(str(d.get("id"))) or {}
+        resolved_stage = _resolve_deal_stage(d, override_entry)
+        if resolved_stage == HOLD_STAGE_ID:
+            section = "On Hold"
+        elif _is_won_stage(resolved_stage):
+            section = "Closed"
+        elif resolved_stage == OBSOLETE_STAGE_ID or resolved_stage in LOST_STAGE_IDS:
+            section = "Cancelled"
+        else:
+            section = "Live"
+        groups[section].append({"company": company_name, "intro_count": _intro_count(company_name),
+                                 "colleague": None})
+
+    for d, colleague in get_firm_closed_sell_deals(person_id):
+        company_name = (_deal_company_name(d) or "").strip()
+        if not company_name:
+            continue
+        groups["Closed"].append({"company": company_name, "intro_count": _intro_count(company_name),
+                                  "colleague": _first_name(colleague)})
+
+    ordered = []
+    for label in ("Live", "On Hold", "Closed", "Cancelled"):
+        rows = groups[label]
+        if not rows:
+            continue
+        rows.sort(key=lambda e: e["company"].lower())
+        ordered.append((label, rows))
+    return ordered
+
+
+def _my_deals_dropdown_html(person_id, anon_key_email, key=None, view_as=None):
+    """Renders _my_deals_nav_groups into the nav dropdown's inner menu
+    HTML (group labels + entry links + intro-count badges + via-colleague
+    chips), capped at 40 entries total across all groups combined —
+    beyond that, the first 40 (in fixed group order, A-Z within each) plus
+    a final "View all in My Deals ->" link to the tab itself. Returns ""
+    when there is no tenant context (person_id is None) or the tenant has
+    no Sell deals at all — the caller (_nav_html) omits the dropdown
+    trigger entirely in that case, same as the "Admin without view_as"
+    rule."""
+    groups = _my_deals_nav_groups(person_id, anon_key_email)
+    if not groups:
+        return ""
+    max_entries = 40
+    parts = []
+    rendered = 0
+    truncated = False
+    for label, rows in groups:
+        if truncated:
+            break
+        remaining = max_entries - rendered
+        if remaining <= 0:
+            truncated = True
+            break
+        take = rows[:remaining]
+        if len(take) < len(rows):
+            truncated = True
+        parts.append(f'<div class="gg-menu-group-label">{_esc(label)}</div>')
+        for entry in take:
+            href = _company_href(entry["company"], "mydeals", key=key, view_as=view_as)
+            via_html = (f'<span class="gg-menu-item-via">via {_esc(entry["colleague"])}</span>'
+                        if entry.get("colleague") else "")
+            badge_html = (f'<span class="gg-menu-badge">{entry["intro_count"]}</span>'
+                          if entry["intro_count"] > 0 else "")
+            parts.append(
+                f'<a class="gg-menu-item" href="{href}" role="menuitem">'
+                f'<span class="gg-menu-item-name">{_esc(entry["company"])}{via_html}</span>'
+                f'{badge_html}</a>'
+            )
+        rendered += len(take)
+    if truncated:
+        view_all_href = f"?tab=mydeals{_tab_qs_suffix(key, view_as)}"
+        parts.append(f'<a class="gg-menu-viewall" href="{view_all_href}" role="menuitem">'
+                      f'View all in My Deals &rarr;</a>')
+    return "".join(parts)
+
+
 def _is_matched_or_later_buy_deal(deal):
     """The one shared predicate for "matched-or-later buy deal": used by
     both the company page's Matched Buyers section and the Active Intros
@@ -3930,6 +4053,77 @@ NAV_CSS = """
   .gg-cef-badge.cef-pending { background: rgba(201,162,39,0.15); color: var(--accredited); }
   .gg-cef-badge.cef-missing { background: rgba(178,59,59,0.12); color: #b23b3b; }
   .gg-cef-badge.cef-missing:hover { text-decoration: underline; }
+  .gg-tab-dropdown { position: relative; display: inline-flex; align-items: stretch; }
+  .gg-tab-caret {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 8px 8px 8px 0;
+    font-size: 11px;
+    line-height: 1;
+  }
+  .gg-tab-caret:hover { color: var(--ink); }
+  .gg-tab-menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 4px;
+    z-index: 50;
+    min-width: 220px;
+    max-width: min(320px, calc(100vw - 32px));
+    max-height: 70vh;
+    overflow-y: auto;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    padding: 6px 0;
+  }
+  .gg-tab-menu[hidden] { display: none; }
+  .gg-menu-group-label {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--muted);
+    padding: 8px 14px 2px;
+  }
+  .gg-menu-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 6px 14px;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 13px;
+  }
+  .gg-menu-item:hover, .gg-menu-item:focus { background: rgba(61,90,115,0.10); outline: none; }
+  .gg-menu-item-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gg-menu-item-via { font-size: 11px; color: var(--muted); margin-left: 6px; white-space: nowrap; }
+  .gg-menu-badge {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: var(--muted);
+    background: rgba(22,24,29,0.06);
+    border-radius: 999px;
+    padding: 1px 7px;
+  }
+  .gg-menu-viewall {
+    display: block;
+    padding: 8px 14px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--accent);
+    text-decoration: none;
+    border-top: 1px solid var(--line);
+    margin-top: 4px;
+  }
+  .gg-menu-viewall:hover { text-decoration: underline; }
+  @media (max-width: 480px) {
+    .gg-tab-menu { position: fixed; left: 12px; right: 12px; top: auto; width: auto; max-width: none; }
+  }
 """
 
 # Feature-request submit box + list, shared verbatim by render_my_deals_page
@@ -4040,7 +4234,8 @@ def _tab_qs_suffix(key=None, view_as=None):
     return suffix
 
 
-def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True, edit_flag=False, cef_html=""):
+def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True, edit_flag=False, cef_html="",
+              mydeals_dropdown_html=""):
     suffix = _tab_qs_suffix(key, view_as)
     mydeals_href = f"?tab=mydeals{suffix}"
     intros_href = f"?tab=intros{suffix}"
@@ -4068,11 +4263,53 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
             badge_text += f" · viewing as {view_as}"
         admin_badge_html = f'<div class="gg-admin-badge">{_esc(badge_text)}</div>'
 
+    # My Deals nav dropdown (every page): mydeals_dropdown_html is
+    # pre-rendered once per request by lambda_handler (via
+    # _my_deals_dropdown_html), same "compute once, thread the string
+    # through every render_* call" convention cef_html already uses —
+    # not recomputed per page. Empty string (admin without view_as, or a
+    # tenant with no Sell deals at all) means no menu to show, so the tab
+    # renders as a plain link exactly as before, with no caret and no
+    # script — clicking the label always goes straight to the My Deals
+    # tab either way; the caret only ever adds the dropdown on top.
+    if mydeals_dropdown_html:
+        mydeals_tab_html = f"""<div class="gg-tab-dropdown">
+        <a class="{mydeals_cls}" href="{mydeals_href}">My Deals</a>
+        <button type="button" class="gg-tab-caret" aria-haspopup="true" aria-expanded="false"
+                aria-controls="gg-mydeals-menu" aria-label="My Deals list">&#9662;</button>
+        <div class="gg-tab-menu" id="gg-mydeals-menu" role="menu" hidden>
+          {mydeals_dropdown_html}
+        </div>
+      </div>
+      <script>
+      (function() {{
+        var wrap = document.currentScript.previousElementSibling;
+        var btn = wrap.querySelector('.gg-tab-caret');
+        var menu = wrap.querySelector('.gg-tab-menu');
+        function openMenu() {{ menu.hidden = false; btn.setAttribute('aria-expanded', 'true'); }}
+        function closeMenu() {{ menu.hidden = true; btn.setAttribute('aria-expanded', 'false'); }}
+        btn.addEventListener('click', function(e) {{
+          e.stopPropagation();
+          if (menu.hidden) openMenu(); else closeMenu();
+        }});
+        wrap.addEventListener('mouseenter', openMenu);
+        wrap.addEventListener('mouseleave', closeMenu);
+        wrap.addEventListener('keydown', function(e) {{
+          if (e.key === 'Escape') {{ closeMenu(); btn.focus(); }}
+        }});
+        document.addEventListener('click', function(e) {{
+          if (!wrap.contains(e.target)) closeMenu();
+        }});
+      }})();
+      </script>"""
+    else:
+        mydeals_tab_html = f'<a class="{mydeals_cls}" href="{mydeals_href}">My Deals</a>'
+
     return f"""<header class="gg-nav">
   <div class="gg-nav-inner">
     <div class="gg-brand">Gracia Group</div>
     <nav class="gg-tabs">
-      <a class="{mydeals_cls}" href="{mydeals_href}">My Deals</a>
+      {mydeals_tab_html}
       <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
     </nav>
@@ -4372,7 +4609,7 @@ def _intro_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, fi
 
 
 def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None, edit_mode=False,
-                        cef_html=""):
+                        cef_html="", mydeals_dropdown_html=""):
     """tenant is None only for admin-without-view_as — the same
     tenant-picker signal render_my_deals_page uses. tenant_email is always
     a real email otherwise (the logged-in tenant's own, or the previewed
@@ -4383,8 +4620,11 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     Deals.
 
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
-    — never for a real tenant."""
-    nav = _nav_html("intros", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
+    — never for a real tenant. mydeals_dropdown_html is pre-rendered once
+    per request by lambda_handler and passed straight through to the nav
+    (see _nav_html)."""
+    nav = _nav_html("intros", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                     mydeals_dropdown_html=mydeals_dropdown_html)
     tenant_picker = tenant is None
 
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, tenant_email or "admin", key=key,
@@ -4967,12 +5207,17 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
 
 
 def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None, cef_html="",
-                          edit_mode=False, person_id=None, anon_key_email=None):
+                          edit_mode=False, person_id=None, anon_key_email=None, mydeals_dropdown_html=""):
     """deals is always Sell-order-tagged only (see lambda_handler's mydeals
     branch). person_id/anon_key_email are needed here (not just deals)
     because the Buyers/Intros/Needs-attention columns are company-level
-    buy-side signals, not attributes of the Sell deal itself."""
-    nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html)
+    buy-side signals, not attributes of the Sell deal itself.
+    mydeals_dropdown_html is pre-rendered once per request by
+    lambda_handler and passed straight through to the nav (see
+    _nav_html) — this page's own table is the dropdown's "View all"
+    target, not a second source of the same data."""
+    nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                     mydeals_dropdown_html=mydeals_dropdown_html)
 
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="my-deals")
@@ -5579,7 +5824,7 @@ def _buyer_tile_html(buyer, anon_key_email, now):
 
 
 def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=None, view_as=None, edit_mode=False,
-                         cef_html=""):
+                         cef_html="", mydeals_dropdown_html=""):
     """No tab is highlighted (active_tab=None never matches mydeals/intros/
     demand in _nav_html). Section (a) is included only when tenant is not
     None — the same "admin with no view_as" signal render_my_deals_page's
@@ -5590,9 +5835,14 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
     — never for a real tenant — and switches the Buyers table to editable
-    rows with no pending/disclosed split (see _matched_buyer_row_edit_html)."""
+    rows with no pending/disclosed split (see _matched_buyer_row_edit_html).
+    mydeals_dropdown_html is pre-rendered once per request by
+    lambda_handler and passed straight through to the nav (see
+    _nav_html) — show_viewer=False's "no identities anywhere" rule is
+    about the viewer's own name, not the dropdown, so it still renders
+    here like every other page."""
     nav = _nav_html(None, viewer_name, key=key, view_as=view_as, show_viewer=False, edit_flag=edit_mode,
-                     cef_html=cef_html)
+                     cef_html=cef_html, mydeals_dropdown_html=mydeals_dropdown_html)
     suffix = _tab_qs_suffix(key, view_as)
     back_href = f"?tab={ref}{suffix}"
     back_label = REF_LABELS.get(ref, "My Deals")
@@ -6563,7 +6813,7 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
 
 
 def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=None, view_as=None, edit_mode=False,
-                       cef_html=""):
+                       cef_html="", mydeals_dropdown_html=""):
     """Item 3 (turn 18): ?buyer=<person_id> — replaces the old inline
     <details> expansion on Active Intros with a real page. DISCLOSURE
     GATE: the full profile (turn 24 layout — one header card, then a
@@ -6587,9 +6837,11 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     tenant stays None only for admin-without-view_as (the same
     tenant-picker signal every other page uses) — there's no tenant
     context to gate disclosure against, so that case gets the same
-    picker placeholder as Active Intros/My Deals."""
+    picker placeholder as Active Intros/My Deals. mydeals_dropdown_html
+    is pre-rendered once per request by lambda_handler and passed
+    straight through to the nav (see _nav_html)."""
     nav = _nav_html(None, viewer_name, key=key, view_as=view_as, show_viewer=False, edit_flag=edit_mode,
-                     cef_html=cef_html)
+                     cef_html=cef_html, mydeals_dropdown_html=mydeals_dropdown_html)
 
     try:
         buyer_id = int(buyer_id_raw)
@@ -6954,7 +7206,7 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
 
 
 def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
-                 tenant_picker=False, edit_mode=False):
+                 tenant_picker=False, edit_mode=False, mydeals_dropdown_html=""):
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="demand")
     raised_headline_html = _raised_headline_html(edit_mode=edit_mode)
@@ -6968,7 +7220,8 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
         f'<td class="num">{r["sellers"]}</td></tr>'
         for r in table
     )
-    nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, cef_html=cef_html)
+    nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, cef_html=cef_html,
+                     mydeals_dropdown_html=mydeals_dropdown_html)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -7597,6 +7850,16 @@ def lambda_handler(event, context):
     if tenant is not None:
         cef_html = _cef_badge_html(_tenant_cef_state(tenant.get("person_id")), tenant["name"])
 
+    # My Deals nav dropdown: same "computed once here since the nav is
+    # shared across every page below" reasoning as cef_html just above.
+    # person_id is None exactly when tenant is None (admin without
+    # view_as) — _my_deals_dropdown_html returns "" in that case, which
+    # is also what a tenant with zero Sell deals gets, and either way
+    # _nav_html falls back to a plain (non-dropdown) My Deals link.
+    mydeals_dropdown_html = _my_deals_dropdown_html(
+        tenant.get("person_id") if tenant is not None else None,
+        anon_key_email, key=nav_key, view_as=nav_view_as)
+
     # Company detail page: same auth resolution as the tabs above, just a
     # different route param.
     company = query.get("company")
@@ -7606,7 +7869,7 @@ def lambda_handler(event, context):
             ref = "mydeals"
         body = render_company_page(company, viewer_name, tenant, anon_key_email, ref,
                                     key=nav_key, view_as=nav_view_as, edit_mode=edit_mode,
-                                    cef_html=cef_html)
+                                    cef_html=cef_html, mydeals_dropdown_html=mydeals_dropdown_html)
         return _html_response(body)
 
     # Buyer detail page (item 3, turn 18): same auth resolution as every
@@ -7614,7 +7877,8 @@ def lambda_handler(event, context):
     buyer_param = query.get("buyer")
     if buyer_param:
         body = render_buyer_page(buyer_param, viewer_name, tenant, anon_key_email,
-                                  key=nav_key, view_as=nav_view_as, edit_mode=edit_mode, cef_html=cef_html)
+                                  key=nav_key, view_as=nav_view_as, edit_mode=edit_mode, cef_html=cef_html,
+                                  mydeals_dropdown_html=mydeals_dropdown_html)
         return _html_response(body)
 
     # Buyer photo (item 1): not an HTML page -- a 302 to Pipeline's signed
@@ -7628,11 +7892,13 @@ def lambda_handler(event, context):
     if tab == "demand":
         table = get_company_table()
         body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as, cef_html=cef_html,
-                            anon_key_email=anon_key_email, tenant_picker=(tenant is None), edit_mode=edit_mode)
+                            anon_key_email=anon_key_email, tenant_picker=(tenant is None), edit_mode=edit_mode,
+                            mydeals_dropdown_html=mydeals_dropdown_html)
     elif tab == "mydeals":
         if tenant is None:
             body = render_my_deals_page(viewer_name, tenant_picker=True,
-                                         key=nav_key, view_as=nav_view_as, cef_html=cef_html)
+                                         key=nav_key, view_as=nav_view_as, cef_html=cef_html,
+                                         mydeals_dropdown_html=mydeals_dropdown_html)
         else:
             person_id = tenant.get("person_id")
             # My Deals shows only Sell Order-tagged deals — the buy side
@@ -7642,9 +7908,10 @@ def lambda_handler(event, context):
                      if person_id is not None else [])
             body = render_my_deals_page(viewer_name, deals=deals,
                                          key=nav_key, view_as=nav_view_as, cef_html=cef_html,
-                                         edit_mode=edit_mode, person_id=person_id, anon_key_email=anon_key_email)
+                                         edit_mode=edit_mode, person_id=person_id, anon_key_email=anon_key_email,
+                                         mydeals_dropdown_html=mydeals_dropdown_html)
     else:
         body = render_intros_page(viewer_name, tenant=tenant, tenant_email=anon_key_email,
                                    key=nav_key, view_as=nav_view_as, edit_mode=edit_mode,
-                                   cef_html=cef_html)
+                                   cef_html=cef_html, mydeals_dropdown_html=mydeals_dropdown_html)
     return _html_response(body)
