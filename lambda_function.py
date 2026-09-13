@@ -3203,6 +3203,62 @@ def _photo_redirect_response(url):
     }
 
 
+def _handle_debug_deal(deal_id_raw):
+    """?debug_deal=<deal_id>, admin-only (ADMIN_KEY gate is checked by the
+    caller before this is ever reached). Fetches deals.json fresh from
+    S3 (never the cached/request-scoped get_deals_list -- this is a
+    one-off diagnostic, not a hot path) and returns the raw deal record
+    as pretty-printed JSON, plus the S3 object's own LastModified/size
+    and which of the four fields this debugging session cares about
+    (Intro Status, Deal Side, stage, person linkage) are actually
+    present on the record. text/plain throughout, never JSON, so it
+    renders readably in a bare browser tab."""
+    s3 = _s3_client()
+    obj = s3.get_object(Bucket=BUCKET, Key=DEALS_KEY)
+    last_modified = obj.get("LastModified")
+    size = obj.get("ContentLength")
+    data = json.loads(obj["Body"].read())
+    deals = data.get("deals", []) if isinstance(data, dict) else (data or [])
+
+    header = (
+        f"S3 object: s3://{BUCKET}/{DEALS_KEY}\n"
+        f"LastModified: {last_modified}\n"
+        f"Size: {size} bytes\n\n"
+    )
+
+    try:
+        wanted_id = int(deal_id_raw)
+    except (TypeError, ValueError):
+        wanted_id = None
+
+    deal = None
+    if wanted_id is not None:
+        for d in deals:
+            if d.get("id") == wanted_id:
+                deal = d
+                break
+
+    if deal is None:
+        body = header + f"Deal {deal_id_raw} not found. Total deals in file: {len(deals)}"
+        return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": body}
+
+    cf = deal.get("custom_fields") or {}
+    present = []
+    present.append("custom_label_4008329" if INTRO_STATUS_FIELD in cf else None)
+    present.append("custom_label_1958" if DEAL_SIDE_FIELD in cf else None)
+    present.append("deal_stage" if "deal_stage" in deal else None)
+    present.append("people" if "people" in deal else ("person_ids" if "person_ids" in deal else None))
+    present = [p for p in present if p]
+
+    body = (
+        header
+        + f"Deal {wanted_id}\n"
+        + f"Present fields: {', '.join(present) if present else '(none)'}\n\n"
+        + json.dumps(deal, indent=2, default=str)
+    )
+    return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": body}
+
+
 def _handle_photo_request(person_id_raw, tenant, anon_key_email, is_admin_key):
     """?photo=<person_id> (item 1): admin (is_admin_key, unconditionally —
     the same "admin always sees the real thing" convention edit_mode
@@ -8193,6 +8249,12 @@ def _lambda_handler_impl(event, context):
 
     admin_key = os.environ.get("ADMIN_KEY")
     is_admin_key = bool(admin_key) and query.get("key") == admin_key
+
+    debug_deal_param = query.get("debug_deal")
+    if debug_deal_param:
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_debug_deal(debug_deal_param)
 
     # SSO handoff: verify, set the durable identity cookie, redirect to a
     # clean URL. An invalid/expired token just falls through to normal
