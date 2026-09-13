@@ -3268,6 +3268,187 @@ def _pipeline_update_deal_person_ids(deal_id, person_ids):
         return False, f"{type(e).__name__}: {e}"
 
 
+def _pipeline_get_person(person_id):
+    """Live GET of a single person from Pipeline -- distinct from
+    _pipeline_fetch_person_photo_url below, which only ever extracts a
+    thumb URL and discards everything else. Used by the "Introduce"
+    write path (_find_existing_buy_deal_for_person_company) to discover
+    which deals a buyer is already on when none of them are in the
+    deals.json snapshot for this company (the snapshot excludes won/
+    lost/obsolete by design). Returns (person_dict_or_None,
+    error_message); same query-string auth and
+    unwrap-a-{"person":...}-envelope-if-present convention as
+    _pipeline_get_deal. Response shape (deal_ids: [int], deals:
+    [{"id","name"}]) given directly by Chad -- see
+    _pipeline_person_deal_ids."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return None, "Pipeline API credentials not configured"
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(f"{PIPELINE_API_BASE}/people/{person_id}.json?{qs}", method="GET")
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if not (200 <= r.status < 300):
+                return None, f"HTTP {r.status}"
+            try:
+                data = json.loads(r.read().decode("utf-8"))
+            except Exception:
+                return None, "Pipeline response was not valid JSON"
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    if isinstance(data, dict) and isinstance(data.get("person"), dict):
+        return data["person"], None
+    if isinstance(data, dict):
+        return data, None
+    return None, "unexpected Pipeline response shape"
+
+
+def _pipeline_person_deal_ids(person):
+    """Deal ids off a live person record (_pipeline_get_person): prefer
+    the flat "deal_ids" list (already plain ints); else derive from
+    "deals" (a list of {"id","name"} dicts -- name only, no company/
+    tag/stage info, per Chad, which is exactly why each candidate still
+    needs its own _pipeline_get_deal). Deduped, order preserved, ints
+    only."""
+    if not isinstance(person, dict):
+        return []
+    out = []
+    seen = set()
+    raw_ids = person.get("deal_ids")
+    source = raw_ids if isinstance(raw_ids, list) else [
+        d.get("id") for d in (person.get("deals") or []) if isinstance(d, dict)
+    ]
+    for did in source:
+        try:
+            did = int(did)
+        except (TypeError, ValueError):
+            continue
+        if did not in seen:
+            seen.add(did)
+            out.append(did)
+    return out
+
+
+# "Introduce" (Buyer Demand tiles, admin-only): past this many candidate
+# deal ids on the buyer's own person record, the live per-deal lookup is
+# skipped entirely (only the snapshot is searched) rather than risking a
+# very slow request -- see _find_existing_buy_deal_for_person_company.
+MAX_LIVE_DEAL_LOOKUP_CANDIDATES = 30
+
+
+def _find_existing_buy_deal_for_person_company(person_id, company):
+    """Locate an existing Buy-tagged deal for `company` that `person_id`
+    (the buyer) is already linked to -- the deals.json snapshot FIRST
+    (fast, no live call, but excludes won/lost/obsolete by design), then
+    a live Pipeline fallback that DOES reach terminal-stage deals: the
+    buyer's own person record names their deal ids
+    (_pipeline_person_deal_ids), each fetched individually
+    (_pipeline_get_deal -- the only deal-read shape this API offers per
+    Chad, no list/search endpoint) and matched on company name + Buy
+    side tag with NO stage filter at all, so a Won/Lost/Obsolete deal
+    matches exactly as readily as a live one.
+
+    Returns (deal_or_None, source, note):
+    - source="snapshot": found in deals.json, note=None.
+    - source="live": a full live scan ran (found or not -- deal is None
+      when not found), note=None.
+    - source="live-skipped": the buyer has more than
+      MAX_LIVE_DEAL_LOOKUP_CANDIDATES deal ids on file, so the live scan
+      was skipped entirely (deal is always None here); note explains
+      why, for the caller to surface.
+    - source="live-error": the live person GET itself failed, so
+      whether a matching deal exists is genuinely unknown (deal is
+      always None); the caller must treat this as a hard failure, NOT
+      "not found" -- proceeding to create a new deal here risks a
+      duplicate for a buyer who already has one. An individual deal GET
+      failing partway through an otherwise-successful scan is NOT
+      treated this way -- that single candidate is just skipped and the
+      scan continues, matching Chad's "best effort, capped" framing
+      rather than hard-failing the whole request over one flaky id."""
+    target = (company or "").strip().lower()
+    for d in get_deals_list():
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            continue
+        if (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        if person_id in _deal_linked_person_ids(d):
+            return d, "snapshot", None
+
+    person, err = _pipeline_get_person(person_id)
+    if person is None:
+        return None, "live-error", f"Pipeline lookup of the buyer's own deals failed: {err}"
+    candidate_ids = _pipeline_person_deal_ids(person)
+    if len(candidate_ids) > MAX_LIVE_DEAL_LOOKUP_CANDIDATES:
+        return None, "live-skipped", (
+            f"the buyer has {len(candidate_ids)} deals on file -- too many to check individually, "
+            f"so only the snapshot was searched"
+        )
+    for deal_id in candidate_ids:
+        live_deal, _get_err = _pipeline_get_deal(deal_id)
+        if live_deal is None:
+            continue
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(live_deal, DEAL_SIDE_FIELD):
+            continue
+        if (_deal_company_name(live_deal) or "").strip().lower() != target:
+            continue
+        return live_deal, "live", None
+    return None, "live", None
+
+
+def _pipeline_create_buy_deal(company, company_id, buyer_person_id, buyer_name, tenant_person_id, status_id):
+    """POST a brand-new Buy-tagged deal to Pipeline when
+    _find_existing_buy_deal_for_person_company comes up empty -- payload
+    shape (DealWritable, same envelope as the PUT writes) given directly
+    by Chad: name/company_name-or-company_id/deal_stage_id/
+    primary_contact_id/person_ids/custom_fields. company_id (from
+    get_company_record) is preferred over company_name when the local
+    companies.json snapshot has it, per Chad; company_name otherwise.
+    person_ids on CREATE is a plain array -- unlike the update path,
+    there is no existing linkage to preserve, so the "never send a bare
+    array" rule doesn't apply here (there's nothing to unlink). Returns
+    (created_deal_dict_or_None, error_message); same abort-on-non-2xx
+    contract as every other Pipeline write in this file."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return None, "Pipeline API credentials not configured"
+    deal_body = {
+        "name": f"{company}: {buyer_name} (Buy)" if buyer_name else f"{company}: Buy",
+        "deal_stage_id": STAGE_MATCHED,
+        "primary_contact_id": buyer_person_id,
+        "person_ids": [buyer_person_id, tenant_person_id],
+        "custom_fields": {DEAL_SIDE_FIELD: [DEAL_SIDE_BUY_ID], INTRO_STATUS_FIELD: status_id},
+    }
+    if company_id is not None:
+        deal_body["company_id"] = company_id
+    else:
+        deal_body["company_name"] = company
+    body = json.dumps({"deal": deal_body}).encode("utf-8")
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/deals.json?{qs}",
+        data=body, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if not (200 <= r.status < 300):
+                return None, f"HTTP {r.status}"
+            try:
+                data = json.loads(r.read().decode("utf-8"))
+            except Exception:
+                return None, "Pipeline response was not valid JSON"
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    created = data.get("deal") if isinstance(data, dict) and isinstance(data.get("deal"), dict) else data
+    if not isinstance(created, dict) or created.get("id") is None:
+        return None, "Pipeline did not return a created deal id"
+    return created, None
+
+
 # ── Buyer photos (?photo=<person_id>) ────────────────────────────────────────
 # Warm-invocation-only cache, same lifetime/reset semantics as every other
 # module-level cache in this file: {person_id: (image_url or None, fetched_at
@@ -6704,8 +6885,23 @@ def _tier_badge_html(tier):
     return f'<span class="tier-badge tier-{tier}">{_esc(tier_label)}</span>'
 
 
-def _buyer_tile_html(buyer, anon_key_email, now):
-    code = _anon_buyer_code(anon_key_email, buyer["person_id"])
+def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None, company=None, tenant_email=None):
+    """Anonymized buyer-code tile for a real tenant (is_admin=False --
+    the ONLY path a tenant's own render ever reaches: code/tier/range/
+    recency dot exactly as before, no name, no raw person id, no
+    controls of any kind -- this function still never receives a
+    buyer's name/email in that case, matching render_company_page's own
+    documented invariant for this section).
+
+    is_admin=True (admin key present, WITH or WITHOUT &view_as, per
+    instruction) additionally shows the buyer's real name -- consistent
+    with edit_mode's "admin always sees the real thing" convention used
+    everywhere else in this file -- and, only when there IS a viewing
+    tenant to introduce them to (tenant_email is not None, i.e. admin
+    is under &view_as), a status dropdown + "Introduce" button that
+    POSTs ?action=introduce_buyer (see _introduce_buyer_script_html).
+    Admin browsing a company with no &view_as sees real names but no
+    controls -- there's no tenant yet to link the buyer to."""
     tier = buyer["tier"]
     tier_html = _tier_badge_html(tier)
 
@@ -6718,23 +6914,105 @@ def _buyer_tile_html(buyer, anon_key_email, now):
     dot_cls = "buyer-dot filled" if recent else "buyer-dot"
     dot_title = "Active within 12 months" if recent else "No recent activity"
 
-    return f"""<div class="buyer-tile">
+    if not is_admin:
+        code = _anon_buyer_code(anon_key_email, buyer["person_id"])
+        return f"""<div class="buyer-tile">
       <span class="{dot_cls}" title="{dot_title}"></span>
       <div class="buyer-code">Buyer {_esc(code)}</div>
       {tier_html}
       {range_html}
     </div>"""
 
+    name_html = f'<div class="buyer-code">{_esc(buyer_name or "—")}</div>'
+    controls_html = ""
+    if tenant_email:
+        status_options = "".join(
+            f'<option value="{sid}"{" selected" if sid == INTRO_STATUS_INTRODUCED_ID else ""}>'
+            f'{_esc(INTRO_STATUS_LABELS[sid])}</option>'
+            for sid in ADD_BUYER_STATUS_ORDER
+        )
+        controls_html = f"""<div class="intro-controls">
+        <select class="intro-status-select" data-person-id="{buyer['person_id']}">{status_options}</select>
+        <button type="button" class="intro-buyer-btn" data-person-id="{buyer['person_id']}"
+                data-company="{_esc(company or '')}" data-tenant-email="{_esc(tenant_email)}">Introduce</button>
+        <span class="ei-msg intro-msg"></span>
+      </div>"""
+    return f"""<div class="buyer-tile admin">
+      <span class="{dot_cls}" title="{dot_title}"></span>
+      {name_html}
+      {tier_html}
+      {range_html}
+      {controls_html}
+    </div>"""
+
+
+def _introduce_buyer_script_html(key):
+    """Shared script for the Buyer Demand tiles' admin-only Introduce
+    control (_buyer_tile_html's is_admin branch): each button already
+    carries its own person_id/company/tenant_email via data-* attributes
+    baked in server-side (never client-supplied), so this just reads
+    the sibling select's chosen status and POSTs ?action=introduce_buyer.
+    Same Saving…/Saved ✓ (reload on success)/error convention as
+    _add_buyer_panel_html -- a successful Introduce moves the buyer out
+    of this grid and into the Buyers section, which only a reload can
+    show."""
+    key_json = json.dumps(key or "")
+    return f"""<script>
+(function() {{
+  var KEY = {key_json};
+  document.querySelectorAll('.intro-buyer-btn').forEach(function(btn) {{
+    btn.addEventListener('click', function() {{
+      var personId = btn.getAttribute('data-person-id');
+      var company = btn.getAttribute('data-company');
+      var tenantEmail = btn.getAttribute('data-tenant-email');
+      var select = btn.parentElement.querySelector('.intro-status-select');
+      var msgEl = btn.parentElement.querySelector('.intro-msg');
+      btn.disabled = true;
+      if (msgEl) {{ msgEl.className = 'ei-msg saving'; msgEl.textContent = 'Introducing…'; }}
+      fetch('?action=introduce_buyer', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{
+          key: KEY, person_id: personId, company: company,
+          status_id: parseInt(select.value, 10), tenant_email: tenantEmail
+        }})
+      }}).then(function(r) {{ return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }}); }})
+        .then(function(res) {{
+          if (res.ok) {{
+            if (msgEl) {{ msgEl.className = 'ei-msg saved'; msgEl.textContent = 'Introduced ✓ Reloading…'; }}
+            setTimeout(function() {{ window.location.reload(); }}, 700);
+          }} else {{
+            btn.disabled = false;
+            if (msgEl) {{
+              msgEl.className = 'ei-msg error';
+              msgEl.textContent = (res.data && res.data.error) || 'Error';
+            }}
+          }}
+        }}).catch(function(err) {{
+          btn.disabled = false;
+          if (msgEl) {{ msgEl.className = 'ei-msg error'; msgEl.textContent = 'Error: ' + err; }}
+        }});
+    }});
+  }});
+}})();
+</script>"""
+
 
 def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=None, view_as=None, edit_mode=False,
-                         cef_html=""):
+                         cef_html="", is_admin_key=False):
     """No tab is highlighted (active_tab=None never matches mydeals/intros/
     demand in _nav_html). Section (a) is included only when tenant is not
     None — the same "admin with no view_as" signal render_my_deals_page's
     tenant_picker branch uses, since there is no tenant to scope deals to.
-    Section (b) never receives — and so can never render — a buyer's name,
-    email, or raw person id; the tile only ever sees the anonymized code,
+    Section (b) (Buyer Demand) never receives — and so can never render —
+    a buyer's name, email, or raw person id for a real tenant view
+    (is_admin_key=False): the tile only ever sees the anonymized code,
     tier, ticket range, and a boolean recency flag from _buyer_tile_html.
+    is_admin_key=True (deliberately the RAW admin-key flag, not
+    edit_mode -- true with or without &view_as, per instruction) instead
+    shows each tile's real buyer name, plus an "Introduce" control when
+    there's a tenant to introduce them to (tenant is not None, i.e.
+    under &view_as) -- see _buyer_tile_html's own is_admin branch.
 
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
     — never for a real tenant — and switches the Buyers table to editable
@@ -6968,11 +7246,27 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     buyers.sort(key=lambda b: b["updated_at"] or "", reverse=True)
     buyers.sort(key=lambda b: TIER_ORDER.get(b["tier"], 3))
     now = datetime.now(timezone.utc)
+    # Introduce controls need an actual tenant to link the buyer to --
+    # anon_key_email is the literal string "admin" for admin-without-
+    # &view_as (see lambda_handler), which must never be sent as a fake
+    # tenant_email, so this is gated on tenant is not None too, not just
+    # is_admin_key.
+    introduce_tenant_email = anon_key_email if (is_admin_key and tenant is not None) else None
     if buyers:
-        tiles_html = "".join(_buyer_tile_html(b, anon_key_email, now) for b in buyers)
+        if is_admin_key:
+            buyer_people_by_id = get_people_by_ids({b["person_id"] for b in buyers})
+            tiles_html = "".join(
+                _buyer_tile_html(b, anon_key_email, now, is_admin=True,
+                                  buyer_name=_person_display_name(buyer_people_by_id.get(b["person_id"])),
+                                  company=company, tenant_email=introduce_tenant_email)
+                for b in buyers
+            )
+        else:
+            tiles_html = "".join(_buyer_tile_html(b, anon_key_email, now) for b in buyers)
         buyer_demand_body = f'<div class="buyer-grid">{tiles_html}</div>'
     else:
         buyer_demand_body = '<div class="gg-placeholder small">No buy interest recorded yet.</div>'
+    introduce_script_html = _introduce_buyer_script_html(key) if (is_admin_key and buyers) else ""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -7106,6 +7400,40 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--unknown); color: var(--ink); }}
   .buyer-range {{ font-size: 12px; color: var(--muted); }}
+  .buyer-tile.admin {{
+    grid-column: span 2;
+    min-width: 220px;
+  }}
+  .intro-controls {{
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--line);
+  }}
+  .intro-status-select {{
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 12px;
+  }}
+  .intro-buyer-btn {{
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }}
+  .intro-buyer-btn:hover {{ opacity: 0.9; }}
+  .intro-buyer-btn:disabled {{ opacity: 0.6; cursor: default; }}
+  .intro-controls .intro-msg {{ flex-basis: 100%; }}
   .deal-card {{
     background: var(--card);
     border: 1px solid var(--line);
@@ -7306,6 +7634,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   <section class="cd-section" id="demand">
     <h2>Buyer Demand</h2>
     {buyer_demand_body}
+    {introduce_script_html}
   </section>
   <section class="cd-section">
     <h2>Feature requests</h2>
@@ -8868,6 +9197,127 @@ def _handle_add_buyer(event):
     return _json_response(resp)
 
 
+def _handle_introduce_buyer(event):
+    """POST ?action=introduce_buyer -- admin-only, enforced here
+    (ADMIN_KEY must be in the body); no tenant path exists for this
+    route, same convention as _handle_add_buyer. Fired from the Buyer
+    Demand tiles' admin-only "Introduce" control: for one buyer
+    (person_id) with expressed interest in this company, either
+    advances an existing Buy-tagged deal or creates a brand-new one,
+    linking the viewing tenant's own person onto it either way, so the
+    buyer moves out of the anonymized demand grid and into the Buyers
+    section immediately.
+
+    1. _find_existing_buy_deal_for_person_company: snapshot first, then
+       a live Pipeline fallback (see its own docstring). A "live-error"
+       source (the live person lookup itself failed, so whether a deal
+       already exists is genuinely unknown) aborts outright here --
+       creating a new deal in that state risks a duplicate for a buyer
+       who already has one.
+    2a. Found: PUT the chosen Intro Status, then GET the deal live and
+        PUT back its person_ids merged with the tenant's id appended --
+        NEVER a bare array. Unlike _handle_add_buyer's best-effort link
+        (which skips rather than guesses when the GET/shape can't be
+        trusted), every step here aborts the whole request on failure,
+        per this instruction's wording -- there is no "link manually"
+        fallback message on this route.
+    2b. Not found (source is "live" with no match, or "live-skipped"):
+        POST a brand-new Buy-tagged deal (_pipeline_create_buy_deal),
+        Matched stage, linked to both buyer and tenant, with the chosen
+        status already set on creation.
+    3. Dynamo status_override + audit, so the row appears immediately
+       even before deals.json's own hourly sync (see
+       _augment_with_dynamo_linked_deals, already wired into both
+       render_company_page and render_intros_page).
+
+    Never raises past this function."""
+    body = _parse_json_body(event)
+
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (bool(admin_key) and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+
+    try:
+        buyer_person_id = int(body.get("person_id"))
+    except (TypeError, ValueError):
+        return _json_response({"error": "person_id is required"}, 400)
+
+    company = str(body.get("company") or "").strip()
+    if not company:
+        return _json_response({"error": "company is required"}, 400)
+
+    raw_status = body.get("status_id")
+    if raw_status in (None, ""):
+        status_id = INTRO_STATUS_INTRODUCED_ID
+    else:
+        try:
+            status_id = int(raw_status)
+        except (TypeError, ValueError):
+            return _json_response({"error": "invalid status_id"}, 400)
+    if status_id not in INTRO_STATUS_LABELS:
+        return _json_response({"error": "invalid status_id"}, 400)
+
+    tenant_email = str(body.get("tenant_email") or "").strip().lower()
+    tenant = _resolve_tenant(tenant_email)
+    if tenant is None:
+        return _json_response({"error": "unknown tenant"}, 400)
+    tenant_person_id = tenant.get("person_id")
+    if tenant_person_id is None:
+        return _json_response({"error": "tenant has no linked person"}, 400)
+
+    buyer_rec = get_people_by_ids({buyer_person_id}).get(buyer_person_id)
+    if buyer_rec is None:
+        return _json_response({"error": "buyer not found"}, 400)
+    buyer_name = _person_display_name(buyer_rec)
+
+    deal, source, note = _find_existing_buy_deal_for_person_company(buyer_person_id, company)
+    if deal is None and source == "live-error":
+        return _json_response({"error": note}, 502)
+
+    if deal is not None:
+        deal_id = str(deal.get("id"))
+
+        ok, err = _pipeline_update_deal_status(deal_id, status_id)
+        if not ok:
+            return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
+
+        live_deal, get_err = _pipeline_get_deal(deal_id)
+        if live_deal is None:
+            return _json_response({"error": f"Pipeline lookup failed before linking the tenant: {get_err}"}, 502)
+        existing_ids, safe = _live_deal_person_ids_safe(live_deal)
+        if not safe:
+            return _json_response({"error": "could not safely confirm the deal's current person linkage"}, 502)
+        if tenant_person_id not in existing_ids:
+            merged_ids = existing_ids + [tenant_person_id]
+            ok2, err2 = _pipeline_update_deal_person_ids(deal_id, merged_ids)
+            if not ok2:
+                return _json_response({"error": f"Pipeline update failed: {err2}"}, 502)
+        created = False
+    else:
+        company_record = get_company_record(None, company)
+        company_id = company_record.get("id") if isinstance(company_record, dict) else None
+        created_deal, cerr = _pipeline_create_buy_deal(company, company_id, buyer_person_id, buyer_name,
+                                                         tenant_person_id, status_id)
+        if created_deal is None:
+            return _json_response({"error": f"Pipeline deal creation failed: {cerr}"}, 502)
+        deal_id = str(created_deal.get("id"))
+        created = True
+
+    deal_snapshot = next((d for d in get_deals_list() if str(d.get("id")) == deal_id), None)
+    old_status = _resolve_intro_status(deal_snapshot, None)["id"] if deal_snapshot is not None else None
+    old_values = {"status": old_status, "lookup_used": source, "created": created}
+
+    ok3, err3 = _dynamo_write_intro_update(tenant_email, deal_id, status_id, None, None, None, None,
+                                            old_values, "admin", milestones=None)
+    if not ok3:
+        return _json_response({"error": f"Save failed: {err3}"}, 502)
+
+    resp = {"ok": True, "deal_id": deal_id, "lookup_used": source, "created": created}
+    if note:
+        resp["note"] = note
+    return _json_response(resp)
+
+
 NOT_ENABLED_MESSAGE = "This dashboard is for sellers."
 
 
@@ -8930,6 +9380,11 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_add_buyer(event)
+
+    if query.get("action") == "introduce_buyer":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_introduce_buyer(event)
 
     if method != "GET":
         return _forbidden()
@@ -9037,7 +9492,7 @@ def _lambda_handler_impl(event, context):
             ref = "mydeals"
         body = render_company_page(company, viewer_name, tenant, anon_key_email, ref,
                                     key=nav_key, view_as=nav_view_as, edit_mode=edit_mode,
-                                    cef_html=cef_html)
+                                    cef_html=cef_html, is_admin_key=is_admin_key)
         return _html_response(body)
 
     # Buyer detail page (item 3, turn 18): same auth resolution as every

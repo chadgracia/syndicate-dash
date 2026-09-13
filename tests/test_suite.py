@@ -3447,6 +3447,360 @@ check("lookup_deal on a Sell-side deal -> 400", ab_resp_lookup_sell["statusCode"
 
 
 # ======================================================================
+# SECTION: Buyer Demand tiles admin controls + "Introduce"
+# (?action=introduce_buyer)
+# ======================================================================
+# Admin-only real names/controls on the Demand grid (server-enforced,
+# not just UI-hidden); find-or-create a Buy-tagged deal (snapshot ->
+# live person-deals scan, capped, with a hard abort on an inconclusive
+# live lookup rather than risking a duplicate create), the same
+# never-a-bare-array merge rule, and the Dynamo override that makes the
+# row appear immediately.
+
+IB_TENANT_EMAIL = "sella-ib@example.com"
+IB_TENANT_PID = 601
+IB_BUYER_PID = 701        # no snapshot deal for Foxtrot Co -- exercises live/create paths
+IB_BUYER_SNAP_PID = 702   # already has a snapshot Buy deal for Foxtrot Co
+
+ib_people = {"people": [
+    {"id": IB_TENANT_PID, "full_name": "Sella Introduce", "email": IB_TENANT_EMAIL, "custom_fields": {}},
+    {"id": IB_BUYER_PID, "first_name": "Ravi", "last_name": "Buyer", "full_name": "Ravi Buyer",
+     "email": "ravi@buyerfirm.com", "company_name": "Ravi Capital", "custom_fields": {}},
+    {"id": IB_BUYER_SNAP_PID, "first_name": "Sana", "last_name": "Snapshot", "full_name": "Sana Snapshot",
+     "email": "sana@snapcap.com", "company_name": "Snap Capital", "custom_fields": {}},
+]}
+ib_sell_deal = {"id": 9700, "name": "IB Sell Deal", "company": {"name": "Foxtrot Co"},
+                "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                "people": [{"id": IB_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+ib_buy_deal_snapshot = {"id": 9701, "name": "IB Snapshot Buy Deal", "company": {"name": "Foxtrot Co"},
+                         "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None),
+                         "people": [{"id": IB_BUYER_SNAP_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+ib_interest = {"buy": {"Foxtrot Co": [IB_BUYER_PID, IB_BUYER_SNAP_PID]}}
+fake_s3_ib, fake_table_ib = use_fixture({
+    lf.PEOPLE_KEY: ib_people, lf.INTEREST_KEY: ib_interest,
+    lf.DEALS_KEY: {"deals": [ib_sell_deal, ib_buy_deal_snapshot]},
+})
+ib_tenant = lf._resolve_tenant(IB_TENANT_EMAIL)
+assert ib_tenant is not None and ib_tenant["person_id"] == IB_TENANT_PID
+
+
+def make_ib_urlopen(calls, person=None, person_fail=False, deals=None, deals_fail=None,
+                     status_put_status=200, link_put_status=200,
+                     create_status=200, create_body=None, create_fail=False):
+    """Dispatches on (method, url) rather than call order, since
+    _find_existing_buy_deal_for_person_company's own scan can issue a
+    variable number of calls before _handle_introduce_buyer's write
+    sequence even starts."""
+    deals = deals or {}
+    deals_fail = deals_fail or set()
+
+    def _urlopen(req, timeout=15):
+        method = req.get_method()
+        url = req.full_url
+        data = json.loads(req.data.decode()) if req.data else None
+        calls.append({"method": method, "url": url, "data": data})
+        if method == "GET" and "/people/" in url:
+            if person_fail:
+                raise lf.urllib.error.HTTPError(url, 502, "boom", {}, None)
+            return _FakeGetResponse(200, {"person": person} if person is not None else {})
+        if method == "POST" and "/deals.json" in url:
+            if create_fail:
+                raise lf.urllib.error.HTTPError(url, create_status, "boom", {}, None)
+            return _FakeGetResponse(create_status, {"deal": create_body} if create_body else {})
+        if method == "GET" and "/deals/" in url:
+            m = re.search(r"/deals/(\d+)\.json", url)
+            did = m.group(1) if m else None
+            if did in deals_fail:
+                raise lf.urllib.error.HTTPError(url, 502, "boom", {}, None)
+            d = deals.get(did)
+            if d is None:
+                raise lf.urllib.error.HTTPError(url, 404, "not found", {}, None)
+            return _FakeGetResponse(200, {"deal": d})
+        if method == "PUT" and "/deals/" in url:
+            is_status_put = bool(data and lf.INTRO_STATUS_FIELD in (data.get("deal") or {}).get("custom_fields", {}))
+            status = status_put_status if is_status_put else link_put_status
+            if status >= 400:
+                raise lf.urllib.error.HTTPError(url, status, "boom", {}, None)
+            return FakeHTTPResponse(status)
+        raise AssertionError(f"unexpected call: {method} {url}")
+    return _urlopen
+
+
+def ib_event(body_dict, cookies=None):
+    return {"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+            "queryStringParameters": {"action": "introduce_buyer"}, "cookies": cookies or [],
+            "body": json.dumps(body_dict)}
+
+
+# --- Rendering: a real tenant NEVER sees a buyer's name/id/controls on
+# the Demand grid, admin key or not -- the anonymized tile is unchanged.
+page_tenant_view = lf.render_company_page("Foxtrot Co", "Sella Introduce", ib_tenant, IB_TENANT_EMAIL, "mydeals",
+                                           key=None, view_as=None, edit_mode=False, is_admin_key=False)
+check("tenant view: no real buyer name leaks onto the Demand grid",
+      "Ravi Buyer" not in page_tenant_view and "Sana Snapshot" not in page_tenant_view)
+# (checked via the actual tag's class="..." attribute, not a bare
+# substring -- "intro-buyer-btn" alone also appears in the page's own
+# <style> block's ".intro-buyer-btn {" selector, which is always
+# present regardless of whether any button renders)
+check("tenant view: no Introduce button/controls at all", 'class="intro-buyer-btn"' not in page_tenant_view
+      and 'class="intro-status-select"' not in page_tenant_view)
+check("tenant view: anonymized 'Buyer ' code tiles still render", "Buyer " in page_tenant_view)
+
+# --- Admin, no &view_as: real names show (admin always sees the real
+# thing), but NO Introduce controls -- there's no tenant yet to link to.
+page_admin_noview = lf.render_company_page("Foxtrot Co", "Admin", None, "admin", "mydeals",
+                                            key=ADMIN_KEY, view_as=None, edit_mode=False, is_admin_key=True)
+check("admin, no &view_as: real buyer names ARE shown", "Ravi Buyer" in page_admin_noview
+      and "Sana Snapshot" in page_admin_noview)
+check("admin, no &view_as: still no Introduce controls (nothing to link the buyer to)",
+      'class="intro-buyer-btn"' not in page_admin_noview)
+
+# --- Admin WITH &view_as: real names AND working Introduce controls,
+# each carrying the right buyer/company/tenant on its own button.
+page_admin_view = lf.render_company_page("Foxtrot Co", "Admin", ib_tenant, IB_TENANT_EMAIL, "mydeals",
+                                          key=ADMIN_KEY, view_as=IB_TENANT_EMAIL, edit_mode=False, is_admin_key=True)
+check("admin + &view_as: real buyer name shown", "Ravi Buyer" in page_admin_view)
+check("admin + &view_as: Introduce button present, keyed to the right buyer/company/tenant",
+      f'data-person-id="{IB_BUYER_PID}"' in page_admin_view
+      and 'data-company="Foxtrot Co"' in page_admin_view
+      and f'data-tenant-email="{IB_TENANT_EMAIL}"' in page_admin_view)
+check("admin + &view_as: status dropdown defaults to Introduced (7207579)",
+      f'<option value="{lf.INTRO_STATUS_INTRODUCED_ID}" selected>' in page_admin_view)
+
+# --- Admin-only, enforced server-side: no ADMIN_KEY, and a real
+# tenant's own cookie -- neither authorizes this route.
+ib_resp_noauth = lf.lambda_handler(ib_event({
+    "person_id": IB_BUYER_PID, "company": "Foxtrot Co", "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce_buyer with no admin key -> 403", ib_resp_noauth["statusCode"] == 403)
+ib_resp_tenant_cookie = lf.lambda_handler(ib_event({
+    "person_id": IB_BUYER_PID, "company": "Foxtrot Co", "tenant_email": IB_TENANT_EMAIL,
+}, cookies=[tenant_cookie(IB_TENANT_EMAIL)]), None)
+check("introduce_buyer with a real tenant cookie but no admin key -> still 403", ib_resp_tenant_cookie["statusCode"] == 403)
+
+# --- Found via the SNAPSHOT (buyer already has a Buy-tagged deal for
+# this company on file) -- no live Pipeline lookup needed at all.
+ib_calls1 = []
+lf.urllib.request.urlopen = make_ib_urlopen(
+    ib_calls1, deals={"9701": {"id": 9701, "person_ids": [IB_BUYER_SNAP_PID]}})
+ib_resp1 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_SNAP_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce (snapshot match) -> 200", ib_resp1["statusCode"] == 200)
+ib_data1 = json.loads(ib_resp1["body"])
+check("introduce (snapshot match): lookup_used == 'snapshot', created == False",
+      ib_data1.get("lookup_used") == "snapshot" and ib_data1.get("created") is False)
+check("introduce (snapshot match): no /people/ call was ever made (found before the live path)",
+      not any("/people/" in c["url"] for c in ib_calls1))
+check("introduce (snapshot match): status PUT, then GET, then the merged-array PUT (buyer kept, tenant appended)",
+      len(ib_calls1) == 3 and ib_calls1[0]["method"] == "PUT" and ib_calls1[1]["method"] == "GET"
+      and ib_calls1[2]["method"] == "PUT"
+      and ib_calls1[2]["data"]["deal"]["person_ids"] == [IB_BUYER_SNAP_PID, IB_TENANT_PID])
+check("introduce (snapshot match): Dynamo status_override stored for deal 9701",
+      fake_table_ib.updates and fake_table_ib.updates[-1]["Key"]["sk"] == "intro#9701")
+
+row_after_snapshot = row_for(
+    lf.render_company_page("Foxtrot Co", "Admin", ib_tenant, IB_TENANT_EMAIL, "mydeals",
+                            key=ADMIN_KEY, view_as=IB_TENANT_EMAIL, edit_mode=True, is_admin_key=True),
+    "9701")
+check("introduced buyer's row appears in the Buyers section immediately", row_after_snapshot is not None)
+
+# --- Not in the snapshot, but a LIVE scan of the buyer's own deals
+# finds a match (a terminal-stage deal the snapshot excludes by
+# design).
+ib_calls2 = []
+lf.urllib.request.urlopen = make_ib_urlopen(
+    ib_calls2,
+    person={"id": IB_BUYER_PID, "deal_ids": [5001, 5002]},
+    deals={
+        "5001": {"id": 5001, "company": {"name": "Some Other Co"},
+                  "custom_fields": {lf.DEAL_SIDE_FIELD: lf.DEAL_SIDE_BUY_ID}},
+        "5002": {"id": 5002, "company": {"name": "Foxtrot Co"}, "deal_stage": {"id": 111802},  # Won -- terminal
+                  "custom_fields": {lf.DEAL_SIDE_FIELD: lf.DEAL_SIDE_BUY_ID}, "person_ids": [IB_BUYER_PID]},
+    })
+ib_resp2 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_CLOSED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce (live scan finds a terminal-stage match) -> 200", ib_resp2["statusCode"] == 200)
+ib_data2 = json.loads(ib_resp2["body"])
+check("introduce (live match): lookup_used == 'live', created == False, deal_id == 5002",
+      ib_data2.get("lookup_used") == "live" and ib_data2.get("created") is False
+      and ib_data2.get("deal_id") == "5002")
+check("introduce (live match): reported which lookup was used, and it checked BOTH candidates before matching 5002",
+      any("/people/" in c["url"] for c in ib_calls2)
+      and any("/deals/5001.json" in c["url"] for c in ib_calls2)
+      and any("/deals/5002.json" in c["url"] for c in ib_calls2))
+
+# --- Not found anywhere (live scan completes, no match) -> CREATE a
+# brand-new Buy-tagged deal, Matched stage, linked to both buyer and
+# tenant, chosen status set on creation.
+ib_calls3 = []
+lf.urllib.request.urlopen = make_ib_urlopen(
+    ib_calls3, person={"id": IB_BUYER_PID, "deal_ids": []},
+    create_status=201, create_body={"id": 9800, "name": "created"})
+ib_resp3 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce (nothing found) -> 200", ib_resp3["statusCode"] == 200)
+ib_data3 = json.loads(ib_resp3["body"])
+check("introduce (nothing found): lookup_used == 'live', created == True, deal_id == '9800'",
+      ib_data3.get("lookup_used") == "live" and ib_data3.get("created") is True
+      and ib_data3.get("deal_id") == "9800")
+create_call = next(c for c in ib_calls3 if c["method"] == "POST")
+create_payload = create_call["data"]["deal"]
+check("introduce create: Matched stage, Buy side tag, chosen status, company_name (no companies.json on file)",
+      create_payload["deal_stage_id"] == lf.STAGE_MATCHED
+      and create_payload["custom_fields"][lf.DEAL_SIDE_FIELD] == [lf.DEAL_SIDE_BUY_ID]
+      and create_payload["custom_fields"][lf.INTRO_STATUS_FIELD] == lf.INTRO_STATUS_INTRODUCED_ID
+      and create_payload["company_name"] == "Foxtrot Co" and "company_id" not in create_payload)
+check("introduce create: linked to BOTH buyer and tenant, buyer as primary contact",
+      create_payload["person_ids"] == [IB_BUYER_PID, IB_TENANT_PID]
+      and create_payload["primary_contact_id"] == IB_BUYER_PID)
+check("introduce create: Dynamo status_override stored under the new deal id",
+      fake_table_ib.updates and fake_table_ib.updates[-1]["Key"]["sk"] == "intro#9800")
+
+# --- company_id preferred over company_name when companies.json has a
+# match for this company (per Chad's instruction).
+fake_s3_ib.objs[lf.COMPANIES_KEY] = {"companies": [{"id": 4242, "name": "Foxtrot Co"}]}
+ib_calls3b = []
+lf.urllib.request.urlopen = make_ib_urlopen(
+    ib_calls3b, person={"id": IB_BUYER_PID, "deal_ids": []},
+    create_status=201, create_body={"id": 9801, "name": "created2"})
+lf._req_cache_reset()
+lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+create_call_b = next(c for c in ib_calls3b if c["method"] == "POST")
+check("introduce create: company_id used instead of company_name once companies.json has a match",
+      create_call_b["data"]["deal"].get("company_id") == 4242
+      and "company_name" not in create_call_b["data"]["deal"])
+del fake_s3_ib.objs[lf.COMPANIES_KEY]
+
+# --- Too many candidate deal ids on the buyer's own record -> live
+# scan skipped entirely, falls back to create, and says why.
+ib_calls4 = []
+lf.urllib.request.urlopen = make_ib_urlopen(
+    ib_calls4, person={"id": IB_BUYER_PID, "deal_ids": list(range(50))},
+    create_status=201, create_body={"id": 9802, "name": "created3"})
+ib_resp4 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+ib_data4 = json.loads(ib_resp4["body"])
+check("introduce (too many candidates): lookup_used == 'live-skipped', still creates, and explains why",
+      ib_data4.get("lookup_used") == "live-skipped" and ib_data4.get("created") is True
+      and "too many" in (ib_data4.get("note") or ""))
+check("introduce (too many candidates): no individual /deals/<id> GETs were attempted at all",
+      not any(c["method"] == "GET" and "/deals/" in c["url"] for c in ib_calls4))
+
+# --- The live PERSON lookup itself fails: genuinely unknown whether a
+# deal already exists, so this aborts rather than risking a duplicate
+# create.
+ib_calls5 = []
+lf.urllib.request.urlopen = make_ib_urlopen(ib_calls5, person_fail=True)
+fake_table_ib.updates.clear()
+ib_resp5 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce (live person lookup fails) -> 502, never guesses 'not found'", ib_resp5["statusCode"] == 502)
+check("introduce (live person lookup fails): no deal-create or Dynamo write was attempted",
+      not any(c["method"] == "POST" for c in ib_calls5) and len(fake_table_ib.updates) == 0)
+
+# --- Found (snapshot), but the GET before the person-linkage merge
+# fails -> abort, no Dynamo write, even though the status PUT already
+# succeeded.
+ib_calls6 = []
+lf.urllib.request.urlopen = make_ib_urlopen(ib_calls6, deals_fail={"9701"})
+fake_table_ib.updates.clear()
+ib_resp6 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_SNAP_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce (snapshot match, merge GET fails) -> 502", ib_resp6["statusCode"] == 502)
+check("introduce (snapshot match, merge GET fails): no Dynamo write (abort)", len(fake_table_ib.updates) == 0)
+
+# --- Found (snapshot), GET succeeds but the shape is unrecognizable
+# (neither person_ids nor people) -> abort (no "link manually" skip on
+# this route, unlike add_buyer).
+ib_calls7 = []
+lf.urllib.request.urlopen = make_ib_urlopen(ib_calls7, deals={"9701": {"id": 9701, "name": "no linkage field"}})
+fake_table_ib.updates.clear()
+ib_resp7 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_SNAP_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce (snapshot match, unsafe GET shape) -> 502, no silent skip on this route",
+      ib_resp7["statusCode"] == 502)
+check("introduce (snapshot match, unsafe GET shape): no Dynamo write", len(fake_table_ib.updates) == 0)
+
+# --- Found (snapshot), tenant already linked -> no redundant merge PUT.
+ib_calls8 = []
+lf.urllib.request.urlopen = make_ib_urlopen(
+    ib_calls8, deals={"9701": {"id": 9701, "person_ids": [IB_BUYER_SNAP_PID, IB_TENANT_PID]}})
+ib_resp8 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_SNAP_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce (already linked): only status PUT + GET, no redundant merge PUT",
+      ib_resp8["statusCode"] == 200 and len(ib_calls8) == 2)
+
+# --- The Intro Status PUT itself fails on a found deal -> abort
+# everything, no GET/merge attempted, no Dynamo write.
+ib_calls9 = []
+lf.urllib.request.urlopen = make_ib_urlopen(ib_calls9, status_put_status=502)
+fake_table_ib.updates.clear()
+ib_resp9 = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_SNAP_PID, "company": "Foxtrot Co",
+    "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce (status PUT fails on a found deal) -> 502", ib_resp9["statusCode"] == 502)
+check("introduce (status PUT fails): only 1 call attempted (never reaches the merge GET)", len(ib_calls9) == 1)
+check("introduce (status PUT fails): no Dynamo write", len(fake_table_ib.updates) == 0)
+
+# --- No status_id in the request -> defaults to Introduced, per
+# instruction ("default Introduced 7207579").
+ib_calls10 = []
+lf.urllib.request.urlopen = make_ib_urlopen(
+    ib_calls10, deals={"9701": {"id": 9701, "person_ids": [IB_BUYER_SNAP_PID]}})
+lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_SNAP_PID, "company": "Foxtrot Co", "tenant_email": IB_TENANT_EMAIL,
+}), None)
+status_put_call = next(c for c in ib_calls10 if c["method"] == "PUT"
+                        and lf.INTRO_STATUS_FIELD in c["data"]["deal"].get("custom_fields", {}))
+check("introduce with no status_id in the request defaults to Introduced",
+      status_put_call["data"]["deal"]["custom_fields"][lf.INTRO_STATUS_FIELD] == lf.INTRO_STATUS_INTRODUCED_ID)
+
+# --- Input validation
+ib_resp_bad_person = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": "not-an-int", "company": "Foxtrot Co", "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce with a non-integer person_id -> 400", ib_resp_bad_person["statusCode"] == 400)
+ib_resp_no_company = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_PID, "company": "", "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce with an empty company -> 400", ib_resp_no_company["statusCode"] == 400)
+ib_resp_bad_status = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_PID, "company": "Foxtrot Co", "status_id": 999999,
+    "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce with an invalid status_id -> 400", ib_resp_bad_status["statusCode"] == 400)
+ib_resp_bad_tenant = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": IB_BUYER_PID, "company": "Foxtrot Co",
+    "tenant_email": "nobody@nowhere.example.com",
+}), None)
+check("introduce with an unresolvable tenant_email -> 400", ib_resp_bad_tenant["statusCode"] == 400)
+ib_resp_bad_buyer = lf.lambda_handler(ib_event({
+    "key": ADMIN_KEY, "person_id": 999999999, "company": "Foxtrot Co", "tenant_email": IB_TENANT_EMAIL,
+}), None)
+check("introduce with a person_id matching no real person -> 400", ib_resp_bad_buyer["statusCode"] == 400)
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 
