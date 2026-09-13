@@ -647,6 +647,23 @@ INTRO_STATUS_WITHDRAWN_ID = 7207586
 INTRO_STATUS_CLOSED_ID = 7207587
 EXIT_STATUS_IDS = {INTRO_STATUS_STALLED_ID, INTRO_STATUS_PASSED_ID, INTRO_STATUS_WITHDRAWN_ID}
 
+# "+ Add buyer" (company page / Active Intros, admin-only): the ten Intro
+# Status options in the fixed display order given in the instruction --
+# same ids as INTRO_STATUS_LABELS, just ordered for the dropdown rather
+# than dict-insertion order (which puts Closed before the three exits).
+ADD_BUYER_STATUS_ORDER = [
+    7207578,  # Matched
+    7207579,  # Introduced
+    7207580,  # NDA Signed
+    7207581,  # VDR Link Provided
+    7207582,  # Signed Sub Docs
+    7207583,  # Wired
+    7207584,  # Stalled
+    7207585,  # Passed
+    7207586,  # Withdrawn
+    7207587,  # Closed
+]
+
 # Active Intros tenant status editing: the six transitions a tenant may set
 # themselves (NDA/VDR/Sub Docs/Wired/Stalled/Passed), and only on a row
 # that's already Introduced-or-later (disclosed) -- never Matched,
@@ -2015,6 +2032,83 @@ def get_my_matched_buy_deals(person_id, company=None):
     return out
 
 
+def _augment_with_dynamo_linked_deals(deals, intro_details, company=None):
+    """Union in any deal referenced by one of the tenant's own intro#
+    Dynamo items but not already present in `deals` -- covers a deal the
+    "+ Add buyer" admin write just linked via a live Pipeline PUT
+    (_handle_add_buyer) that deals.json's own hourly S3 sync hasn't
+    picked up yet, so the row appears immediately instead of waiting for
+    the next sync. Looked up directly by id in get_deals_list() (never
+    person-linkage-filtered, since the whole point is a deal the
+    snapshot doesn't yet show as linked to this tenant), filtered to
+    Buy-tagged deals and, when `company` is given, to that company --
+    same case-insensitive match get_my_matched_buy_deals itself uses. A
+    deal id with no deals.json record at all yet (added so recently even
+    Pipeline's own record can't be found by the id -- shouldn't happen,
+    but not this function's job to assume) is silently skipped; nothing
+    else about `deals` is touched or reordered."""
+    if not intro_details:
+        return deals
+    existing_ids = {str(d.get("id")) for d in deals}
+    extra_ids = set(intro_details.keys()) - existing_ids
+    if not extra_ids:
+        return deals
+    target = company.strip().lower() if company else None
+    by_id = {str(d.get("id")): d for d in get_deals_list()}
+    extra_deals = []
+    for deal_id in extra_ids:
+        d = by_id.get(deal_id)
+        if d is None:
+            continue
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            continue
+        if target is not None and (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        extra_deals.append(d)
+    if not extra_deals:
+        return deals
+    return deals + extra_deals
+
+
+def _company_buy_deals_for_picker(company):
+    """Every Buy-tagged deals.json deal for one company, any stage, any
+    existing person linkage -- the "+ Add buyer" search candidates (see
+    _handle_lookup_company_buyers). Deliberately NOT scoped to any
+    person_id, unlike get_my_matched_buy_deals: the whole point of this
+    picker is finding a deal the viewing tenant ISN'T linked to yet."""
+    target = (company or "").strip().lower()
+    if not target:
+        return []
+    out = []
+    for d in get_deals_list():
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            continue
+        if (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        out.append(d)
+    return out
+
+
+def _deal_picker_summary(deal):
+    """{"id","deal_name","buyer_name","stage_name"} display summary for
+    the add-buyer picker -- shared by the snapshot-embedded search list
+    (_handle_lookup_company_buyers) and the live single-deal lookup
+    (_handle_lookup_deal), so the two surfaces never show different
+    buyer/stage text for what should be the same deal. Never includes
+    person_ids/raw ids -- this response shape reaches the browser."""
+    buyer_ids = _deal_linked_person_ids_ordered(deal)
+    people_by_id = get_people_by_ids(buyer_ids) if buyer_ids else {}
+    buyer_recs = [people_by_id[pid] for pid in buyer_ids if pid in people_by_id]
+    primary, _more = _select_primary_buyer(deal, buyer_recs)
+    stage_id = _deal_stage_id(deal)
+    return {
+        "id": str(deal.get("id")),
+        "deal_name": _deal_title(deal),
+        "buyer_name": _person_display_name(primary) if primary else "—",
+        "stage_name": STAGE_LABELS.get(stage_id, str(stage_id) if stage_id is not None else "—"),
+    }
+
+
 def _company_buy_stats(person_id, company_name, intro_details=None):
     """Per-company Buy-side stats (intro_count, stalled) — perf fix 3:
     request-scoped and shared by BOTH render_my_deals_page's own
@@ -3089,6 +3183,91 @@ def _pipeline_update_deal_deadline(deal_id, deadline_iso):
         return False, f"{type(e).__name__}: {e}"
 
 
+def _pipeline_get_deal(deal_id):
+    """Live GET of a single deal from Pipeline -- never the S3 snapshot
+    (see _handle_debug_deal for that read path). Returns
+    (deal_dict_or_None, error_message). Used by the add-buyer flow both
+    to look up a deal absent from deals.json (the "paste deal id" case --
+    the live snapshot excludes won/lost/obsolete by design) and, at save
+    time, to read the deal's CURRENT person linkage right before merging
+    the tenant's own id into it (see _handle_add_buyer) -- deliberately a
+    fresh, uncached call every time, so the merge is never built against
+    a stale array. Same query-string auth as every other Pipeline call
+    here; unwraps a top-level {"deal": {...}} envelope if present, same
+    as _pipeline_update_deal_stage's own echoed-response handling,
+    otherwise uses the response body directly."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return None, "Pipeline API credentials not configured"
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}", method="GET")
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if not (200 <= r.status < 300):
+                return None, f"HTTP {r.status}"
+            try:
+                data = json.loads(r.read().decode("utf-8"))
+            except Exception:
+                return None, "Pipeline response was not valid JSON"
+    except urllib.error.HTTPError as e:
+        return None, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+    if isinstance(data, dict) and isinstance(data.get("deal"), dict):
+        return data["deal"], None
+    if isinstance(data, dict):
+        return data, None
+    return None, "unexpected Pipeline response shape"
+
+
+def _live_deal_person_ids_safe(deal_obj):
+    """(ids, safe) parsed from a LIVE Pipeline GET deal response (see
+    _pipeline_get_deal) -- mirrors _deal_linked_person_ids_ordered's
+    people/person_ids fallback shape, but distinguishes "a real, if
+    possibly empty, linkage array is present" (safe to merge into) from
+    "neither key is present at all" (unsafe -- see _handle_add_buyer's
+    skip-the-link-write-rather-than-risk-unlinking rule). A deal truly
+    carrying zero linked people is treated as safe as long as one of the
+    two keys is actually present -- an empty list IS the deal's real
+    linkage in that case, not a sign the field is missing."""
+    if not isinstance(deal_obj, dict):
+        return [], False
+    if isinstance(deal_obj.get("people"), list):
+        return _deal_linked_person_ids_ordered(deal_obj), True
+    if isinstance(deal_obj.get("person_ids"), list):
+        return _deal_linked_person_ids_ordered(deal_obj), True
+    return [], False
+
+
+def _pipeline_update_deal_person_ids(deal_id, person_ids):
+    """PUT the deal's person linkage to Pipeline -- see _handle_add_buyer.
+    `person_ids` must already be the full MERGED array (every existing
+    id plus the one being added) -- this function does no merging or
+    safety checking itself, it only writes whatever list it's handed.
+    NEVER call this with a bare [tenant_id] array; that would replace
+    the deal's linkage outright and unlink the buyer. Same auth/
+    abort-on-non-2xx contract as _pipeline_update_deal_status."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    body = json.dumps({"deal": {"person_ids": person_ids}}).encode("utf-8")
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
+        data=body, method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 # ── Buyer photos (?photo=<person_id>) ────────────────────────────────────────
 # Warm-invocation-only cache, same lifetime/reset semantics as every other
 # module-level cache in this file: {person_id: (image_url or None, fetched_at
@@ -4101,6 +4280,17 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, resolved, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
         firm_won_index=firm_won_index, company_repeated=company_repeated)
+    if surface == "intros" and not company_repeated:
+        # "+ Add buyer", defaulting company from this row (see
+        # _add_buyer_panel_html's shared script, which wires up every
+        # .ab-row-trigger by its data-company attribute) -- only on the
+        # first row of a company-repeat group, matching where the
+        # company name itself renders (col1_html is blank on every
+        # other row in the group, see _buy_deal_row_cols_html).
+        row_company_name = _deal_company_name(deal)
+        if row_company_name:
+            col1 += (f'<button type="button" class="ab-row-trigger" '
+                     f'data-company="{_esc(row_company_name)}">+ Add buyer</button>')
     is_stalled = surface == "intros" and resolved["id"] == INTRO_STATUS_STALLED_ID
     row_id = f' id="intro-row-{deal_id}"' if is_stalled else ""
     classes = " ".join(c for c in (extra_cls, "stalled-row" if is_stalled else "") if c)
@@ -4375,6 +4565,345 @@ def _edit_script_html(key):
     el.addEventListener('keydown', function(e) {{
       if (e.key === 'Enter') {{ e.preventDefault(); el.blur(); }}
     }});
+  }});
+}})();
+</script>"""
+
+
+# "+ Add buyer" panel (admin-only): shared verbatim by render_company_page's
+# Buyers section and render_intros_page's per-row triggers -- see
+# _add_buyer_panel_html.
+ADD_BUYER_CSS = """
+  .ab-trigger-btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 5px 12px;
+    border-radius: 6px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-left: 10px;
+    text-transform: none;
+    letter-spacing: normal;
+    vertical-align: middle;
+  }
+  .ab-trigger-btn:hover { opacity: 0.9; }
+  .ab-row-trigger {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--accent);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    margin-left: 8px;
+  }
+  .ab-row-trigger:hover { border-color: var(--accent); }
+  .add-buyer-panel {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin: 0 0 20px;
+    position: relative;
+  }
+  .add-buyer-panel h3 { font-size: 15px; font-weight: 700; margin: 0 0 12px; }
+  .add-buyer-panel h3 .ab-company-label { color: var(--muted); font-weight: 500; }
+  .ab-close {
+    position: absolute;
+    top: 14px;
+    right: 16px;
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+    padding: 4px;
+  }
+  .ab-close:hover { color: var(--ink); }
+  .ab-row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .ab-row input[type="text"] {
+    flex: 1;
+    min-width: 180px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 14px;
+  }
+  .ab-paste-row button, .ab-selected button {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 8px 16px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .ab-paste-row button:hover, .ab-selected button:hover { opacity: 0.9; }
+  .ab-results {
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    margin-bottom: 14px;
+  }
+  .ab-result-row {
+    padding: 8px 12px;
+    font-size: 13px;
+    cursor: pointer;
+    border-bottom: 1px solid var(--line);
+  }
+  .ab-result-row:last-child { border-bottom: none; }
+  .ab-result-row:hover { background: rgba(61,90,115,0.08); }
+  .ab-empty { padding: 14px 12px; font-size: 13px; color: var(--muted); }
+  .ab-selected {
+    border-top: 1px solid var(--line);
+    padding-top: 14px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .ab-selected-info { flex: 1 1 220px; font-size: 13px; }
+  .ab-sel-meta { color: var(--muted); margin-top: 2px; }
+  .ab-status-label {
+    font-size: 12px;
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .ab-status-label select {
+    background: var(--card);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 13px;
+  }
+"""
+
+
+def _add_buyer_panel_html(key, tenant_email, default_company=None):
+    """Shared "+ Add buyer" panel (admin-only -- callers only ever embed
+    this when edit_mode is True), used verbatim by both the company
+    page's Buyers section and Active Intros. This function renders only
+    the panel itself (hidden until triggered) plus its script -- NOT a
+    trigger button, since a button belongs wherever each caller's own
+    markup needs it (inline in the company page's <h2>Buyers</h2>, valid
+    HTML only outside a heading; per-row on Active Intros). The panel's
+    own script wires up whichever trigger element(s) actually exist on
+    the page by id/class: #ab-trigger-btn (company page's single header
+    button, opening on default_company) and every .ab-row-trigger (Active
+    Intros' per-row buttons, each opening on its own data-company
+    attribute -- see _buy_deal_row_edit_html). Either, both, or neither
+    may be present; the script only wires what it finds. One panel
+    instance per page render, hidden until triggered.
+
+    Flow: (a) a client-side-filtered search over the JSON array fetched
+    fresh from ?lookup_company_buyers=<company> whenever the panel's
+    company changes -- every Buy-tagged deals.json deal for that
+    company, matched against buyer or deal name; (b) a "paste deal id"
+    field that live-fetches ?lookup_deal=<id> for a deal absent from
+    the snapshot (the live snapshot excludes won/lost/obsolete by
+    design, or the deal is simply too new to have synced). Selecting
+    either shows the deal's buyer/stage (read-only) plus the ten-option
+    Intro Status dropdown (ADD_BUYER_STATUS_ORDER). Save posts
+    ?action=add_buyer and reloads the page on success -- the same
+    "no row-insertion JS, just reload" convention _feature_box_html
+    already uses, since _handle_add_buyer returns no row HTML to
+    splice in, only {"ok", "link_status", "link_message"?}."""
+    key_json = json.dumps(key or "")
+    tenant_email_json = json.dumps(tenant_email or "")
+    default_company_json = json.dumps(default_company or "")
+    status_options = "".join(
+        f'<option value="{sid}">{_esc(INTRO_STATUS_LABELS[sid])}</option>'
+        for sid in ADD_BUYER_STATUS_ORDER
+    )
+    return f"""<div class="add-buyer-panel" id="add-buyer-panel" hidden>
+  <button type="button" class="ab-close" id="ab-close" aria-label="Close">&times;</button>
+  <h3>Add buyer<span class="ab-company-label" id="ab-company-label"></span></h3>
+  <div class="ab-row">
+    <input type="text" id="ab-search" placeholder="Search by buyer or deal name…">
+  </div>
+  <div class="ab-results" id="ab-results"></div>
+  <div class="ab-row ab-paste-row">
+    <input type="text" id="ab-paste-id" placeholder="…or paste a deal ID">
+    <button type="button" id="ab-paste-btn">Look up</button>
+  </div>
+  <div class="ab-selected" id="ab-selected" hidden>
+    <div class="ab-selected-info">
+      <div><strong id="ab-sel-deal"></strong></div>
+      <div class="ab-sel-meta">Buyer: <span id="ab-sel-buyer"></span> &middot; Stage: <span id="ab-sel-stage"></span></div>
+    </div>
+    <label class="ab-status-label">Intro Status
+      <select id="ab-status">{status_options}</select>
+    </label>
+    <button type="button" id="ab-save-btn">Save</button>
+    <span class="ei-msg" id="ab-msg"></span>
+  </div>
+</div>
+<script>
+(function() {{
+  var KEY = {key_json};
+  var TENANT_EMAIL = {tenant_email_json};
+  var DEFAULT_COMPANY = {default_company_json};
+  var panel = document.getElementById('add-buyer-panel');
+  var companyLabel = document.getElementById('ab-company-label');
+  var searchInput = document.getElementById('ab-search');
+  var resultsEl = document.getElementById('ab-results');
+  var pasteInput = document.getElementById('ab-paste-id');
+  var pasteBtn = document.getElementById('ab-paste-btn');
+  var selectedBox = document.getElementById('ab-selected');
+  var selDeal = document.getElementById('ab-sel-deal');
+  var selBuyer = document.getElementById('ab-sel-buyer');
+  var selStage = document.getElementById('ab-sel-stage');
+  var statusSelect = document.getElementById('ab-status');
+  var saveBtn = document.getElementById('ab-save-btn');
+  var msgEl = document.getElementById('ab-msg');
+  var closeBtn = document.getElementById('ab-close');
+
+  var allDeals = [];
+  var selectedDeal = null;
+
+  function resetSelection() {{
+    selectedDeal = null;
+    selectedBox.hidden = true;
+    msgEl.className = 'ei-msg';
+    msgEl.textContent = '';
+  }}
+
+  function renderResults(list) {{
+    resultsEl.innerHTML = '';
+    if (!list.length) {{
+      resultsEl.innerHTML = '<div class="ab-empty">No matching Buy-side deals found.</div>';
+      return;
+    }}
+    list.forEach(function(d) {{
+      var row = document.createElement('div');
+      row.className = 'ab-result-row';
+      row.textContent = d.buyer_name + ' — ' + d.deal_name + ' (' + d.stage_name + ')';
+      row.addEventListener('click', function() {{ selectDeal(d); }});
+      resultsEl.appendChild(row);
+    }});
+  }}
+
+  function applySearch() {{
+    var q = searchInput.value.trim().toLowerCase();
+    var filtered = !q ? allDeals : allDeals.filter(function(d) {{
+      return d.buyer_name.toLowerCase().indexOf(q) !== -1 || d.deal_name.toLowerCase().indexOf(q) !== -1;
+    }});
+    renderResults(filtered);
+  }}
+
+  function loadCompany(company) {{
+    companyLabel.textContent = company ? (' — ' + company) : '';
+    allDeals = [];
+    renderResults([]);
+    if (!company) return;
+    fetch('?lookup_company_buyers=' + encodeURIComponent(company) + '&key=' + encodeURIComponent(KEY))
+      .then(function(r) {{ return r.json(); }})
+      .then(function(data) {{
+        allDeals = (data && data.deals) || [];
+        applySearch();
+      }})
+      .catch(function() {{ allDeals = []; renderResults([]); }});
+  }}
+
+  function selectDeal(d) {{
+    selectedDeal = d;
+    selDeal.textContent = d.deal_name;
+    selBuyer.textContent = d.buyer_name;
+    selStage.textContent = d.stage_name;
+    selectedBox.hidden = false;
+    msgEl.className = 'ei-msg';
+    msgEl.textContent = '';
+  }}
+
+  searchInput.addEventListener('input', applySearch);
+
+  pasteBtn.addEventListener('click', function() {{
+    var id = pasteInput.value.trim();
+    if (!id) return;
+    msgEl.className = 'ei-msg saving';
+    msgEl.textContent = 'Looking up…';
+    selectedBox.hidden = true;
+    fetch('?lookup_deal=' + encodeURIComponent(id) + '&key=' + encodeURIComponent(KEY))
+      .then(function(r) {{ return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }}); }})
+      .then(function(res) {{
+        if (!res.ok) {{
+          msgEl.className = 'ei-msg error';
+          msgEl.textContent = (res.data && res.data.error) || 'Lookup failed';
+          return;
+        }}
+        selectDeal(res.data);
+      }})
+      .catch(function(err) {{
+        msgEl.className = 'ei-msg error';
+        msgEl.textContent = 'Error: ' + err;
+      }});
+  }});
+
+  saveBtn.addEventListener('click', function() {{
+    if (!selectedDeal) return;
+    msgEl.className = 'ei-msg saving';
+    msgEl.textContent = 'Saving…';
+    fetch('?action=add_buyer', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        key: KEY,
+        deal_id: selectedDeal.id,
+        status_id: parseInt(statusSelect.value, 10),
+        tenant_email: TENANT_EMAIL
+      }})
+    }}).then(function(r) {{ return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }}); }})
+      .then(function(res) {{
+        if (res.ok) {{
+          msgEl.className = 'ei-msg saved';
+          if (res.data && res.data.link_status === 'skipped' && res.data.link_message) {{
+            msgEl.textContent = res.data.link_message + ' Reloading…';
+            setTimeout(function() {{ window.location.reload(); }}, 1800);
+          }} else {{
+            msgEl.textContent = 'Saved ✓ Reloading…';
+            setTimeout(function() {{ window.location.reload(); }}, 700);
+          }}
+        }} else {{
+          msgEl.className = 'ei-msg error';
+          msgEl.textContent = (res.data && res.data.error) || 'Error';
+        }}
+      }}).catch(function(err) {{
+        msgEl.className = 'ei-msg error';
+        msgEl.textContent = 'Error: ' + err;
+      }});
+  }});
+
+  closeBtn.addEventListener('click', function() {{ panel.hidden = true; }});
+
+  function openAddBuyer(company) {{
+    panel.hidden = false;
+    resetSelection();
+    searchInput.value = '';
+    pasteInput.value = '';
+    loadCompany(company);
+    panel.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+  }}
+
+  var triggerBtn = document.getElementById('ab-trigger-btn');
+  if (triggerBtn) {{
+    triggerBtn.addEventListener('click', function() {{
+      if (panel.hidden) {{ openAddBuyer(DEFAULT_COMPANY); }} else {{ panel.hidden = true; }}
+    }});
+  }}
+
+  document.querySelectorAll('.ab-row-trigger').forEach(function(btn) {{
+    btn.addEventListener('click', function() {{ openAddBuyer(btn.getAttribute('data-company')); }});
   }});
 }})();
 </script>"""
@@ -4963,15 +5492,22 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         subtle_html = ""
     else:
         person_id = tenant.get("person_id")
+        # Fetched unconditionally (previously gated on "deals or
+        # closed_out_deals" -- a real Dynamo cost saved for a tenant with
+        # no buy-side activity at all) because "+ Add buyer" needs it
+        # even when deals/closed_out_deals both start out empty: a
+        # brand-new admin-linked deal only exists as an intro# Dynamo
+        # item until deals.json's own hourly sync catches up (see
+        # _augment_with_dynamo_linked_deals, called right below).
+        intro_details, dynamo_failed = get_intro_details(tenant_email)
         deals = get_my_matched_buy_deals(person_id) if person_id is not None else []
+        deals = _augment_with_dynamo_linked_deals(deals, intro_details)
         # Turn 27, item 1: stage-level exits — a dead-stage (Lost/Trade
         # Broken/Obsolete) BUY deal never reaches get_my_matched_buy_deals,
         # so it simply vanished instead of showing as a closed-out intro.
         # Fetched separately, keyed off the deal's own Pipeline stage
         # rather than the Intro Status field — see get_my_closed_out_buy_deals.
         closed_out_deals = get_my_closed_out_buy_deals(person_id) if person_id is not None else []
-
-        intro_details, dynamo_failed = get_intro_details(tenant_email) if (deals or closed_out_deals) else ({}, False)
 
         # Item 3: closed-out rows use their own, simpler disclosure rule
         # (_closed_out_disclosed — raw Intro Status explicitly Introduced-
@@ -5227,7 +5763,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     </div>"""
 
             edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
-            body_html = f"{note_html}{table_html}{closed_out_html}{edit_script}"
+            add_buyer_panel_html = _add_buyer_panel_html(key, tenant_email) if edit_mode else ""
+            body_html = f"{note_html}{table_html}{closed_out_html}{add_buyer_panel_html}{edit_script}"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -5255,6 +5792,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   }}
 {NAV_CSS}
 {FEATURE_CSS}
+{ADD_BUYER_CSS}
   .wrap {{ max-width: 1000px; margin: 28px auto 0; }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
   .mydeals-summary {{ color: var(--ink); font-size: 14px; margin: 0 0 4px; }}
@@ -6253,6 +6791,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   </section>"""
 
         matched_deals = get_my_matched_buy_deals(person_id, company) if person_id is not None else []
+        matched_deals = _augment_with_dynamo_linked_deals(matched_deals, intro_details, company)
         wanted_ids = set()
         for d in matched_deals:
             wanted_ids |= _deal_linked_person_ids(d) - {person_id}
@@ -6406,8 +6945,13 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     </details>"""
 
         edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
+        add_buyer_trigger_html = ('<button type="button" class="ab-trigger-btn" id="ab-trigger-btn">'
+                                   '+ Add buyer</button>') if edit_mode else ""
+        add_buyer_panel_html = (_add_buyer_panel_html(key, anon_key_email, default_company=company)
+                                 if edit_mode else "")
         matched_buyers_html = f"""<section class="cd-section" id="buyers">
-    <h2>Buyers</h2>
+    <h2>Buyers{add_buyer_trigger_html}</h2>
+    {add_buyer_panel_html}
     {matched_body}
     {closed_out_html}
     {edit_script}
@@ -6439,6 +6983,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 <style>
 {NAV_CSS}
 {FEATURE_CSS}
+{ADD_BUYER_CSS}
   :root {{
     --bg: #f4f2ee;
     --card: #ffffff;
@@ -8186,6 +8731,143 @@ def _handle_update_intro(event):
     return _json_response({"ok": True})
 
 
+def _handle_lookup_company_buyers(company_raw):
+    """?lookup_company_buyers=<company>, admin-only (checked by the
+    caller, same convention as _handle_debug_deal). JSON array of
+    Buy-tagged deals.json deals for that company -- any stage, any
+    existing person linkage -- for the "+ Add buyer" search box's
+    candidate list (see _company_buy_deals_for_picker). Never raises;
+    an empty/missing company returns an empty list rather than an
+    error."""
+    company = (company_raw or "").strip()
+    if not company:
+        return _json_response({"ok": True, "deals": []})
+    deals = _company_buy_deals_for_picker(company)
+    return _json_response({"ok": True, "deals": [_deal_picker_summary(d) for d in deals]})
+
+
+def _handle_lookup_deal(deal_id_raw):
+    """?lookup_deal=<deal_id>, admin-only (checked by the caller). Live
+    Pipeline GET (_pipeline_get_deal, never the S3 snapshot) so the
+    "paste deal id" add-buyer flow can show buyer/stage for a deal the
+    snapshot excludes by design (won/lost/obsolete) or simply hasn't
+    synced yet. Returns display strings only -- deal name, company,
+    buyer name, stage -- never the raw person_ids array, since this
+    response reaches the browser."""
+    deal_id = str(deal_id_raw or "").strip()
+    if not deal_id:
+        return _json_response({"error": "deal_id is required"}, 400)
+    live_deal, err = _pipeline_get_deal(deal_id)
+    if live_deal is None:
+        return _json_response({"error": err or "deal not found"}, 404)
+    if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(live_deal, DEAL_SIDE_FIELD):
+        return _json_response({"error": "not a Buy-side deal"}, 400)
+    summary = _deal_picker_summary(live_deal)
+    summary["ok"] = True
+    summary["company_name"] = _deal_company_name(live_deal)
+    return _json_response(summary)
+
+
+def _handle_add_buyer(event):
+    """POST ?action=add_buyer -- admin-only, enforced here (ADMIN_KEY
+    must be present in the body); there is no tenant path for this
+    route at all, unlike _handle_update_intro. Attaches an existing
+    Buy-tagged Pipeline deal (found via the company-page/Active-Intros
+    "+ Add buyer" search, or pasted in by id for a deal absent from the
+    snapshot) to one tenant's Buyers list.
+
+    Two Pipeline PUTs, per instruction:
+    1. The chosen Intro Status, via the same _pipeline_update_deal_status
+       _handle_update_intro itself uses. Abort outright (no Dynamo
+       write, no second PUT) on any non-2xx -- identical contract to
+       every other write path in this file.
+    2. Best-effort: link the tenant's own person onto the deal if
+       they're not on it already. A live _pipeline_get_deal read comes
+       first, and the merge only proceeds when _live_deal_person_ids_safe
+       confirms the response actually carries a person_ids/people array
+       to merge against -- NEVER a bare [tenant_id] PUT, which would
+       replace (not extend) the deal's linkage and unlink the real
+       buyer. When the GET fails or the shape can't be confirmed safe,
+       this write is skipped -- not an error, not an abort -- and the
+       response carries a link_message telling the admin to link the
+       tenant in Pipeline by hand. A determinate non-2xx failure on the
+       merge PUT itself (once a safe array was already computed) is a
+       hard failure, though, exactly like write 1 -- abort, no Dynamo
+       write.
+
+    Finally, write 3: the Dynamo status_override + audit item, via the
+    same _dynamo_write_intro_update _handle_update_intro uses, so the
+    row shows up immediately without waiting on either Pipeline write
+    or the next deals.json sync (see _augment_with_dynamo_linked_deals,
+    which is what actually surfaces the row before that sync happens).
+    Never raises past this function."""
+    body = _parse_json_body(event)
+
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (bool(admin_key) and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+
+    deal_id = str(body.get("deal_id") or "").strip()
+    if not deal_id:
+        return _json_response({"error": "deal_id is required"}, 400)
+
+    try:
+        status_id = int(body.get("status_id"))
+    except (TypeError, ValueError):
+        return _json_response({"error": "invalid status_id"}, 400)
+    if status_id not in INTRO_STATUS_LABELS:
+        return _json_response({"error": "invalid status_id"}, 400)
+
+    tenant_email = str(body.get("tenant_email") or "").strip().lower()
+    tenant = _resolve_tenant(tenant_email)
+    if tenant is None:
+        return _json_response({"error": "unknown tenant"}, 400)
+    tenant_person_id = tenant.get("person_id")
+    if tenant_person_id is None:
+        return _json_response({"error": "tenant has no linked person"}, 400)
+
+    # Write 1: Intro Status. Abort everything on any non-2xx -- nothing
+    # else in this function runs.
+    ok, err = _pipeline_update_deal_status(deal_id, status_id)
+    if not ok:
+        return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
+
+    # Write 2 (best-effort): link the tenant's person onto the deal.
+    link_status = "skipped"
+    link_message = f"Link {tenant['name']} to this deal in Pipeline."
+    live_deal, _get_err = _pipeline_get_deal(deal_id)
+    if live_deal is not None:
+        existing_ids, safe = _live_deal_person_ids_safe(live_deal)
+        if safe:
+            if tenant_person_id in existing_ids:
+                link_status = "already_linked"
+            else:
+                merged_ids = existing_ids + [tenant_person_id]
+                ok2, err2 = _pipeline_update_deal_person_ids(deal_id, merged_ids)
+                if not ok2:
+                    return _json_response({"error": f"Pipeline update failed: {err2}"}, 502)
+                link_status = "linked"
+
+    # Write 3: Dynamo status_override + audit, so the row is visible on
+    # the very next render. old_values reflects the deal's current raw
+    # status from the snapshot when it's already there (a deal that
+    # exists in deals.json but simply isn't linked to this tenant yet),
+    # else None (a deal only reachable via ?lookup_deal= so far).
+    deal_snapshot = next((d for d in get_deals_list() if str(d.get("id")) == deal_id), None)
+    old_status = _resolve_intro_status(deal_snapshot, None)["id"] if deal_snapshot is not None else None
+    old_values = {"status": old_status, "linked_before": link_status != "linked"}
+
+    ok3, err3 = _dynamo_write_intro_update(tenant_email, deal_id, status_id, None, None, None, None,
+                                            old_values, "admin", milestones=None)
+    if not ok3:
+        return _json_response({"error": f"Save failed: {err3}"}, 502)
+
+    resp = {"ok": True, "link_status": link_status}
+    if link_status == "skipped":
+        resp["link_message"] = link_message
+    return _json_response(resp)
+
+
 NOT_ENABLED_MESSAGE = "This dashboard is for sellers."
 
 
@@ -8244,6 +8926,11 @@ def _lambda_handler_impl(event, context):
             return _json_response({"error": "POST only"}, 405)
         return _handle_deal_stage(event)
 
+    if query.get("action") == "add_buyer":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_add_buyer(event)
+
     if method != "GET":
         return _forbidden()
 
@@ -8255,6 +8942,18 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_debug_deal(debug_deal_param)
+
+    lookup_deal_param = query.get("lookup_deal")
+    if lookup_deal_param:
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_lookup_deal(lookup_deal_param)
+
+    lookup_company_buyers_param = query.get("lookup_company_buyers")
+    if lookup_company_buyers_param:
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_lookup_company_buyers(lookup_company_buyers_param)
 
     # SSO handoff: verify, set the durable identity cookie, redirect to a
     # clean URL. An invalid/expired token just falls through to normal

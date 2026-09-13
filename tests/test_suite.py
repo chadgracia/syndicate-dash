@@ -3176,6 +3176,277 @@ check("Perf fix 3 safety: the SAME page's nav dropdown badge stays RAW-only "
 
 
 # ======================================================================
+# SECTION: "+ Add buyer" (admin-only write path) -- ?action=add_buyer,
+# ?lookup_deal=, ?lookup_company_buyers=
+# ======================================================================
+# Two Pipeline PUTs (status, then a best-effort person-linkage merge),
+# abort-on-non-2xx for each, a Dynamo status_override so the row shows
+# up immediately, and the "never send a bare array" merge safety rule.
+
+AB_TENANT_EMAIL = "sella-ab@example.com"
+AB_TENANT_PID = 501
+AB_BUYER_PID = 777
+
+ab_people = {"people": [
+    {"id": AB_TENANT_PID, "full_name": "Sella AddBuyer", "email": AB_TENANT_EMAIL, "custom_fields": {}},
+    {"id": AB_BUYER_PID, "first_name": "Bianca", "last_name": "Buyer", "full_name": "Bianca Buyer",
+     "email": "bianca@buyerfirm.com", "company_name": "Buyer Firm", "custom_fields": {}},
+]}
+# The tenant's own Sell deal (for auto-enrollment eligibility) and a
+# Buy-tagged deal for the SAME company that the tenant's person is NOT
+# yet linked to -- exactly the "+ Add buyer" starting state.
+ab_sell_deal = {"id": 9600, "name": "AB Sell Deal", "company": {"name": "Echo Co"},
+                "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                "people": [{"id": AB_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+ab_buy_deal = {"id": 9601, "name": "AB Buy Deal", "company": {"name": "Echo Co"},
+               "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None),
+               "people": [{"id": AB_BUYER_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+fake_s3_ab, fake_table_ab = use_fixture({
+    lf.PEOPLE_KEY: ab_people, lf.INTEREST_KEY: {"buy": {}},
+    lf.DEALS_KEY: {"deals": [ab_sell_deal, ab_buy_deal]},
+})
+ab_tenant = lf._resolve_tenant(AB_TENANT_EMAIL)
+assert ab_tenant is not None and ab_tenant["person_id"] == AB_TENANT_PID
+
+
+class _FakeGetResponse:
+    def __init__(self, status, body):
+        self.status = status
+        self._body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return json.dumps(self._body).encode()
+
+
+def make_ab_urlopen(calls, get_body=None, get_fail=False, get_status=200,
+                     status_put_status=200, link_put_status=200):
+    """Records every call (method/url/data) into `calls`, in the exact
+    order _handle_add_buyer issues them: PUT (status), then GET, then
+    (maybe) a second PUT (person-linkage merge)."""
+    put_count = {"n": 0}
+
+    def _urlopen(req, timeout=15):
+        method = req.get_method()
+        data = json.loads(req.data.decode()) if req.data else None
+        calls.append({"method": method, "url": req.full_url, "data": data})
+        if method == "GET":
+            if get_fail:
+                raise lf.urllib.error.HTTPError(req.full_url, 502, "boom", {}, None)
+            return _FakeGetResponse(get_status, get_body)
+        put_count["n"] += 1
+        status = status_put_status if put_count["n"] == 1 else link_put_status
+        if status >= 400:
+            raise lf.urllib.error.HTTPError(req.full_url, status, "boom", {}, None)
+        return FakeHTTPResponse(status)
+    return _urlopen
+
+
+def ab_add_buyer_event(body_dict, cookies=None):
+    return {"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+            "queryStringParameters": {"action": "add_buyer"}, "cookies": cookies or [],
+            "body": json.dumps(body_dict)}
+
+
+def ab_get_event(query, cookies=None):
+    return {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+            "queryStringParameters": query, "cookies": cookies or []}
+
+
+# --- Happy path: buyer not yet linked, GET confirms a safe person_ids array
+ab_calls = []
+lf.urllib.request.urlopen = make_ab_urlopen(ab_calls, get_body={"deal": {"id": 9601, "person_ids": [AB_BUYER_PID]}})
+ab_resp = lf.lambda_handler(ab_add_buyer_event({
+    "key": ADMIN_KEY, "deal_id": "9601", "status_id": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": AB_TENANT_EMAIL,
+}), None)
+check("add_buyer happy path -> 200", ab_resp["statusCode"] == 200)
+ab_data = json.loads(ab_resp["body"])
+check("add_buyer happy path: link_status == 'linked'", ab_data.get("link_status") == "linked")
+check("add_buyer happy path: exactly 3 Pipeline calls (status PUT, GET, link PUT)", len(ab_calls) == 3)
+check("add_buyer happy path: call 1 is the Intro Status PUT",
+      ab_calls[0]["method"] == "PUT"
+      and ab_calls[0]["data"]["deal"]["custom_fields"][lf.INTRO_STATUS_FIELD] == lf.INTRO_STATUS_INTRODUCED_ID)
+check("add_buyer happy path: call 2 is the live GET (no body)",
+      ab_calls[1]["method"] == "GET" and ab_calls[1]["data"] is None)
+check("add_buyer happy path: call 3 PUTs the MERGED array (existing buyer kept, tenant appended) "
+      "-- never a bare [tenant_id]",
+      ab_calls[2]["method"] == "PUT" and ab_calls[2]["data"]["deal"]["person_ids"] == [AB_BUYER_PID, AB_TENANT_PID])
+check("add_buyer happy path: Dynamo status_override stored",
+      fake_table_ab.updates and fake_table_ab.updates[-1]["ExpressionAttributeValues"].get(":so")
+      == lf.INTRO_STATUS_INTRODUCED_ID)
+check("add_buyer happy path: audit actor='admin'", fake_table_ab.puts and fake_table_ab.puts[-1].get("actor") == "admin")
+
+# --- The row appears immediately on both surfaces via the Dynamo
+# override even though deals.json's own snapshot STILL only lists the
+# original buyer (AB_BUYER_PID), not the tenant -- exactly the hourly-
+# sync-lag case _augment_with_dynamo_linked_deals exists to bridge.
+# The company page's row shows the BUYER's own name (the page is
+# already scoped to one company, see _buy_deal_row_cols_html's
+# surface="company" branch) -- so "row exists at all" is checked via
+# row_for's data-deal-id match, and "Bianca Buyer" confirms it's the
+# right one.
+page_company_ab = lf.render_company_page("Echo Co", "Admin", ab_tenant, AB_TENANT_EMAIL, "mydeals",
+                                          key=ADMIN_KEY, view_as=AB_TENANT_EMAIL, edit_mode=True)
+row_company_ab = row_for(page_company_ab, "9601")
+check("newly-linked buyer's row appears on the company page immediately",
+      row_company_ab is not None and "Bianca Buyer" in row_company_ab)
+page_intros_ab = lf.render_intros_page("Sella AddBuyer", tenant=ab_tenant, tenant_email=AB_TENANT_EMAIL,
+                                        key=ADMIN_KEY, view_as=AB_TENANT_EMAIL, edit_mode=True)
+row_intros_ab = row_for(page_intros_ab, "9601")
+check("newly-linked buyer's row appears on Active Intros immediately too",
+      row_intros_ab is not None and "Echo Co" in row_intros_ab and "Bianca Buyer" in row_intros_ab)
+check("Active Intros row carries a '+ Add buyer' trigger defaulting to this row's company",
+      'data-company="Echo Co"' in page_intros_ab)
+
+# --- Already linked: GET shows the tenant is already on the deal -> no
+# redundant second PUT
+ab_calls2 = []
+lf.urllib.request.urlopen = make_ab_urlopen(
+    ab_calls2, get_body={"deal": {"id": 9601, "person_ids": [AB_BUYER_PID, AB_TENANT_PID]}})
+ab_resp2 = lf.lambda_handler(ab_add_buyer_event({
+    "key": ADMIN_KEY, "deal_id": "9601", "status_id": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": AB_TENANT_EMAIL,
+}), None)
+check("add_buyer already-linked -> 200", ab_resp2["statusCode"] == 200)
+check("add_buyer already-linked: link_status == 'already_linked'",
+      json.loads(ab_resp2["body"]).get("link_status") == "already_linked")
+check("add_buyer already-linked: only 2 Pipeline calls (status PUT + GET, no redundant merge PUT)",
+      len(ab_calls2) == 2)
+
+# --- GET fails outright: link write is SKIPPED (never guessed), status
+# write still completes, Dynamo still records it, and the response
+# tells the admin to link by hand instead of risking an unsafe write.
+ab_calls3 = []
+lf.urllib.request.urlopen = make_ab_urlopen(ab_calls3, get_fail=True)
+fake_table_ab.updates.clear()
+ab_resp3 = lf.lambda_handler(ab_add_buyer_event({
+    "key": ADMIN_KEY, "deal_id": "9601", "status_id": 7207580,  # NDA Signed
+    "tenant_email": AB_TENANT_EMAIL,
+}), None)
+check("add_buyer GET failure -> still 200 (link is best-effort, not fatal)", ab_resp3["statusCode"] == 200)
+ab_data3 = json.loads(ab_resp3["body"])
+check("add_buyer GET failure: link_status == 'skipped'", ab_data3.get("link_status") == "skipped")
+check("add_buyer GET failure: link_message names the tenant instead of guessing a write",
+      "Sella AddBuyer" in (ab_data3.get("link_message") or ""))
+check("add_buyer GET failure: only 2 calls attempted (status PUT + failed GET, no link PUT at all)",
+      len(ab_calls3) == 2)
+check("add_buyer GET failure: Dynamo status_override is still written",
+      fake_table_ab.updates and fake_table_ab.updates[-1]["ExpressionAttributeValues"].get(":so") == 7207580)
+
+# --- GET succeeds but the shape is unrecognizable (neither person_ids
+# nor people present) -- also skipped, same as an outright GET failure.
+ab_calls4 = []
+lf.urllib.request.urlopen = make_ab_urlopen(ab_calls4, get_body={"deal": {"id": 9601, "name": "no linkage field"}})
+ab_resp4 = lf.lambda_handler(ab_add_buyer_event({
+    "key": ADMIN_KEY, "deal_id": "9601", "status_id": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": AB_TENANT_EMAIL,
+}), None)
+check("add_buyer malformed GET shape: link_status == 'skipped' (never guesses a linkage array)",
+      json.loads(ab_resp4["body"]).get("link_status") == "skipped")
+check("add_buyer malformed GET shape: no merge PUT was ever attempted",
+      len(ab_calls4) == 2 and ab_calls4[1]["method"] == "GET")
+
+# --- The Intro Status PUT itself fails: abort everything, nothing else
+# is even attempted, no Dynamo write.
+ab_calls5 = []
+lf.urllib.request.urlopen = make_ab_urlopen(ab_calls5, status_put_status=502)
+fake_table_ab.updates.clear()
+ab_resp5 = lf.lambda_handler(ab_add_buyer_event({
+    "key": ADMIN_KEY, "deal_id": "9601", "status_id": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": AB_TENANT_EMAIL,
+}), None)
+check("add_buyer status PUT failure -> 502", ab_resp5["statusCode"] == 502)
+check("add_buyer status PUT failure: only 1 call attempted (never reaches the GET)", len(ab_calls5) == 1)
+check("add_buyer status PUT failure: no Dynamo write happens", len(fake_table_ab.updates) == 0)
+
+# --- Status PUT succeeds and the GET confirms a safe array, but the
+# merge PUT itself fails: this is a determinate failure (not a "can't
+# tell" case), so it aborts too -- no Dynamo write, despite the first
+# Pipeline write having already gone through.
+ab_calls6 = []
+lf.urllib.request.urlopen = make_ab_urlopen(
+    ab_calls6, get_body={"deal": {"id": 9601, "person_ids": [AB_BUYER_PID]}}, link_put_status=502)
+fake_table_ab.updates.clear()
+ab_resp6 = lf.lambda_handler(ab_add_buyer_event({
+    "key": ADMIN_KEY, "deal_id": "9601", "status_id": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": AB_TENANT_EMAIL,
+}), None)
+check("add_buyer merge-PUT failure (after a safe GET) -> 502", ab_resp6["statusCode"] == 502)
+check("add_buyer merge-PUT failure: all 3 calls were attempted (status PUT, GET, failed link PUT)",
+      len(ab_calls6) == 3)
+check("add_buyer merge-PUT failure: no Dynamo write happens (abort, even though write 1 already succeeded)",
+      len(fake_table_ab.updates) == 0)
+
+# --- Admin-only, enforced server-side: no ADMIN_KEY at all, and a real
+# tenant's own identity cookie -- neither authorizes this route (unlike
+# ?action=update_intro, there is no tenant fallback here whatsoever).
+ab_resp_noauth = lf.lambda_handler(ab_add_buyer_event({
+    "deal_id": "9601", "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": AB_TENANT_EMAIL,
+}), None)
+check("add_buyer with no admin key -> 403", ab_resp_noauth["statusCode"] == 403)
+ab_resp_tenant_cookie = lf.lambda_handler(ab_add_buyer_event({
+    "deal_id": "9601", "status_id": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": AB_TENANT_EMAIL,
+}, cookies=[tenant_cookie(AB_TENANT_EMAIL)]), None)
+check("add_buyer with a real tenant cookie but no admin key -> still 403 (admin-only, no tenant path exists)",
+      ab_resp_tenant_cookie["statusCode"] == 403)
+
+# --- Input validation
+ab_resp_bad_status = lf.lambda_handler(ab_add_buyer_event({
+    "key": ADMIN_KEY, "deal_id": "9601", "status_id": 999999, "tenant_email": AB_TENANT_EMAIL,
+}), None)
+check("add_buyer with an invalid status_id -> 400", ab_resp_bad_status["statusCode"] == 400)
+ab_resp_bad_tenant = lf.lambda_handler(ab_add_buyer_event({
+    "key": ADMIN_KEY, "deal_id": "9601", "status_id": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": "nobody@nowhere.example.com",
+}), None)
+check("add_buyer with an unresolvable tenant_email -> 400", ab_resp_bad_tenant["statusCode"] == 400)
+
+# --- ?lookup_company_buyers=<company>: the search box's candidate list
+# (admin-only GET route)
+ab_resp_lookup_co = lf.lambda_handler(ab_get_event({"lookup_company_buyers": "Echo Co", "key": ADMIN_KEY}), None)
+check("lookup_company_buyers -> 200", ab_resp_lookup_co["statusCode"] == 200)
+ab_lookup_co_data = json.loads(ab_resp_lookup_co["body"])
+check("lookup_company_buyers finds the Buy-tagged Echo Co deal",
+      any(d["id"] == "9601" for d in ab_lookup_co_data.get("deals", [])))
+check("lookup_company_buyers reports the real buyer name (never the tenant's own id/array)",
+      any(d.get("buyer_name") == "Bianca Buyer" for d in ab_lookup_co_data["deals"]))
+ab_resp_lookup_co_noauth = lf.lambda_handler(ab_get_event({"lookup_company_buyers": "Echo Co"}), None)
+check("lookup_company_buyers with no admin key -> 403", ab_resp_lookup_co_noauth["statusCode"] == 403)
+
+# --- ?lookup_deal=<id>: the "paste deal id" flow, live-fetching a deal
+# that ISN'T in the deals.json snapshot at all (the snapshot excludes
+# won/lost/obsolete by design; this stands in for that case generally).
+lf.urllib.request.urlopen = make_ab_urlopen([], get_body={"deal": {
+    "id": 9999, "name": "Absent Deal", "company": {"name": "Echo Co"},
+    "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None), "person_ids": [AB_BUYER_PID],
+}})
+ab_resp_lookup_deal = lf.lambda_handler(ab_get_event({"lookup_deal": "9999", "key": ADMIN_KEY}), None)
+check("lookup_deal (absent from the snapshot) -> 200", ab_resp_lookup_deal["statusCode"] == 200)
+ab_lookup_deal_data = json.loads(ab_resp_lookup_deal["body"])
+check("lookup_deal reports deal name/company/buyer/stage for a snapshot-absent deal",
+      ab_lookup_deal_data.get("deal_name") == "Absent Deal"
+      and ab_lookup_deal_data.get("company_name") == "Echo Co"
+      and ab_lookup_deal_data.get("buyer_name") == "Bianca Buyer"
+      and ab_lookup_deal_data.get("stage_name") == "MATCHED")
+ab_resp_lookup_deal_noauth = lf.lambda_handler(ab_get_event({"lookup_deal": "9999"}), None)
+check("lookup_deal with no admin key -> 403", ab_resp_lookup_deal_noauth["statusCode"] == 403)
+
+# --- ?lookup_deal= on a Sell-side deal is rejected -- this picker is
+# for Buy-side deals only.
+lf.urllib.request.urlopen = make_ab_urlopen([], get_body={"deal": {
+    "id": 9998, "name": "Sell Deal", "company": {"name": "Echo Co"}, "custom_fields": cf_sell(),
+}})
+ab_resp_lookup_sell = lf.lambda_handler(ab_get_event({"lookup_deal": "9998", "key": ADMIN_KEY}), None)
+check("lookup_deal on a Sell-side deal -> 400", ab_resp_lookup_sell["statusCode"] == 400)
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 
