@@ -4121,6 +4121,147 @@ check("company page: the .buyer-cell-links rule (country/website/LinkedIn line) 
 
 
 # ======================================================================
+# SECTION: In-page admin/tenant view toggle (replaces &edit=1) +
+# "Copy client link" -- full lambda_handler round trips, not direct
+# render_* calls, so these prove the real request path (query params +
+# cookie -> edit_mode -> render) end to end.
+# ======================================================================
+
+VT_TENANT_EMAIL = "toggle-tenant@example.com"
+VT_TENANT_PID = 951
+VT_BUYER_PID = 952
+VT_COMPANY = "Griffin Co"
+
+vt_people = {"people": [
+    {"id": VT_TENANT_PID, "full_name": "Toggle Tenant", "email": VT_TENANT_EMAIL, "custom_fields": {}},
+    {"id": VT_BUYER_PID, "first_name": "Vera", "last_name": "Realname", "full_name": "Vera Realname",
+     "email": "vera@example.com", "company_name": "Vera Capital", "custom_fields": {}},
+]}
+vt_sell_deal = {"id": 9950, "name": "VT Sell Deal", "company": {"name": VT_COMPANY},
+                "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                "people": [{"id": VT_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+vt_buy_deal = {"id": 9951, "name": "VT Buy Deal", "company": {"name": VT_COMPANY},
+               # Deliberately Matched/undisclosed (cf_status(None)), not
+               # Introduced -- a genuinely Introduced-or-later deal
+               # discloses to the tenant themselves too (that's the
+               # normal disclosure gate, not an admin-only reveal), so
+               # it would prove nothing about the admin-view toggle
+               # specifically. Only edit_mode's "admin always sees the
+               # real thing" convention should reveal this buyer.
+               "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None),
+               "people": [{"id": VT_TENANT_PID}, {"id": VT_BUYER_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: vt_people, lf.INTEREST_KEY: {"buy": {"Griffin Co": [VT_BUYER_PID]}},
+             lf.DEALS_KEY: {"deals": [vt_sell_deal, vt_buy_deal]}})
+vt_tenant = lf._resolve_tenant(VT_TENANT_EMAIL)
+assert vt_tenant is not None
+
+
+def vt_get_event(query, cookies=None):
+    return {"requestContext": {"http": {"method": "GET"}}, "queryStringParameters": query,
+            "cookies": cookies or []}
+
+
+# --- DEFAULT: admin key + &view_as, no cookie, no &edit=1 -> exactly
+# the tenant's own read-only view. No real name, no admin controls,
+# anywhere -- on BOTH a company page and Active Intros, proving the
+# same cookie-free default applies across pages/tabs.
+resp_bare_company = lf.lambda_handler(vt_get_event({
+    "key": ADMIN_KEY, "view_as": VT_TENANT_EMAIL, "company": VT_COMPANY,
+}), None)
+check("bare admin+view_as (company page) -> 200", resp_bare_company["statusCode"] == 200)
+check("bare admin+view_as (company page): no real buyer name anywhere", "Vera Realname" not in resp_bare_company["body"])
+check("bare admin+view_as (company page): no Introduce/status-select admin controls",
+      'class="intro-buyer-btn"' not in resp_bare_company["body"]
+      and 'class="intro-status-select"' not in resp_bare_company["body"]
+      and 'class="manual-intro-box"' not in resp_bare_company["body"])
+
+resp_bare_intros = lf.lambda_handler(vt_get_event({
+    "key": ADMIN_KEY, "view_as": VT_TENANT_EMAIL, "tab": "intros",
+}), None)
+check("bare admin+view_as (Active Intros) -> 200", resp_bare_intros["statusCode"] == 200)
+check("bare admin+view_as (Active Intros): no real buyer name anywhere",
+      "Vera Realname" not in resp_bare_intros["body"])
+# (checked via the actual input/select tag's class="..." attribute, not
+# a bare substring -- "ei-milestone"/"ei-flag" alone also appear in the
+# page's own <style> block selectors, which are always present)
+check("bare admin+view_as (Active Intros): no admin edit controls render on the row at all "
+      "(no milestone checkboxes, no flag select)",
+      'class="ei-milestone"' not in resp_bare_intros["body"] and 'class="ei-flag' not in resp_bare_intros["body"])
+
+# --- The nav toggle itself: visible (key present), "Tenant view" is the
+# active side by default, "Copy client link" is ALSO present (it's
+# view_as-gated, not edit_mode-gated -- an admin meta-control, not
+# tenant-facing content).
+check("nav toggle renders under bare admin+view_as", 'class="gg-view-toggle"' in resp_bare_company["body"])
+check("nav toggle: 'Tenant view' is the active side by default (no cookie, no &edit=1)",
+      '<button type="button" class="gg-view-toggle-btn active" data-mode="tenant">Tenant view</button>'
+      in resp_bare_company["body"])
+check("nav toggle: 'Admin view' is present but NOT active",
+      '<button type="button" class="gg-view-toggle-btn" data-mode="admin">Admin view</button>'
+      in resp_bare_company["body"])
+check("'Copy client link' renders whenever a tenant is selected, regardless of tenant/admin view mode",
+      'id="gg-copy-link-btn"' in resp_bare_company["body"])
+check("Copy client link script strips key/view_as/edit, keeping every other param",
+      "url.searchParams.delete(p)" in resp_bare_company["body"]
+      and "['key', 'view_as', 'edit']" in resp_bare_company["body"])
+check("toggle script writes the gg_admin_view cookie client-side, Path=/, no HttpOnly (JS must be able to set it)",
+      "document.cookie = 'gg_admin_view=' + mode" in resp_bare_company["body"]
+      and "Path=/" in resp_bare_company["body"])
+
+# --- TOGGLE: the gg_admin_view=admin cookie alone (no &edit=1 at all)
+# flips to the full admin view -- real name, admin controls -- on both
+# pages, proving the cookie (not the URL) now drives it.
+resp_cookie_company = lf.lambda_handler(vt_get_event(
+    {"key": ADMIN_KEY, "view_as": VT_TENANT_EMAIL, "company": VT_COMPANY},
+    cookies=["gg_admin_view=admin"]), None)
+check("gg_admin_view=admin cookie (company page): real buyer name now shown",
+      "Vera Realname" in resp_cookie_company["body"])
+check("gg_admin_view=admin cookie (company page): nav toggle now shows 'Admin view' as active",
+      '<button type="button" class="gg-view-toggle-btn active" data-mode="admin">Admin view</button>'
+      in resp_cookie_company["body"])
+
+resp_cookie_intros = lf.lambda_handler(vt_get_event(
+    {"key": ADMIN_KEY, "view_as": VT_TENANT_EMAIL, "tab": "intros"},
+    cookies=["gg_admin_view=admin"]), None)
+check("gg_admin_view=admin cookie (Active Intros): admin edit controls now render on the row "
+      "-- SAME cookie, different page/tab",
+      'class="ei-milestone"' in resp_cookie_intros["body"] or 'class="ei-flag' in resp_cookie_intros["body"])
+check("gg_admin_view=admin cookie (Active Intros): nav toggle also shows 'Admin view' as active here",
+      '<button type="button" class="gg-view-toggle-btn active" data-mode="admin">Admin view</button>'
+      in resp_cookie_intros["body"])
+
+# --- &edit=1 still works internally (never required, but not removed)
+resp_edit1 = lf.lambda_handler(vt_get_event({
+    "key": ADMIN_KEY, "view_as": VT_TENANT_EMAIL, "company": VT_COMPANY, "edit": "1",
+}), None)
+check("&edit=1 (no cookie) still works as an internal fallback", "Vera Realname" in resp_edit1["body"])
+
+# --- A garbage/irrelevant cookie value does NOT flip the view -- only
+# the literal "admin" does.
+resp_garbage_cookie = lf.lambda_handler(vt_get_event(
+    {"key": ADMIN_KEY, "view_as": VT_TENANT_EMAIL, "company": VT_COMPANY},
+    cookies=["gg_admin_view=nonsense"]), None)
+check("a non-'admin' gg_admin_view cookie value stays anonymized (Tenant view)",
+      "Vera Realname" not in resp_garbage_cookie["body"])
+
+# --- Admin, no &view_as at all: toggle still renders (key present),
+# but 'Copy client link' does NOT (no tenant selected to link to).
+resp_admin_noview = lf.lambda_handler(vt_get_event({"key": ADMIN_KEY}), None)
+check("admin, no &view_as: nav toggle still renders", 'class="gg-view-toggle"' in resp_admin_noview["body"])
+check("admin, no &view_as: 'Copy client link' does NOT render (nothing to link to)",
+      'id="gg-copy-link-btn"' not in resp_admin_noview["body"])
+
+# --- A real tenant session (gg_id cookie, no admin key): no toggle, no
+# copy-link, no admin badge -- none of this is visible to a tenant at all.
+resp_real_tenant = lf.lambda_handler(vt_get_event(
+    {"tab": "mydeals"}, cookies=[tenant_cookie(VT_TENANT_EMAIL)]), None)
+check("real tenant session -> 200", resp_real_tenant["statusCode"] == 200)
+check("real tenant session: no view toggle", 'class="gg-view-toggle"' not in resp_real_tenant["body"])
+check("real tenant session: no 'Copy client link'", 'id="gg-copy-link-btn"' not in resp_real_tenant["body"])
+check("real tenant session: no ADMIN badge", 'class="gg-admin-badge"' not in resp_real_tenant["body"])
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 

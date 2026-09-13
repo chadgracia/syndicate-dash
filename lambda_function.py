@@ -1224,6 +1224,15 @@ def _make_identity_cookie(email):
     return f"gg_id={val}; Max-Age=31536000; Path=/; Secure; SameSite=Lax"
 
 
+# Admin/tenant view toggle (see _nav_html's switch + _lambda_handler_impl's
+# edit_mode formula). Unsigned and written client-side via document.cookie
+# -- unlike gg_id, it carries no identity and is worthless without a
+# validated ADMIN_KEY already present on the request, so it needs no HMAC.
+# Value "admin" means "Admin view"; anything else (including absent, the
+# default) means "Tenant view".
+ADMIN_VIEW_COOKIE = "gg_admin_view"
+
+
 def _read_identity_email(event):
     """Verified email from the gg_id cookie, or None. Reverses
     _make_identity_cookie. Never raises."""
@@ -5580,6 +5589,47 @@ NAV_CSS = """
   .gg-cef-badge.cef-pending { background: rgba(201,162,39,0.15); color: var(--accredited); }
   .gg-cef-badge.cef-missing { background: rgba(178,59,59,0.12); color: #b23b3b; }
   .gg-cef-badge.cef-missing:hover { text-decoration: underline; }
+  .gg-view-toggle {
+    display: inline-flex;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    padding: 2px;
+    gap: 2px;
+  }
+  .gg-view-toggle-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 5px 12px;
+    border-radius: 999px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .gg-view-toggle-btn.active { background: var(--accent); color: #fff; }
+  .gg-view-toggle-btn:not(.active):hover { color: var(--ink); }
+  .gg-copy-link-btn {
+    background: none;
+    border: 1px solid var(--line);
+    color: var(--ink);
+    font-size: 12px;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .gg-copy-link-btn:hover { border-color: var(--accent); }
+  /* Shared .ei-msg (Saving…/Saved ✓/error) -- most pages already define
+     this themselves, but _nav_html's own "Copy client link" feedback
+     needs it on EVERY page the nav renders on, buyer page and Demand
+     Board included, neither of which otherwise defines it; a harmless
+     duplicate (identical values) on the pages that already do. */
+  .ei-msg { display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }
+  .ei-msg.saving { color: var(--muted); }
+  .ei-msg.saved { color: var(--qp); }
+  .ei-msg.error { color: #b23b3b; }
 """
 
 # Feature-request submit box + list, shared verbatim by render_my_deals_page
@@ -5826,6 +5876,9 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     # reuse here as "is admin" without threading a separate flag through
     # every render_* call.
     admin_badge_html = ""
+    view_toggle_html = ""
+    view_toggle_script = ""
+    copy_link_html = ""
     if key is not None:
         badge_text = "ADMIN"
         if edit_flag:
@@ -5833,6 +5886,75 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
         if view_as:
             badge_text += f" · viewing as {view_as}"
         admin_badge_html = f'<div class="gg-admin-badge">{_esc(badge_text)}</div>'
+
+        # Tenant view / Admin view toggle (replaces &edit=1 as the way to
+        # reveal real names/admin controls under &view_as -- see
+        # _lambda_handler_impl's edit_mode formula). Writes/reads
+        # ADMIN_VIEW_COOKIE client-side, then reloads the CURRENT URL
+        # unchanged -- no query-string edit, ever. edit_flag is this
+        # request's own already-resolved edit_mode, so the active side
+        # reflects reality even when &edit=1 (still supported, never
+        # required) is what actually produced it. Visible whenever an
+        # admin key is present, including admin-without-&view_as, where
+        # it has no visible effect (edit_mode there is always True
+        # regardless of the cookie -- see the formula's own "not
+        # view_as" clause) — that's expected, not a bug.
+        tenant_active = "" if edit_flag else " active"
+        admin_active = " active" if edit_flag else ""
+        view_toggle_html = f"""<div class="gg-view-toggle">
+      <button type="button" class="gg-view-toggle-btn{tenant_active}" data-mode="tenant">Tenant view</button>
+      <button type="button" class="gg-view-toggle-btn{admin_active}" data-mode="admin">Admin view</button>
+    </div>"""
+        view_toggle_script = f"""<script>
+(function() {{
+  document.querySelectorAll('.gg-view-toggle-btn').forEach(function(btn) {{
+    btn.addEventListener('click', function() {{
+      var mode = btn.getAttribute('data-mode');
+      document.cookie = '{ADMIN_VIEW_COOKIE}=' + mode + '; Path=/; Max-Age=31536000; Secure; SameSite=Lax';
+      window.location.reload();
+    }});
+  }});
+}})();
+</script>"""
+
+        # "Copy client link" (item 3): only once a tenant is actually
+        # selected (view_as truthy) -- there's no tenant-facing link to
+        # copy for the admin-without-&view_as aggregate view. Pure
+        # client-side URL surgery on window.location.href (never a
+        # server-constructed URL, so it works identically behind the
+        # raw Function URL, a custom domain, or localhost) -- strips
+        # key/view_as/edit, keeps every other param (tab, company, ref,
+        # buyer, ...) so the copied link lands on this SAME page, ready
+        # for that tenant to open once they've signed in themselves.
+        if view_as:
+            copy_link_html = ('<button type="button" class="gg-copy-link-btn" id="gg-copy-link-btn">'
+                               'Copy client link</button><span class="ei-msg" id="gg-copy-link-msg"></span>')
+            view_toggle_script += """<script>
+(function() {
+  var btn = document.getElementById('gg-copy-link-btn');
+  var msg = document.getElementById('gg-copy-link-msg');
+  if (!btn) return;
+  btn.addEventListener('click', function() {
+    var url = new URL(window.location.href);
+    ['key', 'view_as', 'edit'].forEach(function(p) { url.searchParams.delete(p); });
+    var text = url.toString();
+    function showCopied() {
+      msg.className = 'ei-msg saved';
+      msg.textContent = 'Copied ✓';
+      setTimeout(function() { msg.className = 'ei-msg'; msg.textContent = ''; }, 2000);
+    }
+    function showError(err) {
+      msg.className = 'ei-msg error';
+      msg.textContent = 'Copy failed: ' + err;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(showCopied, function(err) { showError(err); });
+    } else {
+      showError('clipboard unavailable');
+    }
+  });
+})();
+</script>"""
 
     # Nav dropdown: person_id is only ever non-None for a resolved tenant
     # (a real session, or admin &view_as preview) -- admin-without-view_as
@@ -5882,11 +6004,14 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
     </nav>
     {admin_badge_html}
+    {view_toggle_html}
+    {copy_link_html}
     {cef_html}
     <div class="gg-viewer">{viewer_html}</div>
   </div>
 </header>
-{mydeals_script}"""
+{mydeals_script}
+{view_toggle_script}"""
 
 
 def _group_header_row_html(label, colspan):
@@ -10094,11 +10219,20 @@ def _lambda_handler_impl(event, context):
     nav_key = query.get("key") if is_admin_key else None
     nav_view_as = view_as or None
 
-    # Edit UI (Intro Status / Next Steps / Buyer Notes) is admin-only and,
-    # when previewing a tenant via &view_as, opt-in via &edit=1 — without
-    # it, &view_as previews exactly the tenant's read-only page. Never
-    # True for a real tenant: is_admin_key is never True on their session.
-    edit_mode = is_admin_key and (not view_as or query.get("edit") == "1")
+    # Edit UI (Intro Status / Next Steps / Buyer Notes, real names/admin
+    # controls everywhere else) is admin-only and, when previewing a
+    # tenant via &view_as, opt-in via the in-page Tenant view/Admin view
+    # toggle (_nav_html) -- without it, &view_as previews exactly the
+    # tenant's read-only page, which is the DEFAULT the instruction
+    # calls for. The toggle writes/reads a plain client-side cookie
+    # (ADMIN_VIEW_COOKIE, "admin" or absent/anything else = "tenant") so
+    # the choice persists across every page/tab without ever touching
+    # the URL. &edit=1 still works too -- kept for any old bookmarked/
+    # scripted links, but the toggle means it's never REQUIRED, per
+    # instruction. Never True for a real tenant: is_admin_key is never
+    # True on their session, cookie or not.
+    admin_view_cookie = _get_cookie(event, ADMIN_VIEW_COOKIE) == "admin"
+    edit_mode = is_admin_key and (not view_as or admin_view_cookie or query.get("edit") == "1")
 
     # CEF badge: the tenant's own Client Engagement Form state, shown on
     # every page's nav for the tenant view and the admin &view_as preview
