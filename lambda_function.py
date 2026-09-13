@@ -1759,6 +1759,39 @@ def _resolve_tenant(email):
     return _tenant_index().get(email.strip().lower())
 
 
+def _tenant_picker_html(active_tab, key):
+    """Admin-without-view_as's tenant picker: every eligible tenant (same
+    rule _tenant_index()/_resolve_tenant use -- an auto-enrolled person
+    with >=1 Sell Order deal, any stage), each a link back to this same
+    tab with &view_as=<email> appended, admin key carried through via
+    _tab_qs_suffix exactly like every other tab link. One row per email
+    (a person with multiple emails on file gets one row per email, since
+    &view_as= is keyed by email, not person_id -- matches _tenant_index's
+    own per-email keying). Sorted by company A-Z."""
+    tenant_index = _tenant_index()
+    people = get_people_by_ids({e["person_id"] for e in tenant_index.values() if e["person_id"] is not None})
+    entries = []
+    for email, entry in tenant_index.items():
+        rec = people.get(entry["person_id"]) or {}
+        company_name = (rec.get("company_name") or "").strip()
+        entries.append({"email": email, "name": entry["name"], "company_name": company_name})
+    entries.sort(key=lambda r: (r["company_name"].lower(), r["name"].lower()))
+    if not entries:
+        return '<div class="gg-placeholder">No eligible tenants found.</div>'
+    suffix = _tab_qs_suffix(key, None)
+    rows = "".join(
+        f'<li><a href="?tab={active_tab}{suffix}&view_as={urllib.parse.quote(e["email"], safe="")}">'
+        f'{_esc(e["name"])} &middot; {_esc(e["company_name"] or "—")}</a></li>'
+        for e in entries
+    )
+    return (
+        '<div class="gg-tenant-picker">'
+        '<p class="gg-tenant-picker-lead">Pick a tenant to preview:</p>'
+        f'<ul class="gg-tenant-picker-list">{rows}</ul>'
+        '</div>'
+    )
+
+
 def _tenant_cef_state(person_id):
     """The tenant's own Client Engagement Form option id (CEF_FIELD,
     verified via the one-time person_custom_field_labels fetch — one of
@@ -4869,10 +4902,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                                                                    page="intros")
 
     if tenant_picker:
-        body_html = (
-            '<div class="gg-placeholder">Pick a tenant to preview — '
-            'add &amp;view_as=&lt;email&gt; to the URL.</div>'
-        )
+        body_html = _tenant_picker_html("intros", key)
         summary_html = ""
         subtle_html = ""
     else:
@@ -5512,10 +5542,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     subtle_html = ""
     edit_script = ""
     if tenant_picker:
-        body_html = (
-            '<div class="gg-placeholder">Pick a tenant to preview — '
-            'add &amp;view_as=&lt;email&gt; to the URL.</div>'
-        )
+        body_html = _tenant_picker_html("mydeals", key)
     elif not deals:
         body_html = '<div class="gg-placeholder">No deals yet.</div>'
     else:
@@ -6007,6 +6034,13 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     font-size: 15px;
   }}
   .gg-placeholder.small {{ margin: 0; padding: 24px; }}
+  .gg-tenant-picker {{ max-width: 640px; margin: 48px auto; padding: 0 24px; }}
+  .gg-tenant-picker-lead {{ text-align: center; color: var(--muted); font-size: 15px; margin-bottom: 14px; }}
+  .gg-tenant-picker-list {{ list-style: none; padding: 0; margin: 0; border: 1px solid var(--line); border-radius: 8px; }}
+  .gg-tenant-picker-list li {{ border-bottom: 1px solid var(--line); }}
+  .gg-tenant-picker-list li:last-child {{ border-bottom: none; }}
+  .gg-tenant-picker-list a {{ display: block; padding: 12px 18px; color: inherit; text-decoration: none; }}
+  .gg-tenant-picker-list a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
@@ -7550,6 +7584,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
                  tenant_picker=False, edit_mode=False, person_id=None):
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="demand")
+    tenant_picker_html = _tenant_picker_html("demand", key) if tenant_picker else ""
     raised_headline_html = _raised_headline_html(edit_mode=edit_mode)
     rows_html = "".join(
         f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
@@ -7676,6 +7711,13 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     font-size: 15px;
   }}
   .gg-placeholder.small {{ margin: 0; padding: 24px; }}
+  .gg-tenant-picker {{ max-width: 640px; margin: 48px auto; padding: 0 24px; }}
+  .gg-tenant-picker-lead {{ text-align: center; color: var(--muted); font-size: 15px; margin-bottom: 14px; }}
+  .gg-tenant-picker-list {{ list-style: none; padding: 0; margin: 0; border: 1px solid var(--line); border-radius: 8px; }}
+  .gg-tenant-picker-list li {{ border-bottom: 1px solid var(--line); }}
+  .gg-tenant-picker-list li:last-child {{ border-bottom: none; }}
+  .gg-tenant-picker-list a {{ display: block; padding: 12px 18px; color: inherit; text-decoration: none; }}
+  .gg-tenant-picker-list a:hover {{ text-decoration: underline; }}
 </style>
 </head>
 <body>
@@ -7688,6 +7730,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
       <p class="sub">{len(table)} companies with interested buyers</p>
     </div>
   </div>
+  {tenant_picker_html}
   {feature_box_html}
   <div class="toolbar">
     <input id="search" type="text" placeholder="Search companies...">
