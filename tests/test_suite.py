@@ -137,7 +137,19 @@ class FakeDynamoTable:
             items = [it for it in items if it.get("tenant") == tenant_val]
         return {"Items": items}
 
+    def get_item(self, **kwargs):
+        key = kwargs["Key"]
+        item = next((i for i in self.items
+                     if i.get("tenant") == key["tenant"] and i.get("sk") == key["sk"]), None)
+        return {"Item": item} if item is not None else {}
+
     def update_item(self, **kwargs):
+        """Generic SET/REMOVE simulation -- parses the actual
+        UpdateExpression/ExpressionAttributeNames/Values rather than a
+        hardcoded token->field table, so it works for every write path
+        in lambda_function.py (real-deal intro updates, deal-stage
+        overrides, manual intros, ...) without needing its own entry
+        added here each time a new one is written."""
         self.updates.append(kwargs)
         key = kwargs["Key"]
         item = next((i for i in self.items
@@ -147,15 +159,17 @@ class FakeDynamoTable:
             self.items.append(item)
         vals = kwargs.get("ExpressionAttributeValues", {})
         names = kwargs.get("ExpressionAttributeNames", {})
-        mapping = {
-            ":so": "status_override", ":oa": "override_at", ":ms": "milestones",
-            ":ns": "next_steps", ":no": "notes", ":nua": "notes_updated_at",
-            ":fu": "follow_up", ":do": "deadline_override", ":doa": "deadline_override_at",
-        }
-        for token, field in mapping.items():
-            if token in vals:
-                item[field] = vals[token]
         expr = kwargs.get("UpdateExpression", "")
+        set_match = re.search(r"SET (.+?)(?:\s+REMOVE\s|$)", expr)
+        if set_match:
+            for assignment in set_match.group(1).split(","):
+                assignment = assignment.strip()
+                if not assignment or "=" not in assignment:
+                    continue
+                field_token, value_token = [p.strip() for p in assignment.split("=", 1)]
+                field = names.get(field_token, field_token)
+                if value_token in vals:
+                    item[field] = vals[value_token]
         remove_match = re.search(r"REMOVE (.+)$", expr)
         if remove_match:
             for field in remove_match.group(1).split(","):
@@ -3798,6 +3812,249 @@ ib_resp_bad_buyer = lf.lambda_handler(ib_event({
     "key": ADMIN_KEY, "person_id": 999999999, "company": "Foxtrot Co", "tenant_email": IB_TENANT_EMAIL,
 }), None)
 check("introduce with a person_id matching no real person -> 400", ib_resp_bad_buyer["statusCode"] == 400)
+
+
+# ======================================================================
+# SECTION: Manual intros (Dynamo-only, ?action=manual_intro) + the
+# company page's "Add buyer" box below Buyer Demand
+# ======================================================================
+# NO Pipeline call of any kind on this route. Manual rows resolve name/
+# firm/tier/ticket range/contact/photo from the people snapshot exactly
+# like deal-derived rows, follow the same disclosure rule (Introduced-
+# or-later discloses, Matched stays anonymized), route Passed/Withdrawn
+# to Closed out and Closed to a positive closed row, carry a "manual"
+# tag, are admin-only to create/edit, and are suppressed once a real
+# deal-derived intro covers the same tenant+company+buyer.
+
+MI_TENANT_EMAIL = "elana@tworoads.vc"
+MI_TENANT_PID = 801
+MI_BUYER_PID = 1277391706   # Chase Fraser -- the literal instruction test case
+MI_BUYER2_PID = 802         # disclosure (Matched) test
+MI_BUYER3_PID = 803         # suppression test (already has a real deal)
+MI_COMPANY = "Panthalassa"
+
+mi_people = {"people": [
+    {"id": MI_TENANT_PID, "full_name": "Elana Founder", "email": MI_TENANT_EMAIL, "custom_fields": {}},
+    {"id": MI_BUYER_PID, "first_name": "Chase", "last_name": "Fraser", "full_name": "Chase Fraser",
+     "email": "chase@example.com", "company_name": "Fraser Capital", "custom_fields": {}},
+    {"id": MI_BUYER2_PID, "first_name": "Dana", "last_name": "Second", "full_name": "Dana Second",
+     "email": "dana@example.com", "company_name": "Second Capital", "custom_fields": {}},
+    {"id": MI_BUYER3_PID, "first_name": "Wren", "last_name": "Third", "full_name": "Wren Third",
+     "email": "wren@example.com", "company_name": "Third Capital", "custom_fields": {}},
+]}
+mi_sell_deal = {"id": 9900, "name": "MI Sell Deal", "company": {"name": MI_COMPANY},
+                "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                "people": [{"id": MI_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+mi_real_buy_deal = {"id": 9901, "name": "MI Real Buy Deal", "company": {"name": MI_COMPANY},
+                     "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(lf.INTRO_STATUS_INTRODUCED_ID),
+                     "people": [{"id": MI_TENANT_PID}, {"id": MI_BUYER3_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+fake_s3_mi, fake_table_mi = use_fixture({
+    lf.PEOPLE_KEY: mi_people, lf.INTEREST_KEY: {"buy": {}},
+    lf.DEALS_KEY: {"deals": [mi_sell_deal, mi_real_buy_deal]},
+})
+mi_tenant = lf._resolve_tenant(MI_TENANT_EMAIL)
+assert mi_tenant is not None and mi_tenant["person_id"] == MI_TENANT_PID
+
+
+def mi_event(body_dict, cookies=None):
+    return {"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+            "queryStringParameters": {"action": "manual_intro"}, "cookies": cookies or [],
+            "body": json.dumps(body_dict)}
+
+
+# --- Admin-only, enforced server-side -- no tenant write path exists
+# for manual intros at all.
+mi_resp_noauth = lf.lambda_handler(mi_event({
+    "company": MI_COMPANY, "person_id": MI_BUYER_PID, "status": lf.INTRO_STATUS_CLOSED_ID,
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("manual_intro with no admin key -> 403", mi_resp_noauth["statusCode"] == 403)
+mi_resp_tenant_cookie = lf.lambda_handler(mi_event({
+    "company": MI_COMPANY, "person_id": MI_BUYER_PID, "status": lf.INTRO_STATUS_CLOSED_ID,
+    "tenant_email": MI_TENANT_EMAIL,
+}, cookies=[tenant_cookie(MI_TENANT_EMAIL)]), None)
+check("manual_intro with a real tenant cookie but no admin key -> still 403 (no tenant path exists)",
+      mi_resp_tenant_cookie["statusCode"] == 403)
+
+# --- THE literal instruction test case: Chase Fraser (1277391706) on
+# Panthalassa for elana@tworoads.vc, status Closed -> must render
+# NAMED in her Buyers section.
+mi_resp_create = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER_PID,
+    "status": lf.INTRO_STATUS_CLOSED_ID, "note": "Wired via SPV", "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("manual_intro create (Chase Fraser / Panthalassa / Closed) -> 200", mi_resp_create["statusCode"] == 200)
+mi_create_data = json.loads(mi_resp_create["body"])
+check("manual_intro create: created == True", mi_create_data.get("created") is True)
+mi_sk = f"manual-intro#{MI_COMPANY}#{MI_BUYER_PID}"
+check("manual_intro create: Dynamo item written under the right tenant/sk",
+      any(it.get("sk") == mi_sk and it.get("tenant") == MI_TENANT_EMAIL for it in fake_table_mi.items))
+mi_item = next(it for it in fake_table_mi.items if it.get("sk") == mi_sk)
+check("manual_intro create: attributes match (person_id/company/status/note/created_by/created_at/updated_at)",
+      mi_item.get("status") == lf.INTRO_STATUS_CLOSED_ID and mi_item.get("note") == "Wired via SPV"
+      and mi_item.get("created_by") == "admin" and mi_item.get("created_at") is not None
+      and mi_item.get("updated_at") is not None and mi_item.get("person_id") == MI_BUYER_PID
+      and mi_item.get("company") == MI_COMPANY)
+check("manual_intro create: audit item appended",
+      any(it and it.get("actor") == "admin" and str(it.get("sk", "")).startswith(f"audit#{mi_sk}#")
+          for it in fake_table_mi.puts))
+
+page_company_mi = lf.render_company_page(MI_COMPANY, "Admin", mi_tenant, MI_TENANT_EMAIL, "mydeals",
+                                          key=ADMIN_KEY, view_as=MI_TENANT_EMAIL, edit_mode=True)
+check("Chase Fraser renders NAMED in the Buyers section (Closed -> disclosed, positive closed row)",
+      "Chase Fraser" in page_company_mi)
+co_section_mi = page_company_mi[page_company_mi.find("closed-out-section"):]
+check("...inside the Closed out section specifically (Closed routes there per instruction)",
+      "closed-out-section" in page_company_mi and "Chase Fraser" in co_section_mi)
+check("...styled as a POSITIVE closed row (green 'Closed' chip), not gray Passed/Withdrawn styling",
+      '<span class="status-chip closed">Closed</span>' in page_company_mi)
+check("...carries the 'manual' tag distinguishing it from a CRM-derived row",
+      'class="manual-tag"' in page_company_mi)
+
+page_intros_mi = lf.render_intros_page("Elana Founder", tenant=mi_tenant, tenant_email=MI_TENANT_EMAIL,
+                                        key=ADMIN_KEY, view_as=MI_TENANT_EMAIL, edit_mode=True)
+check("Chase Fraser also renders named on Active Intros", "Chase Fraser" in page_intros_mi)
+
+# --- Tenant (read-only, no admin key) sees the rendered row too since
+# it's Closed (disclosed) -- but gets no create/edit control at all.
+MI_BUYER4_PID = 804  # a LIVE (non-closed-out) manual intro, for the disabled-control check below
+mi_people["people"].append({"id": MI_BUYER4_PID, "first_name": "Four", "last_name": "Buyer",
+                             "full_name": "Four Buyer", "email": "four@example.com",
+                             "company_name": "Fourth Capital", "custom_fields": {}})
+lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER4_PID, "status": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+
+page_company_mi_tenant = lf.render_company_page(MI_COMPANY, "Elana Founder", mi_tenant, MI_TENANT_EMAIL, "mydeals",
+                                                 key=None, view_as=None, edit_mode=False)
+check("tenant view: Chase Fraser still renders named (Closed discloses to the tenant too)",
+      "Chase Fraser" in page_company_mi_tenant)
+check("tenant view: Four Buyer (a live, non-closed-out manual intro) also renders named",
+      "Four Buyer" in page_company_mi_tenant)
+check("tenant view: its status control renders but DISABLED (read-only)",
+      'class="mi-status"' in page_company_mi_tenant and " disabled>" in page_company_mi_tenant)
+check("tenant view: note renders as plain text, never an editable textarea",
+      'class="mi-note"' not in page_company_mi_tenant)
+check("tenant view: no 'Add buyer' create box at all", 'class="manual-intro-box"' not in page_company_mi_tenant)
+
+# --- Disclosure: a manual intro left at Matched renders ANONYMIZED,
+# not named -- checked via a non-edit-mode render (tenant/preview),
+# where routing unambiguously sends a Matched row through the
+# always-anonymized pending-row path.
+lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER2_PID, "status": 7207578,  # Matched
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+page_company_matched = lf.render_company_page(MI_COMPANY, "Elana Founder", mi_tenant, MI_TENANT_EMAIL, "mydeals",
+                                               key=None, view_as=None, edit_mode=False)
+check("a manual intro left at Matched renders anonymized (identity shows only Introduced-or-later)",
+      "Dana Second" not in page_company_matched)
+
+# --- Exit routing: Passed/Withdrawn go to Closed out too, but styled
+# gray (not the green Closed chip) -- and per the SAME simple
+# disclosure rule ("not Matched" discloses), a manual row set directly
+# to Passed IS named, unlike a real deal's stricter milestone-gated
+# exit disclosure.
+lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER2_PID, "status": lf.INTRO_STATUS_PASSED_ID,
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+page_company_passed = lf.render_company_page(MI_COMPANY, "Admin", mi_tenant, MI_TENANT_EMAIL, "mydeals",
+                                              key=ADMIN_KEY, view_as=MI_TENANT_EMAIL, edit_mode=True)
+co_section_passed = page_company_passed[page_company_passed.find("closed-out-section"):]
+check("a manual intro set to Passed routes to Closed out and is named there (not the green Closed chip)",
+      "Dana Second" in co_section_passed
+      and '<span class="status-chip closed">Closed</span>' not in
+          co_section_passed[co_section_passed.find("Dana Second"):co_section_passed.find("Dana Second") + 400])
+
+# --- Inline edit: .mi-status / .mi-note controls write back to the
+# SAME Dynamo item (company+person_id, no deal_id involved at all).
+mi_resp_edit_status = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER_PID, "status": 7207583,  # Wired
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("inline status edit -> 200, created == False (existing item updated, not re-created)",
+      mi_resp_edit_status["statusCode"] == 200 and json.loads(mi_resp_edit_status["body"]).get("created") is False)
+mi_item_after_status_edit = next(it for it in fake_table_mi.items if it.get("sk") == mi_sk)
+check("inline status edit: status updated, note UNTOUCHED (partial update, single field)",
+      mi_item_after_status_edit.get("status") == 7207583 and mi_item_after_status_edit.get("note") == "Wired via SPV")
+
+mi_resp_edit_note = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER_PID, "note": "Updated note text",
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("inline note edit -> 200", mi_resp_edit_note["statusCode"] == 200)
+mi_item_after_note_edit = next(it for it in fake_table_mi.items if it.get("sk") == mi_sk)
+check("inline note edit: note updated, status UNTOUCHED",
+      mi_item_after_note_edit.get("note") == "Updated note text" and mi_item_after_note_edit.get("status") == 7207583)
+
+# --- Suppression: a manual intro for a buyer who ALREADY has a real
+# deal-derived intro for this tenant+company is never rendered -- the
+# real row wins outright.
+lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER3_PID, "status": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+page_company_suppress = lf.render_company_page(MI_COMPANY, "Admin", mi_tenant, MI_TENANT_EMAIL, "mydeals",
+                                                key=ADMIN_KEY, view_as=MI_TENANT_EMAIL, edit_mode=True)
+check("Wren Third (real deal + a manual duplicate) appears exactly once, not twice",
+      page_company_suppress.count("Wren Third") == 1)
+wren_row = page_company_suppress[max(page_company_suppress.find("Wren Third") - 400, 0):
+                                  page_company_suppress.find("Wren Third") + 100]
+check("...and that one row is the REAL deal-derived row, not the manual one (no 'manual' tag on it)",
+      'class="manual-tag"' not in wren_row)
+
+# --- The company page's "Add buyer" box itself: rendered admin-only,
+# directly below the Demand tiles, and creates via the same write path.
+check("'Add buyer' box renders below Buyer Demand for admin+&view_as (edit_mode)",
+      'class="manual-intro-box"' in page_company_mi
+      and page_company_mi.find('class="manual-intro-box"') > page_company_mi.find('id="demand"'))
+page_company_admin_noview_mi = lf.render_company_page(MI_COMPANY, "Admin", None, "admin", "mydeals",
+                                                       key=ADMIN_KEY, view_as=None, edit_mode=True)
+check("'Add buyer' box does NOT render for admin without &view_as (no tenant to attach to)",
+      'class="manual-intro-box"' not in page_company_admin_noview_mi)
+
+# --- Input validation
+mi_resp_no_company = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "person_id": MI_BUYER_PID, "status": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("manual_intro with no company -> 400", mi_resp_no_company["statusCode"] == 400)
+mi_resp_bad_person = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": "abc", "status": lf.INTRO_STATUS_INTRODUCED_ID,
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("manual_intro with a non-integer person_id -> 400", mi_resp_bad_person["statusCode"] == 400)
+mi_resp_bad_status = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER_PID, "status": 999999,
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("manual_intro with an invalid status -> 400", mi_resp_bad_status["statusCode"] == 400)
+mi_resp_bad_tenant = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER_PID,
+    "status": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": "nobody@nowhere.example.com",
+}), None)
+check("manual_intro with an unresolvable tenant_email -> 400", mi_resp_bad_tenant["statusCode"] == 400)
+mi_resp_nothing = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER_PID, "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("manual_intro with neither status nor note -> 400 ('nothing to update')", mi_resp_nothing["statusCode"] == 400)
+mi_resp_long_note = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER_PID, "note": "x" * 2001,
+    "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("manual_intro with a note over MAX_INTRO_TEXT_LEN -> 400", mi_resp_long_note["statusCode"] == 400)
+
+# --- Ordinary Pipeline-write regression guard: this whole feature must
+# never make a Pipeline API call, under any of the scenarios above.
+lf.urllib.request.urlopen = lambda *a, **k: (_ for _ in ()).throw(
+    AssertionError("manual_intro must never call Pipeline"))
+mi_resp_no_pipeline = lf.lambda_handler(mi_event({
+    "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER_PID,
+    "status": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": MI_TENANT_EMAIL,
+}), None)
+check("manual_intro write makes no Pipeline call at all", mi_resp_no_pipeline["statusCode"] == 200)
 
 
 # ======================================================================

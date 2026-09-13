@@ -2337,6 +2337,189 @@ def get_intro_details(tenant_email):
         return {}, True
 
 
+# ── Manual intros (Dynamo-only, no backing Pipeline deal at all) ────────────
+# sk "manual-intro#<company>#<person_id>" -- deliberately distinct from a
+# real intro item's "intro#<deal_id>" (never begins_with-matches it, in
+# either direction) so the two Query prefixes (get_intro_details vs
+# get_manual_intros) can never collide.
+
+def _manual_intro_sk(company, person_id):
+    return f"manual-intro#{company}#{person_id}"
+
+
+def get_manual_intros(tenant_email, company=None):
+    """Every manual-intro Dynamo item under this tenant (sk begins_with
+    "manual-intro#"), optionally filtered to one company. The company
+    name is parsed back out of the sk itself via rsplit on the trailing
+    "#<person_id>" segment (never re-queried), so a company name
+    containing "#" still round-trips correctly, and person_id -- always
+    numeric -- can never be mistaken for part of it. Never raises: any
+    failure (missing table, network, permissions) returns ({}, True),
+    matching get_intro_details's own contract, so the caller can fall
+    back to deal-derived-only data and show a small note instead of a
+    broken page. Returns ({(company, person_id): {...}}, dynamo_failed)."""
+    _perf_count("get_manual_intros")
+    try:
+        table = _dynamo_table()
+        with _perf_timer("dynamo"):
+            resp = table.query(
+                KeyConditionExpression=Key("tenant").eq(tenant_email) & Key("sk").begins_with("manual-intro#"),
+            )
+        out = {}
+        for item in resp.get("Items", []):
+            sk = item.get("sk") or ""
+            if not sk.startswith("manual-intro#"):
+                continue
+            rest = sk[len("manual-intro#"):]
+            item_company, sep, person_id_str = rest.rpartition("#")
+            if not sep:
+                continue
+            try:
+                person_id = int(person_id_str)
+            except (TypeError, ValueError):
+                continue
+            if company is not None and item_company.strip().lower() != company.strip().lower():
+                continue
+            out[(item_company, person_id)] = {
+                "company": item_company,
+                "person_id": person_id,
+                "status": item.get("status"),
+                "note": item.get("note"),
+                "created_by": item.get("created_by"),
+                "created_at": item.get("created_at"),
+                "updated_at": item.get("updated_at"),
+            }
+        return out, False
+    except Exception:
+        return {}, True
+
+
+def _get_manual_intro_item(tenant_email, company, person_id):
+    """Single manual-intro Dynamo item (GetItem, not Query -- this is the
+    one place a specific item, not a whole partition's worth, is
+    needed), or None on any failure or if it doesn't exist yet."""
+    try:
+        table = _dynamo_table()
+        with _perf_timer("dynamo"):
+            resp = table.get_item(Key={"tenant": tenant_email, "sk": _manual_intro_sk(company, person_id)})
+        return resp.get("Item")
+    except Exception:
+        return None
+
+
+def _manual_intro_as_deal(item):
+    """A manual-intro Dynamo item (see get_manual_intros), reshaped as a
+    fake Pipeline deal record so it flows through every existing
+    deal-row function completely unchanged: _resolve_intro_status,
+    _buy_deal_row_cols_html, _select_primary_buyer/_select_display_buyers,
+    _deal_size_text, _deal_company_name, sorting, closed-out routing --
+    all of it. Marked "_manual": True so the handful of places that DO
+    need to behave differently can detect it (disclosure -- see
+    _resolve_intro_status; the inline status/note controls -- see
+    _buy_deal_row_html/_buy_deal_row_edit_html; the "manual" tag -- see
+    _buy_deal_row_cols_html); every other reader just sees an ordinary
+    deal shape it already understands. "id" is a synthetic string that
+    can never collide with a real Pipeline deal id (those are always
+    plain integers)."""
+    company = item["company"]
+    person_id = item["person_id"]
+    return {
+        "id": f"manual#{company}#{person_id}",
+        "name": f"Manual intro — {company}",
+        "company": {"name": company},
+        "deal_stage": {"id": STAGE_MATCHED},
+        "custom_fields": {
+            DEAL_SIDE_FIELD: DEAL_SIDE_BUY_ID,
+            INTRO_STATUS_FIELD: item.get("status"),
+        },
+        "people": [{"id": person_id}],
+        "updated_at": item.get("updated_at") or item.get("created_at"),
+        "_manual": True,
+        "_manual_item": item,
+    }
+
+
+def _tenant_has_deal_derived_intro(tenant_person_id, company, buyer_person_id):
+    """True if the tenant already has a REAL (Pipeline-backed) Buy-side
+    deal for this company linking buyer_person_id, checked across
+    get_my_deals broadly -- any stage, not just matched-or-later -- so
+    a manual intro for a buyer who already has ANY real deal on this
+    company is suppressed outright, per instruction ("prefer the
+    deal-derived row and suppress the manual duplicate")."""
+    target = (company or "").strip().lower()
+    for d in get_my_deals(tenant_person_id):
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            continue
+        if (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        if buyer_person_id in _deal_linked_person_ids(d):
+            return True
+    return False
+
+
+def _dynamo_write_manual_intro(tenant_email, company, person_id, status_id, note, actor):
+    """Upsert the manual-intro Dynamo item (table syndicate-dash,
+    tenant=<viewing tenant>, sk="manual-intro#<company>#<person_id>"),
+    then append an audit item -- same two-write shape
+    _dynamo_write_intro_update uses for real deals, just against a
+    differently-shaped item and with NO Pipeline call of any kind, per
+    instruction. status_id/note are each written only when not None,
+    same partial-update convention _dynamo_write_intro_update follows,
+    so a single inline-edit field (just the status select, or just the
+    note textarea) never clobbers the other. A brand-new item (no
+    status ever set) defaults to Introduced -- the create box's own
+    dropdown always sends one anyway, so this only guards a directly-
+    posted create that omitted it. Returns (ok, error_message, was_new)."""
+    now = time.time()
+    old_item = _get_manual_intro_item(tenant_email, company, person_id)
+    is_new = old_item is None
+    old_values = {"status": (old_item or {}).get("status"), "note": (old_item or {}).get("note")}
+
+    status_to_write = status_id
+    if is_new and status_to_write is None:
+        status_to_write = INTRO_STATUS_INTRODUCED_ID
+
+    update_parts = ["company = :c", "person_id = :p", "updated_at = :ua"]
+    expr_names = {}
+    expr_values = {":c": company, ":p": person_id, ":ua": now}
+    new_values = {}
+    if status_to_write is not None:
+        update_parts.append("#s = :s")
+        expr_names["#s"] = "status"
+        expr_values[":s"] = status_to_write
+        new_values["status"] = status_to_write
+    if note is not None:
+        update_parts.append("note = :n")
+        expr_values[":n"] = note
+        new_values["note"] = note
+    if is_new:
+        update_parts.append("created_by = :cb")
+        update_parts.append("created_at = :ca")
+        expr_values[":cb"] = actor
+        expr_values[":ca"] = now
+
+    try:
+        table = _dynamo_table()
+        kwargs = {
+            "Key": {"tenant": tenant_email, "sk": _manual_intro_sk(company, person_id)},
+            "UpdateExpression": "SET " + ", ".join(update_parts),
+            "ExpressionAttributeValues": expr_values,
+        }
+        if expr_names:
+            kwargs["ExpressionAttributeNames"] = expr_names
+        table.update_item(**kwargs)
+        table.put_item(Item={
+            "tenant": tenant_email,
+            "sk": f"audit#manual-intro#{company}#{person_id}#{int(now * 1000)}",
+            "actor": actor,
+            "old": old_values,
+            "new": new_values,
+        })
+        return True, None, is_new
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}", is_new
+
+
 # ── Feature-request capture ──────────────────────────────────────────────
 # Own Query, deliberately NOT merged into get_intro_details's — that query
 # is called from several places that have nothing to do with feature
@@ -3038,7 +3221,34 @@ def _resolve_intro_status(deal, override_entry=None):
     empty/absent field always derives "Matched" (see
     _default_intro_status) -- there is no other derived value, so
     disclosed is False whenever the field is genuinely unset, regardless
-    of any other deal attribute (is_archived included)."""
+    of any other deal attribute (is_archived included).
+
+    Manual intros (deal["_manual"] True -- see _manual_intro_as_deal):
+    a deliberately SIMPLER rule, resolved before any of the above ever
+    runs. There is no Pipeline field to treat as authoritative and no
+    override to layer on top -- the manual Dynamo item's own "status"
+    IS the live value, already written straight into
+    custom_fields[INTRO_STATUS_FIELD] by _manual_intro_as_deal, so it's
+    read the same way _deal_intro_status_id always does. And there is
+    no milestones history to consult, so the real-deal exit carve-out
+    above (an exit only discloses with evidence of prior progress)
+    would incorrectly anonymize a manual row an admin set directly to
+    Passed/Withdrawn/Closed -- undesirable and, for Closed specifically,
+    wrong per instruction ("Closed renders as a positive closed row").
+    So here disclosure is exactly "not Matched", full stop, matching
+    the instruction's own stated rule ("identity shows at
+    Introduced-or-later; Matched renders anonymized") literally for
+    every one of the ten statuses, exits included."""
+    if deal.get("_manual"):
+        status_id = _deal_intro_status_id(deal)
+        name = INTRO_STATUS_LABELS[status_id] if status_id is not None else "Matched"
+        return {
+            "id": status_id,
+            "name": name,
+            "is_exit": status_id in EXIT_STATUS_IDS,
+            "disclosed": name != "Matched",
+        }
+
     status_id = _deal_intro_status_id(deal)
     raw_status_id = status_id
 
@@ -4370,6 +4580,18 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
             col2_html = "—"
             investor_type_cell = ""
 
+    if deal.get("_manual"):
+        # Small muted "manual" tag distinguishing a Dynamo-only manual
+        # intro from a CRM-derived row -- appended to whichever cell
+        # shows the buyer's name/cell on this surface (harmless even on
+        # an anonymized pending row: it names no identity, just
+        # provenance).
+        manual_tag = '<span class="manual-tag" title="Manually added, not from Pipeline">manual</span>'
+        if surface == "intros":
+            col2_html += manual_tag
+        else:
+            col1_html += manual_tag
+
     return col1_td_open, col1_html, col2_html, extra_cls, buyer_recs, investor_type_cell
 
 
@@ -4387,7 +4609,16 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
     cell's controls go interactive, except on a Passed/Withdrawn row --
     nothing left to plan for a dead intro -- and a Closed row locks the
     status controls for tenants regardless of editable. Never called for
-    a not-yet-disclosed deal -- see _pending_buy_deal_row_html."""
+    a not-yet-disclosed deal -- see _pending_buy_deal_row_html.
+
+    A manual intro (deal["_manual"]) is NEVER editable here regardless
+    of the `editable` flag this caller was handed (tenant_edit_mode) --
+    admin-only creation/editing per instruction, so a tenant can never
+    reach a write on one even via the same "tenant edit" mechanism a
+    real disclosed row grants them. Its Status/Notes cells also use the
+    manual-specific plain select/textarea (_manual_intro_status_select_
+    html/_manual_intro_note_cell_html), never the milestone-checkbox/
+    flag system -- a manual intro has no milestones history at all."""
     deal_id = str(deal.get("id"))
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, resolved, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
@@ -4397,16 +4628,23 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
     classes = " ".join(c for c in (extra_cls, "stalled-row" if is_stalled else "") if c)
     row_cls = f' class="{classes}"' if classes else ""
 
-    milestones = entry.get("milestones")
-    is_closed_locked = resolved["name"] == "Closed"
-    status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=False,
-                                                   disabled=(not editable) or is_closed_locked)
+    if deal.get("_manual"):
+        item = deal["_manual_item"]
+        status_html = _manual_intro_status_select_html(item.get("status"), item["company"], item["person_id"],
+                                                         disabled=True)
+        notes_cell_html = _manual_intro_note_cell_html(item.get("note"), item["company"], item["person_id"],
+                                                         editable=False)
+    else:
+        milestones = entry.get("milestones")
+        is_closed_locked = resolved["name"] == "Closed"
+        status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=False,
+                                                       disabled=(not editable) or is_closed_locked)
 
-    is_dead = resolved["name"] in ("Passed", "Withdrawn")
-    notes_value = entry.get("notes")
-    if notes_value is None:
-        notes_value = entry.get("next_steps") or ""
-    notes_cell_html = _notes_cell_html(deal_id, notes_value, editable and not is_dead)
+        is_dead = resolved["name"] in ("Passed", "Withdrawn")
+        notes_value = entry.get("notes")
+        if notes_value is None:
+            notes_value = entry.get("next_steps") or ""
+        notes_cell_html = _notes_cell_html(deal_id, notes_value, editable and not is_dead)
 
     return (
         f'<tr{row_id}{row_cls}>{col1_open}{col1}</td>'
@@ -4477,12 +4715,19 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
     classes = " ".join(c for c in (extra_cls, "stalled-row" if is_stalled else "") if c)
     row_cls = f' class="{classes}"' if classes else ""
 
-    milestones = entry.get("milestones")
-    status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=True)
-    notes_value = entry.get("notes")
-    if notes_value is None:
-        notes_value = entry.get("next_steps") or ""
-    notes_cell_html = _notes_cell_html(deal_id, notes_value, True)
+    if deal.get("_manual"):
+        item = deal["_manual_item"]
+        status_html = _manual_intro_status_select_html(item.get("status"), item["company"], item["person_id"],
+                                                         disabled=False)
+        notes_cell_html = _manual_intro_note_cell_html(item.get("note"), item["company"], item["person_id"],
+                                                         editable=True)
+    else:
+        milestones = entry.get("milestones")
+        status_html = _status_milestones_column_html(resolved, deal_id, milestones, admin_controls=True)
+        notes_value = entry.get("notes")
+        if notes_value is None:
+            notes_value = entry.get("next_steps") or ""
+        notes_cell_html = _notes_cell_html(deal_id, notes_value, True)
 
     return (
         f'<tr{row_id}{row_cls}>{col1_open}{col1}</td>'
@@ -4868,6 +5113,68 @@ ADD_BUYER_CSS = """
     padding: 6px 10px;
     font-size: 13px;
   }
+"""
+
+# Manual intros (Dynamo-only, no backing Pipeline deal) -- the "manual"
+# row tag, the company page's "Add buyer" box, and the .mi-status/.mi-note
+# inline row controls. Shared by both render_company_page (the box, plus
+# manual rows in its own Buyers section) and render_intros_page (manual
+# rows only -- no box there).
+MANUAL_INTRO_CSS = """
+  .manual-tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    background: rgba(107,114,128,0.14);
+    border-radius: 999px;
+    padding: 1px 7px;
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+  .manual-intro-box {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin-top: 16px;
+  }
+  .manual-intro-box h3 { font-size: 14px; font-weight: 700; margin: 0 0 10px; }
+  .mi-box-row { display: flex; gap: 10px; margin-bottom: 10px; flex-wrap: wrap; }
+  .mi-box-row:last-of-type { margin-bottom: 0; }
+  .mi-box-row input[type="text"], .mi-box-row select {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 14px;
+  }
+  #mi-person-id { flex: 0 0 140px; }
+  #mi-box-status { flex: 1; min-width: 160px; }
+  #mi-box-note { flex: 1; min-width: 180px; }
+  #mi-box-save-btn {
+    background: var(--accent);
+    color: #fff;
+    border: none;
+    padding: 8px 18px;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  #mi-box-save-btn:hover { opacity: 0.9; }
+  .mi-status {
+    background: var(--card);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+  .mi-status:disabled { opacity: 0.75; }
 """
 
 
@@ -5647,6 +5954,181 @@ def _notes_cell_html(deal_id, notes_value, editable):
     return _esc(notes_value or "—")
 
 
+def _manual_intro_status_select_html(status_id, company, person_id, disabled=False):
+    """The manual-intro Status cell: a plain ten-option <select>
+    (ADD_BUYER_STATUS_ORDER/INTRO_STATUS_LABELS, same order as the "Add
+    buyer" box's own dropdown) -- deliberately NOT the milestone-
+    checkbox/flag system real deals use (_status_milestones_column_html),
+    since a manual intro has no milestones history at all, just this
+    one status field. Identified by company+person_id (data-* attrs),
+    never a deal_id -- there is no deal. disabled=True for a read-only
+    view (tenant, or admin preview without &edit=1); disabled=False
+    wires it live via _manual_intro_edit_script_html, which posts
+    ?action=manual_intro on change."""
+    options = "".join(
+        f'<option value="{sid}"{" selected" if sid == status_id else ""}>{_esc(INTRO_STATUS_LABELS[sid])}</option>'
+        for sid in ADD_BUYER_STATUS_ORDER
+    )
+    disabled_attr = " disabled" if disabled else ""
+    return (f'<select class="mi-status" data-company="{_esc(company)}" data-person-id="{person_id}"'
+            f'{disabled_attr}>{options}</select><span class="ei-msg"></span>')
+
+
+def _manual_intro_note_cell_html(note_value, company, person_id, editable):
+    """The manual-intro Notes cell -- same 2-line auto-saving textarea /
+    plain-text convention as _notes_cell_html, just posting to
+    ?action=manual_intro (via .mi-note, never .ei-notes) keyed by
+    company+person_id instead of a deal_id."""
+    if editable:
+        return (f'<textarea class="mi-note" data-company="{_esc(company)}" data-person-id="{person_id}" '
+                f'maxlength="{MAX_INTRO_TEXT_LEN}" rows="2" placeholder="Add a note…">{_esc(note_value or "")}'
+                f'</textarea><span class="ei-msg"></span>')
+    return _esc(note_value or "—")
+
+
+def _manual_intro_edit_script_html(key, tenant_email):
+    """Shared auto-save script for manual-intro rows' inline .mi-status
+    select and .mi-note textarea (_manual_intro_status_select_html /
+    _manual_intro_note_cell_html) -- reads company/person_id off each
+    control's own data-* attributes and POSTs ?action=manual_intro, same
+    Saving…/Saved ✓/error convention as _edit_script_html, but a
+    DIFFERENT action and a DIFFERENT identifying key (company+person_id,
+    not deal_id) -- these controls are deliberately never picked up by
+    _edit_script_html's own .ei-status/.ei-notes selectors, so the two
+    scripts can coexist on the same page without cross-wiring."""
+    key_json = json.dumps(key or "")
+    tenant_email_json = json.dumps(tenant_email or "")
+    return f"""<script>
+(function() {{
+  var KEY = {key_json};
+  var TENANT_EMAIL = {tenant_email_json};
+
+  function postManual(payload, msgEl) {{
+    if (msgEl) {{ msgEl.className = 'ei-msg saving'; msgEl.textContent = 'Saving…'; }}
+    fetch('?action=manual_intro', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(payload)
+    }}).then(function(r) {{ return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }}); }})
+      .then(function(res) {{
+        if (!msgEl) return;
+        if (res.ok) {{
+          msgEl.className = 'ei-msg saved';
+          msgEl.textContent = 'Saved ✓';
+          setTimeout(function() {{ msgEl.className = 'ei-msg'; msgEl.textContent = ''; }}, 2000);
+        }} else {{
+          msgEl.className = 'ei-msg error';
+          msgEl.textContent = (res.data && res.data.error) || 'Error';
+        }}
+      }}).catch(function(err) {{
+        if (msgEl) {{ msgEl.className = 'ei-msg error'; msgEl.textContent = 'Error: ' + err; }}
+      }});
+  }}
+
+  document.querySelectorAll('.mi-status').forEach(function(el) {{
+    el.addEventListener('change', function() {{
+      var msgEl = el.nextElementSibling;
+      postManual({{
+        key: KEY, tenant_email: TENANT_EMAIL,
+        company: el.getAttribute('data-company'), person_id: el.getAttribute('data-person-id'),
+        status: parseInt(el.value, 10)
+      }}, msgEl);
+    }});
+  }});
+  document.querySelectorAll('.mi-note').forEach(function(el) {{
+    var msgEl = el.nextElementSibling;
+    el.addEventListener('blur', function() {{
+      postManual({{
+        key: KEY, tenant_email: TENANT_EMAIL,
+        company: el.getAttribute('data-company'), person_id: el.getAttribute('data-person-id'),
+        note: el.value
+      }}, msgEl);
+    }});
+    el.addEventListener('keydown', function(e) {{
+      if (e.key === 'Enter') {{ e.preventDefault(); el.blur(); }}
+    }});
+  }});
+}})();
+</script>"""
+
+
+def _manual_intro_box_html(key, tenant_email, company):
+    """Admin-only "Add buyer" box, directly below the Buyer Demand tiles
+    (company page only) -- a raw person id, the ten-option Intro Status
+    dropdown (default Introduced), and an optional note, writing a
+    Dynamo-only manual-intro record via ?action=manual_intro. NO
+    Pipeline call of any kind, no deal lookup/creation -- deliberately
+    the "I already know who this person is, just record it" path,
+    distinct from the Demand tiles' own Pipeline-backed Introduce
+    control (_introduce_buyer_script_html) and the Buyers table's
+    Pipeline-search-backed "+ Add buyer" panel (_add_buyer_panel_html).
+    Reloads the page on success, same convention as those two."""
+    key_json = json.dumps(key or "")
+    tenant_email_json = json.dumps(tenant_email or "")
+    company_json = json.dumps(company or "")
+    status_options = "".join(
+        f'<option value="{sid}"{" selected" if sid == INTRO_STATUS_INTRODUCED_ID else ""}>'
+        f'{_esc(INTRO_STATUS_LABELS[sid])}</option>'
+        for sid in ADD_BUYER_STATUS_ORDER
+    )
+    return f"""<div class="manual-intro-box">
+  <h3>Add buyer</h3>
+  <div class="mi-box-row">
+    <input type="text" id="mi-person-id" placeholder="Person ID" inputmode="numeric">
+    <select id="mi-box-status">{status_options}</select>
+  </div>
+  <div class="mi-box-row">
+    <input type="text" id="mi-box-note" placeholder="Note (optional)" maxlength="{MAX_INTRO_TEXT_LEN}">
+    <button type="button" id="mi-box-save-btn">Save</button>
+  </div>
+  <span class="ei-msg" id="mi-box-msg"></span>
+</div>
+<script>
+(function() {{
+  var KEY = {key_json};
+  var TENANT_EMAIL = {tenant_email_json};
+  var COMPANY = {company_json};
+  var personInput = document.getElementById('mi-person-id');
+  var statusSelect = document.getElementById('mi-box-status');
+  var noteInput = document.getElementById('mi-box-note');
+  var saveBtn = document.getElementById('mi-box-save-btn');
+  var msgEl = document.getElementById('mi-box-msg');
+
+  saveBtn.addEventListener('click', function() {{
+    var personId = personInput.value.trim();
+    if (!personId) {{
+      msgEl.className = 'ei-msg error';
+      msgEl.textContent = 'Person ID is required';
+      return;
+    }}
+    msgEl.className = 'ei-msg saving';
+    msgEl.textContent = 'Saving…';
+    fetch('?action=manual_intro', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{
+        key: KEY, company: COMPANY, tenant_email: TENANT_EMAIL,
+        person_id: personId, status: parseInt(statusSelect.value, 10), note: noteInput.value
+      }})
+    }}).then(function(r) {{ return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }}); }})
+      .then(function(res) {{
+        if (res.ok) {{
+          msgEl.className = 'ei-msg saved';
+          msgEl.textContent = 'Saved ✓ Reloading…';
+          setTimeout(function() {{ window.location.reload(); }}, 700);
+        }} else {{
+          msgEl.className = 'ei-msg error';
+          msgEl.textContent = (res.data && res.data.error) || 'Error';
+        }}
+      }}).catch(function(err) {{
+        msgEl.className = 'ei-msg error';
+        msgEl.textContent = 'Error: ' + err;
+      }});
+  }});
+}})();
+</script>"""
+
+
 def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None, edit_mode=False,
                         cef_html=""):
     """tenant is None only for admin-without-view_as — the same
@@ -5683,6 +6165,21 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         intro_details, dynamo_failed = get_intro_details(tenant_email)
         deals = get_my_matched_buy_deals(person_id) if person_id is not None else []
         deals = _augment_with_dynamo_linked_deals(deals, intro_details)
+
+        # Manual intros (Dynamo-only, no backing Pipeline deal -- see
+        # _manual_intro_as_deal), across every company this tenant has
+        # one for (company=None), merged in the same way as the augment
+        # step above and BEFORE any per-deal disclosure/routing runs, so
+        # they flow through every existing loop unchanged. Suppressed
+        # when a REAL deal-derived intro already covers the same
+        # buyer+company -- the deal-derived row wins.
+        manual_intros, manual_failed = get_manual_intros(tenant_email) if person_id is not None else ({}, False)
+        if manual_intros:
+            manual_deals = [
+                _manual_intro_as_deal(item) for (m_company, buyer_pid), item in manual_intros.items()
+                if not _tenant_has_deal_derived_intro(person_id, m_company, buyer_pid)
+            ]
+            deals = deals + manual_deals
         # Turn 27, item 1: stage-level exits — a dead-stage (Lost/Trade
         # Broken/Obsolete) BUY deal never reaches get_my_matched_buy_deals,
         # so it simply vanished instead of showing as a closed-out intro.
@@ -5748,7 +6245,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                            else {"by_company_id": set(), "by_company_name": set()})
 
         note_html = ('<p class="gg-note">Status overrides unavailable — showing Pipeline values.</p>'
-                     if dynamo_failed else "")
+                     if (dynamo_failed or manual_failed) else "")
 
         main_rows, pending_rows = [], []
         for d in kept_deals:
@@ -5944,8 +6441,10 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     </div>"""
 
             edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
+            manual_edit_script = _manual_intro_edit_script_html(key, tenant_email) if edit_mode else ""
             add_buyer_panel_html = _add_buyer_panel_html(key, tenant_email) if edit_mode else ""
-            body_html = f"{note_html}{table_html}{closed_out_html}{add_buyer_panel_html}{edit_script}"
+            body_html = (f"{note_html}{table_html}{closed_out_html}{add_buyer_panel_html}"
+                         f"{edit_script}{manual_edit_script}")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -5974,6 +6473,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 {NAV_CSS}
 {FEATURE_CSS}
 {ADD_BUYER_CSS}
+{MANUAL_INTRO_CSS}
   .wrap {{ max-width: 1000px; margin: 28px auto 0; }}
   h1 {{ font-size: 22px; font-weight: 600; margin: 0 0 4px; }}
   .mydeals-summary {{ color: var(--ink); font-size: 14px; margin: 0 0 4px; }}
@@ -7070,6 +7570,24 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 
         matched_deals = get_my_matched_buy_deals(person_id, company) if person_id is not None else []
         matched_deals = _augment_with_dynamo_linked_deals(matched_deals, intro_details, company)
+
+        # Manual intros (Dynamo-only, no backing Pipeline deal at all --
+        # see _manual_intro_as_deal): merged in as synthetic deal dicts
+        # BEFORE wanted_ids/resolved_by_deal_id are computed, so every
+        # downstream step (people lookup, disclosure, main/pending/
+        # closed-out routing, sorting) treats them exactly like a real
+        # row with zero extra code. Suppressed when a REAL deal-derived
+        # intro already covers the same buyer for this company -- the
+        # deal-derived row wins outright, per instruction.
+        manual_intros, manual_failed = (get_manual_intros(anon_key_email, company) if person_id is not None
+                                         else ({}, False))
+        if manual_intros:
+            manual_deals = [
+                _manual_intro_as_deal(item) for (_m_company, buyer_pid), item in manual_intros.items()
+                if not _tenant_has_deal_derived_intro(person_id, company, buyer_pid)
+            ]
+            matched_deals = matched_deals + manual_deals
+
         wanted_ids = set()
         for d in matched_deals:
             wanted_ids |= _deal_linked_person_ids(d) - {person_id}
@@ -7078,7 +7596,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                                 for d in matched_deals}
 
         note_html = ('<p class="gg-note">Next steps and notes unavailable right now.</p>'
-                     if dynamo_failed else "")
+                     if (dynamo_failed or manual_failed) else "")
 
         # Bug fix: a matched-or-later BUY deal whose Intro Status field is
         # explicitly Passed/Withdrawn/Closed (an exit or a win expressed
@@ -7223,6 +7741,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     </details>"""
 
         edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
+        manual_edit_script = _manual_intro_edit_script_html(key, anon_key_email) if edit_mode else ""
         add_buyer_trigger_html = ('<button type="button" class="ab-trigger-btn" id="ab-trigger-btn">'
                                    '+ Add buyer</button>') if edit_mode else ""
         add_buyer_panel_html = (_add_buyer_panel_html(key, anon_key_email, default_company=company)
@@ -7233,6 +7752,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     {matched_body}
     {closed_out_html}
     {edit_script}
+    {manual_edit_script}
   </section>"""
 
     # Nav pass, item 3: the section-nav's "Buyers (N)" count is every row
@@ -7267,6 +7787,13 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     else:
         buyer_demand_body = '<div class="gg-placeholder small">No buy interest recorded yet.</div>'
     introduce_script_html = _introduce_buyer_script_html(key) if (is_admin_key and buyers) else ""
+    # "Add buyer" box, directly below the Demand tiles: admin-only
+    # (edit_mode, same gate as the Buyers table's own write controls --
+    # is_admin_key alone would also allow an unpreviewed admin-without-
+    # &view_as page to show it, but there's no tenant there to attach
+    # the manual intro to), Dynamo-only, no Pipeline call at all.
+    manual_intro_box_html = (_manual_intro_box_html(key, anon_key_email, company)
+                              if (edit_mode and tenant is not None) else "")
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -7278,6 +7805,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 {NAV_CSS}
 {FEATURE_CSS}
 {ADD_BUYER_CSS}
+{MANUAL_INTRO_CSS}
   :root {{
     --bg: #f4f2ee;
     --card: #ffffff;
@@ -7635,6 +8163,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     <h2>Buyer Demand</h2>
     {buyer_demand_body}
     {introduce_script_html}
+    {manual_intro_box_html}
   </section>
   <section class="cd-section">
     <h2>Feature requests</h2>
@@ -9318,6 +9847,63 @@ def _handle_introduce_buyer(event):
     return _json_response(resp)
 
 
+def _handle_manual_intro_write(event):
+    """POST ?action=manual_intro -- admin-only, enforced here (ADMIN_KEY
+    must be in the body); no tenant path exists at all, per instruction
+    ("Admin-only creation and editing... tenants see the rendered rows
+    but cannot create or edit them"). Upserts ONE Dynamo item (table
+    syndicate-dash, tenant=<viewing tenant's email>, sk="manual-intro#
+    <company>#<person_id>") via _dynamo_write_manual_intro -- used both
+    by the company page's "Add buyer" box (company/person_id/status/
+    note all provided in one request, status defaulting client-side to
+    Introduced) and by each manual row's own inline status-select/
+    note-textarea auto-save (one field at a time, matching
+    _edit_script_html's own saveField convention). NO Pipeline call of
+    any kind, ever, on this route -- Dynamo only. Never raises."""
+    body = _parse_json_body(event)
+
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (bool(admin_key) and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+
+    company = str(body.get("company") or "").strip()
+    if not company:
+        return _json_response({"error": "company is required"}, 400)
+
+    try:
+        person_id = int(body.get("person_id"))
+    except (TypeError, ValueError):
+        return _json_response({"error": "person_id is required"}, 400)
+
+    tenant_email = str(body.get("tenant_email") or "").strip().lower()
+    tenant = _resolve_tenant(tenant_email)
+    if tenant is None:
+        return _json_response({"error": "unknown tenant"}, 400)
+
+    status_id = None
+    if body.get("status") not in (None, ""):
+        try:
+            status_id = int(body.get("status"))
+        except (TypeError, ValueError):
+            return _json_response({"error": "invalid status"}, 400)
+        if status_id not in INTRO_STATUS_LABELS:
+            return _json_response({"error": "invalid status"}, 400)
+
+    note = body.get("note")
+    if note is not None:
+        note = str(note)
+        if len(note) > MAX_INTRO_TEXT_LEN:
+            return _json_response({"error": "note too long"}, 400)
+
+    if status_id is None and note is None:
+        return _json_response({"error": "nothing to update"}, 400)
+
+    ok, err, is_new = _dynamo_write_manual_intro(tenant_email, company, person_id, status_id, note, actor="admin")
+    if not ok:
+        return _json_response({"error": f"Save failed: {err}"}, 502)
+    return _json_response({"ok": True, "created": is_new})
+
+
 NOT_ENABLED_MESSAGE = "This dashboard is for sellers."
 
 
@@ -9385,6 +9971,11 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_introduce_buyer(event)
+
+    if query.get("action") == "manual_intro":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_manual_intro_write(event)
 
     if method != "GET":
         return _forbidden()
