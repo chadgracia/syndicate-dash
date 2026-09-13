@@ -2409,6 +2409,21 @@ lf._handle_photo_request("2", tenant_photo, TENANT_A_EMAIL, True)
 check("Photo: warm-invocation cache reused -- only ONE live fetch across two requests within the TTL",
       _fetch_calls.count(2) == 1)
 
+# --- VIEW_AS CONTRACT, bug fix: the 4th arg here is edit_mode, not the
+# bare admin-key flag -- an admin previewing this tenant via BARE
+# &view_as (no &edit=1) computes edit_mode=False, the exact same value
+# passed for the tenant's own session above, so it hits the identical
+# disclosure check and gets the SAME result: the real photo only for a
+# disclosed person, the fallback avatar otherwise. Before this fix,
+# _handle_photo_request keyed off the bare admin-key flag, so a bare
+# &view_as preview could still pull the real photo for a person its
+# own anonymized render never named.
+lf._PHOTO_CACHE.clear()
+resp = lf._handle_photo_request("3", tenant_photo, TENANT_A_EMAIL, False)
+check("Photo: admin + bare &view_as (edit_mode=False) gets the SAME fallback avatar a real tenant "
+      "without disclosure would -- never the real photo it hasn't disclosed",
+      resp["statusCode"] == 200 and resp["headers"]["Content-Type"] == "image/svg+xml")
+
 lf._pipeline_fetch_person_photo_url = _orig_fetch
 lf._PHOTO_CACHE.clear()
 
@@ -3548,8 +3563,13 @@ def ib_event(body_dict, cookies=None):
 
 # --- Rendering: a real tenant NEVER sees a buyer's name/id/controls on
 # the Demand grid, admin key or not -- the anonymized tile is unchanged.
+# edit_mode is the ONLY thing that governs this admin-only content
+# anywhere in render_company_page -- these calls are shaped exactly the
+# way lambda_handler itself would actually compute edit_mode for each
+# scenario (edit_mode = is_admin_key and (not view_as or &edit=1)), so
+# a passing test here really does say something about the real route.
 page_tenant_view = lf.render_company_page("Foxtrot Co", "Sella Introduce", ib_tenant, IB_TENANT_EMAIL, "mydeals",
-                                           key=None, view_as=None, edit_mode=False, is_admin_key=False)
+                                           key=None, view_as=None, edit_mode=False)
 check("tenant view: no real buyer name leaks onto the Demand grid",
       "Ravi Buyer" not in page_tenant_view and "Sana Snapshot" not in page_tenant_view)
 # (checked via the actual tag's class="..." attribute, not a bare
@@ -3560,25 +3580,44 @@ check("tenant view: no Introduce button/controls at all", 'class="intro-buyer-bt
       and 'class="intro-status-select"' not in page_tenant_view)
 check("tenant view: anonymized 'Buyer ' code tiles still render", "Buyer " in page_tenant_view)
 
-# --- Admin, no &view_as: real names show (admin always sees the real
-# thing), but NO Introduce controls -- there's no tenant yet to link to.
+# --- Admin, no &view_as: edit_mode is True here in the real app (view_as
+# empty -> "not view_as" is True), so real names show (admin always sees
+# the real thing), but NO Introduce controls -- there's no tenant yet to
+# link to.
 page_admin_noview = lf.render_company_page("Foxtrot Co", "Admin", None, "admin", "mydeals",
-                                            key=ADMIN_KEY, view_as=None, edit_mode=False, is_admin_key=True)
+                                            key=ADMIN_KEY, view_as=None, edit_mode=True)
 check("admin, no &view_as: real buyer names ARE shown", "Ravi Buyer" in page_admin_noview
       and "Sana Snapshot" in page_admin_noview)
 check("admin, no &view_as: still no Introduce controls (nothing to link the buyer to)",
       'class="intro-buyer-btn"' not in page_admin_noview)
 
-# --- Admin WITH &view_as: real names AND working Introduce controls,
-# each carrying the right buyer/company/tenant on its own button.
+# --- VIEW_AS CONTRACT, bug fix: admin + BARE &view_as (no &edit=1) --
+# edit_mode is False here (see lambda_handler's own formula) -- MUST
+# render exactly what that tenant sees: no real buyer name anywhere,
+# no Introduce button, no status dropdown. This used to leak all three
+# because the Demand-tiles admin branch keyed off the bare admin-key
+# flag instead of edit_mode; regression-locked here.
+page_admin_bare_view_as = lf.render_company_page("Foxtrot Co", "Admin", ib_tenant, IB_TENANT_EMAIL, "mydeals",
+                                                  key=ADMIN_KEY, view_as=IB_TENANT_EMAIL, edit_mode=False)
+check("admin + bare &view_as (no &edit=1): NO real buyer name anywhere on the page",
+      "Ravi Buyer" not in page_admin_bare_view_as and "Sana Snapshot" not in page_admin_bare_view_as)
+check("admin + bare &view_as: NO Introduce button/status-select markup at all",
+      'class="intro-buyer-btn"' not in page_admin_bare_view_as
+      and 'class="intro-status-select"' not in page_admin_bare_view_as)
+check("admin + bare &view_as: anonymized 'Buyer ' code tiles render instead, just like the tenant's own view",
+      "Buyer " in page_admin_bare_view_as)
+
+# --- Admin WITH &view_as AND &edit=1: edit_mode is True -- real names
+# AND working Introduce controls, each carrying the right
+# buyer/company/tenant on its own button.
 page_admin_view = lf.render_company_page("Foxtrot Co", "Admin", ib_tenant, IB_TENANT_EMAIL, "mydeals",
-                                          key=ADMIN_KEY, view_as=IB_TENANT_EMAIL, edit_mode=False, is_admin_key=True)
-check("admin + &view_as: real buyer name shown", "Ravi Buyer" in page_admin_view)
-check("admin + &view_as: Introduce button present, keyed to the right buyer/company/tenant",
+                                          key=ADMIN_KEY, view_as=IB_TENANT_EMAIL, edit_mode=True)
+check("admin + &view_as + &edit=1: real buyer name shown", "Ravi Buyer" in page_admin_view)
+check("admin + &view_as + &edit=1: Introduce button present, keyed to the right buyer/company/tenant",
       f'data-person-id="{IB_BUYER_PID}"' in page_admin_view
       and 'data-company="Foxtrot Co"' in page_admin_view
       and f'data-tenant-email="{IB_TENANT_EMAIL}"' in page_admin_view)
-check("admin + &view_as: status dropdown defaults to Introduced (7207579)",
+check("admin + &view_as + &edit=1: status dropdown defaults to Introduced (7207579)",
       f'<option value="{lf.INTRO_STATUS_INTRODUCED_ID}" selected>' in page_admin_view)
 
 # --- Admin-only, enforced server-side: no ADMIN_KEY, and a real
@@ -3616,7 +3655,7 @@ check("introduce (snapshot match): Dynamo status_override stored for deal 9701",
 
 row_after_snapshot = row_for(
     lf.render_company_page("Foxtrot Co", "Admin", ib_tenant, IB_TENANT_EMAIL, "mydeals",
-                            key=ADMIN_KEY, view_as=IB_TENANT_EMAIL, edit_mode=True, is_admin_key=True),
+                            key=ADMIN_KEY, view_as=IB_TENANT_EMAIL, edit_mode=True),
     "9701")
 check("introduced buyer's row appears in the Buyers section immediately", row_after_snapshot is not None)
 
@@ -4055,6 +4094,30 @@ mi_resp_no_pipeline = lf.lambda_handler(mi_event({
     "status": lf.INTRO_STATUS_INTRODUCED_ID, "tenant_email": MI_TENANT_EMAIL,
 }), None)
 check("manual_intro write makes no Pipeline call at all", mi_resp_no_pipeline["statusCode"] == 200)
+
+
+# ======================================================================
+# SECTION: Layout fix -- company page Buyers table column widths
+# ======================================================================
+# The Buyer name column (rich content: name+link, email/phone, country/
+# website/LinkedIn) used to get only 13% while Company (the buyer's own,
+# usually-short firm name) got 24% -- backwards versus what each column
+# actually holds, and the root cause of the buyer cell's contact line
+# visually overlapping the Company column at typical desktop widths.
+# Rebalanced to 22%/15%, plus overflow-wrap as a second line of defense
+# for any still-unbreakable long token (a long email/URL).
+page_company_layout = lf.render_company_page(MI_COMPANY, "Admin", mi_tenant, MI_TENANT_EMAIL, "mydeals",
+                                              key=ADMIN_KEY, view_as=MI_TENANT_EMAIL, edit_mode=True)
+check("company page: Buyer name column no longer the cramped 13% ('Buyer name'/'Company' swapped in width)",
+      '<col style="width:13%">\n          <col style="width:24%">' not in page_company_layout)
+check("company page: Buyer name column now WIDER than Company (22% vs 15%, was 13% vs 24%)",
+      '<col style="width:22%">\n          <col style="width:15%">' in page_company_layout)
+check("company page: the SAME rebalance applied to the Closed out table's own colgroup, not just the main one",
+      '<col style="width:22%">\n            <col style="width:15%">' in page_company_layout)
+check("company page: overflow-wrap set on table cells (wraps an unbreakable long token instead of overflowing)",
+      "overflow-wrap: anywhere;" in page_company_layout)
+check("company page: the .buyer-cell-links rule (country/website/LinkedIn line) is no longer missing entirely",
+      ".buyer-cell-links {" in page_company_layout)
 
 
 # ======================================================================

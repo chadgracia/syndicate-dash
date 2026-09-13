@@ -3829,22 +3829,33 @@ def _handle_debug_deal(deal_id_raw):
     return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": body}
 
 
-def _handle_photo_request(person_id_raw, tenant, anon_key_email, is_admin_key):
-    """?photo=<person_id> (item 1): admin (is_admin_key, unconditionally —
-    the same "admin always sees the real thing" convention edit_mode
-    follows elsewhere), OR a real signed-in tenant session passing the
-    EXACT buyer-page disclosure gate for that specific person
-    (_tenant_has_disclosed_deal_with) — anyone else gets the fallback
-    avatar, never the real photo, and a photo is never looked up at all
-    for a denied request. 302 to Pipeline's own signed thumb URL when one
-    is on file; an inline SVG initials avatar (200, image/svg+xml)
-    otherwise — an <img> tag pointed at this route never breaks."""
+def _handle_photo_request(person_id_raw, tenant, anon_key_email, edit_mode):
+    """?photo=<person_id> (item 1): admin with actual edit rights
+    (edit_mode -- admin key with no &view_as, or &view_as with &edit=1)
+    sees the real photo unconditionally, the same "admin always sees
+    the real thing" convention edit_mode follows everywhere else in
+    this file. Bug fix: this used to key off the bare admin-key flag
+    instead of edit_mode, so an admin previewing a tenant via bare
+    &view_as (no &edit=1) -- who is supposed to see EXACTLY what that
+    tenant sees -- could still pull the real photo for a person their
+    anonymized preview never named. Anyone else, including that exact
+    bare-view_as preview, falls through to the same disclosure check a
+    real signed-in tenant session gets: _tenant_has_disclosed_deal_with
+    for that specific person, using the VIEWED tenant's own info
+    (tenant/anon_key_email already resolve to the previewed tenant
+    under &view_as, or the real session otherwise) — so a bare preview
+    and the tenant's own session always agree. Anyone failing both
+    gets the fallback avatar, never the real photo, and a photo is
+    never looked up at all for a denied request. 302 to Pipeline's own
+    signed thumb URL when one is on file; an inline SVG initials avatar
+    (200, image/svg+xml) otherwise — an <img> tag pointed at this route
+    never breaks."""
     try:
         person_id = int(person_id_raw)
     except (TypeError, ValueError):
         return _svg_response(_avatar_svg("?"))
 
-    allowed = is_admin_key
+    allowed = edit_mode
     if not allowed and tenant is not None:
         allowed = _tenant_has_disclosed_deal_with(tenant.get("person_id"), anon_key_email, person_id)
 
@@ -7499,20 +7510,30 @@ def _introduce_buyer_script_html(key):
 
 
 def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=None, view_as=None, edit_mode=False,
-                         cef_html="", is_admin_key=False):
+                         cef_html=""):
     """No tab is highlighted (active_tab=None never matches mydeals/intros/
     demand in _nav_html). Section (a) is included only when tenant is not
     None — the same "admin with no view_as" signal render_my_deals_page's
     tenant_picker branch uses, since there is no tenant to scope deals to.
     Section (b) (Buyer Demand) never receives — and so can never render —
-    a buyer's name, email, or raw person id for a real tenant view
-    (is_admin_key=False): the tile only ever sees the anonymized code,
-    tier, ticket range, and a boolean recency flag from _buyer_tile_html.
-    is_admin_key=True (deliberately the RAW admin-key flag, not
-    edit_mode -- true with or without &view_as, per instruction) instead
-    shows each tile's real buyer name, plus an "Introduce" control when
-    there's a tenant to introduce them to (tenant is not None, i.e.
-    under &view_as) -- see _buyer_tile_html's own is_admin branch.
+    a buyer's name, email, or raw person id for a read-only view
+    (edit_mode=False, whether a real tenant session OR an admin's bare
+    &view_as preview with no &edit=1): the tile only ever sees the
+    anonymized code, tier, ticket range, and a boolean recency flag
+    from _buyer_tile_html. edit_mode=True instead shows each tile's
+    real buyer name, plus an "Introduce" control when there's a tenant
+    to introduce them to (tenant is not None) -- see _buyer_tile_html's
+    own is_admin branch.
+
+    Bug fix: this section used to key its admin branch off the bare
+    admin-key flag (is_admin_key) instead of edit_mode, so a bare
+    &view_as preview -- which must render EXACTLY what that tenant
+    sees -- leaked real buyer names and a working Introduce button.
+    edit_mode is already exactly "admin key, AND (no &view_as OR
+    &edit=1)" (see lambda_handler), which is the correct contract, so
+    this function no longer takes is_admin_key as a separate param at
+    all -- edit_mode alone now governs every admin-only affordance on
+    this page, same as everywhere else in this file.
 
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
     — never for a real tenant — and switches the Buyers table to editable
@@ -7671,8 +7692,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
       <div class="table-scroll">
       <table>
         <colgroup>
-          <col style="width:13%">
-          <col style="width:24%">
+          <col style="width:22%">
+          <col style="width:15%">
           <col style="width:11%">
           <col style="width:7%">
           <col style="width:18%">
@@ -7722,8 +7743,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         <div class="table-scroll">
         <table>
           <colgroup>
-            <col style="width:13%">
-            <col style="width:24%">
+            <col style="width:22%">
+            <col style="width:15%">
             <col style="width:11%">
             <col style="width:7%">
             <col style="width:18%">
@@ -7770,10 +7791,13 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     # anon_key_email is the literal string "admin" for admin-without-
     # &view_as (see lambda_handler), which must never be sent as a fake
     # tenant_email, so this is gated on tenant is not None too, not just
-    # is_admin_key.
-    introduce_tenant_email = anon_key_email if (is_admin_key and tenant is not None) else None
+    # edit_mode. edit_mode, not the bare admin-key flag -- see this
+    # function's own docstring: a bare &view_as preview (no &edit=1)
+    # must render exactly what that tenant sees, real name and
+    # Introduce button included nowhere in it.
+    introduce_tenant_email = anon_key_email if (edit_mode and tenant is not None) else None
     if buyers:
-        if is_admin_key:
+        if edit_mode:
             buyer_people_by_id = get_people_by_ids({b["person_id"] for b in buyers})
             tiles_html = "".join(
                 _buyer_tile_html(b, anon_key_email, now, is_admin=True,
@@ -7786,12 +7810,12 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         buyer_demand_body = f'<div class="buyer-grid">{tiles_html}</div>'
     else:
         buyer_demand_body = '<div class="gg-placeholder small">No buy interest recorded yet.</div>'
-    introduce_script_html = _introduce_buyer_script_html(key) if (is_admin_key and buyers) else ""
+    introduce_script_html = _introduce_buyer_script_html(key) if (edit_mode and buyers) else ""
     # "Add buyer" box, directly below the Demand tiles: admin-only
     # (edit_mode, same gate as the Buyers table's own write controls --
-    # is_admin_key alone would also allow an unpreviewed admin-without-
-    # &view_as page to show it, but there's no tenant there to attach
-    # the manual intro to), Dynamo-only, no Pipeline call at all.
+    # there's no tenant to attach a manual intro to on an unpreviewed
+    # admin-without-&view_as page, hence the extra tenant is not None
+    # check too).
     manual_intro_box_html = (_manual_intro_box_html(key, anon_key_email, company)
                               if (edit_mode and tenant is not None) else "")
 
@@ -7871,6 +7895,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     border-bottom: 1px solid var(--line);
     font-size: 14px;
     vertical-align: middle;
+    overflow-wrap: anywhere;
   }}
   tbody tr:last-child td {{ border-bottom: none; }}
   .gg-placeholder {{
@@ -8016,6 +8041,16 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .dc-value {{ font-size: 16px; font-weight: 600; }}
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
   .buyer-contact {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
+  .buyer-cell-links {{
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 2px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }}
+  .buyer-cell-links a {{ color: var(--accent); text-decoration: none; }}
+  .buyer-cell-links a:hover {{ text-decoration: underline; }}
   a.buyer-link {{ color: var(--accent); text-decoration: none; }}
   a.buyer-link:hover {{ text-decoration: underline; }}
   .buyer-link-suffix {{ font-weight: 400; font-size: 11px; color: var(--muted); }}
@@ -10083,7 +10118,7 @@ def _lambda_handler_impl(event, context):
             ref = "mydeals"
         body = render_company_page(company, viewer_name, tenant, anon_key_email, ref,
                                     key=nav_key, view_as=nav_view_as, edit_mode=edit_mode,
-                                    cef_html=cef_html, is_admin_key=is_admin_key)
+                                    cef_html=cef_html)
         return _html_response(body)
 
     # Buyer detail page (item 3, turn 18): same auth resolution as every
@@ -10096,11 +10131,14 @@ def _lambda_handler_impl(event, context):
 
     # Buyer photo (item 1): not an HTML page -- a 302 to Pipeline's signed
     # thumb URL, or an inline SVG fallback avatar. Auth is resolved from
-    # the exact same tenant/is_admin_key context every other route above
-    # already established.
+    # the exact same tenant/edit_mode context every other route above
+    # already established -- edit_mode, not the bare is_admin_key flag,
+    # so a bare &view_as preview (no &edit=1) never gets the real photo
+    # for a person its own anonymized render never named (see
+    # _handle_photo_request's docstring).
     photo_param = query.get("photo")
     if photo_param:
-        return _handle_photo_request(photo_param, tenant, anon_key_email, is_admin_key)
+        return _handle_photo_request(photo_param, tenant, anon_key_email, edit_mode)
 
     if tab == "demand":
         table = get_company_table()
