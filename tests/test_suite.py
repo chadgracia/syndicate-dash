@@ -2114,6 +2114,82 @@ check("rendering these closed-out rows issues no Dynamo writes",
       fake_table.updates == [] and fake_table.puts == [])
 
 
+# --- Real-ticket regression: deal 55422151 ("Panthalassa: $250K Buy"),
+# tenant elana@tworoads.vc -- Buy-tagged (5077819), stage Won Deal
+# (111802), Intro Status Closed (7207587), Elana linked via the deal's
+# own "people" list. Reported as rendering nowhere: no Closed section on
+# My Deals/Active Intros, Buyers(0) and "No introductions yet on this
+# deal." on the company page, Intros column reading "--". Reproduced
+# with the exact ids from the report to prove (not just claim) that
+# _is_matched_or_later_buy_deal's Closed-status OR-check, together with
+# _is_closed_out_buy_deal's matching exclusion, actually holds across
+# every one of the three deployed paths named in the report: the intro
+# fetch (get_my_matched_buy_deals/_resolve_intro_status), per-company
+# stats (_company_buy_stats, My Deals' own Intros column), and the
+# company page's Buyers rendering.
+ELANA_EMAIL = "elana@tworoads.vc"
+ELANA_PID = 990001
+elana_sell_deal = {"id": 900700, "name": "Panthalassa Sell Order", "company": {"name": "Panthalassa"},
+                    "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_sell(),
+                    "people": [{"id": ELANA_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+panthalassa_deal = {"id": 55422151, "name": "Panthalassa: $250K Buy", "company": {"name": "Panthalassa"},
+                     "deal_stage": {"id": 111802},  # Won Deal
+                     "custom_fields": {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID],
+                                       lf.INTRO_STATUS_FIELD: [lf.INTRO_STATUS_CLOSED_ID],
+                                       lf.TICKET_MAX_FIELD: 250000},
+                     "people": [{"id": ELANA_PID}, {"id": 5001}], "updated_at": "2026-08-05T00:00:00Z"}
+elana_people = {"people": [
+    {"id": ELANA_PID, "full_name": "Elana Investor", "email": ELANA_EMAIL, "custom_fields": {}},
+    {"id": 5001, "full_name": "Panthalassa Buyer", "email": "buyer@panthalassa-buyer.example", "custom_fields": {}},
+]}
+use_fixture({lf.PEOPLE_KEY: elana_people, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [elana_sell_deal, panthalassa_deal]}})
+elana_tenant = lf._resolve_tenant(ELANA_EMAIL)
+check("Ticket 55422151: elana@tworoads.vc auto-enrolls as a tenant", elana_tenant is not None)
+
+check("Ticket 55422151: _is_matched_or_later_buy_deal(panthalassa_deal) -> True",
+      lf._is_matched_or_later_buy_deal(panthalassa_deal))
+check("Ticket 55422151: _is_closed_out_buy_deal(panthalassa_deal) -> False (routes via matched-or-later instead)",
+      not lf._is_closed_out_buy_deal(panthalassa_deal))
+
+elana_matched = lf.get_my_matched_buy_deals(elana_tenant["person_id"], "Panthalassa")
+check("Ticket 55422151: get_my_matched_buy_deals (intro fetch) picks it up",
+      [d["id"] for d in elana_matched] == [55422151])
+
+elana_stats = lf._company_buy_stats(elana_tenant["person_id"], "Panthalassa")
+check("Ticket 55422151: per-company stats -- intro_count = 1, not 0",
+      elana_stats["intro_count"] == 1)
+
+elana_sell_only = [d for d in lf.get_my_deals(elana_tenant["person_id"])
+                    if lf.DEAL_SIDE_SELL_ID in lf._deal_cf_option_ids(d, lf.DEAL_SIDE_FIELD)]
+page_elana_mydeals = lf.render_my_deals_page("Elana Investor", deals=elana_sell_only, key=None, view_as=None,
+                                              person_id=elana_tenant["person_id"], anon_key_email=ELANA_EMAIL)
+check("Ticket 55422151: My Deals Intros column shows a count link '1', not '--'",
+      '<a class="mydeals-count-link" href="?company=Panthalassa&ref=mydeals#buyers">1</a>' in page_elana_mydeals)
+
+page_elana_company = lf.render_company_page("Panthalassa", "Elana Investor", elana_tenant, ELANA_EMAIL, "mydeals",
+                                             key=None, view_as=None, edit_mode=False)
+buyers_section = page_elana_company[page_elana_company.find('id="buyers"'):]
+check("Ticket 55422151: company page's Buyers section has a 'Closed out (1)' group",
+      '<summary>Closed out <span class="count">(1)</span></summary>' in buyers_section)
+check("Ticket 55422151: the buyer is named (Closed is always disclosed), not anonymized",
+      "Panthalassa Buyer" in buyers_section)
+check("Ticket 55422151: styled positively (green .status-chip.closed), never the gray Passed/Withdrawn chip",
+      '<span class="status-chip closed">Closed</span>' in buyers_section
+      and '<span class="status-chip exit">Closed</span>' not in buyers_section)
+
+page_elana_intros = lf.render_intros_page("Elana Investor", tenant=elana_tenant, tenant_email=ELANA_EMAIL,
+                                           key=None, view_as=None, edit_mode=False)
+elana_closed_out = page_elana_intros[page_elana_intros.find('<details class="closed-out-section">'):]
+check("Ticket 55422151: Active Intros' Closed out section shows it, named, styled green",
+      "Panthalassa Buyer" in elana_closed_out
+      and '<span class="status-chip closed">Closed</span>' in elana_closed_out)
+
+elana_raised = lf._raised_headline_stats()
+check("Ticket 55422151: contributes to the desk-wide Raised total ($250K)",
+      elana_raised["total"] == 250000)
+
+
 # ======================================================================
 # SECTION: Multi-buyer display (primary + secondary + "+N more"), Deal
 # team, and the company_name fallback for colleague-matching
