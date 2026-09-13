@@ -2872,14 +2872,24 @@ def _feature_requests_list_html(open_items, done_items, show_tenant=False, tenan
     return "".join(rows)
 
 
-def _feature_section_html(tenant_picker, anon_key_email, key=None, page="my-deals"):
+def _feature_section_html(tenant_picker, anon_key_email, key=None, page="my-deals", edit_mode=False):
     """Feature-request box + list, shared verbatim by My Deals, Active
     Intros, and the Demand Board (item 5, turn 20 — page-scoped):
     tenant_picker (admin, no view_as) is the one case with no single
     partition to scope to — it aggregates every
     auto-enrolled tenant partition plus "admin" instead; every other case
     (real tenant session, or admin under &view_as) is scoped to
-    anon_key_email. Returns (feature_box_html, feature_list_html)."""
+    anon_key_email. Returns (feature_box_html, feature_list_html).
+
+    Bug fix: the submit box embeds key into client JS so its POST can
+    identify the writer. tenant_picker is only ever reached with
+    edit_mode already True (admin-without-&view_as), so the real key
+    there is correct as-is; the non-tenant_picker branch covers both a
+    real tenant (key already None) AND admin+&view_as, where the real
+    ADMIN_KEY must NOT reach the page unless Admin view is on --
+    otherwise a Tenant-view preview's feature submission would silently
+    post as "admin" instead of failing the way an unauthenticated
+    write should."""
     if tenant_picker:
         # Admin aggregate: every tenant partition, every page, unfiltered
         # (get_feature_requests(partition) with no page= defaults to
@@ -2898,7 +2908,7 @@ def _feature_section_html(tenant_picker, anon_key_email, key=None, page="my-deal
         feature_list_html = _feature_requests_list_html(agg_open, agg_done, show_tenant=True,
                                                           tenant_names=tenant_names, show_page=True)
     else:
-        feature_box_html = _feature_box_html(anon_key_email, key=key, page=page)
+        feature_box_html = _feature_box_html(anon_key_email, key=(key if edit_mode else None), page=page)
         feature_items, _ = get_feature_requests(anon_key_email, page=page)
         feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
     return feature_box_html, feature_list_html
@@ -5880,12 +5890,19 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     view_toggle_script = ""
     copy_link_html = ""
     if key is not None:
-        badge_text = "ADMIN"
+        # Bug fix: this badge used to render whenever an admin key was
+        # present at all, even with Admin view OFF under &view_as -- so
+        # a Tenant-view preview still carried a visible "ADMIN · viewing
+        # as x@y.com" label, which is itself an admin-only affordance a
+        # real tenant never sees and broke the "renders exactly what
+        # that tenant sees" contract. Gated on edit_flag now, same as
+        # every other admin-only control on the page (admin-without-
+        # &view_as is unaffected -- edit_flag is always True there).
         if edit_flag:
-            badge_text += " · editing"
-        if view_as:
-            badge_text += f" · viewing as {view_as}"
-        admin_badge_html = f'<div class="gg-admin-badge">{_esc(badge_text)}</div>'
+            badge_text = "ADMIN · editing"
+            if view_as:
+                badge_text += f" · viewing as {view_as}"
+            admin_badge_html = f'<div class="gg-admin-badge">{_esc(badge_text)}</div>'
 
         # Tenant view / Admin view toggle (replaces &edit=1 as the way to
         # reveal real names/admin controls under &view_as -- see
@@ -6283,7 +6300,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     tenant_picker = tenant is None
 
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, tenant_email or "admin", key=key,
-                                                                   page="intros")
+                                                                   page="intros", edit_mode=edit_mode)
 
     if tenant_picker:
         body_html = _tenant_picker_html("intros", key)
@@ -6576,7 +6593,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
       </table>
     </div>"""
 
-            edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
+            edit_script = _edit_script_html(key if edit_mode else None) if (edit_mode or tenant_edit_mode) else ""
             manual_edit_script = _manual_intro_edit_script_html(key, tenant_email) if edit_mode else ""
             add_buyer_panel_html = _add_buyer_panel_html(key, tenant_email) if edit_mode else ""
             body_html = (f"{note_html}{table_html}{closed_out_html}{add_buyer_panel_html}"
@@ -6835,7 +6852,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     {feature_list_html}
   </div>
 </div>
-{_feature_toggle_script_html(key)}
+{_feature_toggle_script_html(key if edit_mode else None)}
 </body>
 </html>"""
 
@@ -6924,7 +6941,13 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
                                                     visibility_state, key=key, view_as=view_as))
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
-    actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section, key=key)
+    # Bug fix: Hold/Cancel/Reactivate are tenant self-service (see
+    # _deal_actions_html's own docstring), never admin-only, but the
+    # data-key attribute they carry decides whether the resulting write
+    # is treated as an admin write server-side -- so it must not carry
+    # the real ADMIN_KEY into a Tenant-view preview.
+    actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section,
+                                       key=(key if edit_mode else None))
 
     return (
         f'<tr><td class="company">{company_link}{deal_id_sub}{via_html}</td>'
@@ -6947,7 +6970,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                      person_id=person_id)
 
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
-                                                                   page="my-deals")
+                                                                   page="my-deals", edit_mode=edit_mode)
 
     summary_html = ""
     subtle_html = ""
@@ -7468,7 +7491,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   </div>
 </div>
 {edit_script}
-{_feature_toggle_script_html(key)}
+{_feature_toggle_script_html(key if edit_mode else None)}
 {_deal_stage_script_html()}
 <script>
 (function() {{
@@ -7677,7 +7700,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     # cross-tenant aggregation here, that's render_my_deals_page's
     # tenant_picker branch only (see get_feature_requests).
     feature_items, _ = get_feature_requests(anon_key_email, page="company")
-    feature_box_html = _feature_box_html(anon_key_email, key=key, page="company")
+    feature_box_html = _feature_box_html(anon_key_email, key=(key if edit_mode else None), page="company")
     feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
 
     # tenant_edit_mode: the tenant (real session, or admin &view_as preview
@@ -7886,7 +7909,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
       </div>
     </details>"""
 
-        edit_script = _edit_script_html(key) if (edit_mode or tenant_edit_mode) else ""
+        edit_script = _edit_script_html(key if edit_mode else None) if (edit_mode or tenant_edit_mode) else ""
         manual_edit_script = _manual_intro_edit_script_html(key, anon_key_email) if edit_mode else ""
         add_buyer_trigger_html = ('<button type="button" class="ab-trigger-btn" id="ab-trigger-btn">'
                                    '+ Add buyer</button>') if edit_mode else ""
@@ -8330,7 +8353,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     <div class="card">
       {feature_list_html}
     </div>
-    {_feature_toggle_script_html(key)}
+    {_feature_toggle_script_html(key if edit_mode else None)}
   </section>
 </div>
 </body>
@@ -8889,7 +8912,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                     + f'<div class="buyer-columns"><div class="buyer-col-left">{left_html}</div>'
                     + f'<div class="buyer-col-right">{right_html}</div></div>'
                 )
-                edit_script_html = _edit_script_html(key)
+                edit_script_html = _edit_script_html(key if edit_mode else None)
             else:
                 body_html = _buyer_page_anonymized_html(rec, anon_key_email, buyer_id)
 
@@ -9202,7 +9225,7 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
 def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
                  tenant_picker=False, edit_mode=False, person_id=None):
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
-                                                                   page="demand")
+                                                                   page="demand", edit_mode=edit_mode)
     tenant_picker_html = _tenant_picker_html("demand", key) if tenant_picker else ""
     raised_headline_html = _raised_headline_html(edit_mode=edit_mode)
     rows_html = "".join(
@@ -9215,7 +9238,8 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
         f'<td class="num">{r["sellers"]}</td></tr>'
         for r in table
     )
-    nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, cef_html=cef_html, person_id=person_id)
+    nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                     person_id=person_id)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -9438,7 +9462,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
   }});
 }})();
 </script>
-{_feature_toggle_script_html(key)}
+{_feature_toggle_script_html(key if edit_mode else None)}
 </body>
 </html>"""
 
@@ -10282,7 +10306,7 @@ def _lambda_handler_impl(event, context):
     elif tab == "mydeals":
         if tenant is None:
             body = render_my_deals_page(viewer_name, tenant_picker=True,
-                                         key=nav_key, view_as=nav_view_as, cef_html=cef_html)
+                                         key=nav_key, view_as=nav_view_as, cef_html=cef_html, edit_mode=edit_mode)
         else:
             person_id = tenant.get("person_id")
             # My Deals shows only Sell Order-tagged deals — the buy side

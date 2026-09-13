@@ -4192,6 +4192,23 @@ check("bare admin+view_as (Active Intros): no admin edit controls render on the 
 # active side by default, "Copy client link" is ALSO present (it's
 # view_as-gated, not edit_mode-gated -- an admin meta-control, not
 # tenant-facing content).
+# --- Bug fixes (found via a separate CAREFUL MODE audit of this same
+# feature): two more admin-only affordances that kept checking `key`
+# directly instead of edit_mode, so they stayed live under bare
+# admin+view_as (Tenant view) even though the toggle above is off.
+ADMIN_KEY_JS_MARKERS = (f'var ADMIN_KEY = "{ADMIN_KEY}"', f'var KEY = "{ADMIN_KEY}"')
+check("bare admin+view_as (company page): no ADMIN badge (an admin-only affordance -- "
+      "a real tenant never sees 'ADMIN · viewing as x@y.com')",
+      'class="gg-admin-badge"' not in resp_bare_company["body"])
+check("bare admin+view_as (Active Intros): no ADMIN badge either",
+      'class="gg-admin-badge"' not in resp_bare_intros["body"])
+check("bare admin+view_as (company page): the raw ADMIN_KEY never reaches client-side write "
+      "scripts (edit script / feature box / feature toggle) -- a Tenant-view preview's save "
+      "must fail like an unauthenticated write, never silently succeed as an admin write",
+      not any(m in resp_bare_company["body"] for m in ADMIN_KEY_JS_MARKERS))
+check("bare admin+view_as (Active Intros): same -- no raw ADMIN_KEY in any client script",
+      not any(m in resp_bare_intros["body"] for m in ADMIN_KEY_JS_MARKERS))
+
 check("nav toggle renders under bare admin+view_as", 'class="gg-view-toggle"' in resp_bare_company["body"])
 check("nav toggle: 'Tenant view' is the active side by default (no cookie, no &edit=1)",
       '<button type="button" class="gg-view-toggle-btn active" data-mode="tenant">Tenant view</button>'
@@ -4219,6 +4236,10 @@ check("gg_admin_view=admin cookie (company page): real buyer name now shown",
 check("gg_admin_view=admin cookie (company page): nav toggle now shows 'Admin view' as active",
       '<button type="button" class="gg-view-toggle-btn active" data-mode="admin">Admin view</button>'
       in resp_cookie_company["body"])
+check("gg_admin_view=admin cookie (company page): ADMIN badge now shown",
+      'class="gg-admin-badge"' in resp_cookie_company["body"])
+check("gg_admin_view=admin cookie (company page): raw ADMIN_KEY now reaches client write scripts",
+      any(m in resp_cookie_company["body"] for m in ADMIN_KEY_JS_MARKERS))
 
 resp_cookie_intros = lf.lambda_handler(vt_get_event(
     {"key": ADMIN_KEY, "view_as": VT_TENANT_EMAIL, "tab": "intros"},
@@ -4250,6 +4271,8 @@ resp_admin_noview = lf.lambda_handler(vt_get_event({"key": ADMIN_KEY}), None)
 check("admin, no &view_as: nav toggle still renders", 'class="gg-view-toggle"' in resp_admin_noview["body"])
 check("admin, no &view_as: 'Copy client link' does NOT render (nothing to link to)",
       'id="gg-copy-link-btn"' not in resp_admin_noview["body"])
+check("admin, no &view_as: ADMIN badge still shown (edit_mode is always True with no tenant selected)",
+      'class="gg-admin-badge"' in resp_admin_noview["body"])
 
 # --- A real tenant session (gg_id cookie, no admin key): no toggle, no
 # copy-link, no admin badge -- none of this is visible to a tenant at all.
