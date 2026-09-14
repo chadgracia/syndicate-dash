@@ -5607,7 +5607,7 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
     )
 
 
-def _closed_out_status_chip_html(deal, loss_reason=None):
+def _closed_out_status_chip_html(deal, loss_reason=None, solid_won=False):
     """The status chip for ANY closed-out row: gray for Passed/Withdrawn
     (stage-derived, turn 27, OR a status-based exit on an otherwise
     still-live stage -- see _deal_exit_outcome_name) — reuses
@@ -5618,12 +5618,17 @@ def _closed_out_status_chip_html(deal, loss_reason=None):
     class/copy the normal Introduced-table row already used for a
     tenant viewing a Closed-locked row -- see _status_milestones_
     column_html -- so a won outcome always reads as a win, never lumped
-    in with the gray Passed/Withdrawn styling). Either way, a loss
-    reason on record (never applicable to a Closed outcome in practice)
-    appends a small muted "— <reason>" suffix."""
+    in with the gray Passed/Withdrawn styling). solid_won (company page
+    only, via _closed_out_row_html's surface=="company") swaps that tint
+    for a SOLID green "Won" chip -- unmistakable at a glance, never
+    sharing styling with the gray exit chip; Active Intros keeps the
+    original tinted "Closed" chip unchanged. Either way, a loss reason
+    on record (never applicable to a Closed outcome in practice) appends
+    a small muted "— <reason>" suffix."""
     outcome = _deal_exit_outcome_name(deal)
     if outcome == "Closed":
-        chip = '<span class="status-chip closed">Closed</span>'
+        chip = ('<span class="status-chip won">Won</span>' if solid_won
+                 else '<span class="status-chip closed">Closed</span>')
     else:
         chip = _status_chip_html(None, outcome)
     if loss_reason is None:
@@ -5678,11 +5683,23 @@ def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_k
     this deal's Dynamo intro item (from get_intro_details), already
     scoped to the viewing tenant's own partition by the caller -- never
     None for the loss-notes share flag to read correctly. Same col1/col2
-    surface split as _buy_deal_row_html."""
+    surface split as _buy_deal_row_html.
+
+    Item 2 (company page outcome contrast): surface=="company" adds an
+    outcome-tinted row class -- closed-out-row-won (green tint, full
+    opacity) or closed-out-row-passed (the original muted look) -- and
+    renders the solid-green "Won" chip via solid_won, so Closed and
+    Passed/Withdrawn are visually unmistakable even collapsed. Active
+    Intros (surface=="intros") keeps the original uniform muted row and
+    tinted "Closed" chip -- not part of this instruction's scope."""
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, disclosed, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
         anon_key_email=anon_key_email, firm_won_index=firm_won_index, company_repeated=company_repeated)
-    classes = " ".join(c for c in ("closed-out-row", extra_cls) if c)
+    is_company = surface == "company"
+    outcome_cls = ""
+    if is_company:
+        outcome_cls = "closed-out-row-won" if _deal_exit_outcome_name(deal) == "Closed" else "closed-out-row-passed"
+    classes = " ".join(c for c in ("closed-out-row", outcome_cls, extra_cls) if c)
     row_cls = f' class="{classes}"'
 
     return (
@@ -5690,7 +5707,7 @@ def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_k
         f'<td>{col2}</td>'
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
-        f'<td>{_closed_out_status_chip_html(deal)}</td>'
+        f'<td>{_closed_out_status_chip_html(deal, solid_won=is_company)}</td>'
         f'<td class="notes-cell">{_loss_reason_notes_cell_html(deal, entry, edit_mode)}</td></tr>'
     )
 
@@ -8857,10 +8874,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             closed_out_deals.append(d)
             closed_out_disclosed_by_id[deal_id] = edit_mode or resolved_by_deal_id[deal_id]["disclosed"]
         # Item 3 (company page split): "Closed out" broken into its two
-        # outcomes -- Closed (won: _deal_exit_outcome_name == "Closed",
-        # rendered with the green Won chip) and Passed (everything else
-        # here -- Passed/Withdrawn status, or the stage-based Lost/
-        # Lost(1)/Trade Broken/Obsolete exits, gray chip + loss reason).
+        # outcomes -- "Closed — won" (_deal_exit_outcome_name == "Closed",
+        # rendered with the solid-green "Won" chip) and "Passed /
+        # withdrawn" (everything else here -- Passed/Withdrawn status, or
+        # the stage-based Lost/Lost(1)/Trade Broken/Obsolete exits, gray
+        # chip + loss reason).
         # Each section's own count is the SAME number the "This company"
         # card's Won/Passed lines show (company_stats_for_tenant), not a
         # recount of the rows below -- guarantees the two always match,
@@ -8909,8 +8927,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     </details>"""
 
             closed_out_html = (
-                _closed_out_section_html("Closed", company_stats_for_tenant["won_count"], won_out_deals)
-                + _closed_out_section_html("Passed", company_stats_for_tenant["passed_count"], passed_out_deals)
+                _closed_out_section_html("Closed — won", company_stats_for_tenant["won_count"], won_out_deals)
+                + _closed_out_section_html("Passed / withdrawn", company_stats_for_tenant["passed_count"],
+                                            passed_out_deals)
             )
 
         edit_script = _edit_script_html(key if edit_mode else None) if (edit_mode or tenant_edit_mode) else ""
@@ -9279,6 +9298,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
   .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
+  .status-chip.won {{ background: var(--qp); color: #fff; }}
   .status-column {{ display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }}
   .status-awaiting {{ font-size: 12px; color: var(--muted); font-style: italic; }}
   .ei-milestones {{ display: flex; flex-wrap: wrap; gap: 4px 10px; }}
@@ -9300,6 +9320,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   }}
   tr.pending-row {{ opacity: 0.85; }}
   tr.closed-out-row {{ opacity: 0.7; }}
+  tr.closed-out-row-won {{ opacity: 1; background: rgba(31,122,77,0.08); }}
+  tr.closed-out-row-passed {{ opacity: 0.7; }}
   .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
   .loss-reason-notes {{ color: var(--muted); font-size: 11px; margin-top: 4px; }}
   .loss-reason-share {{ display: block; font-size: 11px; color: var(--muted); margin-top: 4px; }}
