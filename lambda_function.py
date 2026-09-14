@@ -2093,37 +2093,106 @@ def _resolve_tenant(email):
     return _tenant_index().get(email.strip().lower())
 
 
-def _tenant_picker_html(active_tab, key):
-    """Admin-without-view_as's tenant picker: every eligible tenant (same
-    rule _tenant_index()/_resolve_tenant use -- an auto-enrolled person
-    with >=1 Sell Order deal, any stage), each a link back to this same
-    tab with &view_as=<email> appended, admin key carried through via
-    _tab_qs_suffix exactly like every other tab link. One row per email
-    (a person with multiple emails on file gets one row per email, since
-    &view_as= is keyed by email, not person_id -- matches _tenant_index's
-    own per-email keying). Sorted by company A-Z."""
+def _eligible_tenants_list():
+    """Every eligible tenant (same rule _tenant_index()/_resolve_tenant
+    use -- an auto-enrolled person with >=1 Sell Order deal, any stage),
+    one row per email (a person with multiple emails on file gets one
+    row per email, matching _tenant_index's own per-email keying),
+    sorted by firm then name. Shared by the nav's searchable tenant
+    picker (_tenant_search_html) and the ?tenants=list admin JSON route
+    (_handle_tenants_list) so neither recomputes its own copy of this
+    population."""
     tenant_index = _tenant_index()
     people = get_people_by_ids({e["person_id"] for e in tenant_index.values() if e["person_id"] is not None})
     entries = []
     for email, entry in tenant_index.items():
         rec = people.get(entry["person_id"]) or {}
-        company_name = (rec.get("company_name") or "").strip()
-        entries.append({"email": email, "name": entry["name"], "company_name": company_name})
-    entries.sort(key=lambda r: (r["company_name"].lower(), r["name"].lower()))
-    if not entries:
+        firm = (rec.get("company_name") or "").strip()
+        entries.append({"email": email, "name": entry["name"], "firm": firm})
+    entries.sort(key=lambda r: (r["firm"].lower(), r["name"].lower()))
+    return entries
+
+
+def _tenant_picker_html():
+    """Admin-without-view_as's page-body placeholder. The actual tenant
+    picker now lives in the nav on every page (_tenant_search_html,
+    searchable), so this is just the empty-state body content -- no
+    long list here anymore."""
+    if not _eligible_tenants_list():
         return '<div class="gg-placeholder">No eligible tenants found.</div>'
-    suffix = _tab_qs_suffix(key, None)
-    rows = "".join(
-        f'<li><a href="?tab={active_tab}{suffix}&view_as={urllib.parse.quote(e["email"], safe="")}">'
-        f'{_esc(e["name"])} &middot; {_esc(e["company_name"] or "—")}</a></li>'
-        for e in entries
-    )
-    return (
-        '<div class="gg-tenant-picker">'
-        '<p class="gg-tenant-picker-lead">Pick a tenant to preview:</p>'
-        f'<ul class="gg-tenant-picker-list">{rows}</ul>'
-        '</div>'
-    )
+    return '<div class="gg-placeholder">Search for a tenant above to preview their view.</div>'
+
+
+def _tenant_search_html(key, view_as):
+    """Compact searchable tenant-picker dropdown for the nav -- admin-only
+    (key is not None), same admin-only-meta-control gating as the view
+    toggle/copy-link buttons in _nav_html, rendered on every page so
+    switching tenants never requires navigating back to a placeholder
+    list first. The full eligible-tenant population (_eligible_tenants_
+    list, shared with ?tenants=list) is embedded once as a JSON array
+    and filtered client-side on name/firm as the admin types -- no
+    per-keystroke round trip. Selecting an entry sets &view_as=<email>
+    on the CURRENT url (same URL-surgery approach as Copy client link)
+    and reloads; "Clear" removes it, returning to the no-tenant admin
+    view. Returns (html, script); ("", "") when key is None."""
+    if key is None:
+        return "", ""
+    entries = _eligible_tenants_list()
+    entries_json = json.dumps(entries).replace("</", "<\\/")
+    current_label = ""
+    if view_as:
+        match = next((e for e in entries if e["email"] == view_as), None)
+        current_label = f'{match["name"]} · {match["firm"] or "—"}' if match else view_as
+    html = f"""<div class="gg-tenant-search">
+      <input type="text" class="gg-tenant-search-input" id="gg-tenant-search-input"
+             placeholder="Search tenant…" value="{_esc(current_label)}" autocomplete="off">
+      <ul class="gg-tenant-search-results" id="gg-tenant-search-results" hidden></ul>
+    </div>"""
+    script = f"""<script>
+(function() {{
+  var TENANTS = {entries_json};
+  var input = document.getElementById('gg-tenant-search-input');
+  var results = document.getElementById('gg-tenant-search-results');
+  if (!input || !results) return;
+
+  function goTo(email) {{
+    var url = new URL(window.location.href);
+    if (email) {{ url.searchParams.set('view_as', email); }} else {{ url.searchParams.delete('view_as'); }}
+    window.location.href = url.toString();
+  }}
+
+  function render(list) {{
+    results.innerHTML = '';
+    var clearLi = document.createElement('li');
+    clearLi.className = 'gg-tenant-search-clear';
+    clearLi.textContent = 'Clear (no tenant)';
+    clearLi.addEventListener('click', function() {{ goTo(null); }});
+    results.appendChild(clearLi);
+    list.forEach(function(t) {{
+      var li = document.createElement('li');
+      li.textContent = t.name + ' · ' + (t.firm || '—');
+      li.addEventListener('click', function() {{ goTo(t.email); }});
+      results.appendChild(li);
+    }});
+    results.hidden = false;
+  }}
+
+  function filterList() {{
+    var q = input.value.trim().toLowerCase();
+    if (!q) return TENANTS;
+    return TENANTS.filter(function(t) {{
+      return t.name.toLowerCase().indexOf(q) !== -1 || (t.firm || '').toLowerCase().indexOf(q) !== -1;
+    }});
+  }}
+
+  input.addEventListener('focus', function() {{ render(filterList()); }});
+  input.addEventListener('input', function() {{ render(filterList()); }});
+  document.addEventListener('click', function(e) {{
+    if (e.target !== input && !results.contains(e.target)) {{ results.hidden = true; }}
+  }});
+}})();
+</script>"""
+    return html, script
 
 
 def _tenant_cef_state(person_id):
@@ -6016,6 +6085,37 @@ NAV_CSS = """
     white-space: nowrap;
   }
   .gg-copy-link-btn:hover { border-color: var(--accent); }
+  .gg-tenant-search { position: relative; display: inline-flex; }
+  .gg-tenant-search-input {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 12px;
+    width: 200px;
+    color: var(--ink);
+    background: var(--card);
+  }
+  .gg-tenant-search-results {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin: 4px 0 0;
+    padding: 4px 0;
+    min-width: 240px;
+    max-width: min(320px, 92vw);
+    max-height: 60vh;
+    overflow-y: auto;
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.16);
+    z-index: 50;
+    list-style: none;
+  }
+  .gg-tenant-search-results[hidden] { display: none; }
+  .gg-tenant-search-results li { padding: 6px 12px; font-size: 13px; color: var(--ink); cursor: pointer; }
+  .gg-tenant-search-results li:hover { background: rgba(61,90,115,0.08); }
+  .gg-tenant-search-clear { color: var(--muted); border-bottom: 1px solid var(--line); }
   /* Shared .ei-msg (Saving…/Saved ✓/error) -- most pages already define
      this themselves, but _nav_html's own "Copy client link" feedback
      needs it on EVERY page the nav renders on, buyer page and Demand
@@ -6274,6 +6374,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     view_toggle_html = ""
     view_toggle_script = ""
     copy_link_html = ""
+    tenant_search_html = ""
     if key is not None:
         # Bug fix: this badge used to render whenever an admin key was
         # present at all, even with Admin view OFF under &view_as -- so
@@ -6358,6 +6459,12 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
 })();
 </script>"""
 
+        # Compact searchable tenant picker (item 1) -- same admin-only-meta
+        # gating as the view toggle/copy-link controls above, rendered on
+        # every page (not just admin-without-view_as's placeholder body).
+        tenant_search_html, tenant_search_script = _tenant_search_html(key, view_as)
+        view_toggle_script += tenant_search_script
+
     # Nav dropdown: person_id is only ever non-None for a resolved tenant
     # (a real session, or admin &view_as preview) -- admin-without-view_as
     # passes None, same "no tenant context" signal every other
@@ -6406,6 +6513,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
     </nav>
     {admin_badge_html}
+    {tenant_search_html}
     {view_toggle_html}
     {copy_link_html}
     {cef_html}
@@ -6688,7 +6796,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                                                                    page="intros", edit_mode=edit_mode)
 
     if tenant_picker:
-        body_html = _tenant_picker_html("intros", key)
+        body_html = _tenant_picker_html()
         summary_html = ""
         subtle_html = ""
     else:
@@ -7365,7 +7473,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     subtle_html = ""
     edit_script = ""
     if tenant_picker:
-        body_html = _tenant_picker_html("mydeals", key)
+        body_html = _tenant_picker_html()
     elif not deals:
         body_html = '<div class="gg-placeholder">No deals yet.</div>'
     else:
@@ -9633,7 +9741,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
                  tenant_picker=False, edit_mode=False, person_id=None):
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="demand", edit_mode=edit_mode)
-    tenant_picker_html = _tenant_picker_html("demand", key) if tenant_picker else ""
+    tenant_picker_html = _tenant_picker_html() if tenant_picker else ""
     raised_headline_html = _raised_headline_html(edit_mode=edit_mode)
     rows_html = "".join(
         f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
@@ -10196,6 +10304,16 @@ def _handle_update_intro(event):
     return _json_response({"ok": True})
 
 
+def _handle_tenants_list():
+    """?tenants=list, admin-only (checked by the caller). JSON
+    {"count": N, "tenants": [{"name","firm","email"}]} using the exact
+    same eligibility/sort as the nav's searchable tenant picker
+    (_eligible_tenants_list), so other tools can reuse it instead of
+    recomputing this population themselves."""
+    entries = _eligible_tenants_list()
+    return _json_response({"count": len(entries), "tenants": entries})
+
+
 def _handle_lookup_company_buyers(company_raw):
     """?lookup_company_buyers=<company>, admin-only (checked by the
     caller, same convention as _handle_debug_deal). JSON array of
@@ -10607,6 +10725,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_lookup_company_buyers(lookup_company_buyers_param)
+
+    if query.get("tenants") == "list":
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_tenants_list()
 
     # SSO handoff: verify, set the durable identity cookie, redirect to a
     # clean URL. An invalid/expired token just falls through to normal

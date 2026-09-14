@@ -3125,9 +3125,11 @@ line_p12 = lines_p12[0]
 # Before these fixes (see the diagnostic report): calls_get_my_matched_
 # buy_deals=24, calls_get_my_deals=26, calls_get_deals_list=26 (cold),
 # for this same 12-company shape.
-check("Perf fix 2: get_deals_list's own call count collapses 26 -> 3 "
-      "(only the head_object-and-parse path is entered more than once; see below for real fetch count)",
-      "calls_get_deals_list=3" in line_p12)
+check("Perf fix 2: get_deals_list's own call count collapses 26 -> 4 "
+      "(only the head_object-and-parse path is entered more than once; see below for real fetch count -- "
+      "3 -> 4 as of the nav's searchable tenant picker, which now computes the eligible-tenant list, "
+      "and so calls get_deals_list once more via _tenant_index, on every admin page)",
+      "calls_get_deals_list=4" in line_p12)
 check("Perf fix 1: get_my_deals's call count drops 26 -> 14 (get_my_matched_buy_deals' OWN "
       "second set of 12 per-company calls now hit ITS cache before ever reaching get_my_deals)",
       "calls_get_my_deals=14" in line_p12)
