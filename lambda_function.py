@@ -2527,14 +2527,14 @@ def _deal_picker_summary(deal):
     }
 
 
-def _company_buy_stats(person_id, company_name, intro_details=None):
-    """Per-company Buy-side stats (intro_count, stalled) — perf fix 3:
-    request-scoped and shared by BOTH render_my_deals_page's own
+def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email=None):
+    """Per-company Buy-side stats (intro_count, stalled, raised) — perf
+    fix 3: request-scoped and shared by BOTH render_my_deals_page's own
     Buyers/Intros column AND the nav dropdown's badge
     (_mydeals_dropdown_entries), so a company touched by both computes
-    once per (person_id, company, override-aware-or-not) per request
-    instead of running two independent local-closure loops that don't
-    know about each other.
+    once per (person_id, company, override-aware-or-not, manual-aware-
+    or-not) per request instead of running two independent local-closure
+    loops that don't know about each other.
 
     intro_details=None (the nav dropdown's call, on every page) computes
     the RAW-only count deliberately — unchanged from before this fix: a
@@ -2549,36 +2549,74 @@ def _company_buy_stats(person_id, company_name, intro_details=None):
     today, which the zero-user-visible-change constraint on this pass
     rules out.
 
-    intro_count now counts every disclosed introduction that ever
-    happened -- live (matched) PLUS closed-out (Lost/Trade Broken/
-    Obsolete stage exits, via get_my_closed_out_buy_deals/
-    _closed_out_disclosed) -- since a passed intro is still an
-    introduction made. live_intro_count keeps the OLD live-only number
-    (what intro_count used to mean) for callers that specifically need
-    "in motion" rather than "ever introduced" (see render_my_deals_
-    page's summary strip)."""
+    intro_count counts every disclosed introduction that ever happened
+    for this tenant+company -- live (matched) PLUS closed-out (Lost/
+    Trade Broken/Obsolete stage exits, via get_my_closed_out_buy_deals/
+    _closed_out_disclosed) PLUS manual/Dynamo-only intros (when
+    tenant_email is given -- same "a second Dynamo scan isn't worth it
+    for the quick-jump badge" reasoning as intro_details, so the nav
+    dropdown's call, which passes no tenant_email, simply omits these,
+    same as it already omits Dynamo overrides) -- since a passed intro
+    is still an introduction made. Manual items already covered by a
+    real deal are skipped (_tenant_has_deal_derived_intro), matching
+    the render-time suppression rule everywhere else in this file.
+    live_intro_count keeps the OLD live-only number (what intro_count
+    used to mean) for callers that specifically need "in motion" rather
+    than "ever introduced" (see render_my_deals_page's summary strip).
+
+    raised sums the ticket size (TICKET_MAX_FIELD else TICKET_MIN_FIELD
+    else 0, same amount formula _raised_headline_stats uses) of every
+    disclosed CLOSED intro for this tenant+company -- live matched
+    (Intro Status Closed OR stage in WON_STAGE_IDS, same "closed" rule
+    _raised_headline_stats uses) plus manual items with status Closed;
+    a company-scoped mirror of that desk-wide figure. Closed-out
+    (Lost/Trade Broken/Obsolete) deals never contribute -- those are a
+    disjoint, dead-outcome bucket by construction, never a won one."""
     if person_id is None or not company_name:
-        return {"intro_count": 0, "live_intro_count": 0, "stalled": False}
-    cache_key = (person_id, company_name.strip().lower(), intro_details is not None)
+        return {"intro_count": 0, "live_intro_count": 0, "stalled": False, "raised": 0}
+    cache_key = (person_id, company_name.strip().lower(), intro_details is not None, tenant_email is not None)
     cached = _req_cache["company_stats"].get(cache_key)
     if cached is not None:
         return cached
     matched = get_my_matched_buy_deals(person_id, company_name)
     live_intro_count = 0
     stalled = False
+    raised = 0
     for d in matched:
         entry = (intro_details.get(str(d.get("id"))) or {}) if intro_details is not None else None
         resolved = _resolve_intro_status(d, entry)
         if resolved["disclosed"]:
             live_intro_count += 1
+            if _deal_intro_status_id(d) == INTRO_STATUS_CLOSED_ID or _deal_stage_id(d) in WON_STAGE_IDS:
+                max_v = _deal_cf_number(d, TICKET_MAX_FIELD)
+                min_v = _deal_cf_number(d, TICKET_MIN_FIELD)
+                raised += max_v if max_v is not None else (min_v if min_v is not None else 0)
         if resolved["id"] == INTRO_STATUS_STALLED_ID:
             stalled = True
     closed_out_intro_count = sum(
         1 for d in get_my_closed_out_buy_deals(person_id, company_name) if _closed_out_disclosed(d))
+
+    manual_intro_count = 0
+    if tenant_email:
+        manual_intros, _ = get_manual_intros(tenant_email, company_name)
+        for (m_company, buyer_pid), item in manual_intros.items():
+            if _tenant_has_deal_derived_intro(person_id, company_name, buyer_pid):
+                continue
+            fake_deal = _manual_intro_as_deal(item)
+            resolved = _resolve_intro_status(fake_deal, None)
+            if not resolved["disclosed"]:
+                continue
+            manual_intro_count += 1
+            if resolved["name"] == "Closed":
+                max_v = _deal_cf_number(fake_deal, TICKET_MAX_FIELD)
+                min_v = _deal_cf_number(fake_deal, TICKET_MIN_FIELD)
+                raised += max_v if max_v is not None else (min_v if min_v is not None else 0)
+
     stats = {
-        "intro_count": live_intro_count + closed_out_intro_count,
+        "intro_count": live_intro_count + closed_out_intro_count + manual_intro_count,
         "live_intro_count": live_intro_count,
         "stalled": stalled,
+        "raised": raised,
     }
     _req_cache["company_stats"][cache_key] = stats
     return stats
@@ -7474,6 +7512,14 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         intro_text = f'<a class="mydeals-count-link" href="{intro_href}">{stats["intro_count"]}</a>'
     else:
         intro_text = "—"
+    # Company-level Raised: the same figure for every row that shares
+    # this company (multiple sell deals for one company all read the
+    # same _company_buy_stats cache entry) -- labeled explicitly via the
+    # title tooltip so it doesn't read as this ONE deal's own number.
+    raised_html = ""
+    if stats.get("raised"):
+        raised_html = (f'<div class="mydeals-raised" title="Raised for {_esc(company_name or "this company")} '
+                        f'-- company-wide, all sell deals combined">{_esc(_fmt_money(stats["raised"]))}</div>')
 
     if is_won:
         # Item 1 (turn 26): no deadline warnings on the trophy shelf — a
@@ -7516,7 +7562,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         f'<tr><td class="company">{company_link}{deal_id_sub}{via_html}</td>'
         f'<td>{badge_html}{per_share_html}</td>'
         f'<td class="num">{buyer_text}</td>'
-        f'<td class="num">{intro_text}</td>'
+        f'<td class="num">{intro_text}{raised_html}</td>'
         f'<td>{deadline_html}</td>'
         f'<td>{action_chip_html}</td>'
         f'<td class="actions">{actions_html}</td></tr>'
@@ -7556,7 +7602,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         # touched by both (routine -- the dropdown renders on this same
         # page too) computes once, not via two independent local caches.
         def _company_stats(company_name):
-            return _company_buy_stats(person_id, company_name, intro_details)
+            return _company_buy_stats(person_id, company_name, intro_details, tenant_email=anon_key_email)
 
         rows = []
         for d in deals:
@@ -7901,6 +7947,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     padding: 2px 8px;
   }}
   .mydeals-per-share {{ margin-top: 4px; font-size: 12px; color: var(--muted); }}
+  .mydeals-raised {{ margin-top: 2px; font-size: 11px; color: var(--qp); }}
   /* Nav pass, item 1: a count that's a door to the company page still
      reads as a plain number -- no default blue/underline -- with only
      a subtle hover affordance. */
@@ -8501,12 +8548,14 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     {manual_edit_script}
   </section>"""
 
-    # Nav pass, item 3: the section-nav's "Buyers (N)" count is every row
-    # the Buyers table actually shows -- introduced plus still-pending --
-    # not the closed-out section, which is collapsed by default. main_deals/
-    # pending_deals only exist when tenant is not None (see above); an admin
-    # with no &view_as never renders that table, so the nav count is 0.
-    buyers_nav_count = (len(main_deals) + len(pending_deals)) if tenant is not None else 0
+    # Nav pass, item 3: the section-nav's "Buyers (N)" count is every
+    # intro this company page shows for the tenant -- Introduced +
+    # Closed out + Pending, company-wide -- not just the always-visible
+    # rows (closed_out_deals is included even though that section is
+    # collapsed by default). main_deals/pending_deals/closed_out_deals
+    # only exist when tenant is not None (see above); an admin with no
+    # &view_as never renders that table, so the nav count is 0.
+    buyers_nav_count = (len(main_deals) + len(pending_deals) + len(closed_out_deals)) if tenant is not None else 0
 
     buyers = get_company_buyer_details(company)
     buyers.sort(key=lambda b: b["updated_at"] or "", reverse=True)
