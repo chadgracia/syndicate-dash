@@ -2100,8 +2100,8 @@ check("Closed-status-on-live-stage: the green chip and the gray exit chips both 
 
 page_company_lost = lf.render_company_page("Lost Co", "Sella Seller", tenant_a, TENANT_A_EMAIL, "intros",
                                             key=None, view_as=None, edit_mode=False)
-check("Company page (Lost Co): 'Closed out' section present with count (1)",
-      '<summary>Closed out <span class="count">(1)</span></summary>' in page_company_lost)
+check("Company page (Lost Co): 'Passed' section present with count (1)",
+      '<summary>Passed <span class="count">(1)</span></summary>' in page_company_lost)
 check("Company page (Lost Co): disclosed buyer named (Bob Buyer)", "Bob Buyer" in page_company_lost)
 check("Company page (Lost Co): loss-reason suffix shown", "— Went with another sponsor" in page_company_lost)
 
@@ -2119,8 +2119,8 @@ check("Company page (Obsolete Co, admin edit): real buyer shown regardless of di
 # --- Company page: same status-based-exit fix, same Stalled guard ---
 page_company_status_passed = lf.render_company_page("Status Passed Co", "Sella Seller", tenant_a, TENANT_A_EMAIL,
                                                       "intros", key=None, view_as=None, edit_mode=False)
-check("Company page (Status Passed Co): 'Closed out' section present (not stuck in the Buyers table)",
-      '<summary>Closed out <span class="count">(1)</span></summary>' in page_company_status_passed)
+check("Company page (Status Passed Co): 'Passed' section present (not stuck in the Buyers table)",
+      '<summary>Passed <span class="count">(1)</span></summary>' in page_company_status_passed)
 check("Company page (Status Passed Co): disclosed buyer named (Bob Buyer)",
       "Bob Buyer" in page_company_status_passed)
 check("Company page (Status Passed Co): the Buyers table's own 'Introduced' group has nothing (dead intro)",
@@ -2361,8 +2361,8 @@ check("Ticket 55422151: My Deals Intros column shows a count link '1', not '--'"
 page_elana_company = lf.render_company_page("Panthalassa", "Elana Investor", elana_tenant, ELANA_EMAIL, "mydeals",
                                              key=None, view_as=None, edit_mode=False)
 buyers_section = page_elana_company[page_elana_company.find('id="buyers"'):]
-check("Ticket 55422151: company page's Buyers section has a 'Closed out (1)' group",
-      '<summary>Closed out <span class="count">(1)</span></summary>' in buyers_section)
+check("Ticket 55422151: company page's Buyers section has a 'Closed (1)' group",
+      '<summary>Closed <span class="count">(1)</span></summary>' in buyers_section)
 check("Ticket 55422151: the buyer is named (Closed is always disclosed), not anonymized",
       "Panthalassa Buyer" in buyers_section)
 check("Ticket 55422151: styled positively (green .status-chip.closed), never the gray Passed/Withdrawn chip",
@@ -2869,8 +2869,8 @@ check("Parity: colgroup present (6 columns, matches Active Intros)",
       page_parity[page_parity.find("<colgroup>"):page_parity.find("</colgroup>")].count("<col ") == 6)
 check("Parity: table-layout:fixed (no horizontal bleed)", "table-layout: fixed;" in page_parity)
 check("Parity: Size column centered via .num", "text-align: center;" in page_parity)
-check("Parity: Closed-out collapsed section present", '<summary>Closed out <span class="count">(1)</span></summary>'
-      in page_parity)
+check("Parity: Closed-out collapsed section present (Passed, since deal_parity_closed_out is a Lost-stage exit)",
+      '<summary>Passed <span class="count">(1)</span></summary>' in page_parity)
 parity_head = page_parity[page_parity.find("<thead>"):page_parity.find("</thead>")]
 check("Parity: head_row is unconditionally 6 columns (Buyer name/Company/Investor Type/Size/Status/Notes)",
       [parity_head.find(f">{h}<") for h in ["Buyer name", "Company", "Investor Type", "Size", "Status", "Notes"]]

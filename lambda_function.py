@@ -2662,7 +2662,7 @@ def _deal_picker_summary(deal):
         "id": str(deal.get("id")),
         "deal_name": _deal_title(deal),
         "buyer_name": _person_display_name(primary) if primary else "—",
-        "stage_name": STAGE_LABELS.get(stage_id, str(stage_id) if stage_id is not None else "—"),
+        "stage_name": _deal_stage_label(stage_id),
     }
 
 
@@ -2724,9 +2724,17 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     construction, never Closed), and manual Passed/Withdrawn. Neither
     changes live_intro_count/intro_count's own existing values or
     counting rules -- both are additional, independently-scoped tallies
-    over the same already-iterated deals."""
+    over the same already-iterated deals.
+
+    non_terminal_count (the company-page card's "Live intros" line): a
+    disclosed introduction whose resolved outcome is none of Closed/
+    Won-stage/Passed/Withdrawn -- i.e. still actually in motion. Every
+    disclosed row lands in exactly one of won_count/passed_count/
+    non_terminal_count, so the three always sum to live_intro_count +
+    manual_intro_count (closed_out_deals are stage-based and, by
+    construction, never non-terminal)."""
     if person_id is None or not company_name:
-        return {"intro_count": 0, "live_intro_count": 0, "stalled": False, "raised": 0,
+        return {"intro_count": 0, "live_intro_count": 0, "non_terminal_count": 0, "stalled": False, "raised": 0,
                 "won_count": 0, "passed_count": 0}
     cache_key = (person_id, company_name.strip().lower(), intro_details is not None, tenant_email is not None)
     cached = _req_cache["company_stats"].get(cache_key)
@@ -2738,6 +2746,7 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     raised = 0
     won_count = 0
     passed_count = 0
+    non_terminal_count = 0
     for d in matched:
         entry = (intro_details.get(str(d.get("id"))) or {}) if intro_details is not None else None
         resolved = _resolve_intro_status(d, entry)
@@ -2750,6 +2759,8 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
                 raised += max_v if max_v is not None else (min_v if min_v is not None else 0)
             elif resolved["name"] in ("Passed", "Withdrawn"):
                 passed_count += 1
+            else:
+                non_terminal_count += 1
         if resolved["id"] == INTRO_STATUS_STALLED_ID:
             stalled = True
     closed_out_deals = get_my_closed_out_buy_deals(person_id, company_name)
@@ -2774,10 +2785,13 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
                 raised += max_v if max_v is not None else (min_v if min_v is not None else 0)
             elif resolved["name"] in ("Passed", "Withdrawn"):
                 passed_count += 1
+            else:
+                non_terminal_count += 1
 
     stats = {
         "intro_count": live_intro_count + closed_out_intro_count + manual_intro_count,
         "live_intro_count": live_intro_count,
+        "non_terminal_count": non_terminal_count,
         "stalled": stalled,
         "raised": raised,
         "won_count": won_count,
@@ -4593,6 +4607,17 @@ TERMINAL_STAGE_LABELS = {
 }
 
 
+def _deal_stage_label(sid):
+    """Display label for a raw deal stage id -- every UI surface showing
+    a deal's stage should go through this, not STAGE_LABELS directly.
+    STAGE_LABELS only names the live stages; a Buy deal card or picker
+    summary can land on one of the six terminal ones (TERMINAL_STAGE_
+    LABELS) too -- e.g. Obsolete (2348038), the raw id that was leaking
+    top-right on a deal card instead of a label. Falls back to the raw
+    number only for an id in neither map (never expected)."""
+    return STAGE_LABELS.get(sid) or TERMINAL_STAGE_LABELS.get(sid) or (str(sid) if sid is not None else "—")
+
+
 def _handle_debug_closed():
     """?debug_closed=1, admin-only (ADMIN_KEY gate checked by the
     caller). Diagnostic for the closed-deals S3 cache (CLOSED_DEALS_KEY)
@@ -5074,7 +5099,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
     is in the past — no date, no warning."""
     name = _esc(_deal_title(deal))
     sid = _deal_stage_id(deal)
-    stage = _esc(STAGE_LABELS.get(sid, str(sid) if sid is not None else "—"))
+    stage = _esc(_deal_stage_label(sid))
     # Item 2 (company-page parity pass): a min-max RANGE here, not the
     # single largest-value figure row-level Size cells use.
     size_text = _esc(_deal_size_range_text(deal))
@@ -8669,13 +8694,13 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         # different number by design.
         company_stats_for_tenant = (_company_buy_stats(person_id, company, intro_details, tenant_email=anon_key_email)
                                      if person_id is not None else
-                                     {"intro_count": 0, "won_count": 0, "passed_count": 0, "raised": 0})
+                                     {"intro_count": 0, "non_terminal_count": 0, "won_count": 0, "passed_count": 0, "raised": 0})
         buyer_total = len(get_company_buyer_details(company))
         raised_text = _fmt_money(company_stats_for_tenant["raised"]) if company_stats_for_tenant["raised"] else "—"
         company_stats_html = f"""<div class="card cd-stats-card">
       <h3>This company</h3>
       <div class="cd-stat-row"><span>Buyers</span><span class="cd-stat-num">{buyer_total}</span></div>
-      <div class="cd-stat-row"><span>Introduced</span><span class="cd-stat-num">{company_stats_for_tenant["intro_count"]}</span></div>
+      <div class="cd-stat-row"><span>Live intros</span><span class="cd-stat-num">{company_stats_for_tenant["non_terminal_count"]}</span></div>
       <div class="cd-stat-row"><span>Won</span><span class="cd-stat-num">{company_stats_for_tenant["won_count"]}</span></div>
       <div class="cd-stat-row"><span>Passed</span><span class="cd-stat-num">{company_stats_for_tenant["passed_count"]}</span></div>
       <div class="cd-stat-row"><span>Total raised</span><span class="cd-stat-num">{_esc(raised_text)}</span></div>
@@ -8831,19 +8856,36 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             deal_id = str(d.get("id"))
             closed_out_deals.append(d)
             closed_out_disclosed_by_id[deal_id] = edit_mode or resolved_by_deal_id[deal_id]["disclosed"]
+        # Item 3 (company page split): "Closed out" broken into its two
+        # outcomes -- Closed (won: _deal_exit_outcome_name == "Closed",
+        # rendered with the green Won chip) and Passed (everything else
+        # here -- Passed/Withdrawn status, or the stage-based Lost/
+        # Lost(1)/Trade Broken/Obsolete exits, gray chip + loss reason).
+        # Each section's own count is the SAME number the "This company"
+        # card's Won/Passed lines show (company_stats_for_tenant), not a
+        # recount of the rows below -- guarantees the two always match,
+        # regardless of edit_mode's reveal-all affecting which rows are
+        # visible in the table itself.
         closed_out_html = ""
         if closed_out_deals:
             for d in closed_out_deals:
                 wanted_ids |= _deal_linked_person_ids(d) - {person_id}
             people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
-            closed_out_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
-            co_rows_html = "".join(
-                _closed_out_row_html(d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id,
-                                      anon_key_email, key=key, view_as=view_as, surface="company",
-                                      entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode)
-                for d in closed_out_deals)
-            closed_out_html = f"""<details class="closed-out-section">
-      <summary>Closed out <span class="count">({len(closed_out_deals)})</span></summary>
+            won_out_deals = sorted((d for d in closed_out_deals if _deal_exit_outcome_name(d) == "Closed"),
+                                    key=lambda d: (_deal_title(d) or "").lower())
+            passed_out_deals = sorted((d for d in closed_out_deals if _deal_exit_outcome_name(d) != "Closed"),
+                                       key=lambda d: (_deal_title(d) or "").lower())
+
+            def _closed_out_section_html(title, count, rows):
+                if not rows:
+                    return ""
+                rows_html = "".join(
+                    _closed_out_row_html(d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id,
+                                          anon_key_email, key=key, view_as=view_as, surface="company",
+                                          entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode)
+                    for d in rows)
+                return f"""<details class="closed-out-section">
+      <summary>{title} <span class="count">({count})</span></summary>
       <div class="card closed-out-card">
         <div class="table-scroll">
         <table>
@@ -8860,11 +8902,16 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
               {head_row}
             </tr>
           </thead>
-          <tbody>{co_rows_html}</tbody>
+          <tbody>{rows_html}</tbody>
         </table>
         </div>
       </div>
     </details>"""
+
+            closed_out_html = (
+                _closed_out_section_html("Closed", company_stats_for_tenant["won_count"], won_out_deals)
+                + _closed_out_section_html("Passed", company_stats_for_tenant["passed_count"], passed_out_deals)
+            )
 
         edit_script = _edit_script_html(key if edit_mode else None) if (edit_mode or tenant_edit_mode) else ""
         manual_edit_script = _manual_intro_edit_script_html(key, anon_key_email) if edit_mode else ""
