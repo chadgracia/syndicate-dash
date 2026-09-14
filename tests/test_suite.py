@@ -62,6 +62,13 @@ def reset_caches():
     lf._cache["table"] = None
     lf._raised_cache["version"] = None
     lf._raised_cache["total"] = None
+    # Closed-deals cache defaults to fresh-and-empty (never None/stale) so
+    # the 800+ pre-existing tests never trigger an implicit live Pipeline
+    # fetch just from calling get_deals_list() -- only the dedicated
+    # closed-deals test section below deliberately sets this back to
+    # None/stale to exercise the real fetch/cache/TTL logic.
+    lf._closed_deals_cache["fetched_at"] = time.time()
+    lf._closed_deals_cache["deals"] = []
     # Perf fixes 1-5: the request-scoped cache (memoized deals/people/
     # interest/companies lists, get_my_deals/get_my_matched_buy_deals/
     # company-stats results, per-key HEAD versions) and the singleton S3
@@ -92,6 +99,7 @@ class FakeS3:
     def __init__(self, objs, last_modified=None):
         self.objs = objs
         self.last_modified = last_modified or {}
+        self.put_calls = []
 
     def get_object(self, Bucket, Key):
         # ContentLength included (real S3 always returns it) so the
@@ -101,6 +109,16 @@ class FakeS3:
 
     def head_object(self, Bucket, Key):
         return {"LastModified": self.last_modified.get(Key, datetime.now(timezone.utc))}
+
+    def put_object(self, Bucket, Key, Body, ContentType=None):
+        # Body is the real code's already-encoded bytes (json.dumps(...)
+        # .encode("utf-8")) -- decoded/re-parsed here so a get_object
+        # right after a put_object in the same test sees it, matching
+        # real S3's read-after-write behavior for a single-writer key.
+        parsed = json.loads(Body.decode("utf-8") if isinstance(Body, bytes) else Body)
+        self.objs[Key] = parsed
+        self.put_calls.append({"Key": Key, "ContentType": ContentType})
+        return {}
 
 
 def _extract_tenant_from_key_condition(expr):
@@ -4282,6 +4300,286 @@ check("real tenant session -> 200", resp_real_tenant["statusCode"] == 200)
 check("real tenant session: no view toggle", 'class="gg-view-toggle"' not in resp_real_tenant["body"])
 check("real tenant session: no 'Copy client link'", 'id="gg-copy-link-btn"' not in resp_real_tenant["body"])
 check("real tenant session: no ADMIN badge", 'class="gg-admin-badge"' not in resp_real_tenant["body"])
+
+
+# ======================================================================
+# SECTION: Closed-deals Pipeline source (get_closed_deals_list)
+# ======================================================================
+# deals.json excludes every terminal stage by design (TERMINAL_STAGE_IDS),
+# so this Lambda fetches those deals directly from Pipeline
+# (GET /deals.json, conditions[deal_stage][] filter, page/per_page,
+# {"entries":[...],"pagination":{...}} envelope -- exact shape Chad
+# confirmed) and caches them to S3 (CLOSED_DEALS_KEY) with an hourly TTL.
+# get_deals_list() merges this with the live snapshot so every consumer
+# (intro fetch/counts, closed-out predicates, per-company stats, Raised,
+# trophy shelf, buyer-page history, add-buyer/Introduce lookup) sees one
+# combined set automatically.
+
+def cd_urls_query(url):
+    return lf.urllib.parse.parse_qs(lf.urllib.parse.urlparse(url).query)
+
+
+def make_closed_deals_urlopen(all_deals, calls, unfiltered_combined=False, fail=False):
+    """Fake Pipeline GET /deals.json responder for get_closed_deals_list's
+    fetch. Paginates `all_deals`, filtering by the request's own
+    conditions[deal_stage][] ids -- UNLESS unfiltered_combined=True AND
+    more than one stage id is requested in a single call, in which case
+    every deal in `all_deals` is returned regardless of stage (simulating
+    a combined multi-id filter that doesn't actually filter server-side,
+    the one failure mode Chad's fallback exists for -- a single-id call
+    still filters correctly even when unfiltered_combined=True, since
+    that's what the per-stage fallback relies on to recover). fail=True
+    makes every call raise, for fail-soft tests."""
+    def _urlopen(req, timeout=20):
+        url = req.full_url
+        calls.append(url)
+        if fail:
+            raise lf.urllib.error.HTTPError(url, 502, "boom", {}, None)
+        q = cd_urls_query(url)
+        stage_ids = [int(x) for x in q.get("conditions[deal_stage][]", [])]
+        page = int(q.get("page", ["1"])[0])
+        per_page = int(q.get("per_page", ["200"])[0])
+        if unfiltered_combined and len(stage_ids) > 1:
+            pool = list(all_deals)
+        else:
+            pool = [d for d in all_deals if d.get("deal_stage", {}).get("id") in stage_ids]
+        start = (page - 1) * per_page
+        page_entries = pool[start:start + per_page]
+        body = {"entries": page_entries,
+                "pagination": {"page": page, "per_page": per_page, "total": len(pool), "url": "/deals.json"}}
+        return _FakeGetResponse(200, body)
+    return _urlopen
+
+
+def cd_deal(deal_id, stage_id, company="Test Co", buyer_pid=70001):
+    return {"id": deal_id, "name": f"{company}: Buy", "company": {"name": company},
+            "deal_stage": {"id": stage_id},
+            "custom_fields": {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID]},
+            "people": [{"id": buyer_pid}], "updated_at": "2026-08-01T00:00:00Z"}
+
+
+# --- Pagination: 5 records across 3 pages (per_page overridden to 2).
+orig_per_page = lf.CLOSED_DEALS_PER_PAGE
+lf.CLOSED_DEALS_PER_PAGE = 2
+cd_page_calls = []
+cd_pool = [cd_deal(80000 + i, 111802) for i in range(5)]
+lf.urllib.request.urlopen = make_closed_deals_urlopen(cd_pool, cd_page_calls)
+cd_entries, cd_err = lf._fetch_all_pages_for_stage_ids(sorted(lf.TERMINAL_STAGE_IDS), lf.CLOSED_DEALS_PER_PAGE,
+                                                        lf.CLOSED_DEALS_MAX_PAGES)
+check("pagination: no error", cd_err is None)
+check("pagination: all 5 records collected", len(cd_entries) == 5)
+check("pagination: exactly 3 page requests issued (2+2+1)", len(cd_page_calls) == 3)
+check("pagination: no duplicate ids", len({d["id"] for d in cd_entries}) == 5)
+lf.CLOSED_DEALS_PER_PAGE = orig_per_page
+
+# --- Combined filter returns unfiltered results -> per-stage fallback.
+cd_live_stray = cd_deal(81000, lf.STAGE_MATCHED)  # NOT a terminal stage
+cd_terminal_a = cd_deal(81001, 111802)
+cd_terminal_b = cd_deal(81002, 111801)
+cd_fallback_calls = []
+lf.urllib.request.urlopen = make_closed_deals_urlopen(
+    [cd_live_stray, cd_terminal_a, cd_terminal_b], cd_fallback_calls, unfiltered_combined=True)
+cd_fb_deals, cd_fb_stats, cd_fb_err = lf._pipeline_fetch_closed_deals()
+check("unfiltered combined response -> fallback triggered, no error", cd_fb_err is None)
+check("fallback used ('which_filter' == 'per-stage')", cd_fb_stats["which_filter"] == "per-stage")
+check("fallback result excludes the non-terminal stray record",
+      81000 not in {d["id"] for d in cd_fb_deals})
+check("fallback result includes both terminal records",
+      {81001, 81002} <= {d["id"] for d in cd_fb_deals})
+check("fallback issued more than one call (one per stage id, not one combined call)",
+      len(cd_fallback_calls) > 1)
+
+# --- Combined filter working correctly -> stays on the combined path.
+cd_ok_calls = []
+lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_terminal_a, cd_terminal_b], cd_ok_calls)
+cd_ok_deals, cd_ok_stats, cd_ok_err = lf._pipeline_fetch_closed_deals()
+check("working combined filter -> no error", cd_ok_err is None)
+check("working combined filter -> 'which_filter' == 'combined'", cd_ok_stats["which_filter"] == "combined")
+check("working combined filter -> both records present", {81001, 81002} == {d["id"] for d in cd_ok_deals})
+
+# --- Entries missing custom_fields are skipped and counted, not guessed at.
+cd_good = cd_deal(82001, 111802)
+cd_bad = cd_deal(82002, 111802)
+del cd_bad["custom_fields"]
+lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_good, cd_bad], [])
+cd_skip_deals, cd_skip_stats, cd_skip_err = lf._pipeline_fetch_closed_deals()
+check("missing custom_fields: no error", cd_skip_err is None)
+check("missing custom_fields: only the good record kept", [d["id"] for d in cd_skip_deals] == [82001])
+check("missing custom_fields: skip counted", cd_skip_stats["skipped_missing_custom_fields"] == 1)
+check("missing custom_fields: record_count reflects only kept records", cd_skip_stats["record_count"] == 1)
+
+# --- get_closed_deals_list: fresh fetch -> writes through to S3.
+cd_write_deal = cd_deal(83001, 111802, company="Write Co")
+cd_s3, cd_table = use_fixture({lf.DEALS_KEY: {"deals": []}})
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_write_deal], [])
+cd_fetched = lf.get_closed_deals_list()
+check("S3 write: fetched list is correct", [d["id"] for d in cd_fetched] == [83001])
+check("S3 write: put_object called once for CLOSED_DEALS_KEY",
+      [c["Key"] for c in cd_s3.put_calls] == [lf.CLOSED_DEALS_KEY])
+check("S3 write: written object is readable back with the same deals",
+      cd_s3.objs[lf.CLOSED_DEALS_KEY]["deals"][0]["id"] == 83001)
+
+# --- Same warm container, second invocation: TTL not expired -> reused
+# from the in-memory dict, zero S3 or Pipeline calls.
+lf._req_cache_reset()  # a fresh "request" -- deliberately NOT the harness's reset_caches(),
+                        # which would also reset _closed_deals_cache and defeat this check
+def _cd_raise(*a, **k):
+    raise AssertionError("get_closed_deals_list should not hit Pipeline on a warm TTL hit")
+lf.urllib.request.urlopen = _cd_raise
+cd_s3.get_object = lambda **k: (_ for _ in ()).throw(AssertionError("should not hit S3 on a warm TTL hit"))
+cd_reused = lf.get_closed_deals_list()
+check("warm TTL reuse: same list returned with zero I/O", [d["id"] for d in cd_reused] == [83001])
+
+# --- S3 cache read: a fresh cached object skips Pipeline entirely.
+cd_cached_deal = cd_deal(84001, 111801, company="Cached Co")
+cd_s3b, _ = use_fixture({
+    lf.DEALS_KEY: {"deals": []},
+    lf.CLOSED_DEALS_KEY: {"deals": [cd_cached_deal], "fetched_at": time.time(), "stats": {}},
+})
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+lf.urllib.request.urlopen = _cd_raise
+cd_from_s3 = lf.get_closed_deals_list()
+check("fresh S3 cache: served without any Pipeline call", [d["id"] for d in cd_from_s3] == [84001])
+
+# --- S3 cache read: a stale cached object triggers a fresh Pipeline fetch.
+cd_stale_deal = cd_deal(85001, 111801, company="Stale Co")
+cd_fresh_deal = cd_deal(85002, 111801, company="Refreshed Co")
+cd_s3c, _ = use_fixture({
+    lf.DEALS_KEY: {"deals": []},
+    lf.CLOSED_DEALS_KEY: {"deals": [cd_stale_deal], "fetched_at": time.time() - lf.CLOSED_DEALS_TTL_SECONDS - 10,
+                           "stats": {}},
+})
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_fresh_deal], [])
+cd_refreshed = lf.get_closed_deals_list()
+check("stale S3 cache: triggers a real refetch, not the stale record",
+      [d["id"] for d in cd_refreshed] == [85002])
+
+# --- Fail-soft: Pipeline down, but a stale S3 cache exists -> serves the
+# stale list rather than erroring or going empty.
+cd_s3d, _ = use_fixture({
+    lf.DEALS_KEY: {"deals": []},
+    lf.CLOSED_DEALS_KEY: {"deals": [cd_stale_deal], "fetched_at": time.time() - lf.CLOSED_DEALS_TTL_SECONDS - 10,
+                           "stats": {}},
+})
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+lf.urllib.request.urlopen = make_closed_deals_urlopen([], [], fail=True)
+cd_fail_with_stale = lf.get_closed_deals_list()
+check("fail-soft with stale S3 cache: falls back to the stale list, no raise",
+      [d["id"] for d in cd_fail_with_stale] == [85001])
+
+# --- Fail-soft: Pipeline down, no cache anywhere -> empty list, no raise,
+# page still renders.
+cd_s3e, _ = use_fixture({lf.DEALS_KEY: {"deals": []}, lf.PEOPLE_KEY: {"people": []}, lf.INTEREST_KEY: {"buy": {}}})
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+lf.urllib.request.urlopen = make_closed_deals_urlopen([], [], fail=True)
+cd_empty = lf.get_closed_deals_list()
+check("fail-soft with nothing cached: empty list, no raise", cd_empty == [])
+cd_merged_live_only = lf.get_deals_list()
+check("get_deals_list still returns the live-only set when closed fetch fails", cd_merged_live_only == [])
+cd_resp = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": {"key": ADMIN_KEY}, "cookies": []}, None)
+check("fail-soft: page still renders 200 despite the closed-deals fetch failing",
+      cd_resp["statusCode"] == 200)
+
+
+# --- Real-ticket verification: deal 55422151 (Panthalassa, Won Deal
+# 111802, Intro Status Closed) and deal 55461737 (Senra, Lost 111801) --
+# present ONLY via the Pipeline closed-deals fetch, NEVER in the deals.json
+# snapshot fixture, proving the merge (not just the downstream render
+# logic already covered elsewhere) is what makes them visible.
+CD_TENANT_EMAIL = "elana@tworoads.vc"
+CD_TENANT_PID = 991001
+CD_PANTHALASSA_BUYER_PID = 991002
+CD_SENRA_BUYER_PID = 991003
+
+cd_panthalassa_sell = {"id": 991100, "name": "Panthalassa Sell Order", "company": {"name": "Panthalassa"},
+                       "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_sell(),
+                       "people": [{"id": CD_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+cd_senra_sell = {"id": 991101, "name": "Senra Sell Order", "company": {"name": "Senra"},
+                 "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_sell(),
+                 "people": [{"id": CD_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+cd_panthalassa_buy = {"id": 55422151, "name": "Panthalassa: $250K Buy", "company": {"name": "Panthalassa"},
+                      "deal_stage": {"id": 111802},  # Won Deal
+                      "custom_fields": {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID],
+                                        lf.INTRO_STATUS_FIELD: [lf.INTRO_STATUS_CLOSED_ID],
+                                        lf.TICKET_MAX_FIELD: 250000},
+                      "people": [{"id": CD_TENANT_PID}, {"id": CD_PANTHALASSA_BUYER_PID}],
+                      "updated_at": "2026-08-05T00:00:00Z"}
+cd_senra_buy = {"id": 55461737, "name": "Senra: Buy", "company": {"name": "Senra"},
+                "deal_stage": {"id": 111801},  # Lost
+                # Intro Status Introduced (7207579) so this row carries the
+                # prior-progress evidence the disclosure gate requires --
+                # otherwise a Passed/Withdrawn exit renders anonymized, per
+                # the product-law disclosure rule (exit statuses disclose
+                # only given milestone/history evidence). Mirrors the
+                # existing deal_lost fixture elsewhere in this suite.
+                "custom_fields": {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID],
+                                  lf.INTRO_STATUS_FIELD: [7207579]},
+                "people": [{"id": CD_TENANT_PID}, {"id": CD_SENRA_BUYER_PID}],
+                "updated_at": "2026-08-05T00:00:00Z"}
+cd_people = {"people": [
+    {"id": CD_TENANT_PID, "full_name": "Elana Investor", "email": CD_TENANT_EMAIL, "custom_fields": {}},
+    {"id": CD_PANTHALASSA_BUYER_PID, "full_name": "Panthalassa Buyer",
+     "email": "buyer@panthalassa-buyer.example", "custom_fields": {}},
+    {"id": CD_SENRA_BUYER_PID, "full_name": "Senra Buyer", "email": "buyer@senra-buyer.example",
+     "custom_fields": {}},
+]}
+cd_s3f, cd_table_f = use_fixture({lf.PEOPLE_KEY: cd_people, lf.INTEREST_KEY: {"buy": {}},
+                                   lf.DEALS_KEY: {"deals": [cd_panthalassa_sell, cd_senra_sell]}})
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_panthalassa_buy, cd_senra_buy], [])
+
+cd_merged = lf.get_deals_list()
+check("55422151 not present in the live snapshot fixture itself",
+      55422151 not in {d["id"] for d in (cd_panthalassa_sell, cd_senra_sell)})
+check("get_deals_list merge picks up 55422151 (Panthalassa/Won/Closed) from the closed cache",
+      55422151 in {d["id"] for d in cd_merged})
+check("get_deals_list merge picks up 55461737 (Senra/Lost) from the closed cache",
+      55461737 in {d["id"] for d in cd_merged})
+
+cd_tenant = lf._resolve_tenant(CD_TENANT_EMAIL)
+check("elana@tworoads.vc still auto-enrolls as a tenant", cd_tenant is not None)
+
+cd_raised = lf._raised_headline_stats()
+check("Raised counts 55422151 (Won/Closed) toward closed_count", cd_raised["closed_count"] >= 1)
+check("Raised total includes its $250K ticket size", cd_raised["total"] >= 250000)
+
+cd_page_panthalassa = lf.render_company_page("Panthalassa", "Elana Investor", cd_tenant, CD_TENANT_EMAIL, "mydeals",
+                                              key=None, view_as=None, edit_mode=False)
+cd_buyers_panthalassa = cd_page_panthalassa[cd_page_panthalassa.find('id="buyers"'):]
+check("55422151: named in Panthalassa's Buyers section (Closed is always disclosed)",
+      "Panthalassa Buyer" in cd_buyers_panthalassa)
+check("55422151: styled as a positive Closed row (green chip)",
+      '<span class="status-chip closed">Closed</span>' in cd_buyers_panthalassa)
+
+cd_page_senra = lf.render_company_page("Senra", "Elana Investor", cd_tenant, CD_TENANT_EMAIL, "mydeals",
+                                        key=None, view_as=None, edit_mode=False)
+cd_buyers_senra = cd_page_senra[cd_page_senra.find('id="buyers"'):]
+check("55461737: renders in Senra's Buyers Closed out group",
+      "Senra Buyer" in cd_buyers_senra and '<span class="status-chip exit">Passed</span>' in cd_buyers_senra)
+
+cd_intros_page = lf.render_intros_page("Elana Investor", tenant=cd_tenant, tenant_email=CD_TENANT_EMAIL,
+                                        key=None, view_as=None, edit_mode=False)
+cd_closed_out = cd_intros_page[cd_intros_page.find('<details class="closed-out-section">'):]
+check("55422151: Active Intros Closed out section shows Panthalassa Buyer, green Closed chip",
+      "Panthalassa Buyer" in cd_closed_out and '<span class="status-chip closed">Closed</span>' in cd_closed_out)
+check("55461737: Active Intros Closed out section shows Senra Buyer, gray Passed chip",
+      "Senra Buyer" in cd_closed_out and '<span class="status-chip exit">Passed</span>' in cd_closed_out)
+
+cd_existing, cd_existing_source, _ = lf._find_existing_buy_deal_for_person_company(
+    CD_PANTHALASSA_BUYER_PID, "Panthalassa")
+check("add-buyer/Introduce lookup adopts the existing closed deal (source='snapshot'), no duplicate created",
+      cd_existing is not None and cd_existing["id"] == 55422151 and cd_existing_source == "snapshot")
+
+check("no Dynamo writes from any of the above (pure reads)", cd_table_f.updates == [] and cd_table_f.puts == [])
 
 
 # ======================================================================
