@@ -2585,6 +2585,29 @@ def _deal_loss_reason_text(deal):
     return text or None
 
 
+def _deal_loss_reason_notes_text(deal):
+    """Best-effort read of deal_loss_reason_notes -- the free-text note
+    accompanying deal_loss_reason's dropdown value. Same "brand-new,
+    unverified shape" trust basis and defensive decoding as
+    _deal_loss_reason_text (dict with a text-ish key, list of same, or
+    a plain string) -- most plausibly a plain string field, but handled
+    the same permissive way regardless. Never raises. ADMIN-ONLY by
+    product rule (see _loss_reason_notes_cell_html) -- this function
+    itself does no gating, it only extracts the text."""
+    raw = deal.get("deal_loss_reason_notes")
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        text = raw.get("notes") or raw.get("note") or raw.get("text") or raw.get("value")
+    elif isinstance(raw, list):
+        first = raw[0] if raw else None
+        text = first.get("notes") if isinstance(first, dict) else first
+    else:
+        text = raw
+    text = str(text).strip() if text is not None else ""
+    return text or None
+
+
 # ── Intro status pipeline ─────────────────────────────────────────────────
 # Status source of truth is the Pipeline Intro Status deal field
 # (custom_label_4008329, above) — see _resolve_intro_status. DynamoDB
@@ -2648,6 +2671,7 @@ def get_intro_details(tenant_email):
                 "stage_override": item.get("stage_override"),
                 "stage_override_at": item.get("stage_override_at"),
                 "milestones": item.get("milestones") or {},
+                "loss_reason_shared": bool(item.get("loss_reason_shared")),
             }
         return out, False
     except Exception:
@@ -4209,17 +4233,20 @@ def _tenant_email_for_deal(deal):
 
 
 def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
-                                old_values, actor, milestones=None):
+                                old_values, actor, milestones=None, loss_reason_shared=None):
     """Update the intro item's Dynamo-owned attributes (status_override/
     override_at when status_id is not None, next_steps/notes/follow_up
     when they are not None, deadline_override/deadline_override_at when
     deadline is not None, milestones when milestones is not None -- the
     caller (_handle_update_intro) has already merged it add-only against
     the item's prior milestones map, so this just SETs the whole map
-    wholesale rather than touching a single nested key) and append an
-    audit item (sk=audit#<deal_id>#<epoch_ms>, actor "admin" or the
-    tenant's own email, old and new values). Returns (ok, error_message).
-    Never called when a requested Pipeline write failed — see
+    wholesale rather than touching a single nested key, loss_reason_shared
+    when not None -- the admin-only "share this closed deal's loss notes
+    with the tenant" flag, default unshared, see
+    _loss_reason_notes_cell_html) and append an audit item
+    (sk=audit#<deal_id>#<epoch_ms>, actor "admin" or the tenant's own
+    email, old and new values). Returns (ok, error_message). Never
+    called when a requested Pipeline write failed — see
     _handle_update_intro."""
     update_parts = []
     expr_names = {}
@@ -4263,6 +4290,10 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         update_parts.append("deadline_override_at = :doa")
         expr_values[":doa"] = int(now)
         new_values["deadline"] = deadline
+    if loss_reason_shared is not None:
+        update_parts.append("loss_reason_shared = :lrs")
+        expr_values[":lrs"] = bool(loss_reason_shared)
+        new_values["loss_reason_shared"] = bool(loss_reason_shared)
 
     if not update_parts:
         return True, None
@@ -5103,16 +5134,52 @@ def _closed_out_status_chip_html(deal, loss_reason=None):
     return chip
 
 
+def _loss_reason_notes_cell_html(deal, entry, edit_mode):
+    """deal_loss_reason_notes (the free-text note behind the loss-reason
+    dropdown) -- ADMIN-ONLY, shown only under edit_mode, per instruction:
+    a tenant never sees it unless an admin has explicitly flipped the
+    per-intro "share with tenant" flag (loss_reason_shared, Dynamo-
+    backed, default unshared -- see _dynamo_write_intro_update). Empty
+    string (nothing rendered) when there's no note on record at all, or
+    when the viewer is a tenant and the flag isn't set. The checkbox
+    itself posts via the SAME shared _edit_script_html machinery every
+    other admin control on this page already uses (.ei-loss-shared,
+    wired up there) -- deal_id in a data attribute, no inline handlers."""
+    notes = _deal_loss_reason_notes_text(deal)
+    if not notes:
+        return ""
+    entry = entry or {}
+    shared = bool(entry.get("loss_reason_shared"))
+    if edit_mode:
+        deal_id = _esc(str(deal.get("id")))
+        checked = " checked" if shared else ""
+        return (
+            f'<div class="loss-reason-notes">{_esc(notes)}</div>'
+            f'<label class="loss-reason-share"><input type="checkbox" class="ei-loss-shared" '
+            f'data-deal-id="{deal_id}"{checked}> Share with tenant</label><span class="ei-msg"></span>'
+        )
+    if shared:
+        return f'<div class="loss-reason-notes">{_esc(notes)}</div>'
+    return ""
+
+
 def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_key_email, key=None, view_as=None,
-                          surface="intros", firm_won_index=None, company_repeated=False):
+                          surface="intros", firm_won_index=None, company_repeated=False, entry=None,
+                          edit_mode=False):
     """Shared "Closed out" row builder (parity refactor): Status always
     shows the derived, muted outcome chip -- never milestone checkboxes
-    or a flag select, nothing left to edit on a dead deal -- and Notes
-    stays empty. disclosed is a plain bool the caller has already
-    resolved (_closed_out_disclosed(deal), OR'd with admin/edit-mode
-    reveal-all where applicable) -- when False the buyer cell renders
-    exactly like a Pending row's anonymized code. Same col1/col2 surface
-    split as _buy_deal_row_html."""
+    or a flag select, nothing left to edit on a dead deal. Notes now
+    carries the deal's loss notes (deal_loss_reason_notes) when there is
+    one on record -- see _loss_reason_notes_cell_html -- admin-only
+    (edit_mode) unless explicitly shared with this tenant; empty
+    otherwise, unchanged from before. disclosed is a plain bool the
+    caller has already resolved (_closed_out_disclosed(deal), OR'd with
+    admin/edit-mode reveal-all where applicable) -- when False the buyer
+    cell renders exactly like a Pending row's anonymized code. entry is
+    this deal's Dynamo intro item (from get_intro_details), already
+    scoped to the viewing tenant's own partition by the caller -- never
+    None for the loss-notes share flag to read correctly. Same col1/col2
+    surface split as _buy_deal_row_html."""
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, disclosed, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
         anon_key_email=anon_key_email, firm_won_index=firm_won_index, company_repeated=company_repeated)
@@ -5125,7 +5192,7 @@ def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_k
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
         f'<td>{_closed_out_status_chip_html(deal)}</td>'
-        f'<td class="notes-cell"></td></tr>'
+        f'<td class="notes-cell">{_loss_reason_notes_cell_html(deal, entry, edit_mode)}</td></tr>'
     )
 
 
@@ -5314,6 +5381,13 @@ def _edit_script_html(key):
                   milestone_checked: el.checked }}, msgEl);
   }}
 
+  function saveLossShared(el) {{
+    var dealId = el.getAttribute('data-deal-id');
+    var label = el.closest('.loss-reason-share');
+    var msgEl = label ? label.nextElementSibling : null;
+    postUpdate({{ key: ADMIN_KEY, deal_id: dealId, share_loss_reason: el.checked }}, msgEl);
+  }}
+
   document.querySelectorAll('.ei-status').forEach(function(el) {{
     el.addEventListener('change', function() {{ saveField(el, 'status'); }});
   }});
@@ -5322,6 +5396,9 @@ def _edit_script_html(key):
   }});
   document.querySelectorAll('.ei-milestone').forEach(function(el) {{
     el.addEventListener('change', function() {{ saveMilestone(el); }});
+  }});
+  document.querySelectorAll('.ei-loss-shared').forEach(function(el) {{
+    el.addEventListener('change', function() {{ saveLossShared(el); }});
   }});
   document.querySelectorAll('.ei-next-steps, .ei-notes, .ei-follow-up, .ei-deadline').forEach(function(el) {{
     var field = el.getAttribute('data-field');
@@ -6797,7 +6874,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                 co_parts.append(_closed_out_row_html(
                     d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id, tenant_email,
                     key=key, view_as=view_as, surface="intros", firm_won_index=firm_won_index,
-                    company_repeated=closed_out_repeats[i]))
+                    company_repeated=closed_out_repeats[i],
+                    entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode))
             co_rows_html = "".join(co_parts)
             closed_out_html = f"""<details class="closed-out-section">
       <summary>Closed out <span class="count">({len(closed_out_rows)})</span></summary>
@@ -7044,6 +7122,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
      the top of the triage queue visibly differs from healthy rows. */
   tr.stalled-row {{ box-shadow: inset 3px 0 0 #c9a227; }}
   .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
+  .loss-reason-notes {{ color: var(--muted); font-size: 11px; margin-top: 4px; }}
+  .loss-reason-share {{ display: block; font-size: 11px; color: var(--muted); margin-top: 4px; }}
+  .loss-reason-share input {{ margin-right: 4px; vertical-align: middle; }}
   details.closed-out-section {{ margin-top: 20px; }}
   details.closed-out-section summary {{
     cursor: pointer;
@@ -8195,7 +8276,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             closed_out_deals.sort(key=lambda d: (_deal_title(d) or "").lower())
             co_rows_html = "".join(
                 _closed_out_row_html(d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id,
-                                      anon_key_email, key=key, view_as=view_as, surface="company")
+                                      anon_key_email, key=key, view_as=view_as, surface="company",
+                                      entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode)
                 for d in closed_out_deals)
             closed_out_html = f"""<details class="closed-out-section">
       <summary>Closed out <span class="count">({len(closed_out_deals)})</span></summary>
@@ -8581,6 +8663,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   tr.pending-row {{ opacity: 0.85; }}
   tr.closed-out-row {{ opacity: 0.7; }}
   .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
+  .loss-reason-notes {{ color: var(--muted); font-size: 11px; margin-top: 4px; }}
+  .loss-reason-share {{ display: block; font-size: 11px; color: var(--muted); margin-top: 4px; }}
+  .loss-reason-share input {{ margin-right: 4px; vertical-align: middle; }}
   details.closed-out-section {{ margin-top: 14px; }}
   details.closed-out-section summary {{
     cursor: pointer;
@@ -8929,7 +9014,7 @@ def _buyer_process_signals_html(rec):
     return f'<div class="card"><h2 class="buyer-section-heading">Process signals</h2><div class="buyer-page-row">{chips}</div></div>'
 
 
-def _track_deal_row_html(deal, entry, resolved, tenant_label=None, loss_reason=None):
+def _track_deal_row_html(deal, entry, resolved, tenant_label=None, loss_reason=None, edit_mode=False):
     """One deal's row in TRACK WITH YOU: company · size · the resolved
     status as a flag chip (_status_display_html, compact — a pill for
     an in-progress status, a colored chip for Stalled/Passed/Withdrawn/
@@ -8942,7 +9027,12 @@ def _track_deal_row_html(deal, entry, resolved, tenant_label=None, loss_reason=N
     above each of that tenant's rows). loss_reason (turn 27): a small
     muted "— <reason>" suffix appended after the chip, for a stage-
     derived closed-out deal that has one on record — see
-    _deal_loss_reason_text; None for every ordinary row, unchanged."""
+    _deal_loss_reason_text; None for every ordinary row, unchanged.
+    Same admin-only/share-gated loss notes as the Closed out table rows
+    -- see _loss_reason_notes_cell_html -- appended below the
+    checkboxes when the deal has one on record; edit_mode is the admin
+    branch's own flag (always True there), never True on the tenant
+    branch, matching every other admin-only control on this page."""
     deal_id = str(deal.get("id"))
     company_name = _deal_company_name(deal) or "—"
     size_text = _esc(_deal_size_text(deal))
@@ -8952,11 +9042,12 @@ def _track_deal_row_html(deal, entry, resolved, tenant_label=None, loss_reason=N
     if loss_reason:
         flag_chip_html += f' <span class="closed-out-reason">— {_esc(loss_reason)}</span>'
     label_html = f'<div class="track-row-tenant">{tenant_label}</div>' if tenant_label else ""
+    loss_notes_html = _loss_reason_notes_cell_html(deal, entry, edit_mode)
     return (
         f'<div class="track-row">{label_html}'
         f'<div class="track-row-head"><span class="track-row-company">{_esc(company_name)}</span>'
         f'<span class="track-row-size">{size_text}</span>{flag_chip_html}</div>'
-        f'{checkboxes_html}</div>'
+        f'{checkboxes_html}{loss_notes_html}</div>'
     )
 
 
@@ -9022,7 +9113,8 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
             deals_for_tenant = by_tenant[owner_email]
             for i, (d, entry, resolved, loss_reason) in enumerate(deals_for_tenant):
                 label = _esc(tenant_name) if i == 0 else None
-                rows.append(_track_deal_row_html(d, entry, resolved, tenant_label=label, loss_reason=loss_reason))
+                rows.append(_track_deal_row_html(d, entry, resolved, tenant_label=label, loss_reason=loss_reason,
+                                                  edit_mode=True))
     else:
         person_id = tenant.get("person_id")
         intro_details, _ = get_intro_details(anon_key_email)
@@ -9365,6 +9457,9 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .track-row-company {{ font-size: 14px; font-weight: 600; }}
   .track-row-size {{ font-size: 13px; color: var(--muted); }}
   .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
+  .loss-reason-notes {{ color: var(--muted); font-size: 11px; margin-top: 4px; }}
+  .loss-reason-share {{ display: block; font-size: 11px; color: var(--muted); margin-top: 4px; }}
+  .loss-reason-share input {{ margin-right: 4px; vertical-align: middle; }}
   .ledger-entry {{ margin-top: 12px; }}
   .ledger-entry:first-of-type {{ margin-top: 0; }}
   .ledger-entry-head {{
@@ -9835,15 +9930,17 @@ def _handle_update_intro(event):
     - Admin: ADMIN_KEY present IN THE BODY (the session cookie alone never
       authorizes a write, even an admin's own) — full rights over status
       (all ten options via any of the three mechanisms below), next_steps,
-      notes, follow_up, and deadline, on any deal, Closed rows included.
+      notes, follow_up, deadline, and share_loss_reason (the closed-out
+      row's admin-only "share loss notes with the tenant" flag — default
+      unshared), on any deal, Closed rows included.
     - Tenant: no ADMIN_KEY, but a valid gg_id identity cookie naming an
       auto-enrolled tenant email (see _resolve_tenant) — rights to
       next_steps and follow_up always, PLUS status on a row that's
       already Introduced-or-later (disclosed) and NOT Closed (item 2 —
       a Closed row locks read-only for tenants across every status
       mechanism), PLUS notes (item 3, turn 20 — no longer admin-only)
-      on any disclosed row, Closed included. deadline is still rejected
-      outright with 403 for a tenant. Every tenant write is also scoped
+      on any disclosed row, Closed included. deadline and share_loss_reason
+      are both still rejected outright with 403 for a tenant. Every tenant write is also scoped
       to a deal_id whose linked tenant (via person linkage,
       _tenant_email_for_deal) is that same authenticated tenant.
 
@@ -9898,6 +9995,8 @@ def _handle_update_intro(event):
         if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
         if body.get("deadline") not in (None, ""):
+            return _json_response({"error": "forbidden"}, 403)
+        if "share_loss_reason" in body:
             return _json_response({"error": "forbidden"}, 403)
 
     deal_id = str(body.get("deal_id") or "").strip()
@@ -9982,8 +10081,18 @@ def _handle_update_intro(event):
             except ValueError:
                 return _json_response({"error": "invalid deadline date"}, 400)
 
+    # Admin-only "share this closed deal's loss notes with the tenant"
+    # flag (a tenant posting this key at all was already rejected above,
+    # before is_admin could even matter) -- default unshared, per
+    # instruction. Distinct from every other field here in being a
+    # plain bool, not a string/id.
+    share_loss_reason = body.get("share_loss_reason") if is_admin else None
+    if share_loss_reason is not None:
+        share_loss_reason = bool(share_loss_reason)
+
     has_status_intent = status_id is not None or milestone_step is not None or flag is not None
-    if not has_status_intent and next_steps is None and notes is None and follow_up is None and deadline is None:
+    if (not has_status_intent and next_steps is None and notes is None and follow_up is None
+            and deadline is None and share_loss_reason is None):
         return _json_response({"error": "nothing to update"}, 400)
 
     deals = get_deals_list()
@@ -10025,6 +10134,7 @@ def _handle_update_intro(event):
         "notes": old_entry.get("notes"),
         "follow_up": old_entry.get("follow_up"),
         "deadline": _resolve_deal_deadline(deal, old_entry),
+        "loss_reason_shared": bool(old_entry.get("loss_reason_shared")),
     }
 
     milestones_update = None
@@ -10078,7 +10188,8 @@ def _handle_update_intro(event):
 
     actor = "admin" if is_admin else tenant_identity_email
     ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
-                                          old_values, actor, milestones=milestones_update)
+                                          old_values, actor, milestones=milestones_update,
+                                          loss_reason_shared=share_loss_reason)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
 

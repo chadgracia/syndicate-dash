@@ -4583,6 +4583,127 @@ check("no Dynamo writes from any of the above (pure reads)", cd_table_f.updates 
 
 
 # ======================================================================
+# SECTION: Closed-deal loss reason + admin-only loss notes w/ tenant share
+# ======================================================================
+# deal_loss_reason (the dropdown name, via _deal_loss_reason_text) already
+# rendered unconditionally on every closed-out row -- this section covers
+# the NEW piece: deal_loss_reason_notes, admin-only (edit_mode) unless a
+# per-intro Dynamo flag (loss_reason_shared, default unshared) has been
+# explicitly set, via the same write path (?action=update_intro,
+# share_loss_reason) every other admin-only field already uses.
+
+check("_deal_loss_reason_notes_text: plain string",
+      lf._deal_loss_reason_notes_text({"deal_loss_reason_notes": "hi"}) == "hi")
+check("_deal_loss_reason_notes_text: dict w/ 'notes' key",
+      lf._deal_loss_reason_notes_text({"deal_loss_reason_notes": {"notes": "hi"}}) == "hi")
+check("_deal_loss_reason_notes_text: list of dicts",
+      lf._deal_loss_reason_notes_text({"deal_loss_reason_notes": [{"notes": "hi"}]}) == "hi")
+check("_deal_loss_reason_notes_text: missing key -> None", lf._deal_loss_reason_notes_text({}) is None)
+check("_deal_loss_reason_notes_text: blank string -> None",
+      lf._deal_loss_reason_notes_text({"deal_loss_reason_notes": "   "}) is None)
+
+LR_TENANT_EMAIL = "lossreason-tenant@example.com"
+LR_TENANT_PID = 992001
+LR_BUYER_PID = 992002
+LR_NOTES_TEXT = "Buyer said pricing was off by 15%; may revisit next round."
+lr_sell_deal = {"id": 993001, "name": "LR Co Sell Order", "company": {"name": "LR Co"},
+                "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_sell(),
+                "people": [{"id": LR_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+lr_lost_deal = {"id": 993002, "name": "LR Co Buy", "company": {"name": "LR Co"},
+                "deal_stage": {"id": 111801},  # Lost
+                "deal_loss_reason": {"name": "Went with another sponsor"},
+                "deal_loss_reason_notes": LR_NOTES_TEXT,
+                "custom_fields": {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID],
+                                   lf.INTRO_STATUS_FIELD: [7207579]},  # Introduced -- disclosure evidence
+                "people": [{"id": LR_TENANT_PID}, {"id": LR_BUYER_PID}], "updated_at": "2026-08-05T00:00:00Z"}
+lr_people = {"people": [
+    {"id": LR_TENANT_PID, "full_name": "LR Tenant", "email": LR_TENANT_EMAIL, "custom_fields": {}},
+    {"id": LR_BUYER_PID, "full_name": "LR Buyer", "email": "buyer@lr.example", "custom_fields": {}},
+]}
+lr_s3, lr_table = use_fixture({lf.PEOPLE_KEY: lr_people, lf.INTEREST_KEY: {"buy": {}},
+                                lf.DEALS_KEY: {"deals": [lr_sell_deal, lr_lost_deal]}})
+lr_tenant = lf._resolve_tenant(LR_TENANT_EMAIL)
+check("LR: tenant resolves", lr_tenant is not None)
+
+page_admin = lf.render_company_page("LR Co", "Admin", lr_tenant, LR_TENANT_EMAIL, "mydeals",
+                                     key=ADMIN_KEY, view_as=LR_TENANT_EMAIL, edit_mode=True)
+lr_buyers_admin = page_admin[page_admin.find('id="buyers"'):]
+check("LR admin (edit_mode): loss reason dropdown name shown (unconditional, unchanged)",
+      "Went with another sponsor" in lr_buyers_admin)
+check("LR admin (edit_mode): loss notes shown (admin-only)", LR_NOTES_TEXT in lr_buyers_admin)
+check("LR admin (edit_mode): share checkbox present, unchecked by default (default unshared)",
+      'class="ei-loss-shared" data-deal-id="993002">' in lr_buyers_admin)
+
+page_tenant_unshared = lf.render_company_page("LR Co", "LR Tenant", lr_tenant, LR_TENANT_EMAIL, "mydeals",
+                                               key=None, view_as=None, edit_mode=False)
+lr_buyers_tenant = page_tenant_unshared[page_tenant_unshared.find('id="buyers"'):]
+check("LR tenant, default unshared: loss reason dropdown name still shown",
+      "Went with another sponsor" in lr_buyers_tenant)
+check("LR tenant, default unshared: loss notes NOT shown", LR_NOTES_TEXT not in lr_buyers_tenant)
+check("LR tenant: no share checkbox rendered at all (admin-only control, never UI-only-restricted)",
+      'class="ei-loss-shared"' not in lr_buyers_tenant)
+
+resp_tenant_share = lf.lambda_handler(
+    post_event({"deal_id": "993002", "share_loss_reason": False}, cookies=[tenant_cookie(LR_TENANT_EMAIL)]), None)
+check("tenant attempting share_loss_reason directly -> 403 (server-side, not just UI-hidden)",
+      resp_tenant_share["statusCode"] == 403)
+check("tenant's forbidden attempt wrote nothing to Dynamo", lr_table.updates == [] and lr_table.puts == [])
+
+resp_share_only = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "993002", "share_loss_reason": True}),
+                                     None)
+check("admin share_loss_reason-only write is accepted (not rejected as 'nothing to update')",
+      resp_share_only["statusCode"] == 200)
+check("Dynamo item now carries loss_reason_shared=True",
+      any(it.get("tenant") == LR_TENANT_EMAIL and it.get("sk") == "intro#993002"
+          and it.get("loss_reason_shared") is True for it in lr_table.items))
+lr_audit_items = [it for it in lr_table.puts if str(it.get("sk", "")).startswith("audit#993002#")]
+check("audit item recorded the share write (actor=admin, new value True)",
+      any(it.get("actor") == "admin" and it.get("new", {}).get("loss_reason_shared") is True
+          for it in lr_audit_items))
+
+reset_caches()  # same FakeBoto3 S3/table (use_fixture already bound them) -- just clear module caches
+page_tenant_shared = lf.render_company_page("LR Co", "LR Tenant", lr_tenant, LR_TENANT_EMAIL, "mydeals",
+                                             key=None, view_as=None, edit_mode=False)
+lr_buyers_tenant_shared = page_tenant_shared[page_tenant_shared.find('id="buyers"'):]
+check("LR tenant, AFTER admin shares: loss notes now shown", LR_NOTES_TEXT in lr_buyers_tenant_shared)
+
+page_admin_after = lf.render_company_page("LR Co", "Admin", lr_tenant, LR_TENANT_EMAIL, "mydeals",
+                                           key=ADMIN_KEY, view_as=LR_TENANT_EMAIL, edit_mode=True)
+lr_buyers_admin_after = page_admin_after[page_admin_after.find('id="buyers"'):]
+check("LR admin, AFTER sharing: checkbox now renders checked",
+      'class="ei-loss-shared" data-deal-id="993002" checked>' in lr_buyers_admin_after)
+
+# --- Active Intros surfaces the same behavior (shared _closed_out_row_html).
+page_intros_admin = lf.render_intros_page("Admin", tenant=lr_tenant, tenant_email=LR_TENANT_EMAIL,
+                                           key=ADMIN_KEY, view_as=LR_TENANT_EMAIL, edit_mode=True)
+intros_closed_out_admin = page_intros_admin[page_intros_admin.find('<details class="closed-out-section">'):]
+check("Active Intros admin: loss notes shown, share checkbox present",
+      LR_NOTES_TEXT in intros_closed_out_admin and 'class="ei-loss-shared"' in intros_closed_out_admin)
+
+page_intros_tenant = lf.render_intros_page("LR Tenant", tenant=lr_tenant, tenant_email=LR_TENANT_EMAIL,
+                                            key=None, view_as=None, edit_mode=False)
+intros_closed_out_tenant = page_intros_tenant[page_intros_tenant.find('<details class="closed-out-section">'):]
+check("Active Intros tenant (now shared): loss notes shown, no checkbox",
+      LR_NOTES_TEXT in intros_closed_out_tenant and 'class="ei-loss-shared"' not in intros_closed_out_tenant)
+
+# --- A closed deal with a reason but no notes at all: nothing extra
+# renders, even in edit_mode -- there's nothing to admin-gate or share.
+lr_no_notes_deal = {"id": 993003, "name": "LR Co Buy 2", "company": {"name": "LR Co"},
+                     "deal_stage": {"id": lf.OBSOLETE_STAGE_ID},
+                     "custom_fields": {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID]},
+                     "people": [{"id": LR_TENANT_PID}, {"id": LR_BUYER_PID}], "updated_at": "2026-08-05T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: lr_people, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [lr_sell_deal, lr_no_notes_deal]}})
+lr_tenant2 = lf._resolve_tenant(LR_TENANT_EMAIL)
+page_no_notes = lf.render_company_page("LR Co", "Admin", lr_tenant2, LR_TENANT_EMAIL, "mydeals",
+                                        key=ADMIN_KEY, view_as=LR_TENANT_EMAIL, edit_mode=True)
+lr_buyers_no_notes = page_no_notes[page_no_notes.find('id="buyers"'):]
+check("no loss notes on record: no checkbox, no loss-reason-notes div, even for admin",
+      'class="ei-loss-shared"' not in lr_buyers_no_notes
+      and 'class="loss-reason-notes"' not in lr_buyers_no_notes)
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 
