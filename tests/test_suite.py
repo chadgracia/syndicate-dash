@@ -760,7 +760,8 @@ check("actions-stack still renders (Update/Hold/Cancel stacked)", 'class="action
 check("action-chip column header is 'Next Steps'", "<th>Next Steps</th>" in page)
 check("table uses table-layout:fixed", "table-layout: fixed;" in page)
 check("num columns centered (Buyers/Intros use the .num class)",
-      '<th class="num">Buyers</th>' in page and '<th class="num">Intros</th>' in page)
+      '<th class="num">Buyers</th>' in page
+      and '<th class="num" title="All introductions made, including closed">Intros</th>' in page)
 check("deal-id-sub has a clear tap gap (margin-top)", "margin-top: 7px;" in page)
 
 # _fmt_short_date
@@ -3130,9 +3131,12 @@ check("Perf fix 2: get_deals_list's own call count collapses 26 -> 4 "
       "3 -> 4 as of the nav's searchable tenant picker, which now computes the eligible-tenant list, "
       "and so calls get_deals_list once more via _tenant_index, on every admin page)",
       "calls_get_deals_list=4" in line_p12)
-check("Perf fix 1: get_my_deals's call count drops 26 -> 14 (get_my_matched_buy_deals' OWN "
-      "second set of 12 per-company calls now hit ITS cache before ever reaching get_my_deals)",
-      "calls_get_my_deals=14" in line_p12)
+check("Perf fix 1: get_my_deals's call count drops 26 -> 38 (get_my_matched_buy_deals' OWN "
+      "second set of 12 per-company calls now hit ITS cache before ever reaching get_my_deals -- "
+      "14 -> 38 as of the Intros-column fix, which also asks get_my_closed_out_buy_deals per "
+      "company, itself another get_my_deals call each time; every one of those 38 asks is still "
+      "an O(1) cache lookup, not an O(deals) rescan, per the real S3 fetch count checked below)",
+      "calls_get_my_deals=38" in line_p12)
 check("get_my_matched_buy_deals is still asked for once per company by both the dropdown "
       "and the page body (24, unchanged) -- two genuine callers, not a bug -- but each of "
       "those 24 asks is now an O(1) cache lookup instead of an O(deals) rescan (see below)",

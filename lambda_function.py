@@ -1866,8 +1866,39 @@ def _raised_headline_html(edit_mode=False):
     return f'<p class="raised-headline"{title_attr}>{_esc(headline_text)} closed for sellers through this desk</p>'
 
 
+def _dedupe_buy_deals_by_company_and_buyer(deals, tenant_person_id):
+    """Collapse duplicate BUY-side deals for the same (company, buyer
+    person) pair down to one -- the reported bug's exact shape (the
+    same buyer added twice to the same company/deal, e.g. two real
+    Pipeline deal records for the same buyer showing in Closed out
+    twice). `deals` is already sorted newest-updated-first (see
+    get_my_deals), so keeping the FIRST occurrence per key keeps the
+    newest-status record, per instruction ("prefer deal-derived over
+    manual, newest status otherwise"). SELL deals and any BUY deal with
+    no other linked person to key on pass through untouched -- only a
+    genuine buyer+company collision is collapsed."""
+    seen = set()
+    out = []
+    for d in deals:
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            out.append(d)
+            continue
+        buyer_ids = tuple(sorted(pid for pid in _deal_linked_person_ids(d) if pid != tenant_person_id))
+        if not buyer_ids:
+            out.append(d)
+            continue
+        key = ((_deal_company_name(d) or "").strip().lower(), buyer_ids)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(d)
+    return out
+
+
 def get_my_deals(person_id):
-    """Deals linked to person_id, newest-updated first.
+    """Deals linked to person_id, newest-updated first, BUY-side
+    company+buyer duplicates collapsed to one (see
+    _dedupe_buy_deals_by_company_and_buyer).
 
     Perf fix 1: request-scoped memoized by person_id -- previously
     re-scanned and re-sorted the ENTIRE deals list from scratch on
@@ -1882,6 +1913,7 @@ def get_my_deals(person_id):
     deals = get_deals_list()
     mine = [d for d in deals if person_id in _deal_linked_person_ids(d)]
     mine.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
+    mine = _dedupe_buy_deals_by_company_and_buyer(mine, person_id)
     _req_cache["my_deals"][person_id] = mine
     return mine
 
@@ -2515,24 +2547,39 @@ def _company_buy_stats(person_id, company_name, intro_details=None):
     snapshot), not duplicate work to collapse into one — doing so would
     make one of the two surfaces show a different number than it does
     today, which the zero-user-visible-change constraint on this pass
-    rules out."""
+    rules out.
+
+    intro_count now counts every disclosed introduction that ever
+    happened -- live (matched) PLUS closed-out (Lost/Trade Broken/
+    Obsolete stage exits, via get_my_closed_out_buy_deals/
+    _closed_out_disclosed) -- since a passed intro is still an
+    introduction made. live_intro_count keeps the OLD live-only number
+    (what intro_count used to mean) for callers that specifically need
+    "in motion" rather than "ever introduced" (see render_my_deals_
+    page's summary strip)."""
     if person_id is None or not company_name:
-        return {"intro_count": 0, "stalled": False}
+        return {"intro_count": 0, "live_intro_count": 0, "stalled": False}
     cache_key = (person_id, company_name.strip().lower(), intro_details is not None)
     cached = _req_cache["company_stats"].get(cache_key)
     if cached is not None:
         return cached
     matched = get_my_matched_buy_deals(person_id, company_name)
-    intro_count = 0
+    live_intro_count = 0
     stalled = False
     for d in matched:
         entry = (intro_details.get(str(d.get("id"))) or {}) if intro_details is not None else None
         resolved = _resolve_intro_status(d, entry)
         if resolved["disclosed"]:
-            intro_count += 1
+            live_intro_count += 1
         if resolved["id"] == INTRO_STATUS_STALLED_ID:
             stalled = True
-    stats = {"intro_count": intro_count, "stalled": stalled}
+    closed_out_intro_count = sum(
+        1 for d in get_my_closed_out_buy_deals(person_id, company_name) if _closed_out_disclosed(d))
+    stats = {
+        "intro_count": live_intro_count + closed_out_intro_count,
+        "live_intro_count": live_intro_count,
+        "stalled": stalled,
+    }
     _req_cache["company_stats"][cache_key] = stats
     return stats
 
@@ -2849,21 +2896,37 @@ def _manual_intro_as_deal(item):
     }
 
 
-def _tenant_has_deal_derived_intro(tenant_person_id, company, buyer_person_id):
-    """True if the tenant already has a REAL (Pipeline-backed) Buy-side
-    deal for this company linking buyer_person_id, checked across
-    get_my_deals broadly -- any stage, not just matched-or-later -- so
-    a manual intro for a buyer who already has ANY real deal on this
-    company is suppressed outright, per instruction ("prefer the
-    deal-derived row and suppress the manual duplicate")."""
+def _find_deal_derived_intro(tenant_person_id, company, buyer_person_id, exclude_deal_id=None):
+    """The tenant's existing REAL (Pipeline-backed) Buy-side deal for
+    this company+buyer, if any -- checked across get_my_deals broadly
+    (any stage, not just matched-or-later). exclude_deal_id lets a
+    write path tell "is the deal I'm about to write to ALREADY the
+    tracked one" apart from "a DIFFERENT deal already covers this
+    buyer+company" -- see _handle_add_buyer/_handle_introduce_buyer's
+    duplicate-prevention check (idempotent adds: update the existing
+    record's status instead of creating a second one). Returns the
+    deal dict, or None."""
     target = (company or "").strip().lower()
     for d in get_my_deals(tenant_person_id):
         if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
             continue
+        if exclude_deal_id is not None and str(d.get("id")) == str(exclude_deal_id):
+            continue
         if (_deal_company_name(d) or "").strip().lower() != target:
             continue
         if buyer_person_id in _deal_linked_person_ids(d):
-            return True
+            return d
+    return None
+
+
+def _tenant_has_deal_derived_intro(tenant_person_id, company, buyer_person_id):
+    """True if the tenant already has a REAL (Pipeline-backed) Buy-side
+    deal for this company linking buyer_person_id -- so a manual intro
+    for a buyer who already has ANY real deal on this company is
+    suppressed outright, per instruction ("prefer the deal-derived row
+    and suppress the manual duplicate")."""
+    if _find_deal_derived_intro(tenant_person_id, company, buyer_person_id) is not None:
+        return True
     return False
 
 
@@ -5839,7 +5902,10 @@ def _add_buyer_panel_html(key, tenant_email, default_company=None):
       .then(function(res) {{
         if (res.ok) {{
           msgEl.className = 'ei-msg saved';
-          if (res.data && res.data.link_status === 'skipped' && res.data.link_message) {{
+          if (res.data && res.data.message) {{
+            msgEl.textContent = res.data.message + ' Reloading…';
+            setTimeout(function() {{ window.location.reload(); }}, 1800);
+          }} else if (res.data && res.data.link_status === 'skipped' && res.data.link_message) {{
             msgEl.textContent = res.data.link_message + ' Reloading…';
             setTimeout(function() {{ window.location.reload(); }}, 1800);
           }} else {{
@@ -7536,6 +7602,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         not_engaged_count = 0
         terms_incomplete_count = 0
         intros_total = 0
+        intros_live_total = 0
         attention_count = 0
         deadlines = []
         section_row_htmls = {"active": [], "hold": [], "cancelled": [], "closed": []}
@@ -7564,6 +7631,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 if is_overdue or stats["stalled"]:
                     attention_count += 1
                 intros_total += stats["intro_count"]
+                intros_live_total += stats["live_intro_count"]
 
                 # is_held=False: this loop is already gated to the active
                 # section, which by construction never holds a Held deal.
@@ -7642,8 +7710,14 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             summary_parts.append(f"{not_engaged_count} not engaged")
         if terms_incomplete_count:
             summary_parts.append(f"{terms_incomplete_count} awaiting terms")
+        # "In motion" stays live-only (unchanged meaning); "introduced
+        # total" is the new figure that also counts closed-out intros
+        # (Passed/Withdrawn/Closed/stage-exits) -- a passed intro is
+        # still an introduction that happened, per instruction.
+        if intros_live_total:
+            summary_parts.append(f"{intros_live_total} in motion")
         if intros_total:
-            summary_parts.append(f"{intros_total} intros in motion")
+            summary_parts.append(f"{intros_total} introduced total")
         if attention_count:
             summary_parts.append(f"{attention_count} need attention")
         if pipeline_total:
@@ -7689,7 +7763,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
           <th>Company</th>
           <th>Visibility</th>
           <th class="num">Buyers</th>
-          <th class="num">Intros</th>
+          <th class="num" title="All introductions made, including closed">Intros</th>
           <th>Deadline</th>
           <th>Next Steps</th>
           <th></th>
@@ -8139,7 +8213,8 @@ def _introduce_buyer_script_html(key):
       }}).then(function(r) {{ return r.json().then(function(data) {{ return {{ ok: r.ok, data: data }}; }}); }})
         .then(function(res) {{
           if (res.ok) {{
-            if (msgEl) {{ msgEl.className = 'ei-msg saved'; msgEl.textContent = 'Introduced ✓ Reloading…'; }}
+            var okText = (res.data && res.data.message) || 'Introduced ✓';
+            if (msgEl) {{ msgEl.className = 'ei-msg saved'; msgEl.textContent = okText + ' Reloading…'; }}
             setTimeout(function() {{ window.location.reload(); }}, 700);
           }} else {{
             btn.disabled = false;
@@ -10314,6 +10389,53 @@ def _handle_tenants_list():
     return _json_response({"count": len(entries), "tenants": entries})
 
 
+def _handle_duplicate_report():
+    """?duplicate_report=1, admin-only (checked by the caller). Read-only
+    diagnostic: scans every BUY-tagged deal in get_deals_list() (live +
+    closed) grouped by (tenant, company, buyer person ids) and reports
+    every group backed by more than one real Pipeline deal record --
+    the exact shape of the reported bug (the same buyer added twice to
+    the same company). get_my_deals now collapses these at render time
+    (see _dedupe_buy_deals_by_company_and_buyer) and new writes are
+    idempotent (see _handle_add_buyer/_handle_introduce_buyer), but
+    existing duplicate Pipeline deal RECORDS still exist until someone
+    cleans them up there -- this is how Chad sees how many and which
+    ones. Never raises; a lookup failure for any one deal's tenant is
+    just skipped, not fatal to the whole report."""
+    tenant_index = _tenant_index()
+    person_to_tenant = {}
+    for email, entry in tenant_index.items():
+        pid = entry.get("person_id")
+        if pid is not None:
+            person_to_tenant.setdefault(pid, email)
+
+    groups = {}
+    for d in get_deals_list():
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            continue
+        linked = _deal_linked_person_ids(d)
+        tenant_pid = next((pid for pid in linked if pid in person_to_tenant), None)
+        if tenant_pid is None:
+            continue
+        buyer_ids = tuple(sorted(pid for pid in linked if pid != tenant_pid))
+        if not buyer_ids:
+            continue
+        key = (tenant_pid, (_deal_company_name(d) or "").strip().lower(), buyer_ids)
+        groups.setdefault(key, []).append(str(d.get("id")))
+
+    duplicates = [
+        {"tenant_email": person_to_tenant[key[0]], "company": key[1], "buyer_person_ids": list(key[2]),
+         "deal_ids": deal_ids}
+        for key, deal_ids in groups.items() if len(deal_ids) > 1
+    ]
+    duplicates.sort(key=lambda r: (r["tenant_email"], r["company"]))
+    return _json_response({
+        "duplicate_group_count": len(duplicates),
+        "duplicate_deal_count": sum(len(r["deal_ids"]) for r in duplicates),
+        "duplicates": duplicates,
+    })
+
+
 def _handle_lookup_company_buyers(company_raw):
     """?lookup_company_buyers=<company>, admin-only (checked by the
     caller, same convention as _handle_debug_deal). JSON array of
@@ -10409,6 +10531,38 @@ def _handle_add_buyer(event):
     if tenant_person_id is None:
         return _json_response({"error": "tenant has no linked person"}, 400)
 
+    # Idempotent add (duplicate prevention): resolve the target deal's
+    # company + buyer person id up front so we can check whether an
+    # intro for this exact tenant+company+buyer ALREADY exists under a
+    # DIFFERENT deal id (the reported bug -- the same buyer added twice)
+    # or as a manual/Dynamo-only record -- and if so, redirect this
+    # write onto that existing record instead of tracking a second one.
+    probe_deal = next((d for d in get_deals_list() if str(d.get("id")) == deal_id), None)
+    if probe_deal is None:
+        probe_deal, probe_err = _pipeline_get_deal(deal_id)
+        if probe_deal is None:
+            return _json_response({"error": f"Pipeline lookup failed: {probe_err}"}, 502)
+    company = _deal_company_name(probe_deal) or ""
+    buyer_candidates = [pid for pid in _deal_linked_person_ids_ordered(probe_deal) if pid != tenant_person_id]
+    buyer_person_id = buyer_candidates[0] if buyer_candidates else None
+
+    updated_existing_message = None
+    if buyer_person_id is not None:
+        existing_deal = _find_deal_derived_intro(tenant_person_id, company, buyer_person_id,
+                                                   exclude_deal_id=deal_id)
+        if existing_deal is not None:
+            deal_id = str(existing_deal.get("id"))
+            buyer_rec = get_people_by_ids({buyer_person_id}).get(buyer_person_id)
+            buyer_name = _person_display_name(buyer_rec) if buyer_rec else "this buyer"
+            updated_existing_message = f"Updated existing intro for {buyer_name}."
+        else:
+            manual_item = _get_manual_intro_item(tenant_email, company, buyer_person_id)
+            if manual_item is not None:
+                buyer_rec = get_people_by_ids({buyer_person_id}).get(buyer_person_id)
+                buyer_name = _person_display_name(buyer_rec) if buyer_rec else "this buyer"
+                _dynamo_write_manual_intro(tenant_email, company, buyer_person_id, status_id, None, "admin")
+                updated_existing_message = f"Updated existing intro for {buyer_name} (manual record synced)."
+
     # Write 1: Intro Status. Abort everything on any non-2xx -- nothing
     # else in this function runs.
     ok, err = _pipeline_update_deal_status(deal_id, status_id)
@@ -10445,9 +10599,12 @@ def _handle_add_buyer(event):
     if not ok3:
         return _json_response({"error": f"Save failed: {err3}"}, 502)
 
-    resp = {"ok": True, "link_status": link_status}
+    resp = {"ok": True, "link_status": link_status, "deal_id": deal_id}
     if link_status == "skipped":
         resp["link_message"] = link_message
+    if updated_existing_message:
+        resp["updated_existing"] = True
+        resp["message"] = updated_existing_message
     return _json_response(resp)
 
 
@@ -10566,9 +10723,26 @@ def _handle_introduce_buyer(event):
     if not ok3:
         return _json_response({"error": f"Save failed: {err3}"}, 502)
 
+    # Idempotent add (duplicate prevention), continued: a manual/Dynamo-
+    # only record for this exact tenant+company+buyer may already exist
+    # (created before this buyer ever had a real deal). Now that a real
+    # deal is tracked (found or just created above), sync the manual
+    # record's status too rather than leaving two disagreeing records
+    # around -- render-time de-dup already prefers the deal-derived row,
+    # this just keeps the shadow record's own status from going stale.
+    manual_item = _get_manual_intro_item(tenant_email, company, buyer_person_id)
+    manual_synced = manual_item is not None
+    if manual_synced:
+        _dynamo_write_manual_intro(tenant_email, company, buyer_person_id, status_id, None, "admin")
+
     resp = {"ok": True, "deal_id": deal_id, "lookup_used": source, "created": created}
     if note:
         resp["note"] = note
+    if not created:
+        resp["updated_existing"] = True
+        resp["message"] = f"Updated existing intro for {buyer_name}."
+    if manual_synced:
+        resp["message"] = resp.get("message", f"Updated existing intro for {buyer_name}.") + " (manual record synced)"
     return _json_response(resp)
 
 
@@ -10622,6 +10796,27 @@ def _handle_manual_intro_write(event):
 
     if status_id is None and note is None:
         return _json_response({"error": "nothing to update"}, 400)
+
+    # Idempotent add (duplicate prevention): only a first-time CREATE
+    # (no manual item for this exact tenant+company+person yet) can
+    # duplicate anything -- an inline edit of an already-existing
+    # manual row is never blocked here. If a REAL Pipeline-backed deal
+    # already covers this tenant+company+buyer, refuse the shadow
+    # manual record rather than create a second, competing intro (this
+    # route never touches Pipeline, so there's no "update the real
+    # deal's status" option here -- point the admin at it instead).
+    tenant_person_id = tenant.get("person_id")
+    if (_get_manual_intro_item(tenant_email, company, person_id) is None
+            and tenant_person_id is not None):
+        existing_deal = _find_deal_derived_intro(tenant_person_id, company, person_id)
+        if existing_deal is not None:
+            buyer_rec = get_people_by_ids({person_id}).get(person_id)
+            buyer_name = _person_display_name(buyer_rec) if buyer_rec else "This buyer"
+            return _json_response({
+                "error": f"{buyer_name} already has a real Pipeline deal for {company} "
+                         f"(#{existing_deal.get('id')}) -- update that intro's status instead "
+                         f"of adding a manual one."
+            }, 409)
 
     ok, err, is_new = _dynamo_write_manual_intro(tenant_email, company, person_id, status_id, note, actor="admin")
     if not ok:
@@ -10730,6 +10925,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_tenants_list()
+
+    if query.get("duplicate_report"):
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_duplicate_report()
 
     # SSO handoff: verify, set the durable identity cookie, redirect to a
     # clean URL. An invalid/expired token just falls through to normal
