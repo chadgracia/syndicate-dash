@@ -3948,7 +3948,26 @@ def _resolve_intro_status(deal, override_entry=None):
     So here disclosure is exactly "not Matched", full stop, matching
     the instruction's own stated rule ("identity shows at
     Introduced-or-later; Matched renders anonymized") literally for
-    every one of the ten statuses, exits included."""
+    every one of the ten statuses, exits included.
+
+    FAST MODE fix: a TERMINAL Pipeline deal stage supersedes the Intro
+    Status field ENTIRELY -- checked first, before the raw field or any
+    Dynamo status_override, on a REAL (non-manual) deal. Won stages
+    (WON_STAGE_IDS) resolve straight to Closed; Lost/Trade Broken
+    resolve to Passed; Obsolete resolves to Withdrawn -- the exact
+    mapping _closed_out_outcome_name already uses -- regardless of
+    whatever the Intro Status field happens to say (a deal can sit at
+    Won Deal stage with a stale "Wired" Intro Status that Pipeline
+    simply never advanced, and must never render as still-in-progress
+    for that reason). Always disclosed: Closed already disclosed
+    unconditionally before this fix, and a terminal stage is itself
+    the strongest form of the deal-evidence disclosure carve-out
+    (_deal_is_introduction_evidence already treats every one of these
+    same stage ids as proof an introduction happened) -- so gating
+    disclosure further here would be redundant, not safer. No other
+    field (a Win Reason, a milestone, anything else) is consulted --
+    stage alone decides. A non-terminal stage falls through to every
+    rule below, unchanged."""
     if deal.get("_manual"):
         status_id = _deal_intro_status_id(deal)
         name = INTRO_STATUS_LABELS[status_id] if status_id is not None else "Matched"
@@ -3958,6 +3977,14 @@ def _resolve_intro_status(deal, override_entry=None):
             "is_exit": status_id in EXIT_STATUS_IDS,
             "disclosed": name != "Matched",
         }
+
+    stage_id = _deal_stage_id(deal)
+    if stage_id in WON_STAGE_IDS:
+        return {"id": INTRO_STATUS_CLOSED_ID, "name": "Closed", "is_exit": False, "disclosed": True}
+    if stage_id in (LOST_STAGE_IDS | {STAGE_TRADE_BROKEN}):
+        return {"id": INTRO_STATUS_PASSED_ID, "name": "Passed", "is_exit": True, "disclosed": True}
+    if stage_id == OBSOLETE_STAGE_ID:
+        return {"id": INTRO_STATUS_WITHDRAWN_ID, "name": "Withdrawn", "is_exit": True, "disclosed": True}
 
     status_id = _deal_intro_status_id(deal)
     raw_status_id = status_id
