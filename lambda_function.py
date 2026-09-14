@@ -4376,6 +4376,78 @@ def _handle_debug_deal(deal_id_raw):
     return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": body}
 
 
+# Same trust basis as every other bare stage id/label in this file --
+# these six are exactly TERMINAL_STAGE_IDS, but STAGE_LABELS (the live-
+# stage map) never names them, so _handle_debug_closed gets its own
+# small label map rather than falling back to raw numeric ids.
+TERMINAL_STAGE_LABELS = {
+    111802: "Won Deal",
+    2379321: "Won",
+    111801: "Lost",
+    2379322: "Lost(1)",
+    STAGE_TRADE_BROKEN: "Trade Broken",
+    OBSOLETE_STAGE_ID: "Obsolete",
+}
+
+
+def _handle_debug_closed():
+    """?debug_closed=1, admin-only (ADMIN_KEY gate checked by the
+    caller). Diagnostic for the closed-deals S3 cache (CLOSED_DEALS_KEY)
+    -- a fresh, one-off S3 read, never the warm-container/request-scoped
+    get_closed_deals_list() (same "not the hot path" convention as
+    _handle_debug_deal), so this reports exactly what's sitting in S3
+    right now -- the last successful write's own output. If the key
+    doesn't exist yet (or any other read failure), reports that plainly
+    and runs a live fetch attempt on the spot so the admin sees what it
+    would produce, without waiting on the next natural cache miss.
+    text/plain throughout, same as _handle_debug_deal."""
+    s3 = _s3_client()
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=CLOSED_DEALS_KEY)
+    except Exception as e:
+        fetched, stats, err = _pipeline_fetch_closed_deals()
+        body = (
+            f"S3 object s3://{BUCKET}/{CLOSED_DEALS_KEY} does not exist or could not be read "
+            f"({type(e).__name__}: {e}).\n\n"
+            "Live fetch attempted just now: "
+        )
+        if err is not None:
+            body += f"FAILED -- {err}\n"
+        else:
+            body += (
+                f"OK -- record_count={stats['record_count']} page_size={stats['page_size']} "
+                f"skipped_missing_custom_fields={stats['skipped_missing_custom_fields']} "
+                f"filter={stats['which_filter']}\n"
+            )
+        return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": body}
+
+    last_modified = obj.get("LastModified")
+    size = obj.get("ContentLength")
+    data = json.loads(obj["Body"].read())
+    deals = data.get("deals", []) if isinstance(data, dict) else (data or [])
+
+    stage_counts = {}
+    for d in deals:
+        sid = _deal_stage_id(d)
+        label = TERMINAL_STAGE_LABELS.get(sid, str(sid) if sid is not None else "(none)")
+        stage_counts[label] = stage_counts.get(label, 0) + 1
+    by_stage_lines = "".join(
+        f"  {label}: {count}\n" for label, count in sorted(stage_counts.items(), key=lambda kv: -kv[1])
+    ) or "  (none)\n"
+
+    first_three_ids = [d.get("id") for d in deals[:3]]
+
+    body = (
+        f"S3 object: s3://{BUCKET}/{CLOSED_DEALS_KEY}\n"
+        f"LastModified: {last_modified}\n"
+        f"Size: {size} bytes\n\n"
+        f"Deal records: {len(deals)}\n\n"
+        f"By stage:\n{by_stage_lines}\n"
+        f"First three ids: {first_three_ids}\n"
+    )
+    return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": body}
+
+
 def _handle_photo_request(person_id_raw, tenant, anon_key_email, edit_mode):
     """?photo=<person_id> (item 1): admin with actual edit rights
     (edit_mode -- admin key with no &view_as, or &view_as with &edit=1)
@@ -11038,6 +11110,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_debug_deal(debug_deal_param)
+
+    if query.get("debug_closed"):
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_debug_closed()
 
     lookup_deal_param = query.get("lookup_deal")
     if lookup_deal_param:
