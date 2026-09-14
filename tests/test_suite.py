@@ -1066,8 +1066,9 @@ check("exit-via-status-on-live-stage: 806 has no milestone evidence, but the dea
       "linking the tenant, at a live matched-or-later stage) is evidence an introduction happened -> "
       "discloses ('Alice Buyer' named, not an anonymized code)",
       "Alice Buyer" in page[page.find('<details class="closed-out-section">'):])
-check("exit-via-status-on-live-stage: the Closed out chip reads 'Passed' (via _deal_exit_outcome_name's status fallback)",
-      '<span class="status-chip exit">Passed</span>' in page[page.find('<details class="closed-out-section">'):])
+check("exit-via-status-on-live-stage: the Closed out chip reads 'Lost' (via _deal_exit_outcome_name's status "
+      "fallback, display-renamed from Passed)",
+      '<span class="status-chip exit">Lost</span>' in page[page.find('<details class="closed-out-section">'):])
 
 intro_section = page[page.find(">Introduced<"):page.find("Pending introductions")
                       if "Pending introductions" in page else len(page)]
@@ -1154,7 +1155,7 @@ check("editable Wired: no chip", "status-chip" not in html5)
 
 # Read-only (disabled=True): both the chip AND the select render.
 html6 = lf._status_milestones_column_html(closed_r, "6", {}, admin_controls=False, disabled=True)
-check("disabled Closed (tenant-locked): status-chip present", 'class="status-chip closed">Closed<' in html6)
+check("disabled Closed (tenant-locked): status-chip present", 'class="status-chip closed">Won<' in html6)
 check("disabled Closed: select still present, disabled", '<select class="ei-flag"' in html6 and " disabled" in html6)
 html7 = lf._status_milestones_column_html(stalled_r, "7", {}, admin_controls=False, disabled=True)
 check("disabled Stalled: status-chip present", 'class="status-chip stalled">Stalled<' in html7)
@@ -1241,10 +1242,10 @@ closed_out_tenant = page_tenant[page_tenant.find('<details class="closed-out-sec
 closed_out_admin = page_admin[page_admin.find('<details class="closed-out-section">'):]
 check("804 (Closed) IS in Closed out (tenant), named since Closed is always disclosed",
       "Gamma Co" in closed_out_tenant and "Alice Buyer" in closed_out_tenant)
-check("804's Closed out chip is the positive green one, not the gray Passed/Withdrawn styling",
-      '<span class="status-chip closed">Closed</span>' in closed_out_tenant)
+check("804's Closed out chip is the positive green 'Won' one, not the red Lost styling",
+      '<span class="status-chip closed">Won</span>' in closed_out_tenant)
 check("804 (Closed) IS in Closed out (admin edit mode too)",
-      "Gamma Co" in closed_out_admin and '<span class="status-chip closed">Closed</span>' in closed_out_admin)
+      "Gamma Co" in closed_out_admin and '<span class="status-chip closed">Won</span>' in closed_out_admin)
 
 check("805 (Matched/pending) has no checkbox markup", 'class="ei-milestone" data-deal-id="805"' not in page_tenant)
 check("805 is listed in the Pending introductions section", "Pending introductions" in page_tenant)
@@ -1607,11 +1608,17 @@ check("Closer chip: firm_won via company_name fallback (no company_id on Carla's
 page_dana = lf.render_buyer_page(5, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("Closer chip: no chip at all when nobody has won", "Proven closer" not in page_dana and "Firm has closed" not in page_dana)
 
-check("Process signals: Accepts chip lists both selected labels", "Accepts: SPV" in page_alice and "Fees" in page_alice)
-check("Process signals: the middot separator renders as an HTML entity, not literal text",
-      "Accepts: SPV &middot; Fees" in page_alice and "&amp;middot;" not in page_alice)
-check("Process signals: IQF chip shown (Alice is IQF-OK)", "Qualification on file" in page_alice)
-check("Process signals: Accepts chip absent for a buyer with none set", "Accepts:" not in page_bob)
+# Item 3: "Process signals" (Accepts chips + IQF "Qualification on file"
+# line) removed entirely from the buyer page, even for a buyer (Alice)
+# whose fixture still carries ACCEPTS_FIELD/IQF_FIELD values -- the
+# underlying field constants stay in the file (ACCEPTS_FIELD, IQF_FIELD,
+# ACCEPTS_LABELS), only the rendering is gone.
+check("Process signals card heading removed entirely (Alice, who has Accepts+IQF data)",
+      "Process signals" not in page_alice)
+check("Process signals: no Accepts chip renders even though Alice's fixture sets ACCEPTS_FIELD",
+      "Accepts:" not in page_alice)
+check("Process signals: no IQF chip renders even though Alice is IQF-OK",
+      "Qualification on file" not in page_alice)
 
 check("Track with you: heading present", "Track with you" in page_alice)
 check("Track with you: Alpha Industries (disclosed) shown", "Alpha Industries" in page_alice)
@@ -1725,7 +1732,8 @@ check("right column present", 'class="buyer-col-right"' in page_alice)
 left_html = page_alice.split('class="buyer-col-left"')[1].split('class="buyer-col-right"')[0]
 right_html = page_alice.split('class="buyer-col-right"')[1]
 check("About the firm card is in the LEFT column", "About Alice Capital" in left_html)
-check("Process signals card is in the LEFT column", "Process signals" in left_html)
+check("Process signals card is gone entirely, not just moved (left column no longer carries it)",
+      "Process signals" not in left_html)
 check("Track with you card is in the RIGHT column", "Track with you" in right_html)
 check("Notes card is in the RIGHT column", ">Notes</h2" in right_html)
 
@@ -2053,8 +2061,11 @@ check("Active Intros: a stage-based closed-out row (Obsolete, empty status) stil
       "deal itself (Buy-tagged, linking the tenant, at the Obsolete stage) is evidence an introduction "
       "happened, per the disclosure-evidence fix -- names the real buyer (Alice Buyer)",
       "Alice Buyer" in obs_row)
-check("Active Intros: that row shows the Withdrawn outcome", "Withdrawn" in obs_row)
-check("Active Intros: the Lost row shows the Passed outcome", "Passed" in page_intros)
+check("Active Intros: that row shows the Lost outcome (display-renamed from Withdrawn)",
+      '<span class="status-chip exit">Lost</span>' in obs_row)
+lost_co_row = page_intros[page_intros.find(">Lost Co<") - 200: page_intros.find(">Lost Co<") + 400]
+check("Active Intros: the Lost Co (stage=Lost) row shows the Lost outcome (display-renamed from Passed)",
+      '<span class="status-chip exit">Lost</span>' in lost_co_row)
 
 # --- Bug fix regression: exit-via-status-on-live-stage (804/805), and
 # the negative case, Stalled-stays-in-Introduced (806) ---
@@ -2072,9 +2083,9 @@ check("exit-via-status-on-live-stage: no milestone evidence, but the deal itself
       "Status Withdrawn Co" in closed_out_section
       and "Alice Buyer" in closed_out_section[closed_out_section.find("Status Withdrawn Co"):
                                                 closed_out_section.find("Status Withdrawn Co") + 600])
-check("exit-via-status-on-live-stage: both status-based chips read their own outcome",
-      closed_out_section.count('<span class="status-chip exit">Passed</span>') >= 1
-      and closed_out_section.count('<span class="status-chip exit">Withdrawn</span>') >= 1)
+check("exit-via-status-on-live-stage: both status-based exits (Passed AND Withdrawn) render the same "
+      "display-renamed 'Lost' chip -- at least two occurrences in the section",
+      closed_out_section.count('<span class="status-chip exit">Lost</span>') >= 2)
 check("Stalled-stays-in-Introduced: Stalled Co (806, Matched+Stalled) is NOT in Closed out",
       "Stalled Co" not in closed_out_section)
 check("Stalled-stays-in-Introduced: Stalled Co IS in the main Introduced table, flagged (stalled-row)",
@@ -2090,18 +2101,17 @@ check("Closed-status-on-live-stage: always disclosed (Closed is never anonymized
       "Status Closed Co" in closed_out_section
       and "Alice Buyer" in closed_out_section[closed_out_section.find("Status Closed Co"):
                                                closed_out_section.find("Status Closed Co") + 600])
-check("Closed-status-on-live-stage: rendered with the positive GREEN chip, not the gray Passed/Withdrawn one",
-      '<span class="status-chip closed">Closed</span>' in closed_out_section)
-check("Closed-status-on-live-stage: the green chip and the gray exit chips both appear in the same section "
-      "(visually distinct outcomes coexist)",
-      '<span class="status-chip closed">Closed</span>' in closed_out_section
-      and '<span class="status-chip exit">Passed</span>' in closed_out_section
-      and '<span class="status-chip exit">Withdrawn</span>' in closed_out_section)
+check("Closed-status-on-live-stage: rendered with the positive GREEN 'Won' chip, not the red Lost one",
+      '<span class="status-chip closed">Won</span>' in closed_out_section)
+check("Closed-status-on-live-stage: the green Won chip and the red Lost chips both appear in the same "
+      "section (visually distinct outcomes coexist)",
+      '<span class="status-chip closed">Won</span>' in closed_out_section
+      and closed_out_section.count('<span class="status-chip exit">Lost</span>') >= 2)
 
 page_company_lost = lf.render_company_page("Lost Co", "Sella Seller", tenant_a, TENANT_A_EMAIL, "intros",
                                             key=None, view_as=None, edit_mode=False)
-check("Company page (Lost Co): 'Passed / withdrawn' section present with count (1)",
-      '<summary>Passed / withdrawn <span class="count">(1)</span></summary>' in page_company_lost)
+check("Company page (Lost Co): 'Lost' section present with count (1)",
+      '<summary>Lost <span class="count">(1)</span></summary>' in page_company_lost)
 check("Company page (Lost Co): disclosed buyer named (Bob Buyer)", "Bob Buyer" in page_company_lost)
 check("Company page (Lost Co): loss-reason suffix shown", "— Went with another sponsor" in page_company_lost)
 
@@ -2119,8 +2129,8 @@ check("Company page (Obsolete Co, admin edit): real buyer shown regardless of di
 # --- Company page: same status-based-exit fix, same Stalled guard ---
 page_company_status_passed = lf.render_company_page("Status Passed Co", "Sella Seller", tenant_a, TENANT_A_EMAIL,
                                                       "intros", key=None, view_as=None, edit_mode=False)
-check("Company page (Status Passed Co): 'Passed / withdrawn' section present (not stuck in the Buyers table)",
-      '<summary>Passed / withdrawn <span class="count">(1)</span></summary>' in page_company_status_passed)
+check("Company page (Status Passed Co): 'Lost' section present (not stuck in the Buyers table)",
+      '<summary>Lost <span class="count">(1)</span></summary>' in page_company_status_passed)
 check("Company page (Status Passed Co): disclosed buyer named (Bob Buyer)",
       "Bob Buyer" in page_company_status_passed)
 check("Company page (Status Passed Co): the Buyers table's own 'Introduced' group has nothing (dead intro)",
@@ -2136,8 +2146,8 @@ check("Company page (Status Withdrawn Co): Withdrawn outcome shown", "Withdrawn"
 # --- Company page: same Closed-status routing, same positive-green chip ---
 page_company_status_closed = lf.render_company_page("Status Closed Co", "Sella Seller", tenant_a, TENANT_A_EMAIL,
                                                       "intros", key=None, view_as=None, edit_mode=False)
-check("Company page (Status Closed Co): 'Closed — won' section present (not stuck in the Buyers table)",
-      '<summary>Closed — won <span class="count">(1)</span></summary>' in page_company_status_closed)
+check("Company page (Status Closed Co): 'Won' section present (not stuck in the Buyers table)",
+      '<summary>Won <span class="count">(1)</span></summary>' in page_company_status_closed)
 check("Company page (Status Closed Co): always-disclosed buyer named (Alice Buyer)",
       "Alice Buyer" in page_company_status_closed)
 check("Company page (Status Closed Co): positive solid-green 'Won' chip, not the gray Passed/Withdrawn styling",
@@ -2153,8 +2163,9 @@ check("Stalled-stays-in-Introduced (company page): Stalled Co is in the Buyers t
 
 page_buyer_bob = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("Buyer page (Bob, disclosed closed-out deal): Lost Co appears in Track with you", "Lost Co" in page_buyer_bob)
-check("Buyer page (Bob): Passed chip + loss-reason suffix present",
-      "Passed" in page_buyer_bob and "— Went with another sponsor" in page_buyer_bob)
+check("Buyer page (Bob): Lost chip (display-renamed from Passed) + loss-reason suffix present",
+      '<span class="status-chip exit">Lost</span>' in page_buyer_bob
+      and "— Went with another sponsor" in page_buyer_bob)
 
 page_buyer_alice = lf.render_buyer_page(2, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("Buyer page (Alice): the live Matched deal (Live Buy Co) still appears", "Live Buy Co" in page_buyer_alice)
@@ -2169,18 +2180,19 @@ check("Buyer page (Alice): the closed-out deal (Obsolete Co) now discloses (deal
 # needed on this surface, only this regression guard confirming it.
 check("Buyer page (Bob): the status-based exit (Status Passed Co, disclosed) appears in Track with you",
       "Status Passed Co" in page_buyer_bob)
-check("Buyer page (Bob): its chip reads 'Passed'",
-      '<span class="status-chip exit">Passed</span>' in page_buyer_bob)
+check("Buyer page (Bob): its chip reads 'Lost' (display-renamed from Passed)",
+      '<span class="status-chip exit">Lost</span>' in page_buyer_bob)
 check("Buyer page (Alice): the status-based exit (Status Withdrawn Co) now discloses (deal-evidence "
       "carve-out) and appears in Track with you",
       "Status Withdrawn Co" in page_buyer_alice)
 check("Buyer page (Alice): the Closed-status deal (Status Closed Co, always disclosed) appears in Track with you",
       "Status Closed Co" in page_buyer_alice)
-check("Buyer page (Alice): Closed is not is_exit, so it renders as a plain status pill here -- never the gray "
-      "'status-chip exit' styling used for a real Passed/Withdrawn exit (this surface is unaffected by the fix; "
-      "Track with you already routed matched-or-later deals by stage/resolved-status directly)",
-      '<span class="status-pill">Closed</span>' in page_buyer_alice
-      and '<span class="status-chip exit">Closed</span>' not in page_buyer_alice)
+check("Buyer page (Alice): Closed now renders its own solid-tint green 'Won' chip here too (item 1 fix -- "
+      "previously fell through to a plain, uncolored status-pill since Closed isn't is_exit), never the red "
+      "Lost styling used for a real Passed/Withdrawn exit",
+      '<span class="status-chip closed">Won</span>' in page_buyer_alice
+      and '<span class="status-pill">Closed</span>' not in page_buyer_alice
+      and '<span class="status-chip exit">Won</span>' not in page_buyer_alice)
 page_buyer_cara = lf.render_buyer_page(4, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("Stalled-stays-in-Introduced (buyer page): Stalled Co appears with the Stalled chip, not an exit chip",
       "Stalled Co" in page_buyer_cara and "Stalled — needs a nudge" in page_buyer_cara)
@@ -2362,8 +2374,8 @@ check("Ticket 55422151: My Deals Intros column shows a count link '1', not '--'"
 page_elana_company = lf.render_company_page("Panthalassa", "Elana Investor", elana_tenant, ELANA_EMAIL, "mydeals",
                                              key=None, view_as=None, edit_mode=False)
 buyers_section = page_elana_company[page_elana_company.find('id="buyers"'):]
-check("Ticket 55422151: company page's Buyers section has a 'Closed — won (1)' group",
-      '<summary>Closed — won <span class="count">(1)</span></summary>' in buyers_section)
+check("Ticket 55422151: company page's Buyers section has a 'Won (1)' group",
+      '<summary>Won <span class="count">(1)</span></summary>' in buyers_section)
 check("Ticket 55422151: the buyer is named (Closed is always disclosed), not anonymized",
       "Panthalassa Buyer" in buyers_section)
 check("Ticket 55422151: styled positively (solid-green .status-chip.won 'Won'), never the gray Passed/Withdrawn chip",
@@ -2373,9 +2385,9 @@ check("Ticket 55422151: styled positively (solid-green .status-chip.won 'Won'), 
 page_elana_intros = lf.render_intros_page("Elana Investor", tenant=elana_tenant, tenant_email=ELANA_EMAIL,
                                            key=None, view_as=None, edit_mode=False)
 elana_closed_out = page_elana_intros[page_elana_intros.find('<details class="closed-out-section">'):]
-check("Ticket 55422151: Active Intros' Closed out section shows it, named, styled green",
+check("Ticket 55422151: Active Intros' Closed out section shows it, named, styled green 'Won'",
       "Panthalassa Buyer" in elana_closed_out
-      and '<span class="status-chip closed">Closed</span>' in elana_closed_out)
+      and '<span class="status-chip closed">Won</span>' in elana_closed_out)
 
 elana_raised = lf._raised_headline_stats()
 check("Ticket 55422151: contributes to the desk-wide Raised total ($250K)",
@@ -2870,9 +2882,8 @@ check("Parity: colgroup present (6 columns, matches Active Intros)",
       page_parity[page_parity.find("<colgroup>"):page_parity.find("</colgroup>")].count("<col ") == 6)
 check("Parity: table-layout:fixed (no horizontal bleed)", "table-layout: fixed;" in page_parity)
 check("Parity: Size column centered via .num", "text-align: center;" in page_parity)
-check("Parity: Closed-out collapsed section present (Passed / withdrawn, since deal_parity_closed_out is a "
-      "Lost-stage exit)",
-      '<summary>Passed / withdrawn <span class="count">(1)</span></summary>' in page_parity)
+check("Parity: Closed-out collapsed section present (Lost, since deal_parity_closed_out is a Lost-stage exit)",
+      '<summary>Lost <span class="count">(1)</span></summary>' in page_parity)
 parity_head = page_parity[page_parity.find("<thead>"):page_parity.find("</thead>")]
 check("Parity: head_row is unconditionally 6 columns (Buyer name/Company/Investor Type/Size/Status/Notes)",
       [parity_head.find(f">{h}<") for h in ["Buyer name", "Company", "Investor Type", "Size", "Status", "Notes"]]
@@ -4779,16 +4790,16 @@ check("55422151: styled as a positive Won row (solid-green chip)",
 cd_page_senra = lf.render_company_page("Senra", "Elana Investor", cd_tenant, CD_TENANT_EMAIL, "mydeals",
                                         key=None, view_as=None, edit_mode=False)
 cd_buyers_senra = cd_page_senra[cd_page_senra.find('id="buyers"'):]
-check("55461737: renders in Senra's Buyers Closed out group",
-      "Senra Buyer" in cd_buyers_senra and '<span class="status-chip exit">Passed</span>' in cd_buyers_senra)
+check("55461737: renders in Senra's Buyers Lost group",
+      "Senra Buyer" in cd_buyers_senra and '<span class="status-chip exit">Lost</span>' in cd_buyers_senra)
 
 cd_intros_page = lf.render_intros_page("Elana Investor", tenant=cd_tenant, tenant_email=CD_TENANT_EMAIL,
                                         key=None, view_as=None, edit_mode=False)
 cd_closed_out = cd_intros_page[cd_intros_page.find('<details class="closed-out-section">'):]
-check("55422151: Active Intros Closed out section shows Panthalassa Buyer, green Closed chip",
-      "Panthalassa Buyer" in cd_closed_out and '<span class="status-chip closed">Closed</span>' in cd_closed_out)
-check("55461737: Active Intros Closed out section shows Senra Buyer, gray Passed chip",
-      "Senra Buyer" in cd_closed_out and '<span class="status-chip exit">Passed</span>' in cd_closed_out)
+check("55422151: Active Intros Closed out section shows Panthalassa Buyer, green Won chip",
+      "Panthalassa Buyer" in cd_closed_out and '<span class="status-chip closed">Won</span>' in cd_closed_out)
+check("55461737: Active Intros Closed out section shows Senra Buyer, red Lost chip",
+      "Senra Buyer" in cd_closed_out and '<span class="status-chip exit">Lost</span>' in cd_closed_out)
 
 cd_existing, cd_existing_source, _ = lf._find_existing_buy_deal_for_person_company(
     CD_PANTHALASSA_BUYER_PID, "Panthalassa")
@@ -4917,6 +4928,122 @@ lr_buyers_no_notes = page_no_notes[page_no_notes.find('id="buyers"'):]
 check("no loss notes on record: no checkbox, no loss-reason-notes div, even for admin",
       'class="ei-loss-shared"' not in lr_buyers_no_notes
       and 'class="loss-reason-notes"' not in lr_buyers_no_notes)
+
+
+# ======================================================================
+# SECTION: Buyer page — Private notes (item 4), per-tenant + buyer,
+# autosaved via ?action=update_buyer_note
+# ======================================================================
+PN_TENANT_EMAIL = "tessa@example.com"
+PN_TENANT_PID = 601
+PN_OTHER_TENANT_EMAIL = "nora@example.com"
+PN_OTHER_TENANT_PID = 602
+PN_BUYER_PID = 603
+
+pn_people = {"people": [
+    {"id": PN_TENANT_PID, "full_name": "Tessa Seller", "email": PN_TENANT_EMAIL, "custom_fields": {}},
+    {"id": PN_OTHER_TENANT_PID, "full_name": "Nora Seller", "email": PN_OTHER_TENANT_EMAIL, "custom_fields": {}},
+    {"id": PN_BUYER_PID, "name": "Barry Buyer", "email": "barry@example.com", "custom_fields": {}},
+]}
+pn_sell_tessa = {"id": 940001, "name": "Tessa's Own Deal", "company": {"name": "PN Sell Co A"},
+                 "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                 "people": [{"id": PN_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+pn_sell_nora = {"id": 940002, "name": "Nora's Own Deal", "company": {"name": "PN Sell Co B"},
+                "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                "people": [{"id": PN_OTHER_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+pn_buy_deal = {"id": 940003, "name": "Barry's Deal", "company": {"name": "PN Buy Co"},
+               "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),
+               "people": [{"id": PN_TENANT_PID}, {"id": PN_BUYER_PID}], "updated_at": "2026-08-02T00:00:00Z"}
+_, pn_table = use_fixture({lf.PEOPLE_KEY: pn_people, lf.INTEREST_KEY: {"buy": {}},
+                            lf.DEALS_KEY: {"deals": [pn_sell_tessa, pn_sell_nora, pn_buy_deal]}})
+pn_tenant = lf._resolve_tenant(PN_TENANT_EMAIL)
+pn_other_tenant = lf._resolve_tenant(PN_OTHER_TENANT_EMAIL)
+assert pn_tenant is not None and pn_other_tenant is not None
+
+pn_page = lf.render_buyer_page(PN_BUYER_PID, "Tessa Seller", pn_tenant, PN_TENANT_EMAIL,
+                                key=None, view_as=None, edit_mode=False)
+check("Private notes: card renders with the exact required label",
+      '<h2 class="buyer-section-heading">Private notes — only you and Gracia Group see these.</h2>' in pn_page)
+check("Private notes: textarea present, keyed by buyer_id, empty when no note on record",
+      f'<textarea class="bn-notes" data-buyer-id="{PN_BUYER_PID}" placeholder="Add a private note…"></textarea>'
+      in pn_page)
+# Slice past the <style> block first -- .buyer-private-notes-card is
+# also a CSS selector defined in <head>, so an ordering check against
+# the raw page would false-positive on that definition rather than the
+# actual body markup.
+pn_page_body = pn_page[pn_page.find("</style>"):]
+check("Private notes: card sits beside the name card (buyer-top-row wraps both)",
+      '<div class="buyer-top-row">' in pn_page_body
+      and pn_page_body.find('<div class="buyer-top-row">') < pn_page_body.find('class="card buyer-header"')
+      < pn_page_body.find('buyer-private-notes-card'))
+
+pn_anon_page = lf.render_buyer_page(PN_BUYER_PID, "Nora Seller", pn_other_tenant, PN_OTHER_TENANT_EMAIL,
+                                     key=None, view_as=None, edit_mode=False)
+# Substring checks target the actual rendered ELEMENTS, not the class
+# name alone -- .bn-notes/.buyer-private-notes-card are legitimately
+# defined once in the page's <style> block regardless of which branch
+# renders (same as every other CSS rule on this page), so a bare
+# "bn-notes" in page check would false-positive on the stylesheet.
+check("Private notes: never rendered on the anonymized (not-yet-disclosed) card",
+      '<textarea class="bn-notes"' not in pn_anon_page
+      and '<h2 class="buyer-section-heading">Private notes' not in pn_anon_page)
+
+def buyer_note_event(body_dict, cookies=None):
+    return {"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+            "queryStringParameters": {"action": "update_buyer_note"}, "cookies": cookies or [],
+            "body": json.dumps(body_dict)}
+
+resp_forbidden_nocookie = lf.lambda_handler(buyer_note_event({"buyer_id": PN_BUYER_PID, "note": "x"}), None)
+check("Private notes write: no identity cookie, no admin key -> 403",
+      resp_forbidden_nocookie["statusCode"] == 403)
+
+resp_forbidden_undisclosed = lf.lambda_handler(
+    buyer_note_event({"buyer_id": PN_BUYER_PID, "note": "sneaky"}, cookies=[tenant_cookie(PN_OTHER_TENANT_EMAIL)]),
+    None)
+check("Private notes write: tenant with NO disclosed deal linking this buyer -> 403 (server-side, not "
+      "just UI-hidden)", resp_forbidden_undisclosed["statusCode"] == 403)
+check("Private notes write: the forbidden write above wrote nothing to Dynamo",
+      pn_table.updates == [] and pn_table.puts == [])
+
+resp_tenant_write = lf.lambda_handler(
+    buyer_note_event({"buyer_id": PN_BUYER_PID, "note": "Wants a 2-layer SPV, follow up in Q3"},
+                      cookies=[tenant_cookie(PN_TENANT_EMAIL)]),
+    None)
+check("Private notes write: tenant WITH a disclosed deal -> 200", resp_tenant_write["statusCode"] == 200)
+pn_written = pn_table.updates[-1]
+check("Private notes write: Dynamo key is (tenant=<tenant email>, sk='buyer-note#<person_id>')",
+      pn_written["Key"] == {"tenant": PN_TENANT_EMAIL, "sk": f"buyer-note#{PN_BUYER_PID}"})
+check("Private notes write: note text written correctly",
+      pn_written["ExpressionAttributeValues"].get(":n") == "Wants a 2-layer SPV, follow up in Q3")
+check("Private notes write: audit item appended", any(
+    it and it.get("actor") == PN_TENANT_EMAIL and str(it.get("sk", "")).startswith(f"audit#buyer-note#{PN_BUYER_PID}#")
+    for it in pn_table.puts))
+
+pn_page_after = lf.render_buyer_page(PN_BUYER_PID, "Tessa Seller", pn_tenant, PN_TENANT_EMAIL,
+                                      key=None, view_as=None, edit_mode=False)
+check("Private notes: textarea pre-fills with the saved note on next render",
+      "Wants a 2-layer SPV, follow up in Q3</textarea>" in pn_page_after)
+
+resp_admin_no_tenant = lf.lambda_handler(
+    buyer_note_event({"key": ADMIN_KEY, "buyer_id": PN_BUYER_PID, "note": "admin note"}), None)
+check("Private notes write: admin key present but no tenant_email -> 400 (no deal_id to derive it from)",
+      resp_admin_no_tenant["statusCode"] == 400)
+
+resp_admin_write = lf.lambda_handler(
+    buyer_note_event({"key": ADMIN_KEY, "buyer_id": PN_BUYER_PID, "note": "Admin follow-up: sent updated deck",
+                       "tenant_email": PN_TENANT_EMAIL}),
+    None)
+check("Private notes write: admin WITH tenant_email -> 200, writes into that same tenant's partition",
+      resp_admin_write["statusCode"] == 200
+      and pn_table.updates[-1]["Key"] == {"tenant": PN_TENANT_EMAIL, "sk": f"buyer-note#{PN_BUYER_PID}"})
+
+pn_page_admin = lf.render_buyer_page(PN_BUYER_PID, "Admin", pn_tenant, PN_TENANT_EMAIL,
+                                      key=ADMIN_KEY, view_as=PN_TENANT_EMAIL, edit_mode=True)
+check("Private notes: admin (view_as this tenant) sees the SAME note the tenant wrote",
+      "Admin follow-up: sent updated deck</textarea>" in pn_page_admin)
+
+check("Private notes: never leaked into Nora's (other tenant's) own partition",
+      lf._get_buyer_note_item(PN_OTHER_TENANT_EMAIL, PN_BUYER_PID) is None)
 
 
 # ======================================================================

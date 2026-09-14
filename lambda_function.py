@@ -3234,6 +3234,50 @@ def _dynamo_write_manual_intro(tenant_email, company, person_id, status_id, note
         return False, f"{type(e).__name__}: {e}", is_new
 
 
+def _buyer_note_sk(buyer_id):
+    return f"buyer-note#{buyer_id}"
+
+
+def _get_buyer_note_item(tenant_email, buyer_id):
+    """Single private-notes Dynamo item (GetItem), or None on any
+    failure or if the tenant has never written one for this buyer --
+    same shape/trust basis as _get_manual_intro_item."""
+    try:
+        table = _dynamo_table()
+        with _perf_timer("dynamo"):
+            resp = table.get_item(Key={"tenant": tenant_email, "sk": _buyer_note_sk(buyer_id)})
+        return resp.get("Item")
+    except Exception:
+        return None
+
+
+def _dynamo_write_buyer_note(tenant_email, buyer_id, note, actor):
+    """Upsert the private-notes Dynamo item (table syndicate-dash,
+    tenant=<viewing tenant>, sk="buyer-note#<person_id>"), then append
+    an audit item -- same two-write shape _dynamo_write_manual_intro
+    uses, no Pipeline call of any kind (no CRM field backs this)."""
+    now = time.time()
+    old_item = _get_buyer_note_item(tenant_email, buyer_id)
+    old_note = (old_item or {}).get("note")
+    try:
+        table = _dynamo_table()
+        table.update_item(
+            Key={"tenant": tenant_email, "sk": _buyer_note_sk(buyer_id)},
+            UpdateExpression="SET note = :n, buyer_id = :b, updated_at = :ua",
+            ExpressionAttributeValues={":n": note, ":b": buyer_id, ":ua": now},
+        )
+        table.put_item(Item={
+            "tenant": tenant_email,
+            "sk": f"audit#buyer-note#{buyer_id}#{int(now * 1000)}",
+            "actor": actor,
+            "old": {"note": old_note},
+            "new": {"note": note},
+        })
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 # ── Feature-request capture ──────────────────────────────────────────────
 # Own Query, deliberately NOT merged into get_intro_details's — that query
 # is called from several places that have nothing to do with feature
@@ -4838,18 +4882,27 @@ def _status_pill_html(status):
 
 
 def _status_chip_html(status_id, name):
-    """Stalled/Passed/Withdrawn — never a strip/pill segment."""
+    """Stalled/Lost -- never a strip/pill segment. Lost is the display-
+    only rename of a real exit (Passed or Withdrawn, the only two other
+    names ever passed in here); Pipeline's own option names are
+    untouched, only this rendered text and the chip's color (red, not
+    gray -- see .status-chip.exit) change."""
     if status_id == INTRO_STATUS_STALLED_ID:
         return '<span class="status-chip stalled">Stalled — needs a nudge</span>'
-    return f'<span class="status-chip exit">{_esc(name)}</span>'
+    return '<span class="status-chip exit">Lost</span>'
 
 
 def _status_display_html(resolved, compact):
     """compact=True -> pill (Matched Buyers/Buyers table); False -> the
-    7-segment strip (Active Intros). Exit states always render as a chip
-    regardless of compact."""
+    7-segment strip (Active Intros). Exit states (display-renamed
+    "Lost") always render as a chip regardless of compact. Closed
+    (display-renamed "Won") also always renders its own green chip --
+    the only caller today is the buyer page's Track with you, where
+    this used to fall through to compact's plain, uncolored pill."""
     if resolved["is_exit"]:
         return _status_chip_html(resolved["id"], resolved["name"])
+    if resolved["name"] == "Closed":
+        return '<span class="status-chip closed">Won</span>'
     if compact:
         return _status_pill_html(resolved["name"])
     return _status_strip_html(resolved["name"])
@@ -5608,27 +5661,29 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
 
 
 def _closed_out_status_chip_html(deal, loss_reason=None, solid_won=False):
-    """The status chip for ANY closed-out row: gray for Passed/Withdrawn
-    (stage-derived, turn 27, OR a status-based exit on an otherwise
-    still-live stage -- see _deal_exit_outcome_name) — reuses
-    _status_chip_html's existing "exit" styling (status_id=None never
-    matches INTRO_STATUS_STALLED_ID, so this always renders the plain
-    gray chip, never the amber Stalled one) — versus GREEN for a
-    genuinely Closed/won deal (bug fix: same ".status-chip.closed"
+    """The status chip for ANY closed-out row: RED "Lost" for Passed/
+    Withdrawn (stage-derived, turn 27, OR a status-based exit on an
+    otherwise still-live stage -- see _deal_exit_outcome_name) — reuses
+    _status_chip_html's own display rename+styling (status_id=None
+    never matches INTRO_STATUS_STALLED_ID, so this always renders the
+    red "Lost" chip, never the amber Stalled one) — versus GREEN "Won"
+    for a genuinely Closed/won deal (bug fix: same ".status-chip.closed"
     class/copy the normal Introduced-table row already used for a
     tenant viewing a Closed-locked row -- see _status_milestones_
     column_html -- so a won outcome always reads as a win, never lumped
-    in with the gray Passed/Withdrawn styling). solid_won (company page
+    in with the red Passed/Withdrawn styling). solid_won (company page
     only, via _closed_out_row_html's surface=="company") swaps that tint
     for a SOLID green "Won" chip -- unmistakable at a glance, never
-    sharing styling with the gray exit chip; Active Intros keeps the
-    original tinted "Closed" chip unchanged. Either way, a loss reason
-    on record (never applicable to a Closed outcome in practice) appends
-    a small muted "— <reason>" suffix."""
+    sharing styling with the red exit chip; Active Intros keeps the
+    original tinted "Won" chip unchanged, just a lighter shade of the
+    same green. Either way, a loss reason on record (never applicable to
+    a Closed outcome in practice) appends a small muted "— <reason>"
+    suffix. Display-only throughout: Pipeline's own option names
+    (Closed/Passed/Withdrawn) are never touched."""
     outcome = _deal_exit_outcome_name(deal)
     if outcome == "Closed":
         chip = ('<span class="status-chip won">Won</span>' if solid_won
-                 else '<span class="status-chip closed">Closed</span>')
+                 else '<span class="status-chip closed">Won</span>')
     else:
         chip = _status_chip_html(None, outcome)
     if loss_reason is None:
@@ -5788,9 +5843,10 @@ def _flag_select_html(deal_id, resolved, admin_controls, disabled=False):
 
 def _status_milestones_column_html(resolved, deal_id, milestones, admin_controls, disabled=False):
     """Turn 17: the full Active Intros status cell -- the four milestone
-    checkboxes (item 1), the flag chip (Stalled amber, Passed/Withdrawn
-    gray, Closed its own color), a muted "Awaiting our confirmation"
-    note on a Wired-not-yet-Closed row, and the flag select (item 2) —
+    checkboxes (item 1), the flag chip (Stalled amber, Lost -- display-
+    renamed Passed/Withdrawn -- red, Won -- display-renamed Closed --
+    green), a muted "Awaiting our confirmation" note on a Wired-not-yet-
+    Closed row, and the flag select (item 2) —
     one shared .ei-msg at the end covers every control in the cell (see
     _edit_script_html's saveMilestone).
 
@@ -5810,10 +5866,12 @@ def _status_milestones_column_html(resolved, deal_id, milestones, admin_controls
     flag_html = ""
     if disabled:
         if resolved["is_exit"]:
-            flag_cls = "stalled" if resolved["id"] == INTRO_STATUS_STALLED_ID else "exit"
-            flag_html = f'<span class="status-chip {flag_cls}">{_esc(resolved["name"])}</span>'
+            if resolved["id"] == INTRO_STATUS_STALLED_ID:
+                flag_html = '<span class="status-chip stalled">Stalled</span>'
+            else:
+                flag_html = '<span class="status-chip exit">Lost</span>'
         elif resolved["name"] == "Closed":
-            flag_html = '<span class="status-chip closed">Closed</span>'
+            flag_html = '<span class="status-chip closed">Won</span>'
 
     awaiting_html = ('<div class="status-awaiting">Awaiting our confirmation</div>'
                       if resolved["name"] == "Wired" else "")
@@ -5834,7 +5892,7 @@ def _ei_date_field_html(deal_id, value, css_class="ei-follow-up", field="follow_
             f'<span class="ei-msg"></span>')
 
 
-def _edit_script_html(key):
+def _edit_script_html(key, tenant_email=None):
     """Plain HTML+fetch(), no frameworks, no Save button: the Status/Flag
     dropdown posts on change, a milestone checkbox posts on change too
     (turn 17), Next Steps / Follow-up / Buyer Notes post on blur or
@@ -5846,15 +5904,26 @@ def _edit_script_html(key):
     .status-column (see _status_milestones_column_html), found via
     closest(), since there's no sensible single "next sibling" for four
     inputs. One shared script, included on both Active Intros and the
-    Buyers table when edit_mode is on."""
+    Buyers table when edit_mode is on, and unconditionally on the buyer
+    page (tenant and admin alike).
+
+    tenant_email (item 4, buyer page only): the &view_as tenant an ADMIN
+    is previewing, so an admin's own Private-notes save
+    (?action=update_buyer_note) can tell the server which tenant
+    partition it's writing -- there's no deal_id to derive that from the
+    way every other save here works. None for every other caller and
+    for a tenant's own session (the server derives their identity from
+    the auth cookie instead, same as update_intro already does)."""
     admin_key_json = json.dumps(key or "")
+    tenant_email_json = json.dumps(tenant_email or "")
     return f"""<script>
 (function() {{
   var ADMIN_KEY = {admin_key_json};
+  var TENANT_EMAIL = {tenant_email_json};
 
-  function postUpdate(payload, msgEl) {{
+  function postUpdate(payload, msgEl, action) {{
     if (msgEl) {{ msgEl.className = 'ei-msg saving'; msgEl.textContent = 'Saving…'; }}
-    fetch('?action=update_intro', {{
+    fetch('?action=' + (action || 'update_intro'), {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify(payload)
@@ -5903,6 +5972,21 @@ def _edit_script_html(key):
     var msgEl = label ? label.nextElementSibling : null;
     postUpdate({{ key: ADMIN_KEY, deal_id: dealId, share_loss_reason: el.checked }}, msgEl);
   }}
+
+  function saveBuyerNote(el) {{
+    var buyerId = el.getAttribute('data-buyer-id');
+    var msgEl = el.nextElementSibling;
+    var payload = {{ key: ADMIN_KEY, buyer_id: buyerId, note: el.value }};
+    if (TENANT_EMAIL) {{ payload.tenant_email = TENANT_EMAIL; }}
+    postUpdate(payload, msgEl, 'update_buyer_note');
+  }}
+
+  document.querySelectorAll('.bn-notes').forEach(function(el) {{
+    el.addEventListener('blur', function() {{ saveBuyerNote(el); }});
+    el.addEventListener('keydown', function(e) {{
+      if (e.key === 'Enter') {{ e.preventDefault(); el.blur(); }}
+    }});
+  }});
 
   document.querySelectorAll('.ei-status').forEach(function(el) {{
     el.addEventListener('change', function() {{ saveField(el, 'status'); }});
@@ -7655,7 +7739,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     padding: 3px 9px;
   }}
   .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #8a6d1f; }}
-  .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
+  .status-chip.exit {{ background: rgba(178,59,59,0.15); color: #b23b3b; }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .buyer-code {{ font-size: 12px; font-weight: 600; color: var(--ink); }}
   .buyer-range {{ font-size: 11px; color: var(--muted); margin-top: 2px; }}
@@ -8719,7 +8803,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
       <div class="cd-stat-row"><span>Buyers</span><span class="cd-stat-num">{buyer_total}</span></div>
       <div class="cd-stat-row"><span>Live intros</span><span class="cd-stat-num">{company_stats_for_tenant["non_terminal_count"]}</span></div>
       <div class="cd-stat-row"><span>Won</span><span class="cd-stat-num">{company_stats_for_tenant["won_count"]}</span></div>
-      <div class="cd-stat-row"><span>Passed</span><span class="cd-stat-num">{company_stats_for_tenant["passed_count"]}</span></div>
+      <div class="cd-stat-row"><span>Lost</span><span class="cd-stat-num">{company_stats_for_tenant["passed_count"]}</span></div>
       <div class="cd-stat-row"><span>Total raised</span><span class="cd-stat-num">{_esc(raised_text)}</span></div>
     </div>"""
 
@@ -8874,13 +8958,13 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             closed_out_deals.append(d)
             closed_out_disclosed_by_id[deal_id] = edit_mode or resolved_by_deal_id[deal_id]["disclosed"]
         # Item 3 (company page split): "Closed out" broken into its two
-        # outcomes -- "Closed — won" (_deal_exit_outcome_name == "Closed",
-        # rendered with the solid-green "Won" chip) and "Passed /
-        # withdrawn" (everything else here -- Passed/Withdrawn status, or
-        # the stage-based Lost/Lost(1)/Trade Broken/Obsolete exits, gray
-        # chip + loss reason).
+        # outcomes -- "Won" (_deal_exit_outcome_name == "Closed", rendered
+        # with the solid-green "Won" chip) and "Lost" (everything else
+        # here -- Passed/Withdrawn status, or the stage-based Lost/
+        # Lost(1)/Trade Broken/Obsolete exits, red chip + loss reason;
+        # Pipeline's own option names are unchanged, this is display only).
         # Each section's own count is the SAME number the "This company"
-        # card's Won/Passed lines show (company_stats_for_tenant), not a
+        # card's Won/Lost lines show (company_stats_for_tenant), not a
         # recount of the rows below -- guarantees the two always match,
         # regardless of edit_mode's reveal-all affecting which rows are
         # visible in the table itself.
@@ -8927,9 +9011,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     </details>"""
 
             closed_out_html = (
-                _closed_out_section_html("Closed — won", company_stats_for_tenant["won_count"], won_out_deals)
-                + _closed_out_section_html("Passed / withdrawn", company_stats_for_tenant["passed_count"],
-                                            passed_out_deals)
+                _closed_out_section_html("Won", company_stats_for_tenant["won_count"], won_out_deals)
+                + _closed_out_section_html("Lost", company_stats_for_tenant["passed_count"], passed_out_deals)
             )
 
         edit_script = _edit_script_html(key if edit_mode else None) if (edit_mode or tenant_edit_mode) else ""
@@ -9296,7 +9379,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     padding: 3px 9px;
   }}
   .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
-  .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
+  .status-chip.exit {{ background: rgba(178,59,59,0.15); color: #b23b3b; }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .status-chip.won {{ background: var(--qp); color: #fff; }}
   .status-column {{ display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }}
@@ -9650,30 +9733,6 @@ def _buyer_deal_team_html(buyer_id, buyer_rec, firm_name, tenant, anon_key_email
             f'{rows}</div>')
 
 
-def _buyer_process_signals_html(rec):
-    """Turn 23, block 5 (PROCESS SIGNALS): Accepts (custom_label_3998063,
-    ACCEPTS_LABELS) as one small chip listing every accepted structure
-    ("Accepts: SPV · Fees"); IQF status as a green "Qualification on
-    file" chip when the SAME IQF_FIELD/IQF_OK_IDS this file's tier
-    classifier already uses (6496840 Yes / 6596073 Unnecessary) is set,
-    otherwise omitted outright -- no partial/negative state shown."""
-    cf = rec.get("custom_fields") or {}
-    accepted_ids = cf_list(cf, ACCEPTS_FIELD)
-    accepted_labels = [ACCEPTS_LABELS[i] for i in accepted_ids if i in ACCEPTS_LABELS]
-    accepts_html = ""
-    if accepted_labels:
-        accepts_html = (f'<span class="accepts-chip">Accepts: '
-                         f'{" &middot; ".join(_esc(label) for label in accepted_labels)}</span>')
-    iqf_html = ""
-    if set(cf_list(cf, IQF_FIELD)) & IQF_OK_IDS:
-        iqf_html = '<span class="iqf-chip">Qualification on file</span>'
-
-    if not (accepts_html or iqf_html):
-        return ""
-    chips = "".join(h for h in (accepts_html, iqf_html) if h)
-    return f'<div class="card"><h2 class="buyer-section-heading">Process signals</h2><div class="buyer-page-row">{chips}</div></div>'
-
-
 def _track_deal_row_html(deal, entry, resolved, tenant_label=None, loss_reason=None, edit_mode=False):
     """One deal's row in TRACK WITH YOU: company · size · the resolved
     status as a flag chip (_status_display_html, compact — a pill for
@@ -9879,6 +9938,31 @@ def _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode):
     return f'<div class="card buyer-notes-card"><h2 class="buyer-section-heading">Notes</h2>{body}</div>'
 
 
+def _buyer_private_notes_html(tenant_email, buyer_id):
+    """Item 4: the buyer page's "Private notes" card, beside the name
+    card at the top. One free-text note per (tenant, buyer) pair, stored
+    in Dynamo (_get_buyer_note_item/_dynamo_write_buyer_note, table
+    syndicate-dash, tenant=<viewing tenant>, sk="buyer-note#<person_id>"
+    -- never a Pipeline field, nothing here is ever sent to the CRM).
+    tenant_email is always anon_key_email from the caller -- the real
+    tenant this page is showing, whether they're logged in as
+    themselves or an admin is previewing via &view_as -- so admin and
+    that one tenant read/write the SAME note; no other tenant ever
+    reaches this partition. Autosaved on blur via the SAME
+    _edit_script_html machinery every other inline note field uses
+    (.bn-notes, data-buyer-id, posting to ?action=update_buyer_note)."""
+    item = _get_buyer_note_item(tenant_email, buyer_id)
+    note_text = (item or {}).get("note") or ""
+    return (
+        '<div class="card buyer-private-notes-card">'
+        '<h2 class="buyer-section-heading">Private notes — only you and Gracia Group see these.</h2>'
+        f'<textarea class="bn-notes" data-buyer-id="{_esc(str(buyer_id))}" '
+        f'placeholder="Add a private note…">{_esc(note_text)}</textarea>'
+        '<span class="ei-msg"></span>'
+        '</div>'
+    )
+
+
 def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
     """The not-yet-disclosed fallback (item 3, turn 18) — the same code/
     tier/ticket-range shape as _pending_buyer_cell_html and the Buyer
@@ -9962,21 +10046,20 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 deal_team_html = _buyer_deal_team_html(buyer_id, rec, firm_name, tenant, anon_key_email,
                                                         key=key, view_as=view_as)
 
-                left_html = (
-                    _buyer_about_firm_html(firm_name, company_rec, edit_mode)
-                    + _buyer_process_signals_html(rec)
-                )
+                left_html = _buyer_about_firm_html(firm_name, company_rec, edit_mode)
                 right_html = (
                     _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode)
                     + _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode)
                 )
+                private_notes_html = _buyer_private_notes_html(anon_key_email, buyer_id)
                 body_html = (
-                    header_html
+                    f'<div class="buyer-top-row">{header_html}{private_notes_html}</div>'
                     + deal_team_html
                     + f'<div class="buyer-columns"><div class="buyer-col-left">{left_html}</div>'
                     + f'<div class="buyer-col-right">{right_html}</div></div>'
                 )
-                edit_script_html = _edit_script_html(key if edit_mode else None)
+                edit_script_html = _edit_script_html(key if edit_mode else None,
+                                                       tenant_email=anon_key_email if edit_mode else None)
             else:
                 body_html = _buyer_page_anonymized_html(rec, anon_key_email, buyer_id)
 
@@ -10059,12 +10142,11 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .tier-badge.tier-qp {{ background: var(--qp); }}
   .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--muted); }}
-  /* Closer chip and small green signal chips (ID verified, IQF) -- all
-     the same pill shape, green fill, white text, used only where the
-     underlying boolean is True (see _closer_chip_html /
-     _buyer_header_html / _buyer_process_signals_html — the false/unset
+  /* Closer chip and the ID-verified signal chip -- same pill shape,
+     green fill, white text, used only where the underlying boolean is
+     True (see _closer_chip_html / _buyer_header_html — the false/unset
      case is always just omitted, never a red/amber chip). */
-  .closer-chip, .id-verified-chip, .iqf-chip {{
+  .closer-chip, .id-verified-chip {{
     display: inline-block;
     font-size: 11px;
     font-weight: 600;
@@ -10072,15 +10154,6 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     border-radius: 999px;
     background: var(--qp);
     color: #ffffff;
-  }}
-  .accepts-chip {{
-    display: inline-block;
-    font-size: 11px;
-    font-weight: 600;
-    padding: 3px 9px;
-    border-radius: 999px;
-    background: rgba(22,24,29,0.06);
-    color: var(--muted);
   }}
   .gg-placeholder {{
     max-width: 640px;
@@ -10092,12 +10165,14 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   }}
   .gg-placeholder.small {{ margin: 0; padding: 6px 0; text-align: left; font-size: 13px; }}
   /* Turn 24: header card, then a two-column body (single column under
-     680px) -- About the firm + Process signals on the left, Track
-     with you + Notes on the right (see render_buyer_page). Cards
-     within a column stack with a tight gap; an empty column (nothing
-     to show in either of its cards) just collapses to nothing, never
-     a visible empty box. */
-  .buyer-header {{ margin-bottom: 14px; }}
+     680px) -- About the firm on the left; the buyer's tracked deals
+     and Notes on the right (see render_buyer_page). Cards within a
+     column stack with a tight gap; an empty column (nothing to show
+     in either of its cards) just collapses to nothing, never a
+     visible empty box. */
+  .buyer-top-row {{ display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 14px; }}
+  .buyer-top-row .buyer-header {{ flex: 1 1 420px; margin-bottom: 0; }}
+  .buyer-private-notes-card {{ flex: 1 1 280px; max-width: 360px; }}
   .buyer-columns {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }}
   .buyer-col-left, .buyer-col-right {{ display: flex; flex-direction: column; gap: 14px; min-width: 0; }}
   @media (max-width: 680px) {{
@@ -10158,7 +10233,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     padding: 3px 9px;
   }}
   .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #8a6d1f; }}
-  .status-chip.exit {{ background: rgba(22,24,29,0.06); color: var(--muted); }}
+  .status-chip.exit {{ background: rgba(178,59,59,0.15); color: #b23b3b; }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   /* "About the firm" card: description is admin-only for now (a
      zero-JS <details>/<summary> "more" expander), everyone else sees
@@ -10180,6 +10255,21 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     box-sizing: border-box;
   }}
   textarea.ei-notes {{ resize: vertical; min-height: 44px; font-family: inherit; line-height: 1.35; }}
+  .buyer-private-notes-card .buyer-section-heading {{ font-size: 13px; color: var(--muted); font-weight: 600; }}
+  .bn-notes {{
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--ink);
+    border-radius: 6px;
+    padding: 6px 9px;
+    font-size: 13px;
+    font-family: inherit;
+    line-height: 1.35;
+    width: 100%;
+    box-sizing: border-box;
+    resize: vertical;
+    min-height: 60px;
+  }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
@@ -11312,6 +11402,63 @@ def _handle_manual_intro_write(event):
     return _json_response({"ok": True, "created": is_new})
 
 
+def _handle_update_buyer_note(event):
+    """POST ?action=update_buyer_note -- item 4: per-tenant, per-buyer
+    private notes, free text, never shown to any other tenant, never
+    sent to Pipeline (no CRM field backs this -- Dynamo only, table
+    syndicate-dash, tenant=<viewing tenant>, sk="buyer-note#<person_id>"
+    via _dynamo_write_buyer_note). Autosaved on blur through the same
+    _edit_script_html machinery every other inline note field uses
+    (.bn-notes, data-buyer-id).
+
+    Auth: admin (ADMIN_KEY in body) must also supply tenant_email -- the
+    &view_as tenant whose note this is, since there's no deal_id here to
+    derive the owning tenant from server-side the way update_intro does
+    -- and it must resolve to a real tenant. A tenant (no ADMIN_KEY, a
+    valid gg_id identity cookie) always writes their OWN partition only,
+    and only for a buyer they actually have a disclosed introduction
+    with today -- enforced here, not just by the card being hidden
+    client-side otherwise (tenant rights are restricted server-side)."""
+    body = _parse_json_body(event)
+
+    admin_key = os.environ.get("ADMIN_KEY")
+    is_admin = bool(admin_key) and body.get("key") == admin_key
+
+    if is_admin:
+        tenant_email = str(body.get("tenant_email") or "").strip().lower()
+        tenant = _resolve_tenant(tenant_email)
+        if tenant is None:
+            return _json_response({"error": "unknown tenant"}, 400)
+    else:
+        identity_email = _read_identity_email(event)
+        tenant_email = identity_email.strip().lower() if identity_email else None
+        tenant = _resolve_tenant(tenant_email) if tenant_email else None
+        if tenant is None:
+            return _json_response({"error": "forbidden"}, 403)
+
+    try:
+        buyer_id = int(body.get("buyer_id"))
+    except (TypeError, ValueError):
+        return _json_response({"error": "buyer_id is required"}, 400)
+
+    if not is_admin:
+        person_id = tenant.get("person_id")
+        if not _tenant_has_disclosed_deal_with(person_id, tenant_email, buyer_id):
+            return _json_response({"error": "forbidden"}, 403)
+
+    note = body.get("note")
+    if note is None:
+        return _json_response({"error": "nothing to update"}, 400)
+    note = str(note)
+    if len(note) > MAX_INTRO_TEXT_LEN:
+        return _json_response({"error": "note too long"}, 400)
+
+    ok, err = _dynamo_write_buyer_note(tenant_email, buyer_id, note, actor=("admin" if is_admin else tenant_email))
+    if not ok:
+        return _json_response({"error": f"Save failed: {err}"}, 502)
+    return _json_response({"ok": True})
+
+
 NOT_ENABLED_MESSAGE = "This dashboard is for sellers."
 
 
@@ -11384,6 +11531,11 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_manual_intro_write(event)
+
+    if query.get("action") == "update_buyer_note":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_update_buyer_note(event)
 
     if method != "GET":
         return _forbidden()
