@@ -7552,15 +7552,19 @@ def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None
     buyer's name/email in that case, matching render_company_page's own
     documented invariant for this section).
 
-    is_admin=True (admin key present, WITH or WITHOUT &view_as, per
-    instruction) additionally shows the buyer's real name -- consistent
-    with edit_mode's "admin always sees the real thing" convention used
-    everywhere else in this file -- and, only when there IS a viewing
-    tenant to introduce them to (tenant_email is not None, i.e. admin
-    is under &view_as), a status dropdown + "Introduce" button that
-    POSTs ?action=introduce_buyer (see _introduce_buyer_script_html).
-    Admin browsing a company with no &view_as sees real names but no
-    controls -- there's no tenant yet to link the buyer to."""
+    is_admin=True -- the caller only ever passes this under edit_mode
+    (see render_company_page, "if edit_mode:"), never on the bare
+    admin-key flag alone, so a Tenant-view/bare-&view_as preview always
+    gets is_admin=False here just like a real tenant would -- shows the
+    buyer's real name, consistent with edit_mode's "admin always sees
+    the real thing" convention used everywhere else in this file -- and,
+    only when there IS a viewing tenant to introduce them to
+    (tenant_email is not None, i.e. admin is under &view_as with
+    edit_mode on), a status dropdown + "Introduce" button that POSTs
+    ?action=introduce_buyer (see _introduce_buyer_script_html). Admin
+    browsing a company with no &view_as (edit_mode is always True there)
+    sees real names but no controls -- there's no tenant yet to link
+    the buyer to."""
     tier = buyer["tier"]
     tier_html = _tier_badge_html(tier)
 
