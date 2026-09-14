@@ -629,6 +629,23 @@ MATCHED_OR_LATER_STAGE_IDS = {
     STAGE_CONFIRM, STAGE_INVOICED, STAGE_ROFR, STAGE_BLOCKED,
 } | WON_STAGE_IDS
 
+# Disclosure carve-out (CAREFUL MODE fix): a BUY deal is only ever
+# CREATED at Matched (see _pipeline_create_buy_deal's hardcoded
+# deal_stage_id=STAGE_MATCHED) -- there is no "Buy deal at a pre-match
+# stage" in this data model at all (Inquiry/Firm/Hold are SELL-side-only
+# stages). So a Buy deal currently at ANY of these stage ids -- live
+# matched-or-later, OR one of the three dead-exit stages it can only be
+# reached FROM matched-or-later -- is itself proof an introduction
+# happened, even when this snapshot carries no stage-history to point
+# at directly and no milestone/status evidence was ever recorded (the
+# gap for historical exits predating this app's milestone tracking --
+# see _deal_is_introduction_evidence, _closed_out_disclosed,
+# _resolve_intro_status's exit-status branch). WON_STAGE_IDS is
+# redundant with MATCHED_OR_LATER_STAGE_IDS (already unioned in) --
+# named here anyway so the three genuinely-new dead-exit stages
+# (TERMINAL_STAGE_IDS' non-WON members) read as the actual addition.
+DEAL_EVIDENCE_STAGE_IDS = MATCHED_OR_LATER_STAGE_IDS | TERMINAL_STAGE_IDS
+
 # Intro Status: a brand-new deal dropdown (custom_label_4008329), created
 # the same day this was written, so no repo's code can possibly reference
 # it yet — this is the first and only place it's read. Option ids given
@@ -2856,14 +2873,38 @@ def get_my_closed_out_buy_deals(person_id, company=None):
     return out
 
 
+def _deal_is_introduction_evidence(deal):
+    """True when the deal record itself -- Buy-tagged, at a stage in
+    DEAL_EVIDENCE_STAGE_IDS -- is proof an introduction happened,
+    independent of any milestone/status evidence (CAREFUL MODE fix:
+    historical exits predating this app's milestone tracking were
+    rendering anonymized for want of it). Callers already guarantee
+    "links the tenant" via their own deal-list scoping (get_my_deals/
+    get_my_matched_buy_deals/get_my_closed_out_buy_deals all filter to
+    one person_id before this ever runs), so this only re-checks
+    Buy-tagging and stage. See DEAL_EVIDENCE_STAGE_IDS for why a
+    dead-exit stage counts too."""
+    if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
+        return False
+    return _deal_stage_id(deal) in DEAL_EVIDENCE_STAGE_IDS
+
+
 def _closed_out_disclosed(deal):
-    """Item 3's first, standalone disclosure rule for closed-out rows: the
-    RAW (never override-aware) Intro Status field must explicitly hold an
-    Introduced-or-later value. No milestone fallback here (unlike
-    _resolve_intro_status's own exit-status fix) -- the instruction states
-    this rule on its own, without reference to milestones. An empty status
-    on a dead deal renders anonymized exactly like a Pending row."""
-    return _deal_intro_status_id(deal) in INTRODUCED_OR_LATER_STATUS_IDS
+    """Item 3's first, standalone disclosure rule for closed-out rows:
+    discloses when the RAW (never override-aware) Intro Status field
+    explicitly holds an Introduced-or-later value, OR (CAREFUL MODE
+    fix) the deal record itself is evidence an introduction happened
+    (_deal_is_introduction_evidence) -- every deal get_my_closed_out_
+    buy_deals ever hands this is, by construction, one of the three
+    dead-exit stages DEAL_EVIDENCE_STAGE_IDS names, so this carve-out
+    covers exactly the historical-exit gap the milestone-only rule
+    left open (old dead deals that never recorded a status). Only a
+    Buy-tagged deal with no evidence at all anywhere -- e.g. one
+    somehow outside the normal Matched-start flow -- stays anonymized,
+    exactly like a Pending row."""
+    if _deal_intro_status_id(deal) in INTRODUCED_OR_LATER_STATUS_IDS:
+        return True
+    return _deal_is_introduction_evidence(deal)
 
 
 def _deal_loss_reason_text(deal):
@@ -3937,6 +3978,19 @@ def _resolve_intro_status(deal, override_entry=None):
     if status_id in EXIT_STATUS_IDS:
         has_milestone = bool((override_entry or {}).get("milestones"))
         disclosed = has_milestone or (raw_status_id in INTRODUCED_OR_LATER_STATUS_IDS)
+        # CAREFUL MODE fix: Passed/Withdrawn specifically (never Stalled
+        # -- an ongoing, not historical, state) ALSO disclose when the
+        # deal record itself is evidence an introduction happened. A
+        # still-live-stage deal whose RAW Intro Status was set straight
+        # to Passed/Withdrawn is, by construction, at a stage in
+        # MATCHED_OR_LATER_STAGE_IDS (Pipeline's stage field never
+        # moved) -- exactly what DEAL_EVIDENCE_STAGE_IDS covers. Same
+        # historical-exit gap _closed_out_disclosed's own carve-out
+        # closes for the stage-based dead exits -- old rows that
+        # predate milestone tracking and never had their raw status
+        # field independently set either.
+        if not disclosed and status_id in (INTRO_STATUS_PASSED_ID, INTRO_STATUS_WITHDRAWN_ID):
+            disclosed = _deal_is_introduction_evidence(deal)
     else:
         disclosed = name != "Matched"
     return {
@@ -10623,20 +10677,31 @@ def _handle_update_intro(event):
 
     if has_status_intent and not is_admin:
         if not old_resolved["disclosed"]:
-            return _json_response({"error": "forbidden"}, 403)
+            # CAREFUL MODE fix: a clear inline message, not a bare
+            # "forbidden" -- this UI shouldn't normally offer status
+            # controls on an undisclosed row at all, but a stale/cached
+            # page render (or the disclosure-evidence gap Issue 1
+            # fixed) could still get a request here.
+            return _json_response(
+                {"error": "This buyer hasn't been introduced yet — status can't be changed until then."}, 403)
         if old_resolved["name"] == "Closed":
             # Item 2: a Closed row locks read-only for tenants across
             # every status mechanism -- checkbox, flag, and (defensively)
             # a literal status id too.
-            return _json_response({"error": "forbidden"}, 403)
+            return _json_response({"error": "This intro is closed — status is locked."}, 403)
 
     if notes is not None and not is_admin and not old_resolved["disclosed"]:
         # Item 3 (turn 20): a tenant may only write Notes on a row
         # that's already Introduced-or-later -- same disclosure gate as
         # status, but NOT the Closed-lock above: Notes stays editable
         # after a deal closes (there's still reason to annotate it),
-        # unlike the status controls.
-        return _json_response({"error": "forbidden"}, 403)
+        # unlike the status controls. CAREFUL MODE fix: a clear inline
+        # message here too -- this is exactly the check that was
+        # rejecting a tenant's own Notes edit on a row the disclosure-
+        # evidence gap (see DEAL_EVIDENCE_STAGE_IDS) left wrongly
+        # undisclosed, surfacing as a bare "forbidden" under the field.
+        return _json_response(
+            {"error": "Notes can only be added once this buyer has been introduced."}, 403)
 
     old_values = {
         "status": old_resolved["id"] if old_resolved["id"] is not None else old_resolved["name"],

@@ -1062,8 +1062,10 @@ check("exit-via-status-on-live-stage: Delta Corp (806, Matched+Passed) is NOT in
 check("exit-via-status-on-live-stage: Delta Corp (806) DOES render, in Closed out",
       "Delta Corp" in page and '<details class="closed-out-section">' in page
       and "Delta Corp" in page[page.find('<details class="closed-out-section">'):])
-check("exit-via-status-on-live-stage: 806 has no milestone evidence -> anonymized (Buyer code, not 'Alice Buyer')",
-      "Alice Buyer" not in page[page.find('<details class="closed-out-section">'):])
+check("exit-via-status-on-live-stage: 806 has no milestone evidence, but the deal itself (Buy-tagged, "
+      "linking the tenant, at a live matched-or-later stage) is evidence an introduction happened -> "
+      "discloses ('Alice Buyer' named, not an anonymized code)",
+      "Alice Buyer" in page[page.find('<details class="closed-out-section">'):])
 check("exit-via-status-on-live-stage: the Closed out chip reads 'Passed' (via _deal_exit_outcome_name's status fallback)",
       '<span class="status-chip exit">Passed</span>' in page[page.find('<details class="closed-out-section">'):])
 
@@ -2047,9 +2049,11 @@ check("Active Intros: a disclosed closed-out row shows the loss-reason suffix",
 check("Active Intros: a disclosed-no-reason closed-out row shows a plain gray chip",
       ">Broken Co<" in page_intros and "Cara Buyer" in page_intros)
 obs_row = row_for(page_intros, "803") or page_intros[page_intros.find(">Obsolete Co<") - 400: page_intros.find(">Obsolete Co<") + 400]
-check("Active Intros: an anonymized closed-out row (Obsolete, empty status) never names the real buyer",
-      "Buyer " in obs_row and "Alice Buyer" not in obs_row)
-check("Active Intros: an anonymized closed-out row shows the Withdrawn outcome", "Withdrawn" in obs_row)
+check("Active Intros: a stage-based closed-out row (Obsolete, empty status) still discloses -- the "
+      "deal itself (Buy-tagged, linking the tenant, at the Obsolete stage) is evidence an introduction "
+      "happened, per the disclosure-evidence fix -- names the real buyer (Alice Buyer)",
+      "Alice Buyer" in obs_row)
+check("Active Intros: that row shows the Withdrawn outcome", "Withdrawn" in obs_row)
 check("Active Intros: the Lost row shows the Passed outcome", "Passed" in page_intros)
 
 # --- Bug fix regression: exit-via-status-on-live-stage (804/805), and
@@ -2062,10 +2066,12 @@ check("exit-via-status-on-live-stage: disclosed (milestone evidence) -> names th
       "Bob Buyer" in closed_out_section)
 check("exit-via-status-on-live-stage: Status Withdrawn Co (805, LOI Signed+Withdrawn, no milestone) IS in Closed out",
       "Status Withdrawn Co" in closed_out_section and "Status Withdrawn Co" not in intros_section_only)
-check("exit-via-status-on-live-stage: no milestone evidence -> anonymized (not 'Alice Buyer')",
+check("exit-via-status-on-live-stage: no milestone evidence, but the deal itself (Buy-tagged, linking "
+      "the tenant, at LOI Signed -- a live matched-or-later stage) is evidence an introduction happened "
+      "-> discloses ('Alice Buyer' named)",
       "Status Withdrawn Co" in closed_out_section
-      and "Alice Buyer" not in closed_out_section[closed_out_section.find("Status Withdrawn Co"):
-                                                    closed_out_section.find("Status Withdrawn Co") + 600])
+      and "Alice Buyer" in closed_out_section[closed_out_section.find("Status Withdrawn Co"):
+                                                closed_out_section.find("Status Withdrawn Co") + 600])
 check("exit-via-status-on-live-stage: both status-based chips read their own outcome",
       closed_out_section.count('<span class="status-chip exit">Passed</span>') >= 1
       and closed_out_section.count('<span class="status-chip exit">Withdrawn</span>') >= 1)
@@ -2101,8 +2107,8 @@ check("Company page (Lost Co): loss-reason suffix shown", "— Went with another
 
 page_company_obsolete = lf.render_company_page("Obsolete Co", "Sella Seller", tenant_a, TENANT_A_EMAIL, "intros",
                                                 key=None, view_as=None, edit_mode=False)
-check("Company page (Obsolete Co): closed-out row anonymized (no Alice Buyer name)",
-      "Alice Buyer" not in page_company_obsolete)
+check("Company page (Obsolete Co): closed-out row discloses -- deal-evidence carve-out (real buyer named)",
+      "Alice Buyer" in page_company_obsolete)
 check("Company page (Obsolete Co): Withdrawn outcome shown", "Withdrawn" in page_company_obsolete)
 
 page_company_admin = lf.render_company_page("Obsolete Co", "Admin", tenant_a, "admin", "demand",
@@ -2123,8 +2129,8 @@ check("Company page (Status Passed Co): the Buyers table's own 'Introduced' grou
 page_company_status_withdrawn = lf.render_company_page("Status Withdrawn Co", "Sella Seller", tenant_a,
                                                          TENANT_A_EMAIL, "intros", key=None, view_as=None,
                                                          edit_mode=False)
-check("Company page (Status Withdrawn Co): closed-out row anonymized (no Alice Buyer name)",
-      "Alice Buyer" not in page_company_status_withdrawn)
+check("Company page (Status Withdrawn Co): closed-out row discloses -- deal-evidence carve-out (real buyer named)",
+      "Alice Buyer" in page_company_status_withdrawn)
 check("Company page (Status Withdrawn Co): Withdrawn outcome shown", "Withdrawn" in page_company_status_withdrawn)
 
 # --- Company page: same Closed-status routing, same positive-green chip ---
@@ -2151,8 +2157,9 @@ check("Buyer page (Bob): Passed chip + loss-reason suffix present",
 
 page_buyer_alice = lf.render_buyer_page(2, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("Buyer page (Alice): the live Matched deal (Live Buy Co) still appears", "Live Buy Co" in page_buyer_alice)
-check("Buyer page (Alice): the undisclosed closed-out deal (Obsolete Co) is NOT in Track with you",
-      "Obsolete Co" not in page_buyer_alice)
+check("Buyer page (Alice): the closed-out deal (Obsolete Co) now discloses (deal-evidence carve-out) "
+      "and appears in Track with you",
+      "Obsolete Co" in page_buyer_alice)
 
 # --- Buyer page parity check: Track with you already routes matched-or-
 # later deals through _resolve_intro_status directly (never filtered by
@@ -2163,8 +2170,9 @@ check("Buyer page (Bob): the status-based exit (Status Passed Co, disclosed) app
       "Status Passed Co" in page_buyer_bob)
 check("Buyer page (Bob): its chip reads 'Passed'",
       '<span class="status-chip exit">Passed</span>' in page_buyer_bob)
-check("Buyer page (Alice): the undisclosed status-based exit (Status Withdrawn Co) is NOT in Track with you",
-      "Status Withdrawn Co" not in page_buyer_alice)
+check("Buyer page (Alice): the status-based exit (Status Withdrawn Co) now discloses (deal-evidence "
+      "carve-out) and appears in Track with you",
+      "Status Withdrawn Co" in page_buyer_alice)
 check("Buyer page (Alice): the Closed-status deal (Status Closed Co, always disclosed) appears in Track with you",
       "Status Closed Co" in page_buyer_alice)
 check("Buyer page (Alice): Closed is not is_exit, so it renders as a plain status pill here -- never the gray "
@@ -2178,6 +2186,123 @@ check("Stalled-stays-in-Introduced (buyer page): Stalled Co appears with the Sta
 
 check("rendering these closed-out rows issues no Dynamo writes",
       fake_table.updates == [] and fake_table.puts == [])
+
+
+# ======================================================================
+# SECTION: Disclosure-evidence carve-out for historical exits (CAREFUL
+# MODE fix) + the Notes "forbidden" bug it caused
+# ======================================================================
+# A Buy-tagged deal is only ever CREATED at Matched (_pipeline_create_
+# buy_deal), so reaching a dead-exit stage (Lost/Trade Broken/Obsolete)
+# or sitting at any live matched-or-later stage is itself proof an
+# introduction happened -- even with zero milestone/status history.
+# _deal_is_introduction_evidence/DEAL_EVIDENCE_STAGE_IDS is the shared
+# carve-out; _closed_out_disclosed and _resolve_intro_status's exit
+# branch (Passed/Withdrawn only, never Stalled) both consult it.
+
+check("_deal_is_introduction_evidence: Buy-tagged, matched-or-later stage -> True",
+      lf._deal_is_introduction_evidence({"custom_fields": cf_buy(), "deal_stage": {"id": lf.STAGE_MATCHED}}))
+check("_deal_is_introduction_evidence: Buy-tagged, dead-exit stage (Lost) -> True",
+      lf._deal_is_introduction_evidence({"custom_fields": cf_buy(), "deal_stage": {"id": 111801}}))
+check("_deal_is_introduction_evidence: Buy-tagged, dead-exit stage (Trade Broken) -> True",
+      lf._deal_is_introduction_evidence({"custom_fields": cf_buy(), "deal_stage": {"id": lf.STAGE_TRADE_BROKEN}}))
+check("_deal_is_introduction_evidence: Buy-tagged, dead-exit stage (Obsolete) -> True",
+      lf._deal_is_introduction_evidence({"custom_fields": cf_buy(), "deal_stage": {"id": lf.OBSOLETE_STAGE_ID}}))
+check("_deal_is_introduction_evidence: Buy-tagged, a non-evidence stage (Inquiry) -> False",
+      not lf._deal_is_introduction_evidence({"custom_fields": cf_buy(), "deal_stage": {"id": lf.STAGE_INQUIRY}}))
+check("_deal_is_introduction_evidence: no deal_stage at all -> False",
+      not lf._deal_is_introduction_evidence({"custom_fields": cf_buy()}))
+check("_deal_is_introduction_evidence: SELL-tagged deal at a matched-or-later stage -> False (not Buy-tagged)",
+      not lf._deal_is_introduction_evidence({"custom_fields": cf_sell(), "deal_stage": {"id": lf.STAGE_MATCHED}}))
+
+check("_closed_out_disclosed: Buy-tagged deal at a non-evidence stage, no raw status -> stays anonymized "
+      "(the negative case the carve-out does NOT swallow)",
+      not lf._closed_out_disclosed({"custom_fields": cf_buy(), "deal_stage": {"id": lf.STAGE_INQUIRY}}))
+
+r_stalled_evidence = lf._resolve_intro_status(
+    {"custom_fields": cf_buy(7207584), "deal_stage": {"id": lf.STAGE_MATCHED}, "updated_at": "2026-08-01T00:00:00Z"}, None)
+check("_resolve_intro_status: Stalled at a matched-or-later stage, no milestone -> STILL not disclosed "
+      "(the deal-evidence carve-out applies only to Passed/Withdrawn, never Stalled -- an ongoing, not "
+      "historical, state)",
+      r_stalled_evidence["disclosed"] is False)
+r_passed_evidence = lf._resolve_intro_status(
+    {"custom_fields": cf_buy(7207585), "deal_stage": {"id": lf.STAGE_MATCHED}, "updated_at": "2026-08-01T00:00:00Z"}, None)
+check("_resolve_intro_status: Passed at a matched-or-later stage, no milestone -> discloses via deal evidence",
+      r_passed_evidence["disclosed"] is True)
+r_withdrawn_evidence = lf._resolve_intro_status(
+    {"custom_fields": cf_buy(7207586), "deal_stage": {"id": lf.STAGE_LOI_SIGNED}, "updated_at": "2026-08-01T00:00:00Z"}, None)
+check("_resolve_intro_status: Withdrawn at a matched-or-later stage, no milestone -> discloses via deal evidence",
+      r_withdrawn_evidence["disclosed"] is True)
+
+# --- Real-ticket regression: "forbidden" under Notes on Ferkol's Destinus
+# row in Tenant view. Repro: a Matched-stage Introduced deal the tenant
+# flags Passed (no milestones ever recorded -- realistic for a deal that
+# never had a checkbox ticked before dying) -- same session, no reload
+# (the inline-edit script never reloads the page) -- then the tenant
+# edits Notes on that SAME still-visible row. Before the fix, the flag
+# write flips the row's OWN disclosure to False (no milestone evidence),
+# so the very next Notes write on it 403s with a bare "forbidden".
+FERKOL_TENANT_EMAIL = "ferkol@example.com"
+FERKOL_TENANT_PID = 991201
+DESTINUS_BUYER_PID = 991202
+DESTINUS_PENDING_BUYER_PID = 991203
+ferkol_sell = {"id": 993101, "name": "Ferkol Sell Order", "company": {"name": "Destinus"},
+               "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_sell(),
+               "people": [{"id": FERKOL_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+ferkol_buy = {"id": 993102, "name": "Destinus: Buy", "company": {"name": "Destinus"},
+              "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),  # Introduced
+              "people": [{"id": FERKOL_TENANT_PID}, {"id": DESTINUS_BUYER_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+ferkol_pending = {"id": 993103, "name": "Destinus: Buy 2", "company": {"name": "Destinus"},
+                   "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(None),  # never introduced
+                   "people": [{"id": FERKOL_TENANT_PID}, {"id": DESTINUS_PENDING_BUYER_PID}],
+                   "updated_at": "2026-08-01T00:00:00Z"}
+ferkol_people = {"people": [
+    {"id": FERKOL_TENANT_PID, "full_name": "Ferkol", "email": FERKOL_TENANT_EMAIL, "custom_fields": {}},
+    {"id": DESTINUS_BUYER_PID, "full_name": "Destinus Buyer", "email": "buyer@destinus.example",
+     "custom_fields": {}},
+    {"id": DESTINUS_PENDING_BUYER_PID, "full_name": "Destinus Pending Buyer", "email": "pending@destinus.example",
+     "custom_fields": {}},
+]}
+_, ferkol_table = use_fixture({lf.PEOPLE_KEY: ferkol_people, lf.INTEREST_KEY: {"buy": {}},
+                                lf.DEALS_KEY: {"deals": [ferkol_sell, ferkol_buy, ferkol_pending]}})
+
+resp_flag = lf.lambda_handler(post_event({"deal_id": "993102", "flag": "passed"},
+                                          cookies=[tenant_cookie(FERKOL_TENANT_EMAIL)]), None)
+check("Ferkol/Destinus repro: tenant flags the deal Passed -> 200", resp_flag["statusCode"] == 200)
+
+resp_notes = lf.lambda_handler(post_event({"deal_id": "993102", "notes": "Following up next week"},
+                                           cookies=[tenant_cookie(FERKOL_TENANT_EMAIL)]), None)
+check("Ferkol/Destinus repro: Notes write on the same row now succeeds (bug fixed, no more 'forbidden')",
+      resp_notes["statusCode"] == 200)
+check("Ferkol/Destinus repro: the note was actually saved",
+      any(it.get("sk") == "intro#993102" and it.get("notes") == "Following up next week"
+          for it in ferkol_table.items))
+
+# --- A genuinely never-introduced (Matched, no evidence) row still 403s
+# for a tenant's Notes write -- but with a clear inline message now,
+# never the bare "forbidden" string.
+resp_notes_pending = lf.lambda_handler(
+    post_event({"deal_id": "993103", "notes": "trying anyway"}, cookies=[tenant_cookie(FERKOL_TENANT_EMAIL)]), None)
+check("Notes write on a genuinely undisclosed row: still 403 (correctly rejected)",
+      resp_notes_pending["statusCode"] == 403)
+check("Notes write on a genuinely undisclosed row: clear inline message, not the bare word 'forbidden'",
+      json.loads(resp_notes_pending["body"])["error"] != "forbidden"
+      and "introduced" in json.loads(resp_notes_pending["body"])["error"].lower())
+
+# --- Same clarity fix for the status-write disclosure/Closed-lock 403s.
+resp_status_pending = lf.lambda_handler(
+    post_event({"deal_id": "993103", "flag": "passed"}, cookies=[tenant_cookie(FERKOL_TENANT_EMAIL)]), None)
+check("Status write on a genuinely undisclosed row: still 403, clear message not bare 'forbidden'",
+      resp_status_pending["statusCode"] == 403
+      and json.loads(resp_status_pending["body"])["error"] != "forbidden")
+
+resp_status_closed_lock = lf.lambda_handler(
+    post_event({"deal_id": "993102", "flag": "stalled"}, cookies=[tenant_cookie(FERKOL_TENANT_EMAIL)]), None)
+# 993102 is Passed (an exit), not Closed, so this should actually succeed
+# (tenants may re-flag a Passed row) -- included to prove the Closed-lock
+# message change didn't accidentally start blocking non-Closed exits too.
+check("Re-flagging a Passed (non-Closed) row is still allowed for a tenant",
+      resp_status_closed_lock["statusCode"] == 200)
 
 
 # --- Real-ticket regression: deal 55422151 ("Panthalassa: $250K Buy"),
