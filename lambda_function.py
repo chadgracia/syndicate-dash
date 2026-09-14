@@ -2726,9 +2726,10 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     counting rules -- both are additional, independently-scoped tallies
     over the same already-iterated deals.
 
-    non_terminal_count (the company-page card's "Live intros" line): a
-    disclosed introduction whose resolved outcome is none of Closed/
-    Won-stage/Passed/Withdrawn -- i.e. still actually in motion. Every
+    non_terminal_count (the "This company" card's, section nav's, and
+    My Deals' shared "Active intros" figure): a disclosed introduction
+    whose resolved outcome is none of Closed/Won-stage/Passed/
+    Withdrawn -- i.e. still actually in motion. Every
     disclosed row lands in exactly one of won_count/passed_count/
     non_terminal_count, so the three always sum to live_intro_count +
     manual_intro_count (closed_out_deals are stage-based and, by
@@ -7924,22 +7925,27 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         per_share_html = (f'<div class="mydeals-per-share">{_esc(per_share_text)}</div>'
                            if per_share_text else "")
 
-    # Nav pass, item 1: "counts become doors" -- a nonzero Buyers/Intros
-    # count links straight to the matching section on this company's own
-    # page (Buyers count -> Buyer Demand, the raw interest tally that
-    # column reports; Intros count -> the Buyers table, where actual
-    # introductions live). Zero / "—" stays plain text -- nothing to
-    # click through to. Styled to still read as a plain number
-    # (.mydeals-count-link: inherits color, no underline) with only a
-    # hover affordance, never a blue-underlined link.
+    # Nav pass, item 1: "counts become doors" -- a nonzero Interested-
+    # buyers/Active-intros count links straight to the matching section
+    # on this company's own page (Interested buyers -> Buyer Demand, the
+    # raw interest tally that column reports; Active intros -> the
+    # Buyers table, where actual introductions live). Zero / "—" stays
+    # plain text -- nothing to click through to. Styled to still read as
+    # a plain number (.mydeals-count-link: inherits color, no underline)
+    # with only a hover affordance, never a blue-underlined link.
+    # Active intros deliberately reads non_terminal_count, not
+    # intro_count -- same vocabulary and same number as the "This
+    # company" stats card and the company-page nav's own "Active
+    # intros" link (Won/Lost are each broken out separately elsewhere,
+    # never folded into this column).
     if buyer_count and company_name:
         buyer_href = f"{_company_href(company_name, 'mydeals', key, view_as)}#demand"
         buyer_text = f'<a class="mydeals-count-link" href="{buyer_href}">{buyer_count}</a>'
     else:
         buyer_text = str(buyer_count)
-    if stats["intro_count"] and company_name:
+    if stats["non_terminal_count"] and company_name:
         intro_href = f"{_company_href(company_name, 'mydeals', key, view_as)}#buyers"
-        intro_text = f'<a class="mydeals-count-link" href="{intro_href}">{stats["intro_count"]}</a>'
+        intro_text = f'<a class="mydeals-count-link" href="{intro_href}">{stats["non_terminal_count"]}</a>'
     else:
         intro_text = "—"
     # Company-level Raised: the same figure for every row that shares
@@ -8238,8 +8244,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         <tr>
           <th>Company</th>
           <th>Visibility</th>
-          <th class="num">Buyers</th>
-          <th class="num" title="All introductions made, including closed">Intros</th>
+          <th class="num">Interested buyers</th>
+          <th class="num" title="Introductions still in progress -- not yet Won or Lost">Active intros</th>
           <th>Deadline</th>
           <th>Next Steps</th>
           <th></th>
@@ -8788,11 +8794,15 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 
         # "This company" stats card -- company-level for this tenant,
         # reusing _company_buy_stats' own already-computed split (no new
-        # aggregation here). Buyers is the raw demand-pool interest
-        # count (get_company_buyer_details), same population the
-        # Demand section below counts -- deliberately NOT _company_buy_
-        # stats' intro_count, which is actual introductions, a
-        # different number by design.
+        # aggregation here). "Interested buyers" is the raw demand-pool
+        # interest count (get_company_buyer_details), same population
+        # the section nav's own "Interested buyers" link counts below --
+        # deliberately NOT _company_buy_stats' intro_count, which is
+        # actual introductions, a different number by design.
+        # "Active intros" is non_terminal_count -- a disclosed intro
+        # still in motion (not yet Won or Lost) -- the SAME vocabulary
+        # and the SAME number as the nav's "Active intros" link and My
+        # Deals' "Active intros" column (see render_my_deals_page).
         company_stats_for_tenant = (_company_buy_stats(person_id, company, intro_details, tenant_email=anon_key_email)
                                      if person_id is not None else
                                      {"intro_count": 0, "non_terminal_count": 0, "won_count": 0, "passed_count": 0, "raised": 0})
@@ -8800,8 +8810,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         raised_text = _fmt_money(company_stats_for_tenant["raised"]) if company_stats_for_tenant["raised"] else "—"
         company_stats_html = f"""<div class="card cd-stats-card">
       <h3>This company</h3>
-      <div class="cd-stat-row"><span>Buyers</span><span class="cd-stat-num">{buyer_total}</span></div>
-      <div class="cd-stat-row"><span>Live intros</span><span class="cd-stat-num">{company_stats_for_tenant["non_terminal_count"]}</span></div>
+      <div class="cd-stat-row"><span>Interested buyers</span><span class="cd-stat-num">{buyer_total}</span></div>
+      <div class="cd-stat-row"><span>Active intros</span><span class="cd-stat-num">{company_stats_for_tenant["non_terminal_count"]}</span></div>
       <div class="cd-stat-row"><span>Won</span><span class="cd-stat-num">{company_stats_for_tenant["won_count"]}</span></div>
       <div class="cd-stat-row"><span>Lost</span><span class="cd-stat-num">{company_stats_for_tenant["passed_count"]}</span></div>
       <div class="cd-stat-row"><span>Total raised</span><span class="cd-stat-num">{_esc(raised_text)}</span></div>
@@ -9030,14 +9040,15 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     {manual_edit_script}
   </section>"""
 
-    # Nav pass, item 3: the section-nav's "Buyers (N)" count is every
-    # intro this company page shows for the tenant -- Introduced +
-    # Closed out + Pending, company-wide -- not just the always-visible
-    # rows (closed_out_deals is included even though that section is
-    # collapsed by default). main_deals/pending_deals/closed_out_deals
-    # only exist when tenant is not None (see above); an admin with no
-    # &view_as never renders that table, so the nav count is 0.
-    buyers_nav_count = (len(main_deals) + len(pending_deals) + len(closed_out_deals)) if tenant is not None else 0
+    # Nav pass, item 3 (renamed for vocabulary consistency with the
+    # "This company" stats card and My Deals): the section-nav's
+    # "Active intros (N)" is the SAME non_terminal_count the stats card
+    # already shows -- a disclosed intro still in motion, Won/Lost
+    # excluded (those are broken out on the card, not folded into any
+    # nav total). company_stats_for_tenant only exists when tenant is
+    # not None (see above); an admin with no &view_as never renders
+    # that table, so the nav count is 0.
+    active_intros_nav_count = company_stats_for_tenant["non_terminal_count"] if tenant is not None else 0
 
     buyers = get_company_buyer_details(company)
     buyers.sort(key=lambda b: b["updated_at"] or "", reverse=True)
@@ -9477,7 +9488,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   <a class="cd-back" href="{back_href}">&larr; Back to {_esc(back_label)}</a>
   <h1>{_esc(company)}</h1>
   <p class="cd-subnav">
-    <a href="#deal-details">Deal details</a><span class="sep">·</span><a href="#buyers">Buyers ({buyers_nav_count})</a><span class="sep">·</span><a href="#demand">Demand ({len(buyers)})</a>
+    <a href="#deal-details">Deal details</a><span class="sep">·</span><a href="#buyers">Active intros ({active_intros_nav_count})</a><span class="sep">·</span><a href="#demand">Interested buyers ({len(buyers)})</a>
   </p>
   {feature_box_html}
   {your_deals_html}

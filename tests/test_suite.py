@@ -771,7 +771,7 @@ check("_message_page has no leftover dark bg", "#14161a" not in msg_page)
 # Item: Deal ID moved under the company name (own sub-line, not a
 # standalone column), Size column removed entirely, header order.
 head = page[page.find("<thead>"):page.find("</thead>")]
-expected_order = ["Company", "Visibility", "Buyers", "Intros", "Deadline", "Next Steps"]
+expected_order = ["Company", "Visibility", "Interested buyers", "Active intros", "Deadline", "Next Steps"]
 positions = [head.find(f">{h}<") for h in expected_order]
 check("header columns present in the exact expected order", positions == sorted(positions) and all(p != -1 for p in positions))
 check("Deal ID column header removed", "<th>Deal ID</th>" not in page)
@@ -792,9 +792,9 @@ check("sticky thead offset (top:0) present", "position: sticky;" in page and "to
 check("actions-stack still renders (Update/Hold/Cancel stacked)", 'class="actions-stack"' in page)
 check("action-chip column header is 'Next Steps'", "<th>Next Steps</th>" in page)
 check("table uses table-layout:fixed", "table-layout: fixed;" in page)
-check("num columns centered (Buyers/Intros use the .num class)",
-      '<th class="num">Buyers</th>' in page
-      and '<th class="num" title="All introductions made, including closed">Intros</th>' in page)
+check("num columns centered (Interested buyers/Active intros use the .num class)",
+      '<th class="num">Interested buyers</th>' in page
+      and '<th class="num" title="Introductions still in progress -- not yet Won or Lost">Active intros</th>' in page)
 check("deal-id-sub has a clear tap gap (margin-top)", "margin-top: 7px;" in page)
 
 # _fmt_short_date
@@ -2368,8 +2368,9 @@ elana_sell_only = [d for d in lf.get_my_deals(elana_tenant["person_id"])
                     if lf.DEAL_SIDE_SELL_ID in lf._deal_cf_option_ids(d, lf.DEAL_SIDE_FIELD)]
 page_elana_mydeals = lf.render_my_deals_page("Elana Investor", deals=elana_sell_only, key=None, view_as=None,
                                               person_id=elana_tenant["person_id"], anon_key_email=ELANA_EMAIL)
-check("Ticket 55422151: My Deals Intros column shows a count link '1', not '--'",
-      '<a class="mydeals-count-link" href="?company=Panthalassa&ref=mydeals#buyers">1</a>' in page_elana_mydeals)
+check("Ticket 55422151: My Deals Active intros column shows '—', since a Won intro is terminal, not active "
+      "(Won/Lost are each broken out on the company page and stats card instead)",
+      '<a class="mydeals-count-link" href="?company=Panthalassa&ref=mydeals#buyers">' not in page_elana_mydeals)
 
 page_elana_company = lf.render_company_page("Panthalassa", "Elana Investor", elana_tenant, ELANA_EMAIL, "mydeals",
                                              key=None, view_as=None, edit_mode=False)
@@ -3016,11 +3017,11 @@ check("Item 2: company page never gets a stalled-row class, even in admin edit m
 # --- Item 3: company-page section nav ---
 page_nav_company = lf.render_company_page("Nav Co", "Sella Seller", tenant_nav, TENANT_A_EMAIL, "mydeals",
                                            key=None, view_as=None, edit_mode=False)
-check("Item 3: section nav under the title links to Deal details / Buyers (N) / Demand (M)",
+check("Item 3: section nav under the title links to Deal details / Active intros (N) / Interested buyers (M)",
       '<p class="cd-subnav">' in page_nav_company
       and '<a href="#deal-details">Deal details</a>' in page_nav_company
-      and '<a href="#buyers">Buyers (2)</a>' in page_nav_company
-      and '<a href="#demand">Demand (2)</a>' in page_nav_company)
+      and '<a href="#buyers">Active intros (2)</a>' in page_nav_company
+      and '<a href="#demand">Interested buyers (2)</a>' in page_nav_company)
 
 # --- Item 4: no new cross-links from company-page buyer rows to Active Intros ---
 buyers_section_nav = page_nav_company[page_nav_company.find('id="buyers"'):page_nav_company.find('id="demand"')]
