@@ -2571,9 +2571,24 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     _raised_headline_stats uses) plus manual items with status Closed;
     a company-scoped mirror of that desk-wide figure. Closed-out
     (Lost/Trade Broken/Obsolete) deals never contribute -- those are a
-    disjoint, dead-outcome bucket by construction, never a won one."""
+    disjoint, dead-outcome bucket by construction, never a won one.
+
+    won_count/passed_count (the company-page "This company" stats card)
+    are the same per-deal loop split out into named buckets rather than
+    just summed into raised/intro_count: won_count is every disclosed
+    Closed intro (live matched Closed/won-stage, or manual Closed) --
+    exactly what raised is a dollar sum OF. passed_count is every
+    disclosed Passed/Withdrawn outcome -- live matched deals whose raw
+    status is explicitly Passed/Withdrawn on an otherwise-live stage,
+    every stage-based closed-out exit (Lost/Trade Broken/Obsolete, via
+    get_my_closed_out_buy_deals -- always a Passed/Withdrawn outcome by
+    construction, never Closed), and manual Passed/Withdrawn. Neither
+    changes live_intro_count/intro_count's own existing values or
+    counting rules -- both are additional, independently-scoped tallies
+    over the same already-iterated deals."""
     if person_id is None or not company_name:
-        return {"intro_count": 0, "live_intro_count": 0, "stalled": False, "raised": 0}
+        return {"intro_count": 0, "live_intro_count": 0, "stalled": False, "raised": 0,
+                "won_count": 0, "passed_count": 0}
     cache_key = (person_id, company_name.strip().lower(), intro_details is not None, tenant_email is not None)
     cached = _req_cache["company_stats"].get(cache_key)
     if cached is not None:
@@ -2582,19 +2597,25 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     live_intro_count = 0
     stalled = False
     raised = 0
+    won_count = 0
+    passed_count = 0
     for d in matched:
         entry = (intro_details.get(str(d.get("id"))) or {}) if intro_details is not None else None
         resolved = _resolve_intro_status(d, entry)
         if resolved["disclosed"]:
             live_intro_count += 1
             if _deal_intro_status_id(d) == INTRO_STATUS_CLOSED_ID or _deal_stage_id(d) in WON_STAGE_IDS:
+                won_count += 1
                 max_v = _deal_cf_number(d, TICKET_MAX_FIELD)
                 min_v = _deal_cf_number(d, TICKET_MIN_FIELD)
                 raised += max_v if max_v is not None else (min_v if min_v is not None else 0)
+            elif resolved["name"] in ("Passed", "Withdrawn"):
+                passed_count += 1
         if resolved["id"] == INTRO_STATUS_STALLED_ID:
             stalled = True
-    closed_out_intro_count = sum(
-        1 for d in get_my_closed_out_buy_deals(person_id, company_name) if _closed_out_disclosed(d))
+    closed_out_deals = get_my_closed_out_buy_deals(person_id, company_name)
+    closed_out_intro_count = sum(1 for d in closed_out_deals if _closed_out_disclosed(d))
+    passed_count += closed_out_intro_count
 
     manual_intro_count = 0
     if tenant_email:
@@ -2608,15 +2629,20 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
                 continue
             manual_intro_count += 1
             if resolved["name"] == "Closed":
+                won_count += 1
                 max_v = _deal_cf_number(fake_deal, TICKET_MAX_FIELD)
                 min_v = _deal_cf_number(fake_deal, TICKET_MIN_FIELD)
                 raised += max_v if max_v is not None else (min_v if min_v is not None else 0)
+            elif resolved["name"] in ("Passed", "Withdrawn"):
+                passed_count += 1
 
     stats = {
         "intro_count": live_intro_count + closed_out_intro_count + manual_intro_count,
         "live_intro_count": live_intro_count,
         "stalled": stalled,
         "raised": raised,
+        "won_count": won_count,
+        "passed_count": passed_count,
     }
     _req_cache["company_stats"][cache_key] = stats
     return stats
@@ -8355,9 +8381,38 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             )
         else:
             deals_body = '<div class="gg-placeholder small">No deals with this company yet.</div>'
+
+        # "This company" stats card -- company-level for this tenant,
+        # reusing _company_buy_stats' own already-computed split (no new
+        # aggregation here). Buyers is the raw demand-pool interest
+        # count (get_company_buyer_details), same population the
+        # Demand section below counts -- deliberately NOT _company_buy_
+        # stats' intro_count, which is actual introductions, a
+        # different number by design.
+        company_stats_for_tenant = (_company_buy_stats(person_id, company, intro_details, tenant_email=anon_key_email)
+                                     if person_id is not None else
+                                     {"intro_count": 0, "won_count": 0, "passed_count": 0, "raised": 0})
+        buyer_total = len(get_company_buyer_details(company))
+        raised_text = _fmt_money(company_stats_for_tenant["raised"]) if company_stats_for_tenant["raised"] else "—"
+        company_stats_html = f"""<div class="card cd-stats-card">
+      <h3>This company</h3>
+      <div class="cd-stat-row"><span>Buyers</span><span class="cd-stat-num">{buyer_total}</span></div>
+      <div class="cd-stat-row"><span>Introduced</span><span class="cd-stat-num">{company_stats_for_tenant["intro_count"]}</span></div>
+      <div class="cd-stat-row"><span>Won</span><span class="cd-stat-num">{company_stats_for_tenant["won_count"]}</span></div>
+      <div class="cd-stat-row"><span>Passed</span><span class="cd-stat-num">{company_stats_for_tenant["passed_count"]}</span></div>
+      <div class="cd-stat-row"><span>Total raised</span><span class="cd-stat-num">{_esc(raised_text)}</span></div>
+    </div>"""
+
         your_deals_html = f"""<section class="cd-section" id="deal-details">
     <h2>Deal Details</h2>
-    {deals_body}
+    <div class="cd-details-grid">
+      <div class="cd-details-col">
+        {deals_body}
+      </div>
+      <div class="cd-stats-col">
+        {company_stats_html}
+      </div>
+    </div>
   </section>"""
 
         matched_deals = get_my_matched_buy_deals(person_id, company) if person_id is not None else []
@@ -8646,6 +8701,32 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     font-weight: 600;
     margin: 0 0 12px;
   }}
+  .cd-details-grid {{ display: flex; align-items: stretch; gap: 24px; }}
+  .cd-details-col {{ flex: 0 1 60%; max-width: 60%; min-width: 0; }}
+  .cd-stats-col {{ flex: 1 1 0; min-width: 200px; display: flex; }}
+  @media (max-width: 640px) {{
+    .cd-details-grid {{ flex-direction: column; }}
+    .cd-details-col, .cd-stats-col {{ flex: 1 1 auto; max-width: 100%; }}
+  }}
+  .cd-stats-card {{ padding: 20px 22px; flex: 1; }}
+  .cd-stats-card h3 {{
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    font-weight: 600;
+    margin: 0 0 14px;
+  }}
+  .cd-stat-row {{
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--line);
+    font-size: 14px;
+  }}
+  .cd-stat-row:last-child {{ border-bottom: none; }}
+  .cd-stat-num {{ font-weight: 700; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--line);
