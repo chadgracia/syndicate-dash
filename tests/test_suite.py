@@ -100,12 +100,16 @@ class FakeS3:
         self.objs = objs
         self.last_modified = last_modified or {}
         self.put_calls = []
+        self.multipart_calls = []  # [{"key", "parts": [bytes, ...], "aborted": bool}], one per upload id
+        self._multipart_uploads = {}
+        self._next_upload_id = 1
 
     def get_object(self, Bucket, Key):
         # ContentLength included (real S3 always returns it) so the
         # perf report's byte-size logging (TIMING line, item 6) has
         # something real to read in tests.
-        return {"Body": FakeBody(self.objs[Key]), "ContentLength": len(json.dumps(self.objs[Key]))}
+        return {"Body": FakeBody(self.objs[Key]), "ContentLength": len(json.dumps(self.objs[Key])),
+                "LastModified": self.last_modified.get(Key, datetime.now(timezone.utc))}
 
     def head_object(self, Bucket, Key):
         return {"LastModified": self.last_modified.get(Key, datetime.now(timezone.utc))}
@@ -118,6 +122,35 @@ class FakeS3:
         parsed = json.loads(Body.decode("utf-8") if isinstance(Body, bytes) else Body)
         self.objs[Key] = parsed
         self.put_calls.append({"Key": Key, "ContentType": ContentType})
+
+    # ── Multipart upload (see _write_closed_deals_cache_to_s3) ──────────
+    # Real S3 requires every non-final part to be >=5MB; this fake
+    # doesn't enforce that (tests use small fixtures well under the
+    # threshold), it just assembles whatever parts arrive, in
+    # PartNumber order, exactly like the real API does on complete.
+    def create_multipart_upload(self, Bucket, Key, ContentType=None):
+        upload_id = f"upload-{self._next_upload_id}"
+        self._next_upload_id += 1
+        self._multipart_uploads[upload_id] = {"key": Key, "parts": {}}
+        self.multipart_calls.append({"key": Key, "upload_id": upload_id, "aborted": False})
+        return {"UploadId": upload_id}
+
+    def upload_part(self, Bucket, Key, UploadId, PartNumber, Body):
+        self._multipart_uploads[UploadId]["parts"][PartNumber] = Body
+        return {"ETag": f'"etag-{UploadId}-{PartNumber}"'}
+
+    def complete_multipart_upload(self, Bucket, Key, UploadId, MultipartUpload):
+        parts_by_number = self._multipart_uploads[UploadId]["parts"]
+        ordered = [parts_by_number[p["PartNumber"]] for p in MultipartUpload["Parts"]]
+        body = b"".join(ordered)
+        self.objs[Key] = json.loads(body.decode("utf-8"))
+        del self._multipart_uploads[UploadId]
+
+    def abort_multipart_upload(self, Bucket, Key, UploadId):
+        self._multipart_uploads.pop(UploadId, None)
+        for call in self.multipart_calls:
+            if call["upload_id"] == UploadId:
+                call["aborted"] = True
         return {}
 
 
@@ -4364,6 +4397,14 @@ def cd_deal(deal_id, stage_id, company="Test Co", buyer_pid=70001):
             "people": [{"id": buyer_pid}], "updated_at": "2026-08-01T00:00:00Z"}
 
 
+def cd_iso(seconds_ago=0):
+    """last_updated-shaped ISO 8601 UTC timestamp, `seconds_ago` in the
+    past -- matches the {"last_updated": ..., "deals": [...]} cache file
+    shape _read_closed_deals_cache_from_s3/_decide_closed_deals_fetch_
+    mode expect (never a raw epoch float)."""
+    return (datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 # --- Pagination: 5 records across 3 pages (per_page overridden to 2).
 orig_per_page = lf.CLOSED_DEALS_PER_PAGE
 lf.CLOSED_DEALS_PER_PAGE = 2
@@ -4414,7 +4455,8 @@ check("missing custom_fields: only the good record kept", [d["id"] for d in cd_s
 check("missing custom_fields: skip counted", cd_skip_stats["skipped_missing_custom_fields"] == 1)
 check("missing custom_fields: record_count reflects only kept records", cd_skip_stats["record_count"] == 1)
 
-# --- get_closed_deals_list: fresh fetch -> writes through to S3.
+# --- get_closed_deals_list: fresh fetch (no cache at all) -> full pull,
+# streamed to S3 via multipart upload, never put_object.
 cd_write_deal = cd_deal(83001, 111802, company="Write Co")
 cd_s3, cd_table = use_fixture({lf.DEALS_KEY: {"deals": []}})
 lf._closed_deals_cache["fetched_at"] = None
@@ -4422,10 +4464,12 @@ lf._closed_deals_cache["deals"] = None
 lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_write_deal], [])
 cd_fetched = lf.get_closed_deals_list()
 check("S3 write: fetched list is correct", [d["id"] for d in cd_fetched] == [83001])
-check("S3 write: put_object called once for CLOSED_DEALS_KEY",
-      [c["Key"] for c in cd_s3.put_calls] == [lf.CLOSED_DEALS_KEY])
-check("S3 write: written object is readable back with the same deals",
-      cd_s3.objs[lf.CLOSED_DEALS_KEY]["deals"][0]["id"] == 83001)
+check("S3 write: went through multipart upload, never put_object",
+      len(cd_s3.multipart_calls) == 1 and cd_s3.put_calls == [])
+check("S3 write: multipart upload was not aborted", cd_s3.multipart_calls[0]["aborted"] is False)
+check("S3 write: written object shape is {last_updated, deals}, readable back",
+      "last_updated" in cd_s3.objs[lf.CLOSED_DEALS_KEY]
+      and cd_s3.objs[lf.CLOSED_DEALS_KEY]["deals"][0]["id"] == 83001)
 
 # --- Same warm container, second invocation: TTL not expired -> reused
 # from the in-memory dict, zero S3 or Pipeline calls.
@@ -4442,7 +4486,7 @@ check("warm TTL reuse: same list returned with zero I/O", [d["id"] for d in cd_r
 cd_cached_deal = cd_deal(84001, 111801, company="Cached Co")
 cd_s3b, _ = use_fixture({
     lf.DEALS_KEY: {"deals": []},
-    lf.CLOSED_DEALS_KEY: {"deals": [cd_cached_deal], "fetched_at": time.time(), "stats": {}},
+    lf.CLOSED_DEALS_KEY: {"deals": [cd_cached_deal], "last_updated": cd_iso(0)},
 })
 lf._closed_deals_cache["fetched_at"] = None
 lf._closed_deals_cache["deals"] = None
@@ -4450,27 +4494,49 @@ lf.urllib.request.urlopen = _cd_raise
 cd_from_s3 = lf.get_closed_deals_list()
 check("fresh S3 cache: served without any Pipeline call", [d["id"] for d in cd_from_s3] == [84001])
 
-# --- S3 cache read: a stale cached object triggers a fresh Pipeline fetch.
+# --- S3 cache read: a stale-but-within-7-days cached object triggers an
+# INCREMENTAL refresh -- merged with, not replacing, the existing cache
+# (a deal Pipeline doesn't mention this round stays exactly as it was).
 cd_stale_deal = cd_deal(85001, 111801, company="Stale Co")
 cd_fresh_deal = cd_deal(85002, 111801, company="Refreshed Co")
 cd_s3c, _ = use_fixture({
     lf.DEALS_KEY: {"deals": []},
-    lf.CLOSED_DEALS_KEY: {"deals": [cd_stale_deal], "fetched_at": time.time() - lf.CLOSED_DEALS_TTL_SECONDS - 10,
-                           "stats": {}},
+    lf.CLOSED_DEALS_KEY: {"deals": [cd_stale_deal], "last_updated": cd_iso(lf.CLOSED_DEALS_TTL_SECONDS + 10)},
 })
 lf._closed_deals_cache["fetched_at"] = None
 lf._closed_deals_cache["deals"] = None
-lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_fresh_deal], [])
+cd_incr_calls = []
+lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_fresh_deal], cd_incr_calls)
 cd_refreshed = lf.get_closed_deals_list()
-check("stale S3 cache: triggers a real refetch, not the stale record",
-      [d["id"] for d in cd_refreshed] == [85002])
+check("stale-but-recent S3 cache: incremental refresh merges in the new record",
+      {d["id"] for d in cd_refreshed} == {85001, 85002})
+check("incremental refresh's request carries conditions[deal_updated][from_date]",
+      "conditions[deal_updated][from_date]" in cd_urls_query(cd_incr_calls[0]))
+
+# --- S3 cache older than the 7-day full-repull threshold -> FULL pull,
+# replacing the cache wholesale (an id the new fetch doesn't mention is
+# dropped, unlike the incremental-merge case above).
+cd_old_deal = cd_deal(86001, 111801, company="Ancient Co")
+cd_full_deal = cd_deal(86002, 111801, company="Fresh Full-Pull Co")
+cd_s3f, _ = use_fixture({
+    lf.DEALS_KEY: {"deals": []},
+    lf.CLOSED_DEALS_KEY: {"deals": [cd_old_deal], "last_updated": cd_iso(lf.CLOSED_DEALS_FULL_REPULL_SECONDS + 10)},
+})
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+cd_full_calls = []
+lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_full_deal], cd_full_calls)
+cd_full_refreshed = lf.get_closed_deals_list()
+check("cache older than 7 days: full pull replaces the cache wholesale (old id dropped)",
+      [d["id"] for d in cd_full_refreshed] == [86002])
+check("full pull's request carries no conditions[deal_updated][from_date]",
+      "conditions[deal_updated][from_date]" not in cd_urls_query(cd_full_calls[0]))
 
 # --- Fail-soft: Pipeline down, but a stale S3 cache exists -> serves the
 # stale list rather than erroring or going empty.
 cd_s3d, _ = use_fixture({
     lf.DEALS_KEY: {"deals": []},
-    lf.CLOSED_DEALS_KEY: {"deals": [cd_stale_deal], "fetched_at": time.time() - lf.CLOSED_DEALS_TTL_SECONDS - 10,
-                           "stats": {}},
+    lf.CLOSED_DEALS_KEY: {"deals": [cd_stale_deal], "last_updated": cd_iso(lf.CLOSED_DEALS_TTL_SECONDS + 10)},
 })
 lf._closed_deals_cache["fetched_at"] = None
 lf._closed_deals_cache["deals"] = None
@@ -4478,6 +4544,23 @@ lf.urllib.request.urlopen = make_closed_deals_urlopen([], [], fail=True)
 cd_fail_with_stale = lf.get_closed_deals_list()
 check("fail-soft with stale S3 cache: falls back to the stale list, no raise",
       [d["id"] for d in cd_fail_with_stale] == [85001])
+
+# --- Multipart write failure (e.g. complete_multipart_upload erroring)
+# aborts the upload and fails soft -- the freshly fetched list is still
+# returned/used for this invocation regardless of the write outcome.
+cd_s3g, _ = use_fixture({lf.DEALS_KEY: {"deals": []}})
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+def _cd_broken_complete(Bucket, Key, UploadId, MultipartUpload):
+    raise RuntimeError("simulated S3 failure")
+cd_s3g.complete_multipart_upload = _cd_broken_complete
+cd_abort_deal = cd_deal(87001, 111801, company="Abort Co")
+lf.urllib.request.urlopen = make_closed_deals_urlopen([cd_abort_deal], [])
+cd_after_write_failure = lf.get_closed_deals_list()
+check("write failure: fetched list still used for this invocation despite the write failing",
+      [d["id"] for d in cd_after_write_failure] == [87001])
+check("write failure: multipart upload was aborted", cd_s3g.multipart_calls[0]["aborted"] is True)
+check("write failure: nothing landed in S3 (object never completed)", lf.CLOSED_DEALS_KEY not in cd_s3g.objs)
 
 # --- Fail-soft: Pipeline down, no cache anywhere -> empty list, no raise,
 # page still renders.

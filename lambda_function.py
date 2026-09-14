@@ -769,9 +769,13 @@ PIPELINE_API_BASE = "https://api.pipelinecrm.com/api/v3"
 # params, and envelope shape ({"entries":[...],"pagination":{"page",
 # "per_page","total","url"}}, no next-page flag) all given directly by
 # Chad. per_page is Pipeline's own hard limit, not a choice made here.
-CLOSED_DEALS_TTL_SECONDS = 3600
+# TTL/full-repull/multipart-threshold all mirror Chad's console-only
+# crm-snapshot Lambda's own proven pattern for this same API.
+CLOSED_DEALS_TTL_SECONDS = 6 * 3600
+CLOSED_DEALS_FULL_REPULL_SECONDS = 7 * 24 * 3600
 CLOSED_DEALS_PER_PAGE = 200
 CLOSED_DEALS_MAX_PAGES = 50
+CLOSED_DEALS_MULTIPART_THRESHOLD_BYTES = 5 * 1024 * 1024
 
 # Shared with chadgracia/trades and chadgracia/portfolio-deploy: signs both
 # the trades gg_id identity cookie and the ?sso= handoff token. Never in
@@ -1514,23 +1518,29 @@ def _closed_deals_cache_token():
     return _closed_deals_cache["fetched_at"]
 
 
-def _pipeline_fetch_deals_page(stage_ids, page, per_page):
+def _pipeline_fetch_deals_page(stage_ids, page, per_page, updated_from=None):
     """One page of GET /deals.json filtered to `stage_ids` via repeated
-    conditions[deal_stage][] query params -- exact shape Chad confirmed
-    (list-deals has no other documented filter/pagination form). Same
-    query-string auth as every other Pipeline call in this file.
-    Returns (entries_list_or_None, total_or_None, error_message)."""
+    conditions[deal_stage][] query params, plus (when given)
+    conditions[deal_updated][from_date]=<updated_from> for an
+    incremental refresh -- exact shapes Chad confirmed. Same query-
+    string auth as every other Pipeline call in this file. 30s timeout,
+    no retry/backoff/429 handling, mirroring Chad's console-only
+    crm-snapshot Lambda's own proven pattern against this same API
+    (throttling hasn't been an issue there). Returns (entries_list_or_
+    None, total_or_None, error_message)."""
     if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
         return None, None, "Pipeline API credentials not configured"
     params = [("api_key", PIPELINE_API_KEY), ("app_key", PIPELINE_APP_KEY),
               ("page", page), ("per_page", per_page)]
     for sid in stage_ids:
         params.append(("conditions[deal_stage][]", sid))
+    if updated_from:
+        params.append(("conditions[deal_updated][from_date]", updated_from))
     qs = urllib.parse.urlencode(params)
     req = urllib.request.Request(f"{PIPELINE_API_BASE}/deals.json?{qs}", method="GET")
     try:
         _perf_count("pipeline_api_call")
-        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=20) as r:
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=30) as r:
             if not (200 <= r.status < 300):
                 return None, None, f"HTTP {r.status}"
             try:
@@ -1550,21 +1560,20 @@ def _pipeline_fetch_deals_page(stage_ids, page, per_page):
     return data["entries"], total, None
 
 
-def _fetch_all_pages_for_stage_ids(stage_ids, per_page, max_pages):
-    """Pages GET /deals.json for `stage_ids` until every record
-    pagination.total names has been collected, per Chad ("no next-page
-    flag -- loop while page*per_page < total, i.e. keep fetching until
-    you've collected total records"). Capped at max_pages as a guard
-    against a runaway loop if total is ever wrong; stops on any
-    non-2xx. Returns (entries_list, error_message) -- error_message is
-    set only on a hard failure (a page request itself erroring); a page
-    that comes back empty before total is reached just ends the loop
-    early rather than erroring."""
+def _fetch_all_pages_for_stage_ids(stage_ids, per_page, max_pages, updated_from=None):
+    """Pages GET /deals.json for `stage_ids` until kept >= pagination.
+    total (per Chad's crm-snapshot pattern -- no next-page flag in the
+    envelope). Capped at max_pages as a guard against a runaway loop if
+    total is ever wrong; stops on any non-2xx. Returns (entries_list,
+    error_message) -- error_message is set only on a hard failure (a
+    page request itself erroring); a page that comes back empty before
+    total is reached just ends the loop early rather than erroring."""
     entries = []
     page = 1
     total = None
     while True:
-        page_entries, page_total, err = _pipeline_fetch_deals_page(stage_ids, page, per_page)
+        page_entries, page_total, err = _pipeline_fetch_deals_page(stage_ids, page, per_page,
+                                                                     updated_from=updated_from)
         if err is not None:
             return entries, err
         if page_total is not None:
@@ -1580,20 +1589,23 @@ def _fetch_all_pages_for_stage_ids(stage_ids, per_page, max_pages):
     return entries, None
 
 
-def _pipeline_fetch_closed_deals():
-    """Fetch every terminal-stage deal from Pipeline. Tries the combined
-    conditions[deal_stage][] filter (all six ids, one paginated fetch)
-    first; if that comes back carrying any entry OUTSIDE
-    TERMINAL_STAGE_IDS, treats the filter as unverified and falls back
-    to Chad's alternative -- one paginated fetch per stage id, merged
-    and de-duped by deal id. Entries missing custom_fields are skipped
-    and counted rather than guessed at, per Chad ("skip it and report
-    rather than guessing"). Returns (deals_list_or_None, stats_dict,
-    error_message); stats_dict carries record_count, page_size,
-    skipped_missing_custom_fields, and which_filter ("combined" or
-    "per-stage") so the caller can report exactly what ran."""
+def _pipeline_fetch_closed_deals(updated_from=None):
+    """Fetch terminal-stage deals from Pipeline -- every one when
+    updated_from is None (a full pull), else only those updated since
+    updated_from (an incremental refresh, still stage-filtered the same
+    way). Tries the combined conditions[deal_stage][] filter (all six
+    ids, one paginated fetch) first; if that comes back carrying any
+    entry OUTSIDE TERMINAL_STAGE_IDS, treats the filter as unverified
+    and falls back to Chad's alternative -- one paginated fetch per
+    stage id, merged and de-duped by deal id. Entries missing
+    custom_fields are skipped and counted rather than guessed at, per
+    Chad ("skip it and report rather than guessing"). Returns
+    (deals_list_or_None, stats_dict, error_message); stats_dict carries
+    record_count, page_size, skipped_missing_custom_fields, and
+    which_filter ("combined" or "per-stage") so the caller can report
+    exactly what ran."""
     entries, err = _fetch_all_pages_for_stage_ids(
-        sorted(TERMINAL_STAGE_IDS), CLOSED_DEALS_PER_PAGE, CLOSED_DEALS_MAX_PAGES)
+        sorted(TERMINAL_STAGE_IDS), CLOSED_DEALS_PER_PAGE, CLOSED_DEALS_MAX_PAGES, updated_from=updated_from)
     if err is not None:
         return None, None, err
 
@@ -1604,7 +1616,7 @@ def _pipeline_fetch_closed_deals():
         per_stage_err = None
         for sid in sorted(TERMINAL_STAGE_IDS):
             stage_entries, stage_err = _fetch_all_pages_for_stage_ids(
-                [sid], CLOSED_DEALS_PER_PAGE, CLOSED_DEALS_MAX_PAGES)
+                [sid], CLOSED_DEALS_PER_PAGE, CLOSED_DEALS_MAX_PAGES, updated_from=updated_from)
             if stage_err is not None:
                 per_stage_err = stage_err
                 continue
@@ -1633,11 +1645,29 @@ def _pipeline_fetch_closed_deals():
     return kept, stats, None
 
 
+def _merge_closed_deals_by_id(existing_deals, new_deals):
+    """Upsert `new_deals` into `existing_deals` by id -- an incremental
+    refresh's own records win over the stale copies they replace; any
+    deal id `new_deals` doesn't mention stays exactly as it was."""
+    by_id = {}
+    for d in existing_deals or []:
+        if isinstance(d, dict) and d.get("id") is not None:
+            by_id[d.get("id")] = d
+    for d in new_deals or []:
+        if isinstance(d, dict) and d.get("id") is not None:
+            by_id[d.get("id")] = d
+    return list(by_id.values())
+
+
 def _read_closed_deals_cache_from_s3(s3):
     """Best-effort read of the last-written closed-deals cache object --
     a missing key (first deploy, or the write path has never
     succeeded) or any parse problem is treated as "nothing cached yet"
-    rather than raised, per this feature's fail-soft contract."""
+    rather than raised, per this feature's fail-soft contract. File
+    shape is {"last_updated": "<ISO 8601 UTC>", "deals": [...]} --
+    last_updated is both the S3-cache staleness marker AND the value
+    handed straight back to Pipeline as conditions[deal_updated]
+    [from_date] on the next incremental refresh."""
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=CLOSED_DEALS_KEY)
         data = json.loads(obj["Body"].read())
@@ -1648,20 +1678,126 @@ def _read_closed_deals_cache_from_s3(s3):
     return data
 
 
-def _write_closed_deals_cache_to_s3(s3, deals, stats):
-    """Best-effort write-back of a freshly fetched closed-deals list.
-    Failure here (e.g. this Lambda's role lacking s3:PutObject on
-    CLOSED_DEALS_KEY) must never break the page -- the freshly fetched
-    list is already being used for this invocation and every warm one
-    until the TTL expires again either way; this write only spares the
-    NEXT cold start (or a different warm container) an extra Pipeline
-    round trip."""
-    body = json.dumps({"deals": deals, "fetched_at": time.time(), "stats": stats}).encode("utf-8")
+def _write_closed_deals_cache_to_s3(s3, deals, last_updated):
+    """Streams {"last_updated": ..., "deals": [...]} to S3 via multipart
+    upload (create_multipart_upload / upload_part / complete_multipart_
+    upload) instead of building the whole ~3000-record JSON payload in
+    memory for one put_object call -- mirrors Chad's console-only
+    crm-snapshot Lambda's own proven pattern against this same S3 key
+    shape, and is the fix for the write silently never landing
+    (NoSuchKey on every read) despite the fetch itself succeeding.
+    Buffers each deal's JSON and flushes a part whenever the buffered
+    BYTES (not chars -- S3 requires each non-final part to be >=5MB)
+    exceed CLOSED_DEALS_MULTIPART_THRESHOLD_BYTES. Aborts the upload on
+    any exception rather than leaving an orphaned incomplete multipart
+    upload sitting in the bucket. Best-effort: a write failure here
+    must never break the page -- the freshly fetched list is already
+    in use for this invocation and every warm one until the TTL expires
+    again either way; this write only spares the NEXT cold start (or a
+    different warm container) an extra Pipeline round trip. Returns
+    True/False so the caller can log/report the outcome honestly."""
+    upload_id = None
     try:
-        s3.put_object(Bucket=BUCKET, Key=CLOSED_DEALS_KEY, Body=body,
-                       ContentType="application/json")
+        create_resp = s3.create_multipart_upload(Bucket=BUCKET, Key=CLOSED_DEALS_KEY,
+                                                   ContentType="application/json")
+        upload_id = create_resp["UploadId"]
+        parts = []
+        part_number = 1
+        buf = []
+        buf_len = 0
+
+        def flush():
+            nonlocal buf, buf_len, part_number
+            if not buf:
+                return
+            body = b"".join(buf)
+            resp = s3.upload_part(Bucket=BUCKET, Key=CLOSED_DEALS_KEY, UploadId=upload_id,
+                                   PartNumber=part_number, Body=body)
+            parts.append({"ETag": resp["ETag"], "PartNumber": part_number})
+            part_number += 1
+            buf = []
+            buf_len = 0
+
+        header = f'{{"last_updated": {json.dumps(last_updated)}, "deals": ['.encode("utf-8")
+        buf.append(header)
+        buf_len += len(header)
+        for i, d in enumerate(deals):
+            chunk = (("" if i == 0 else ",") + json.dumps(d, default=str)).encode("utf-8")
+            buf.append(chunk)
+            buf_len += len(chunk)
+            if buf_len > CLOSED_DEALS_MULTIPART_THRESHOLD_BYTES:
+                flush()
+        buf.append(b"]}")
+        flush()  # final part -- sent even if small, required to complete
+
+        s3.complete_multipart_upload(Bucket=BUCKET, Key=CLOSED_DEALS_KEY, UploadId=upload_id,
+                                      MultipartUpload={"Parts": parts})
+        return True
     except Exception:
-        pass
+        if upload_id is not None:
+            try:
+                s3.abort_multipart_upload(Bucket=BUCKET, Key=CLOSED_DEALS_KEY, UploadId=upload_id)
+            except Exception:
+                pass
+        return False
+
+
+def _decide_closed_deals_fetch_mode(s3_cached, now):
+    """(mode, updated_from): "full" (no usable cache, or the cache's own
+    last_updated is older than CLOSED_DEALS_FULL_REPULL_SECONDS) with
+    updated_from=None, or "incremental" (a fresh-enough cache exists to
+    merge into) with updated_from set to that cache's own last_updated,
+    handed straight to Pipeline as the updated-since filter."""
+    if s3_cached is None:
+        return "full", None
+    last_updated_dt = _parse_dt(s3_cached.get("last_updated"))
+    if last_updated_dt is None:
+        return "full", None
+    age = now - last_updated_dt.timestamp()
+    if age > CLOSED_DEALS_FULL_REPULL_SECONDS:
+        return "full", None
+    return "incremental", s3_cached.get("last_updated")
+
+
+def _refresh_closed_deals_cache(s3, s3_cached, now):
+    """Runs one fetch-and-write cycle unconditionally -- no TTL check
+    here, that's get_closed_deals_list's own job before ever calling
+    this; _handle_debug_closed calls this directly, bypassing the TTL,
+    so an admin can watch a full pull followed by an incremental one
+    back-to-back without waiting out the TTL between them. Decides
+    full vs incremental (_decide_closed_deals_fetch_mode) from the
+    ALREADY-READ s3_cached the caller passes in -- never re-reads S3
+    itself. Returns (deals_list, mode_or_None, error_or_None); mode is
+    None only when the fetch itself failed, in which case deals_list is
+    the best already-known fallback (stale S3 cache, else the warm-
+    container copy, else [])."""
+    mode, updated_from = _decide_closed_deals_fetch_mode(s3_cached, now)
+
+    fetched, stats, err = _pipeline_fetch_closed_deals(updated_from=updated_from)
+    if err is not None or fetched is None:
+        fallback = (s3_cached.get("deals") if s3_cached is not None
+                    else _closed_deals_cache["deals"])
+        deals = fallback if fallback is not None else []
+        print(f"CLOSED_DEALS_FETCH_FAILED mode={mode} error={err!r} fallback_count={len(deals)}")
+        return deals, None, err
+
+    merged = (_merge_closed_deals_by_id(s3_cached["deals"], fetched)
+              if mode == "incremental" and s3_cached is not None else fetched)
+    last_updated = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    print(f"CLOSED_DEALS_FETCH_OK mode={mode} fetched_this_call={stats['record_count']} "
+          f"total_after_merge={len(merged)} page_size={stats['page_size']} "
+          f"skipped_missing_custom_fields={stats['skipped_missing_custom_fields']} "
+          f"filter={stats['which_filter']}")
+
+    with _perf_timer("s3_closed_deals_write"):
+        write_ok = _write_closed_deals_cache_to_s3(s3, merged, last_updated)
+    if not write_ok:
+        print(f"CLOSED_DEALS_WRITE_FAILED key={CLOSED_DEALS_KEY}")
+
+    _closed_deals_cache["fetched_at"] = now
+    _closed_deals_cache["deals"] = merged
+    return merged, mode, None
 
 
 def get_closed_deals_list():
@@ -1671,8 +1807,10 @@ def get_closed_deals_list():
     warm-container dict (_closed_deals_cache, TTL
     CLOSED_DEALS_TTL_SECONDS, no I/O at all); the S3 object this Lambda
     owns (CLOSED_DEALS_KEY), so a fleet of warm containers shares one
-    Pipeline fetch per hour instead of each paying for its own; and
-    only then a live Pipeline fetch. Every failure mode (Pipeline
+    Pipeline fetch per TTL window instead of each paying for its own;
+    and only then a live Pipeline fetch (full if the cache is missing
+    or older than CLOSED_DEALS_FULL_REPULL_SECONDS, else incremental --
+    see _refresh_closed_deals_cache). Every failure mode (Pipeline
     unreachable, S3 read/write failure, unexpected response shape)
     fails soft: falls back to the freshest already-known list (warm
     dict, else stale S3 cache, else empty), NEVER raises, so this
@@ -1695,32 +1833,16 @@ def get_closed_deals_list():
     with _perf_timer("s3_closed_deals"):
         s3_cached = _read_closed_deals_cache_from_s3(s3)
     if s3_cached is not None:
-        fetched_at = s3_cached.get("fetched_at")
-        if isinstance(fetched_at, (int, float)) and now - fetched_at < CLOSED_DEALS_TTL_SECONDS:
-            _closed_deals_cache["fetched_at"] = fetched_at
+        last_updated_dt = _parse_dt(s3_cached.get("last_updated"))
+        if last_updated_dt is not None and now - last_updated_dt.timestamp() < CLOSED_DEALS_TTL_SECONDS:
+            _closed_deals_cache["fetched_at"] = now
             _closed_deals_cache["deals"] = s3_cached["deals"]
             _req_cache["closed_deals"] = s3_cached["deals"]
             return s3_cached["deals"]
 
-    fetched, stats, err = _pipeline_fetch_closed_deals()
-    if err is not None or fetched is None:
-        fallback = (s3_cached.get("deals") if s3_cached is not None
-                    else _closed_deals_cache["deals"])
-        deals = fallback if fallback is not None else []
-        print(f"CLOSED_DEALS_FETCH_FAILED error={err!r} fallback_count={len(deals)}")
-        _req_cache["closed_deals"] = deals
-        return deals
-
-    print(f"CLOSED_DEALS_FETCH_OK record_count={stats['record_count']} "
-          f"page_size={stats['page_size']} "
-          f"skipped_missing_custom_fields={stats['skipped_missing_custom_fields']} "
-          f"filter={stats['which_filter']}")
-    _closed_deals_cache["fetched_at"] = now
-    _closed_deals_cache["deals"] = fetched
-    with _perf_timer("s3_closed_deals_write"):
-        _write_closed_deals_cache_to_s3(s3, fetched, stats)
-    _req_cache["closed_deals"] = fetched
-    return fetched
+    deals, _mode, _err = _refresh_closed_deals_cache(s3, s3_cached, now)
+    _req_cache["closed_deals"] = deals
+    return deals
 
 
 def _merge_deal_lists(live_deals, closed_deals):
@@ -1794,7 +1916,7 @@ def _raised_headline_stats():
     Cached against the same deals.json S3 object version get_deals_list
     already checks, PLUS _closed_deals_cache_token() -- the live
     snapshot's version alone can't detect a closed-deals-only refresh
-    (a warm container's hourly Pipeline re-fetch happening while
+    (a warm container's periodic Pipeline re-fetch happening while
     deals.json itself hasn't changed), so it must be folded into the
     cache key too or a newly-closed deal wouldn't count toward Raised
     until the container recycles. A fresh snapshot OR a fresh closed-
@@ -4393,38 +4515,39 @@ TERMINAL_STAGE_LABELS = {
 def _handle_debug_closed():
     """?debug_closed=1, admin-only (ADMIN_KEY gate checked by the
     caller). Diagnostic for the closed-deals S3 cache (CLOSED_DEALS_KEY)
-    -- a fresh, one-off S3 read, never the warm-container/request-scoped
-    get_closed_deals_list() (same "not the hot path" convention as
-    _handle_debug_deal), so this reports exactly what's sitting in S3
-    right now -- the last successful write's own output. If the key
-    doesn't exist yet (or any other read failure), reports that plainly
-    and runs a live fetch attempt on the spot so the admin sees what it
-    would produce, without waiting on the next natural cache miss.
-    text/plain throughout, same as _handle_debug_deal."""
+    that FORCES one fetch-and-write cycle on every call (bypassing
+    get_closed_deals_list's own TTL gate, via _refresh_closed_deals_
+    cache directly) rather than just reading whatever's already
+    cached -- so calling this twice in a row is the intended way to
+    watch the cache go from missing -> full pull, then full -> another
+    call's incremental refresh, without waiting out the TTL between
+    them. Reports whether the object existed before this call, which
+    fetch mode this call ran (full/incremental), the resulting object's
+    own LastModified/size, record count, counts by stage name, and the
+    first three ids. text/plain throughout, same as _handle_debug_deal."""
     s3 = _s3_client()
-    try:
-        obj = s3.get_object(Bucket=BUCKET, Key=CLOSED_DEALS_KEY)
-    except Exception as e:
-        fetched, stats, err = _pipeline_fetch_closed_deals()
+    s3_cached_before = _read_closed_deals_cache_from_s3(s3)
+    existed_before = s3_cached_before is not None
+
+    deals, mode, err = _refresh_closed_deals_cache(s3, s3_cached_before, time.time())
+
+    if mode is None:
         body = (
-            f"S3 object s3://{BUCKET}/{CLOSED_DEALS_KEY} does not exist or could not be read "
-            f"({type(e).__name__}: {e}).\n\n"
-            "Live fetch attempted just now: "
+            f"S3 object s3://{BUCKET}/{CLOSED_DEALS_KEY} "
+            + ("exists but this call's refresh failed.\n\n" if existed_before
+               else "does not exist yet, and this call's fetch failed.\n\n")
+            + f"Fetch error: {err}\n"
+            + (f"Falling back to the {len(deals)} already-cached record(s).\n" if existed_before else "")
         )
-        if err is not None:
-            body += f"FAILED -- {err}\n"
-        else:
-            body += (
-                f"OK -- record_count={stats['record_count']} page_size={stats['page_size']} "
-                f"skipped_missing_custom_fields={stats['skipped_missing_custom_fields']} "
-                f"filter={stats['which_filter']}\n"
-            )
         return {"statusCode": 200, "headers": {"Content-Type": "text/plain"}, "body": body}
 
-    last_modified = obj.get("LastModified")
-    size = obj.get("ContentLength")
-    data = json.loads(obj["Body"].read())
-    deals = data.get("deals", []) if isinstance(data, dict) else (data or [])
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=CLOSED_DEALS_KEY)
+        last_modified = obj.get("LastModified")
+        size = obj.get("ContentLength")
+    except Exception as e:
+        last_modified = f"(could not re-read: {type(e).__name__}: {e})"
+        size = None
 
     stage_counts = {}
     for d in deals:
@@ -4439,6 +4562,8 @@ def _handle_debug_closed():
 
     body = (
         f"S3 object: s3://{BUCKET}/{CLOSED_DEALS_KEY}\n"
+        f"Existed before this call: {existed_before}\n"
+        f"This call's fetch mode: {mode}\n"
         f"LastModified: {last_modified}\n"
         f"Size: {size} bytes\n\n"
         f"Deal records: {len(deals)}\n\n"
