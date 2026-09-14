@@ -2767,11 +2767,16 @@ check("get_firm_closed_sell_deals: the viewer's OWN won deal (910) excluded (alr
 colleague_rec = next(c for d, c in firm_pairs if d.get("id") == 911)
 check("get_firm_closed_sell_deals: colleague record is Marco", lf._person_display_name(colleague_rec) == "Marco Colleague")
 
-my_own_deals = [own_won_deal, live_own_deal]
+# Firm-level tenancy: render_my_deals_page now takes `deals` exactly as
+# the caller (lambda_handler's mydeals branch) fetches it -- via
+# get_firm_sell_deals, already firm-wide -- rather than bolting the
+# colleague's closed deal on internally. Mirror that real call here
+# instead of hand-building a personal-only list.
+firm_sell_deals = lf.get_firm_sell_deals(TENANT_A_PID)
 # body_only: the nav dropdown's own Closed group now also carries a "via
 # Marco" entry for the same firm-wide deal -- slice it off so the
 # occurrence count below reflects the actual table, not the nav.
-page_mydeals_firm = body_only(lf.render_my_deals_page("Sella Seller", deals=my_own_deals, key=None, view_as=None,
+page_mydeals_firm = body_only(lf.render_my_deals_page("Sella Seller", deals=firm_sell_deals, key=None, view_as=None,
                                                        edit_mode=False, person_id=TENANT_A_PID,
                                                        anon_key_email=TENANT_A_EMAIL))
 check("My Deals: Closed section count includes BOTH the personal (910) and firm (911) won deals",
@@ -2779,10 +2784,10 @@ check("My Deals: Closed section count includes BOTH the personal (910) and firm 
 check("My Deals: the firm-wide row shows a 'via Marco' chip", "via Marco" in page_mydeals_firm)
 check("My Deals: exactly one via-chip (only the firm row gets one, not the personal row)",
       page_mydeals_firm.count("via Marco") == 1)
-check("My Deals: 'Total closed' stays personal-scoped ($3M, not inflated by the firm row's $4M)",
-      "$3M" in page_mydeals_firm.split("Total closed")[1][:80])
-check("My Deals: 'Firm total closed' segment shown ($7M = $3M personal + $4M colleague)",
-      "Firm total closed" in page_mydeals_firm and "$7M" in page_mydeals_firm.split("Firm total closed")[1][:80])
+check("My Deals: 'Total closed' is now the merged firm-wide figure ($7M = $3M personal + $4M colleague -- "
+      "there's no separate personal/firm split anymore now that Active through Closed is one shared view; "
+      "the 'via Marco' chip is what tells a personal deal from a colleague's)",
+      "$7M" in page_mydeals_firm.split("Total closed")[1][:80])
 check("My Deals: net-per-share line on the personal Closed row ('9,524 sh @ $20.00 net')",
       "9,524 sh @ $20.00 net" in page_mydeals_firm)
 check("My Deals: no per-share line for the firm row (neither field set on that deal)",
@@ -3233,8 +3238,8 @@ check("TIMING: reports s3_people/s3_deals/s3_interest fetch+parse timings",
 check("TIMING: reports dynamo/pipeline_api/render/total",
       "dynamo=" in line1 and "pipeline_api=0.00s" in line1 and "render=" in line1 and "total=" in line1)
 check("TIMING: reports call counts for the named expensive functions",
-      "calls_get_my_deals=" in line1 and "calls_get_deals_list=" in line1
-      and "calls_get_my_matched_buy_deals=" in line1 and "calls_build_tenant_index=" in line1)
+      "calls_get_firm_deals=" in line1 and "calls_get_deals_list=" in line1
+      and "calls_get_firm_matched_buy_deals=" in line1 and "calls_build_tenant_index=" in line1)
 check("TIMING: no Pipeline API call happens on a normal page render",
       "calls_pipeline_api_call=" not in line1)
 
@@ -3297,22 +3302,30 @@ line_p12 = lines_p12[0]
 
 # Before these fixes (see the diagnostic report): calls_get_my_matched_
 # buy_deals=24, calls_get_my_deals=26, calls_get_deals_list=26 (cold),
-# for this same 12-company shape.
-check("Perf fix 2: get_deals_list's own call count collapses 26 -> 4 "
+# for this same 12-company shape. Firm-level tenancy then swapped My
+# Deals' read path from get_my_deals/get_my_matched_buy_deals to their
+# firm-scoped mirrors (get_firm_deals/get_firm_matched_buy_deals) --
+# same request-scoped-cache shape, so the same O(1)-per-ask argument
+# still holds, just under the new names -- and added one more
+# get_deals_list() ask (_firm_sell_person_ids_by_company's own scan,
+# itself still just one more request-cache hit, not a real fetch; see
+# below for the real S3 fetch count).
+check("Perf fix 2: get_deals_list's own call count collapses 26 -> 5 "
       "(only the head_object-and-parse path is entered more than once; see below for real fetch count -- "
       "3 -> 4 as of the nav's searchable tenant picker, which now computes the eligible-tenant list, "
-      "and so calls get_deals_list once more via _tenant_index, on every admin page)",
-      "calls_get_deals_list=4" in line_p12)
-check("Perf fix 1: get_my_deals's call count drops 26 -> 38 (get_my_matched_buy_deals' OWN "
-      "second set of 12 per-company calls now hit ITS cache before ever reaching get_my_deals -- "
-      "14 -> 38 as of the Intros-column fix, which also asks get_my_closed_out_buy_deals per "
-      "company, itself another get_my_deals call each time; every one of those 38 asks is still "
+      "and so calls get_deals_list once more via _tenant_index, on every admin page -- then 4 -> 5 as of "
+      "firm-level tenancy's _firm_sell_person_ids_by_company, which scans deals.json once more per request "
+      "to group the firm's own Sell deals by company)",
+      "calls_get_deals_list=5" in line_p12)
+check("Perf fix 1: get_firm_deals's call count is 26 (firm-level tenancy's mirror of get_my_deals -- "
+      "get_firm_matched_buy_deals' OWN second set of 12 per-company calls hit ITS cache before ever "
+      "reaching get_firm_deals, same as the old get_my_deals shape; every one of those asks is still "
       "an O(1) cache lookup, not an O(deals) rescan, per the real S3 fetch count checked below)",
-      "calls_get_my_deals=38" in line_p12)
-check("get_my_matched_buy_deals is still asked for once per company by both the dropdown "
+      "calls_get_firm_deals=26" in line_p12)
+check("get_firm_matched_buy_deals is still asked for once per company by both the dropdown "
       "and the page body (24, unchanged) -- two genuine callers, not a bug -- but each of "
       "those 24 asks is now an O(1) cache lookup instead of an O(deals) rescan (see below)",
-      "calls_get_my_matched_buy_deals=24" in line_p12)
+      "calls_get_firm_matched_buy_deals=24" in line_p12)
 
 # The real win get_deals_list's call count alone doesn't show: only the
 # FIRST of its 3 logical entries this request ever reaches the actual
@@ -5045,6 +5058,120 @@ check("Private notes: admin (view_as this tenant) sees the SAME note the tenant 
 
 check("Private notes: never leaked into Nora's (other tenant's) own partition",
       lf._get_buyer_note_item(PN_OTHER_TENANT_EMAIL, PN_BUYER_PID) is None)
+
+
+# ======================================================================
+# SECTION: Firm-level tenancy -- Natoli/Kevin at Mangusta Capital
+# ======================================================================
+# The live bug this covers: viewing as natoli@mangustacap.com showed
+# Kevin Jiang (a Mangusta colleague) as "the buyer" on AMI Labs/
+# Anthropic-style deals -- deals where Kevin was the one BUYING equity
+# from some unrelated third-party seller, nothing to do with Mangusta's
+# own sell-side book. Firm-level tenancy broadens SCOPE (colleagues
+# share one view of the firm's own Sell deals and the Buy deals matched
+# against them) but must NOT broaden a colleague's own, unrelated
+# Buy-side purchase into "one of the firm's intros" just because they
+# happen to work at the same firm as the viewing tenant.
+
+MANGUSTA_CID = 8800
+MANGUSTA_NATOLI_PID = 601001
+MANGUSTA_KEVIN_PID = 601002
+MANGUSTA_BUYER_PID = 601010          # legit buyer, matched against Mangusta's own sell deal
+MANGUSTA_OUTSIDE_SELLER_PID = 601020  # the real seller on Kevin's own AMI Labs purchase -- not Mangusta
+
+people_mangusta = {"people": [
+    {"id": MANGUSTA_NATOLI_PID, "full_name": "Natoli Silva", "email": "natoli@mangustacap.com",
+     "company_id": MANGUSTA_CID, "company_name": "Mangusta Capital", "custom_fields": {}},
+    {"id": MANGUSTA_KEVIN_PID, "first_name": "Kevin", "last_name": "Jiang", "email": "kevin@mangustacap.com",
+     "company_id": MANGUSTA_CID, "company_name": "Mangusta Capital", "custom_fields": {}},
+    {"id": MANGUSTA_BUYER_PID, "full_name": "Prime Capital Rep", "email": "buyer@primecapital.example",
+     "custom_fields": {}},
+    {"id": MANGUSTA_OUTSIDE_SELLER_PID, "full_name": "AMI Labs Founder", "email": "founder@amilabs.example",
+     "company_id": 990000, "company_name": "AMI Labs", "custom_fields": {}},
+]}
+
+# 1) Natoli's own Sell deal -- the firm's book, and her eligibility grant.
+deal_natoli_sell = {"id": 930001, "name": "Mangusta HoldCo Sell", "company": {"name": "Mangusta HoldCo"},
+                     "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                     "people": [{"id": MANGUSTA_NATOLI_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+# 2) Kevin's own Sell deal -- a DIFFERENT company, same firm. Proves
+#    "shared sell deals visible to both" (item 1/4): it should render
+#    on Natoli's My Deals (via a "via Kevin" chip) and vice versa.
+deal_kevin_sell = {"id": 930002, "name": "Kevin Ventures Sell", "company": {"name": "Kevin Ventures Co"},
+                    "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                    "people": [{"id": MANGUSTA_KEVIN_PID}], "updated_at": "2026-08-02T00:00:00Z"}
+# 3) A legitimate matched buyer against Natoli's OWN sell deal -- must
+#    keep showing up as an intro (baseline, unaffected by firm-scoping).
+deal_matched_intro = {"id": 930003, "name": "Prime Capital Match", "company": {"name": "Mangusta HoldCo"},
+                       "deal_stage": {"id": lf.STAGE_MATCHED},
+                       "custom_fields": cf_status(7207579),
+                       "people": [{"id": MANGUSTA_BUYER_PID}, {"id": MANGUSTA_NATOLI_PID}],
+                       "updated_at": "2026-08-03T00:00:00Z"}
+# 4) THE BUG: Kevin's own, unrelated Buy-side purchase of AMI Labs
+#    equity, matched against AMI Labs' own (non-Mangusta) seller. Kevin
+#    is the buyer here, not a seller of record for any Mangusta company
+#    -- this must never render as one of the firm's intros on ANY
+#    Mangusta colleague's page, Natoli's included.
+deal_kevin_buy_ami = {"id": 930004, "name": "Kevin buys AMI Labs", "company": {"name": "AMI Labs"},
+                       "deal_stage": {"id": lf.STAGE_MATCHED},
+                       "custom_fields": cf_status(7207579),
+                       "people": [{"id": MANGUSTA_KEVIN_PID}, {"id": MANGUSTA_OUTSIDE_SELLER_PID}],
+                       "updated_at": "2026-08-04T00:00:00Z"}
+
+use_fixture({lf.PEOPLE_KEY: people_mangusta, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [deal_natoli_sell, deal_kevin_sell, deal_matched_intro, deal_kevin_buy_ami]}})
+natoli_tenant = lf._resolve_tenant("natoli@mangustacap.com")
+assert natoli_tenant is not None
+kevin_tenant = lf._resolve_tenant("kevin@mangustacap.com")
+assert kevin_tenant is not None
+
+# --- 1) SCOPE: shared sell deals visible to both -----------------------
+natoli_sell_ids = {d.get("id") for d in lf.get_firm_sell_deals(MANGUSTA_NATOLI_PID)}
+kevin_sell_ids = {d.get("id") for d in lf.get_firm_sell_deals(MANGUSTA_KEVIN_PID)}
+check("Firm tenancy: Natoli's firm-wide sell deals include BOTH her own and Kevin's",
+      natoli_sell_ids == {930001, 930002})
+check("Firm tenancy: Kevin's firm-wide sell deals include BOTH his own and Natoli's (shared, symmetric)",
+      kevin_sell_ids == {930001, 930002})
+
+# --- 2) CRITICAL FIX: a colleague's own Buy deal is excluded ------------
+natoli_intro_ids = {d.get("id") for d in lf.get_firm_matched_buy_deals(MANGUSTA_NATOLI_PID)}
+check("Firm tenancy: the legit matched buyer against Natoli's own sell deal IS an intro",
+      930003 in natoli_intro_ids)
+check("CRITICAL FIX: Kevin's own AMI Labs purchase is NOT one of the firm's intros",
+      930004 not in natoli_intro_ids)
+check("_is_firm_intro_buy_deal: AMI Labs deal fails the company+seller match directly",
+      not lf._is_firm_intro_buy_deal(
+          deal_kevin_buy_ami, MANGUSTA_NATOLI_PID, lf._firm_person_ids(MANGUSTA_NATOLI_PID),
+          lf._firm_sell_person_ids_by_company(lf._firm_person_ids(MANGUSTA_NATOLI_PID))))
+
+# --- 3) No colleague ever rendered as "the buyer" on the tenant's page -
+intros_natoli_full = lf.render_intros_page("Natoli Silva", tenant=natoli_tenant, tenant_email="natoli@mangustacap.com",
+                                            key=None, view_as=None, edit_mode=False)
+# body_only: the nav's own My Deals quick-jump dropdown legitimately
+# lists Kevin's sell deal with a "via Kevin" chip (item 1/4 -- shared
+# sell-deal visibility, verified separately above) -- strip it off so
+# this checks the actual Buyers table, not the nav.
+intros_natoli = body_only(intros_natoli_full)
+check("Active Intros: the legit buyer's row is present", "Prime Capital" in intros_natoli or "Mangusta HoldCo" in intros_natoli)
+check("Active Intros: Kevin's own AMI Labs purchase never appears at all", "AMI Labs" not in intros_natoli)
+check("Active Intros: Kevin never rendered as a buyer identity on Natoli's page", "Kevin" not in intros_natoli)
+check("Active Intros: the outside AMI Labs seller never leaks onto Natoli's page either",
+      "AMI Labs Founder" not in intros_natoli)
+
+# --- ATTRIBUTION (item 2): the shared sell deal carries a "via Kevin" --
+mydeals_natoli = body_only(lf.render_my_deals_page(
+    "Natoli Silva", deals=lf.get_firm_sell_deals(MANGUSTA_NATOLI_PID), key=None, view_as=None,
+    edit_mode=False, person_id=MANGUSTA_NATOLI_PID, anon_key_email="natoli@mangustacap.com"))
+check("My Deals: Kevin's own sell deal shows a 'via Kevin' chip on Natoli's page",
+      "via Kevin" in mydeals_natoli)
+check("My Deals: Natoli's own sell deal carries no via-chip (it's genuinely hers)",
+      mydeals_natoli.count("via Kevin") == 1)
+
+mydeals_kevin = body_only(lf.render_my_deals_page(
+    "Kevin Jiang", deals=lf.get_firm_sell_deals(MANGUSTA_KEVIN_PID), key=None, view_as=None,
+    edit_mode=False, person_id=MANGUSTA_KEVIN_PID, anon_key_email="kevin@mangustacap.com"))
+check("My Deals: Natoli's sell deal shows a 'via Natoli' chip on Kevin's page (shared, symmetric)",
+      "via Natoli" in mydeals_kevin)
 
 
 # ======================================================================

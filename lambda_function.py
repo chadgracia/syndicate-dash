@@ -115,6 +115,8 @@ _req_cache = {
     "deals": None, "closed_deals": None, "people": None, "interest": None, "companies": None,
     "object_version": {}, "object_size": {},
     "my_deals": {}, "matched_buy_deals": {}, "company_stats": {},
+    "firm_person_ids": {}, "firm_sell_by_company": {}, "firm_deals": {},
+    "firm_matched_buy_deals": {}, "firm_closed_out_buy_deals": {},
 }
 
 
@@ -129,6 +131,11 @@ def _req_cache_reset():
     _req_cache["my_deals"] = {}
     _req_cache["matched_buy_deals"] = {}
     _req_cache["company_stats"] = {}
+    _req_cache["firm_person_ids"] = {}
+    _req_cache["firm_sell_by_company"] = {}
+    _req_cache["firm_deals"] = {}
+    _req_cache["firm_matched_buy_deals"] = {}
+    _req_cache["firm_closed_out_buy_deals"] = {}
 
 
 def _perf_start(page):
@@ -2005,7 +2012,7 @@ def _raised_headline_html(edit_mode=False):
     return f'<p class="raised-headline"{title_attr}>{_esc(headline_text)} closed for sellers through this desk</p>'
 
 
-def _dedupe_buy_deals_by_company_and_buyer(deals, tenant_person_id):
+def _dedupe_buy_deals_by_company_and_buyer(deals, tenant_person_id, firm_person_ids=None):
     """Collapse duplicate BUY-side deals for the same (company, buyer
     person) pair down to one -- the reported bug's exact shape (the
     same buyer added twice to the same company/deal, e.g. two real
@@ -2015,14 +2022,22 @@ def _dedupe_buy_deals_by_company_and_buyer(deals, tenant_person_id):
     newest-status record, per instruction ("prefer deal-derived over
     manual, newest status otherwise"). SELL deals and any BUY deal with
     no other linked person to key on pass through untouched -- only a
-    genuine buyer+company collision is collapsed."""
+    genuine buyer+company collision is collapsed.
+
+    firm_person_ids (get_firm_deals's caller) excludes every firm
+    person, not just tenant_person_id, from the buyer-id key -- without
+    this, the SAME buyer matched via two different colleagues' Sell
+    deals for one company would key on two different "everyone but the
+    seller" tuples and never collapse. Defaults to {tenant_person_id}
+    for get_my_deals's own single-person callers, unchanged."""
+    exclude = firm_person_ids if firm_person_ids is not None else {tenant_person_id}
     seen = set()
     out = []
     for d in deals:
         if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
             out.append(d)
             continue
-        buyer_ids = tuple(sorted(pid for pid in _deal_linked_person_ids(d) if pid != tenant_person_id))
+        buyer_ids = tuple(sorted(pid for pid in _deal_linked_person_ids(d) if pid not in exclude))
         if not buyer_ids:
             out.append(d)
             continue
@@ -2055,6 +2070,95 @@ def get_my_deals(person_id):
     mine = _dedupe_buy_deals_by_company_and_buyer(mine, person_id)
     _req_cache["my_deals"][person_id] = mine
     return mine
+
+
+def get_firm_deals(person_id):
+    """Firm-level tenancy's core read-scope fetch: every deal that
+    belongs to person_id's FIRM's book, newest-updated first. SELL deals
+    are included whenever ANY firm person is linked (that's what "the
+    firm's book" means). BUY deals are included only when
+    _is_firm_intro_buy_deal says so -- linked to the specific firm
+    person who is the seller of record for that same company -- so a
+    colleague's own BUY-side purchase elsewhere is never included (see
+    the module note above get_my_deals's firm-level neighbors). Any
+    other deal side/shape is skipped.
+
+    Deliberately separate from get_my_deals rather than broadening it in
+    place: get_my_deals also backs write-path idempotency probes
+    (_find_deal_derived_intro, _find_existing_buy_deal_for_person_
+    company) and _dedupe_buy_deals_by_company_and_buyer's own key -- all
+    of which must stay scoped to the one acting person_id, not the whole
+    firm, or a write could get misdirected onto a colleague's deal.
+
+    Request-scoped memoized by person_id, same convention as
+    get_my_deals."""
+    _perf_count("get_firm_deals")
+    if person_id in _req_cache["firm_deals"]:
+        return _req_cache["firm_deals"][person_id]
+    firm_person_ids = _firm_person_ids(person_id)
+    sellers_by_company = _firm_sell_person_ids_by_company(firm_person_ids)
+    out = []
+    for d in get_deals_list():
+        if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            if _deal_linked_person_ids(d) & firm_person_ids:
+                out.append(d)
+        elif _is_firm_intro_buy_deal(d, person_id, firm_person_ids, sellers_by_company):
+            out.append(d)
+    out.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
+    out = _dedupe_buy_deals_by_company_and_buyer(out, person_id, firm_person_ids)
+    _req_cache["firm_deals"][person_id] = out
+    return out
+
+
+def get_firm_sell_deals(person_id, company=None):
+    """The firm's SELL deals -- every stage, every company when `company`
+    is None (My Deals), else just that one (the company page's Deal
+    Details section). Mirrors get_my_sell_deals but firm-wide."""
+    target = company.strip().lower() if company else None
+    out = []
+    for d in get_firm_deals(person_id):
+        if DEAL_SIDE_SELL_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            continue
+        if target is not None and (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        out.append(d)
+    return out
+
+
+def get_firm_matched_buy_deals(person_id, company=None):
+    """The firm's BUY deals at Matched-or-later stage -- firm-wide mirror
+    of get_my_matched_buy_deals. Request-scoped memoized by
+    (person_id, company), same convention."""
+    _perf_count("get_firm_matched_buy_deals")
+    target = company.strip().lower() if company else None
+    cache_key = (person_id, target)
+    if cache_key in _req_cache["firm_matched_buy_deals"]:
+        return _req_cache["firm_matched_buy_deals"][cache_key]
+    out = []
+    for d in get_firm_deals(person_id):
+        if target is not None and (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        if _is_matched_or_later_buy_deal(d):
+            out.append(d)
+    _req_cache["firm_matched_buy_deals"][cache_key] = out
+    return out
+
+
+def get_firm_closed_out_buy_deals(person_id, company=None):
+    """The firm's BUY deals whose stage is a dead-stage exit -- firm-wide
+    mirror of get_my_closed_out_buy_deals."""
+    cache_key = (person_id, company.strip().lower() if company else None)
+    if cache_key in _req_cache["firm_closed_out_buy_deals"]:
+        return _req_cache["firm_closed_out_buy_deals"][cache_key]
+    target = company.strip().lower() if company else None
+    out = []
+    for d in get_firm_deals(person_id):
+        if target is not None and (_deal_company_name(d) or "").strip().lower() != target:
+            continue
+        if _is_closed_out_buy_deal(d):
+            out.append(d)
+    _req_cache["firm_closed_out_buy_deals"][cache_key] = out
+    return out
 
 
 def get_company_buyer_details(company):
@@ -2225,11 +2329,20 @@ def _build_tenant_index():
         except (TypeError, ValueError):
             pass
         default_name = _person_display_name(rec)
+        # Firm-level tenancy: company_id (else company_name, same two-path
+        # convention _closer_kind/get_company_record/get_firm_closed_sell_
+        # deals already use) travels with the tenant record so every
+        # firm-scoping call downstream (_firm_person_ids) can resolve a
+        # tenant's firm from the tenant record alone, with no extra
+        # people.json lookup.
+        company_id = rec.get("company_id")
+        company_name = (rec.get("company_name") or "").strip() or None
         for email in _person_all_emails(rec):
             if email in TENANT_BLOCKLIST:
                 continue
             override_name = (TENANT_OVERRIDES.get(email) or {}).get("name")
-            by_email[email] = {"name": override_name or default_name or email, "person_id": pid}
+            by_email[email] = {"name": override_name or default_name or email, "person_id": pid,
+                                "company_id": company_id, "company_name": company_name}
     return by_email
 
 
@@ -2255,13 +2368,167 @@ def _tenant_index():
 
 
 def _resolve_tenant(email):
-    """{"name", "person_id"} for a qualifying (auto-enrolled,
-    non-blocklisted) tenant email, case-insensitive, or None. The single
-    source of truth every access-control check below calls instead of
-    the old TENANTS lookup."""
+    """{"name", "person_id", "company_id", "company_name"} for a
+    qualifying (auto-enrolled, non-blocklisted) tenant email, case-
+    insensitive, or None. The single source of truth every access-
+    control check below calls instead of the old TENANTS lookup."""
     if not email:
         return None
     return _tenant_index().get(email.strip().lower())
+
+
+# ── Firm-level tenancy ──────────────────────────────────────────────────
+# Colleagues at the same firm (company_id, falling back to exact
+# company_name when company_id is absent -- the same two-path convention
+# _closer_kind/get_company_record/get_firm_closed_sell_deals already use)
+# share one view. Eligibility is unchanged (a person still needs >=1 Sell
+# deal of their own to auto-enroll at all -- see _build_tenant_index) --
+# once a person qualifies, every deal linked to ANY person at their firm
+# becomes part of their visible deal set, not just deals linked to their
+# own person_id.
+#
+# The one deliberate exception: BUY-side deals. Only SELL-side deals
+# define "the firm's book" (see _firm_sell_person_ids_by_company below);
+# a colleague's own BUY deal -- where the firm is the buyer, not the
+# seller -- must never be mistaken for one of the firm's own intros. See
+# _is_firm_intro_buy_deal.
+#
+# Write paths (_find_deal_derived_intro, _find_existing_buy_deal_for_
+# person_company, _handle_add_buyer, _pipeline_create_buy_deal,
+# _handle_deal_stage, _handle_update_intro, _tenant_email_for_deal,
+# _company_update_link_html) are deliberately LEFT untouched, still
+# scoped to the single acting person_id: broadening those would let a
+# write intended for one person land on a colleague's deal, or let the
+# Dynamo/audit-trail actor resolution (_tenant_email_for_deal) become
+# genuinely ambiguous between colleagues sharing a deal. This turn is
+# read-scope only -- "share one view" -- exactly as instructed.
+
+def _firm_person_ids(person_id):
+    """Every person_id sharing person_id's own company_id (else exact
+    lowercased company_name) -- always includes person_id itself, even
+    when no company_id/company_name is on file (a firm of one). people.
+    json-only (never deals.json), so this is safe to memoize for the
+    life of the request regardless of what deals.json call happens
+    first/last. Cross-matched via str() throughout -- people.json's own
+    "id" field is not reliably int-typed (see _build_tenant_index's own
+    docstring for the live example), so a bare `pid == self_id` would
+    silently drop a colleague whose id happens to be string-typed in
+    the snapshot."""
+    if person_id is None:
+        return frozenset()
+    cache = _req_cache["firm_person_ids"]
+    if person_id in cache:
+        return cache[person_id]
+    people_list = _people_list()
+    pid_str = str(person_id)
+    self_rec = next((rec for rec in people_list if str(rec.get("id")) == pid_str), None)
+    out = {person_id}
+    if self_rec is not None:
+        company_id = self_rec.get("company_id")
+        company_name = (self_rec.get("company_name") or "").strip().lower()
+        if company_id is not None or company_name:
+            for rec in people_list:
+                if company_id is not None:
+                    if rec.get("company_id") != company_id:
+                        continue
+                else:
+                    cand = (rec.get("company_name") or "").strip().lower()
+                    if not cand or cand != company_name:
+                        continue
+                pid = rec.get("id")
+                if pid is None:
+                    continue
+                try:
+                    pid = int(pid)
+                except (TypeError, ValueError):
+                    continue
+                out.add(pid)
+    result = frozenset(out)
+    cache[person_id] = result
+    return result
+
+
+def _firm_sell_person_ids_by_company(firm_person_ids):
+    """{company_name_lower: set(person_ids)} of every firm person linked
+    to one of the firm's OWN Sell-tagged deals, grouped by that deal's
+    target company. This -- not the raw firm_person_ids set -- is what
+    decides whether a Buy deal is "one of the firm's own intros" (see
+    _is_firm_intro_buy_deal): a Buy deal only counts if it's linked to
+    the SAME person who is the seller of record for THAT company, so a
+    colleague's own, unrelated Buy-side purchase (a different company,
+    or the same company via a completely different seller) is never
+    mistaken for an intro against the firm's book."""
+    cache_key = firm_person_ids
+    cache = _req_cache["firm_sell_by_company"]
+    if cache_key in cache:
+        return cache[cache_key]
+    out = {}
+    if firm_person_ids:
+        for d in get_deals_list():
+            if DEAL_SIDE_SELL_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+                continue
+            linked = _deal_linked_person_ids(d) & firm_person_ids
+            if not linked:
+                continue
+            company = (_deal_company_name(d) or "").strip().lower()
+            if not company:
+                continue
+            out.setdefault(company, set()).update(linked)
+    cache[cache_key] = out
+    return out
+
+
+def _is_firm_intro_buy_deal(deal, person_id, firm_person_ids, sellers_by_company):
+    """CRITICAL FIX: a Buy-tagged deal counts as one of the firm's own
+    intros in one of two ways. (1) The viewing tenant (person_id) is
+    directly linked to it -- exactly the pre-existing, single-person
+    model (get_my_matched_buy_deals), which never required any company-
+    name relationship between a tenant's Sell deal and their own Buy-
+    side intros (_pipeline_create_buy_deal always embeds the specific
+    seller directly on their own Buy deals, so direct linkage alone was
+    always sufficient and must stay sufficient here -- otherwise firm-
+    scoping would regress single-person tenants whose Sell deal's
+    company name doesn't match their intro deals' company names, e.g.
+    a master "Sella HoldCo" Sell record against differently-named
+    portfolio-company Buy deals). (2) Some OTHER firm person (a
+    colleague) is linked to it -- but only when they are also the
+    specific firm person who is the seller of record for that SAME
+    target company (sellers_by_company, from
+    _firm_sell_person_ids_by_company) -- never merely "linked to some
+    firm person". Without this company+person match on the colleague
+    path, a colleague's own Buy deal (they are genuinely the buyer,
+    matched against some OTHER seller entirely) would render as if the
+    viewing tenant's firm were the seller on it -- the exact live bug
+    this fixes (Kevin Jiang rendering as "the buyer" on AMI Labs/
+    Anthropic, deals where he was the one buying, on
+    natoli@mangustacap.com's view)."""
+    if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
+        return False
+    linked = _deal_linked_person_ids(deal)
+    if person_id in linked:
+        return True
+    company = (_deal_company_name(deal) or "").strip().lower()
+    sellers = sellers_by_company.get(company)
+    if not sellers:
+        return False
+    return bool(linked & sellers & firm_person_ids)
+
+
+def _deal_colleague_owner(deal, tenant_person_id, firm_person_ids, people_by_id):
+    """None when the viewing tenant is personally linked to this deal
+    (it's genuinely theirs -- no attribution needed); otherwise the
+    first OTHER firm person linked to it, in deals.json order -- the
+    "via <colleague>" chip's subject (ATTRIBUTION, item 2). people_by_id
+    must already carry a record for every firm person that could be
+    linked (callers already batch-fetch across the full firm_person_ids
+    set -- see get_people_by_ids call sites in the render_* functions
+    below)."""
+    if tenant_person_id in _deal_linked_person_ids(deal):
+        return None
+    for pid in _deal_linked_person_ids_ordered(deal):
+        if pid in firm_person_ids and pid != tenant_person_id:
+            return people_by_id.get(pid)
+    return None
 
 
 def _eligible_tenants_list():
@@ -2741,7 +3008,13 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     cached = _req_cache["company_stats"].get(cache_key)
     if cached is not None:
         return cached
-    matched = get_my_matched_buy_deals(person_id, company_name)
+    # Firm-level tenancy (item 1, "Raised, stats"): firm-wide fetches, so
+    # a colleague's own matched/closed-out buy deal for this company
+    # contributes to the SAME Intros/Raised/Won/Lost figures the viewing
+    # tenant sees -- one shared number for the whole firm, not a
+    # personal one. Manual/Dynamo-only intros (tenant_email below) stay
+    # person-scoped -- see get_firm_deals's own docstring for why.
+    matched = get_firm_matched_buy_deals(person_id, company_name)
     live_intro_count = 0
     stalled = False
     raised = 0
@@ -2764,7 +3037,7 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
                 non_terminal_count += 1
         if resolved["id"] == INTRO_STATUS_STALLED_ID:
             stalled = True
-    closed_out_deals = get_my_closed_out_buy_deals(person_id, company_name)
+    closed_out_deals = get_firm_closed_out_buy_deals(person_id, company_name)
     closed_out_intro_count = sum(1 for d in closed_out_deals if _closed_out_disclosed(d))
     passed_count += closed_out_intro_count
 
@@ -4105,7 +4378,10 @@ def _tenant_has_disclosed_deal_with(person_id, tenant_email, buyer_id):
     if person_id is None or buyer_id is None:
         return False
     intro_details = None
-    deals = get_my_matched_buy_deals(person_id)
+    # Firm-level tenancy (item 1, "buyer pages"): firm-wide fetches -- a
+    # colleague's own disclosed introduction to this buyer unlocks the
+    # buyer page for the viewing tenant too, same as their own would.
+    deals = get_firm_matched_buy_deals(person_id)
     if deals:
         intro_details, _ = get_intro_details(tenant_email)
         for d in deals:
@@ -4114,7 +4390,7 @@ def _tenant_has_disclosed_deal_with(person_id, tenant_email, buyer_id):
             resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
             if resolved["disclosed"]:
                 return True
-    for d in get_my_closed_out_buy_deals(person_id):
+    for d in get_firm_closed_out_buy_deals(person_id):
         if buyer_id not in _deal_linked_person_ids(d):
             continue
         if _closed_out_disclosed(d):
@@ -5436,7 +5712,8 @@ def _intro_buyer_cell_html(primary, secondary, more_count, firm_won_index, key=N
 
 
 def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_person_id, surface, key=None,
-                             view_as=None, anon_key_email=None, firm_won_index=None, company_repeated=False):
+                             view_as=None, anon_key_email=None, firm_won_index=None, company_repeated=False,
+                             firm_person_ids=None, colleague_name=None):
     """Parity refactor: the ONE shared piece of column 1/2 logic for a buy
     deal's row, used by every row-builder below (_buy_deal_row_html,
     _buy_deal_row_edit_html, _pending_buy_deal_row_html,
@@ -5458,11 +5735,24 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
     extra_row_cls, buyer_recs, investor_type_cell) -- extra_row_cls is a
     bare class token ("" or "grouped-row"), not a formatted attribute;
     each caller composes its own class="..." with whatever base class
-    that row type needs (pending-row, closed-out-row, ...)."""
+    that row type needs (pending-row, closed-out-row, ...).
+
+    CRITICAL FIX (firm-level tenancy, item 3): buyer_recs excludes every
+    person in firm_person_ids (defaults to {tenant_person_id}, the old
+    single-person behavior), not just the viewing tenant's own id -- so
+    once a Sell/Buy deal reaches this row via a firm colleague rather
+    than the viewing tenant personally, that colleague is never rendered
+    as "the buyer" on their own firm's page. colleague_name (surface=
+    "intros" only -- see the render_* callers) adds the muted "via
+    <colleague>" attribution chip next to the company name when this
+    row came from a colleague's own deal rather than the viewing
+    tenant's."""
     disclosed = (resolved_or_disclosed["disclosed"] if isinstance(resolved_or_disclosed, dict)
                  else resolved_or_disclosed)
-    linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid != tenant_person_id]
+    exclude_ids = firm_person_ids if firm_person_ids is not None else {tenant_person_id}
+    linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid not in exclude_ids]
     buyer_recs = [people_by_id[pid] for pid in linked_ordered if pid in people_by_id]
+    via_html = f'<span class="via-colleague-chip">via {_esc(colleague_name)}</span>' if colleague_name else ""
 
     if surface == "intros":
         col1_td_open = '<td class="company">'
@@ -5472,7 +5762,7 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
             extra_cls = "grouped-row"
         elif company_name:
             col1_html = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
-                         f'{_esc(company_name)}</a>')
+                         f'{_esc(company_name)}</a>{via_html}')
             col1_html += _company_update_link_html(tenant_person_id, company_name)
             extra_cls = ""
         else:
@@ -5519,7 +5809,7 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
 
 def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, key=None, view_as=None,
                         editable=False, surface="intros", firm_won_index=None, company_repeated=False,
-                        anon_key_email=None):
+                        anon_key_email=None, firm_person_ids=None, colleague_name=None):
     """Shared DISCLOSED-row builder (parity refactor) for both Active
     Intros and the company page's Buyers table: Investor Type (with tier
     badge), Size, Status (milestone checkboxes + flag select --
@@ -5544,7 +5834,8 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
     deal_id = str(deal.get("id"))
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, resolved, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
-        anon_key_email=anon_key_email, firm_won_index=firm_won_index, company_repeated=company_repeated)
+        anon_key_email=anon_key_email, firm_won_index=firm_won_index, company_repeated=company_repeated,
+        firm_person_ids=firm_person_ids, colleague_name=colleague_name)
     is_stalled = surface == "intros" and resolved["id"] == INTRO_STATUS_STALLED_ID
     row_id = f' id="intro-row-{deal_id}"' if is_stalled else ""
     classes = " ".join(c for c in (extra_cls, "stalled-row" if is_stalled else "") if c)
@@ -5579,7 +5870,8 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
 
 
 def _pending_buy_deal_row_html(deal, people_by_id, tenant_person_id, anon_key_email, key=None, view_as=None,
-                                surface="intros", company_repeated=False):
+                                surface="intros", company_repeated=False, firm_person_ids=None,
+                                colleague_name=None):
     """Shared PENDING-row builder (parity refactor): never gets inputs --
     only Introduced-or-later rows are editable, disclosed or not -- and
     always shows the anonymized buyer cell. Same col1/col2 surface split
@@ -5587,7 +5879,8 @@ def _pending_buy_deal_row_html(deal, people_by_id, tenant_person_id, anon_key_em
     always the fixed "Matched" pill and Notes is always empty."""
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, False, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
-        anon_key_email=anon_key_email, company_repeated=company_repeated)
+        anon_key_email=anon_key_email, company_repeated=company_repeated,
+        firm_person_ids=firm_person_ids, colleague_name=colleague_name)
     classes = " ".join(c for c in ("pending-row", extra_cls) if c)
     row_cls = f' class="{classes}"'
 
@@ -5602,7 +5895,8 @@ def _pending_buy_deal_row_html(deal, people_by_id, tenant_person_id, anon_key_em
 
 
 def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details, key=None, view_as=None,
-                             surface="intros", firm_won_index=None, company_repeated=False):
+                             surface="intros", firm_won_index=None, company_repeated=False,
+                             firm_person_ids=None, colleague_name=None):
     """Shared ADMIN edit-mode row builder (parity refactor): always the
     real buyer(s) regardless of disclosure -- the disclosure gate is a
     tenant-facing privacy rule, not something that should blind the
@@ -5620,7 +5914,8 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
     resolved = _resolve_intro_status(deal, entry)
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, resolved, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
-        firm_won_index=firm_won_index, company_repeated=company_repeated)
+        firm_won_index=firm_won_index, company_repeated=company_repeated,
+        firm_person_ids=firm_person_ids, colleague_name=colleague_name)
     if surface == "intros" and not company_repeated:
         # "+ Add buyer", defaulting company from this row (see
         # _add_buyer_panel_html's shared script, which wires up every
@@ -5725,7 +6020,7 @@ def _loss_reason_notes_cell_html(deal, entry, edit_mode):
 
 def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_key_email, key=None, view_as=None,
                           surface="intros", firm_won_index=None, company_repeated=False, entry=None,
-                          edit_mode=False):
+                          edit_mode=False, firm_person_ids=None, colleague_name=None):
     """Shared "Closed out" row builder (parity refactor): Status always
     shows the derived, muted outcome chip -- never milestone checkboxes
     or a flag select, nothing left to edit on a dead deal. Notes now
@@ -5750,7 +6045,8 @@ def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_k
     tinted "Closed" chip -- not part of this instruction's scope."""
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, disclosed, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
-        anon_key_email=anon_key_email, firm_won_index=firm_won_index, company_repeated=company_repeated)
+        anon_key_email=anon_key_email, firm_won_index=firm_won_index, company_repeated=company_repeated,
+        firm_person_ids=firm_person_ids, colleague_name=colleague_name)
     is_company = surface == "company"
     outcome_cls = ""
     if is_company:
@@ -6772,14 +7068,14 @@ def _tab_qs_suffix(key=None, view_as=None):
 
 def _mydeals_dropdown_entries(person_id):
     """The My Deals nav dropdown's raw entries: one per distinct company
-    among the tenant's own Sell deals (get_my_deals, Sell-tagged only --
-    the exact same filter lambda_handler's mydeals branch applies) plus
-    the firm-wide Closed rows (get_firm_closed_sell_deals, "via
-    <colleague>"), grouped into the same four sections render_my_deals_
-    page's own row loop classifies deals into -- Live/On Hold/Closed/
-    Cancelled -- sorted company A-Z within each group, in that group
-    order. Two deals for the same company in the same group collapse to
-    one entry (the dropdown jumps to a company page, not a deal).
+    among the FIRM's Sell deals (get_firm_sell_deals -- firm-level
+    tenancy, item 1: every colleague's own Sell deal is part of this
+    same shared view, not just the viewing tenant's), grouped into the
+    same four sections render_my_deals_page's own row loop classifies
+    deals into -- Live/On Hold/Closed/Cancelled -- sorted company A-Z
+    within each group, in that group order. Two deals for the same
+    company in the same group collapse to one entry (the dropdown jumps
+    to a company page, not a deal).
 
     intro_count ignores Dynamo status overrides (unlike My Deals' own
     Intros column) -- this menu builds on every single page load, so a
@@ -6793,8 +7089,12 @@ def _mydeals_dropdown_entries(person_id):
     jump to."""
     if person_id is None:
         return []
-    sell_deals = [d for d in get_my_deals(person_id)
-                  if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)]
+    firm_person_ids = _firm_person_ids(person_id)
+    sell_deals = get_firm_sell_deals(person_id)
+    colleague_wanted_ids = set()
+    for d in sell_deals:
+        colleague_wanted_ids |= _deal_linked_person_ids(d) - {person_id}
+    people_by_id = get_people_by_ids(colleague_wanted_ids) if colleague_wanted_ids else {}
 
     def _intro_count(company_name):
         # Perf fix 3: shares _company_buy_stats' request-scoped cache
@@ -6824,10 +7124,8 @@ def _mydeals_dropdown_entries(person_id):
             group = "Cancelled"
         else:
             group = "Live"
-        _add(_deal_company_name(d), group)
-
-    for d, colleague in get_firm_closed_sell_deals(person_id):
-        _add(_deal_company_name(d), "Closed", colleague=_first_name(colleague))
+        colleague = _deal_colleague_owner(d, person_id, firm_person_ids, people_by_id)
+        _add(_deal_company_name(d), group, colleague=_first_name(colleague) if colleague else None)
 
     ordered = []
     for group in ("Live", "On Hold", "Closed", "Cancelled"):
@@ -7077,7 +7375,14 @@ def _company_update_link_html(person_id, company_name):
     file for the same company (get_my_deals already sorts that way).
     Omitted outright when HMAC_SECRET isn't configured (see
     _deal_update_form_url, which returns None) or the tenant has no Sell
-    deal on file for this company."""
+    deal on file for this company.
+
+    Deliberately still get_my_sell_deals (person-scoped), not the firm-
+    wide get_firm_sell_deals: this mints a signed link straight into
+    Pipeline's own deal-update form, which must only ever point at the
+    VIEWING tenant's own deal record, never a colleague's -- see the
+    write-path exceptions noted above get_my_deals's firm-level
+    neighbors."""
     sell_deals = get_my_sell_deals(person_id, company_name)
     if not sell_deals:
         return ""
@@ -7343,8 +7648,20 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         # brand-new admin-linked deal only exists as an intro# Dynamo
         # item until deals.json's own hourly sync catches up (see
         # _augment_with_dynamo_linked_deals, called right below).
+        # Firm-level tenancy (item 1): every colleague sharing person_id's
+        # firm shares this same view -- get_firm_matched_buy_deals/
+        # get_firm_closed_out_buy_deals below are the firm-wide mirrors
+        # of get_my_matched_buy_deals/get_my_closed_out_buy_deals, using
+        # _is_firm_intro_buy_deal's company+seller match so a colleague's
+        # own BUY-side purchase elsewhere (they are the buyer, not us)
+        # never appears here (item 3, the critical fix). Manual/Dynamo-
+        # only intros stay person_id-scoped, not broadened to the firm --
+        # extending those would mean querying every colleague's own
+        # Dynamo partition on every page load, a real added cost for a
+        # feature not part of this instruction.
+        firm_person_ids = _firm_person_ids(person_id)
         intro_details, dynamo_failed = get_intro_details(tenant_email)
-        deals = get_my_matched_buy_deals(person_id) if person_id is not None else []
+        deals = get_firm_matched_buy_deals(person_id) if person_id is not None else []
         deals = _augment_with_dynamo_linked_deals(deals, intro_details)
 
         # Manual intros (Dynamo-only, no backing Pipeline deal -- see
@@ -7366,7 +7683,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         # so it simply vanished instead of showing as a closed-out intro.
         # Fetched separately, keyed off the deal's own Pipeline stage
         # rather than the Intro Status field — see get_my_closed_out_buy_deals.
-        closed_out_deals = get_my_closed_out_buy_deals(person_id) if person_id is not None else []
+        closed_out_deals = get_firm_closed_out_buy_deals(person_id) if person_id is not None else []
 
         # Item 3: closed-out rows use their own, simpler disclosure rule
         # (_closed_out_disclosed — raw Intro Status explicitly Introduced-
@@ -7415,6 +7732,13 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         for d in closed_out_deals:
             wanted_ids |= _deal_linked_person_ids(d) - {person_id}
         people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
+
+        # ATTRIBUTION (item 2): a row that came via a colleague's own
+        # deal (not one the viewing tenant is personally linked to)
+        # carries the "via <colleague>" chip -- see _deal_colleague_owner.
+        def _colleague_name_for(d):
+            owner = _deal_colleague_owner(d, person_id, firm_person_ids, people_by_id)
+            return _first_name(owner) if owner else None
         # Turn 23: the closed-dot needs the same person-or-firm closer
         # signal as the buyer page's chip. Admin edit mode shows the
         # real buyer (and so the real dot) on every row, pending
@@ -7518,7 +7842,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                     d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id, tenant_email,
                     key=key, view_as=view_as, surface="intros", firm_won_index=firm_won_index,
                     company_repeated=closed_out_repeats[i],
-                    entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode))
+                    entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode,
+                    firm_person_ids=firm_person_ids, colleague_name=_colleague_name_for(d)))
             co_rows_html = "".join(co_parts)
             closed_out_html = f"""<details class="closed-out-section">
       <summary>Closed out <span class="count">({len(closed_out_rows)})</span></summary>
@@ -7567,13 +7892,26 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                     parts += [_buy_deal_row_edit_html(d, people_by_id, person_id, intro_details,
                                                        key=key, view_as=view_as, surface="intros",
                                                        firm_won_index=firm_won_index,
-                                                       company_repeated=main_repeats[i])
+                                                       company_repeated=main_repeats[i],
+                                                       firm_person_ids=firm_person_ids,
+                                                       colleague_name=_colleague_name_for(d))
                               for i, (d, _) in enumerate(main_rows)]
                 else:
+                    # A colleague's own row is never editable by the
+                    # viewing tenant -- only the tenant's own rows are
+                    # (tenant_edit_mode), matching what the backend would
+                    # actually authorize (_tenant_email_for_deal resolves
+                    # writes to the deal's OWN linked tenant, not the
+                    # viewer) and avoiding a save button that would just
+                    # 403.
                     parts += [_buy_deal_row_html(d, resolved, people_by_id, person_id, _entry_for(d),
-                                                  key=key, view_as=view_as, editable=tenant_edit_mode,
+                                                  key=key, view_as=view_as,
+                                                  editable=(tenant_edit_mode
+                                                            and _colleague_name_for(d) is None),
                                                   surface="intros", firm_won_index=firm_won_index,
-                                                  company_repeated=main_repeats[i])
+                                                  company_repeated=main_repeats[i],
+                                                  firm_person_ids=firm_person_ids,
+                                                  colleague_name=_colleague_name_for(d))
                               for i, (d, resolved) in enumerate(main_rows)]
             else:
                 parts.append(_group_empty_row_html("No introductions yet on this deal.", 6))
@@ -7591,7 +7929,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                     parts += [_buy_deal_row_edit_html(d, people_by_id, person_id, intro_details,
                                                        key=key, view_as=view_as, surface="intros",
                                                        firm_won_index=firm_won_index,
-                                                       company_repeated=pending_repeats[i])
+                                                       company_repeated=pending_repeats[i],
+                                                       firm_person_ids=firm_person_ids,
+                                                       colleague_name=_colleague_name_for(d))
                               for i, (d, _) in enumerate(pending_rows)]
                 else:
                     # Pending rows never get inputs even under
@@ -7599,7 +7939,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                     # editable.
                     parts += [_pending_buy_deal_row_html(d, people_by_id, person_id, tenant_email,
                                                           key=key, view_as=view_as, surface="intros",
-                                                          company_repeated=pending_repeats[i])
+                                                          company_repeated=pending_repeats[i],
+                                                          firm_person_ids=firm_person_ids,
+                                                          colleague_name=_colleague_name_for(d))
                               for i, (d, resolved) in enumerate(pending_rows)]
 
             rows_html = "".join(parts)
@@ -7991,7 +8333,16 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # data-key attribute they carry decides whether the resulting write
     # is treated as an admin write server-side -- so it must not carry
     # the real ADMIN_KEY into a Tenant-view preview.
-    actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section,
+    #
+    # Firm-level tenancy: a colleague's own row (colleague_name set) never
+    # gets the stage-change buttons for a real tenant session -- the
+    # backend would 403 anyway (_tenant_email_for_deal resolves writes to
+    # the deal's OWN linked tenant, not the viewer), so showing them would
+    # just be a button that fails. Falls back to "cancelled"/"closed"'s
+    # own Update-only behavior. Admin edit_mode is unaffected -- an admin
+    # can still act on any deal.
+    actions_section = section if (edit_mode or colleague_name is None) else "closed"
+    actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, actions_section,
                                        key=(key if edit_mode else None))
 
     return (
@@ -8030,6 +8381,22 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 
         intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
         cef_state = _tenant_cef_state(person_id)
+
+        # ATTRIBUTION (item 2): every row that came via a colleague's own
+        # Sell deal (not one the viewing tenant is personally linked to)
+        # carries the "via <colleague>" chip. firm_person_ids/people_by_id
+        # are only needed at all once `deals` actually contains a
+        # colleague's deal, but the lookup is cheap (people.json is
+        # already request-cached) and simplest done unconditionally here.
+        firm_person_ids = _firm_person_ids(person_id)
+        colleague_wanted_ids = set()
+        for d in deals:
+            colleague_wanted_ids |= _deal_linked_person_ids(d) - {person_id}
+        colleague_people_by_id = get_people_by_ids(colleague_wanted_ids) if colleague_wanted_ids else {}
+
+        def _colleague_name_for(d):
+            owner = _deal_colleague_owner(d, person_id, firm_person_ids, colleague_people_by_id)
+            return _first_name(owner) if owner else None
 
         # Per-company buy-side aggregation (Intros count, Stalled flag).
         # Turn 22: follow_up is no longer read here — see _my_deal_action_chip_html.
@@ -8073,6 +8440,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 "buyer_count": buyer_counts.get((company_name or "").strip().lower(), 0),
                 "resolved_stage": resolved_stage,
                 "section": section,
+                "colleague_name": _colleague_name_for(d),
             })
 
         # Deadline ascending (ISO yyyy-mm-dd sorts correctly as a string),
@@ -8127,7 +8495,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 
             section_row_htmls[section].append(
                 _my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
-                                   section, key=key, view_as=view_as, edit_mode=edit_mode))
+                                   section, key=key, view_as=view_as, edit_mode=edit_mode,
+                                   colleague_name=r["colleague_name"]))
 
         today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         future_deadlines = [dl for dl in deadlines if dl >= today_iso]
@@ -8157,29 +8526,18 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         # already falls back from ticket min/max to the deal's own
         # "value" field when neither custom field is set, exactly as
         # asked to verify.
+        # Firm-level tenancy: `rows`/`deals` (get_firm_sell_deals) already
+        # includes every firm colleague's own won Sell deals -- unlike
+        # before, when only closed colleague deals were bolted on
+        # separately here (get_firm_closed_sell_deals), everything from
+        # Active through Closed is now the SAME shared firm-wide view, so
+        # closed_total is already the firm-wide figure -- no separate
+        # "Firm total closed" number needed anymore (that distinction
+        # only made sense when personal and firm views were different
+        # things; item 2's "via <colleague>" chip on each row is now
+        # what tells a personal deal from a colleague's).
         closed_rows = [r for r in rows if r["section"] == "closed"]
         closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in closed_rows) if v is not None)
-
-        # Item 4: firm-wide Closed — won Sell deals linked to a colleague
-        # sharing the viewer's own company, appended to the SAME "closed"
-        # section (so the section heading's own count already includes
-        # them) but never counted toward closed_total/pipeline math above
-        # — that stays scoped to the viewer's own personal deals (rows),
-        # exactly as instructed. firm_total_closed is a SEPARATE summary
-        # figure that includes both.
-        firm_total_closed = closed_total
-        if person_id is not None:
-            for d, colleague in get_firm_closed_sell_deals(person_id):
-                firm_company_name = _deal_company_name(d)
-                firm_deadline = _resolve_deal_deadline(d, {})
-                firm_size = _deal_pipeline_size(d)
-                if firm_size is not None:
-                    firm_total_closed += firm_size
-                section_row_htmls["closed"].append(
-                    _my_deal_row_html(d, firm_company_name, firm_deadline, _company_stats(firm_company_name),
-                                       buyer_counts.get((firm_company_name or "").strip().lower(), 0), cef_state,
-                                       "closed", key=key, view_as=view_as, edit_mode=edit_mode,
-                                       colleague_name=_first_name(colleague)))
 
         # Each part is escaped individually rather than the joined string as
         # a whole, so the dollar totals can carry their own <span> for
@@ -8208,9 +8566,6 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         if closed_total:
             summary_parts.append(f'Total closed: <span class="mydeals-total">'
                                   f'{_esc(_fmt_money(closed_total))}</span>')
-        if firm_total_closed > closed_total:
-            summary_parts.append(f'Firm total closed: <span class="mydeals-total">'
-                                  f'{_esc(_fmt_money(firm_total_closed))}</span>')
         if future_deadlines:
             next_deadline = min(future_deadlines)
             summary_parts.append(f"next deadline {_esc(_fmt_short_date(next_deadline) or next_deadline)}")
@@ -8783,7 +9138,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         # status/next_steps/follow_up on their BUY-side matches (Buyers).
         intro_details, dynamo_failed = get_intro_details(anon_key_email)
 
-        sell_deals = get_my_sell_deals(person_id, company) if person_id is not None else []
+        firm_person_ids = _firm_person_ids(person_id) if person_id is not None else frozenset()
+        # Firm-level tenancy (item 1): every colleague's own Sell deal for
+        # this company is part of the same shared Deal Details view now,
+        # not just the viewing tenant's.
+        sell_deals = get_firm_sell_deals(person_id, company) if person_id is not None else []
         if sell_deals:
             deals_body = "".join(
                 _deal_card_html(d, company, intro_details.get(str(d.get("id"))), edit_mode=edit_mode)
@@ -8829,7 +9188,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     </div>
   </section>"""
 
-        matched_deals = get_my_matched_buy_deals(person_id, company) if person_id is not None else []
+        matched_deals = get_firm_matched_buy_deals(person_id, company) if person_id is not None else []
         matched_deals = _augment_with_dynamo_linked_deals(matched_deals, intro_details, company)
 
         # Manual intros (Dynamo-only, no backing Pipeline deal at all --
@@ -8901,13 +9260,14 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         if main_deals:
             if edit_mode:
                 rows_parts += [_buy_deal_row_edit_html(d, people_by_id, person_id, intro_details,
-                                                        key=key, view_as=view_as, surface="company")
+                                                        key=key, view_as=view_as, surface="company",
+                                                        firm_person_ids=firm_person_ids)
                                for d in main_deals]
             else:
                 rows_parts += [_buy_deal_row_html(d, resolved_by_deal_id[str(d.get("id"))], people_by_id, person_id,
                                                    intro_details.get(str(d.get("id"))) or {}, key=key, view_as=view_as,
                                                    editable=tenant_edit_mode, surface="company",
-                                                   anon_key_email=anon_key_email)
+                                                   anon_key_email=anon_key_email, firm_person_ids=firm_person_ids)
                                for d in main_deals]
         else:
             rows_parts.append(_group_empty_row_html("No introductions yet on this deal.", 6))
@@ -8918,13 +9278,15 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                 # Edit mode never anonymizes — the admin sees and edits the
                 # real buyer regardless of pending/disclosed.
                 rows_parts += [_buy_deal_row_edit_html(d, people_by_id, person_id, intro_details,
-                                                        key=key, view_as=view_as, surface="company")
+                                                        key=key, view_as=view_as, surface="company",
+                                                        firm_person_ids=firm_person_ids)
                                for d in pending_deals]
             else:
                 # Pending rows never get inputs even under tenant_edit_mode —
                 # only Introduced-or-later rows are editable.
                 rows_parts += [_pending_buy_deal_row_html(d, people_by_id, person_id, anon_key_email,
-                                                           key=key, view_as=view_as, surface="company")
+                                                           key=key, view_as=view_as, surface="company",
+                                                           firm_person_ids=firm_person_ids)
                                for d in pending_deals]
 
         matched_rows_html = "".join(rows_parts)
@@ -8954,7 +9316,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         # a dead-stage (Lost/Trade Broken/Obsolete) BUY deal for this
         # company, keyed off get_my_closed_out_buy_deals rather than the
         # matched-or-later fetch above.
-        closed_out_deals = get_my_closed_out_buy_deals(person_id, company) if person_id is not None else []
+        closed_out_deals = get_firm_closed_out_buy_deals(person_id, company) if person_id is not None else []
         closed_out_disclosed_by_id = {str(d.get("id")): (edit_mode or _closed_out_disclosed(d))
                                        for d in closed_out_deals}
         # Merge in the status-based exits routed here above: disjoint by
@@ -8994,7 +9356,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                 rows_html = "".join(
                     _closed_out_row_html(d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id,
                                           anon_key_email, key=key, view_as=view_as, surface="company",
-                                          entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode)
+                                          entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode,
+                                          firm_person_ids=firm_person_ids)
                     for d in rows)
                 return f"""<details class="closed-out-section">
       <summary>{title} <span class="count">({count})</span></summary>
@@ -9703,13 +10066,13 @@ def _buyer_deal_team_html(buyer_id, buyer_rec, firm_name, tenant, anon_key_email
     intro_details, _ = get_intro_details(anon_key_email)
 
     candidate_ids = set()
-    for d in get_my_matched_buy_deals(person_id):
+    for d in get_firm_matched_buy_deals(person_id):
         if buyer_id not in _deal_linked_person_ids(d):
             continue
         resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
         if resolved["disclosed"]:
             candidate_ids |= _deal_linked_person_ids(d)
-    for d in get_my_closed_out_buy_deals(person_id):
+    for d in get_firm_closed_out_buy_deals(person_id):
         if buyer_id not in _deal_linked_person_ids(d):
             continue
         if _closed_out_disclosed(d):
@@ -9848,7 +10211,22 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
     else:
         person_id = tenant.get("person_id")
         intro_details, _ = get_intro_details(anon_key_email)
-        for d in get_my_matched_buy_deals(person_id):
+        # Firm-level tenancy (item 1, "buyer pages"): firm-wide fetches --
+        # a colleague's own history with this buyer shows here too. Read-
+        # only, so it's safe to accept one known limitation: entry/
+        # intro_details only ever holds the VIEWING tenant's own Dynamo
+        # overrides, so a colleague's row's milestone checkboxes/status
+        # reflect raw Pipeline only, never the colleague's own status
+        # override/milestones -- can under-represent progress on a
+        # colleague's deal, never over-represent it (the safe direction),
+        # and never wrong enough to be worth fetching every colleague's
+        # own Dynamo partition here (same cost this turn declines
+        # elsewhere -- see get_firm_deals's docstring). Contrast with
+        # _buyer_notes_ledger_html below, which stays person_id-scoped:
+        # that surface is EDITABLE, so a colleague's blank-looking entry
+        # there would invite a write that just 403s -- worse than simply
+        # not listing it.
+        for d in get_firm_matched_buy_deals(person_id):
             if buyer_id not in _deal_linked_person_ids(d):
                 continue
             entry = intro_details.get(str(d.get("id"))) or {}
@@ -9856,7 +10234,7 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
             if not resolved["disclosed"]:
                 continue
             rows.append(_track_deal_row_html(d, entry, resolved))
-        for d in get_my_closed_out_buy_deals(person_id):
+        for d in get_firm_closed_out_buy_deals(person_id):
             if buyer_id not in _deal_linked_person_ids(d):
                 continue
             resolved = _closed_out_resolved_dict(d)
@@ -9931,6 +10309,16 @@ def _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode):
     else:
         person_id = tenant.get("person_id")
         intro_details, _ = get_intro_details(anon_key_email)
+        # Deliberately NOT broadened to get_firm_matched_buy_deals: Notes
+        # are stored per-deal under the OWNING tenant's own Dynamo
+        # partition (intro_details above only ever reads the VIEWING
+        # tenant's own partition), so a colleague's deal pulled in here
+        # would show as a blank, seemingly-empty note (wrong) rather than
+        # their real one -- worse than just leaving this list scoped to
+        # the deals this partition actually has notes for. Reading every
+        # firm colleague's own Dynamo partition to do this properly is
+        # the same added cost/complexity this turn already declined for
+        # manual intros (see get_firm_deals's docstring).
         for d in get_my_matched_buy_deals(person_id):
             if buyer_id not in _deal_linked_person_ids(d):
                 continue
@@ -11714,8 +12102,10 @@ def _lambda_handler_impl(event, context):
             # My Deals shows only Sell Order-tagged deals — the buy side
             # (Matched Buyers / Active Intros) and untouched ?company= pages
             # keep seeing exactly what they saw before this filter.
-            deals = ([d for d in get_my_deals(person_id) if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)]
-                     if person_id is not None else [])
+            # Firm-level tenancy (item 1): get_firm_sell_deals, not
+            # get_my_deals -- every colleague's own Sell deal is now part
+            # of this same shared view too, not just the viewing tenant's.
+            deals = (get_firm_sell_deals(person_id) if person_id is not None else [])
             body = render_my_deals_page(viewer_name, deals=deals,
                                          key=nav_key, view_as=nav_view_as, cef_html=cef_html,
                                          edit_mode=edit_mode, person_id=person_id, anon_key_email=anon_key_email)
