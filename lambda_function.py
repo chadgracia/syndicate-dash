@@ -2581,38 +2581,45 @@ def _tenant_search_html(key, view_as):
     if view_as:
         match = next((e for e in entries if e["email"] == view_as), None)
         current_label = f'{match["name"]} · {match["firm"] or "—"}' if match else view_as
-    html = f"""<div class="gg-tenant-search">
+    html = f"""<div class="gg-tenant-search" id="gg-tenant-search">
       <input type="text" class="gg-tenant-search-input" id="gg-tenant-search-input"
-             placeholder="Search tenant…" value="{_esc(current_label)}" autocomplete="off">
-      <ul class="gg-tenant-search-results" id="gg-tenant-search-results" hidden></ul>
+             placeholder="Search tenant…" value="{_esc(current_label)}" autocomplete="off"
+             role="combobox" aria-haspopup="listbox" aria-expanded="false">
+      <ul class="gg-tenant-search-results" id="gg-tenant-search-results" role="menu"></ul>
     </div>"""
     script = f"""<script>
 (function() {{
   var TENANTS = {entries_json};
+  var wrap = document.getElementById('gg-tenant-search');
   var input = document.getElementById('gg-tenant-search-input');
   var results = document.getElementById('gg-tenant-search-results');
-  if (!input || !results) return;
+  if (!wrap || !input || !results) return;
 
-  function goTo(email) {{
+  function hrefFor(email) {{
     var url = new URL(window.location.href);
     if (email) {{ url.searchParams.set('view_as', email); }} else {{ url.searchParams.delete('view_as'); }}
-    window.location.href = url.toString();
+    return url.toString();
   }}
 
   function render(list) {{
     results.innerHTML = '';
     var clearLi = document.createElement('li');
     clearLi.className = 'gg-tenant-search-clear';
-    clearLi.textContent = 'Clear (no tenant)';
-    clearLi.addEventListener('click', function() {{ goTo(null); }});
+    var clearA = document.createElement('a');
+    clearA.href = hrefFor(null);
+    clearA.setAttribute('role', 'menuitem');
+    clearA.textContent = 'Clear (no tenant)';
+    clearLi.appendChild(clearA);
     results.appendChild(clearLi);
     list.forEach(function(t) {{
       var li = document.createElement('li');
-      li.textContent = t.name + ' · ' + (t.firm || '—');
-      li.addEventListener('click', function() {{ goTo(t.email); }});
+      var a = document.createElement('a');
+      a.href = hrefFor(t.email);
+      a.setAttribute('role', 'menuitem');
+      a.textContent = t.name + ' · ' + (t.firm || '—');
+      li.appendChild(a);
       results.appendChild(li);
     }});
-    results.hidden = false;
   }}
 
   function filterList() {{
@@ -2623,10 +2630,17 @@ def _tenant_search_html(key, view_as):
     }});
   }}
 
-  input.addEventListener('focus', function() {{ render(filterList()); }});
-  input.addEventListener('input', function() {{ render(filterList()); }});
-  document.addEventListener('click', function(e) {{
-    if (e.target !== input && !results.contains(e.target)) {{ results.hidden = true; }}
+  var api = GGDropdown.register(wrap, input, results, {{
+    itemSelector: 'a[role="menuitem"]',
+    toggleOnClick: false,
+    openOnFocus: true,
+    onOpen: function() {{ input.setAttribute('aria-expanded', 'true'); render(filterList()); }},
+    onClose: function() {{ input.setAttribute('aria-expanded', 'false'); }}
+  }});
+
+  input.addEventListener('input', function() {{
+    api.open();
+    render(filterList());
   }});
 }})();
 </script>"""
@@ -6762,13 +6776,15 @@ NAV_CSS = """
   /* My Deals nav dropdown -- the tab <a> is untouched (still a plain
      link straight to the tab); the caret is a separate focusable button
      so a click on the tab label itself never gets hijacked into opening
-     the menu instead of navigating. Hover opens it (.gg-mydeals-nav:hover)
-     for a mouse; the caret's own click handler toggles a .open class for
-     keyboard/touch, and Escape / an outside click close it (see the
-     inline script in _nav_html). position:absolute + a scoped z-index
-     keeps it from ever affecting the sticky table headers elsewhere on
-     the page -- it lives entirely inside <header>, with no overflow:hidden
-     on any ancestor. */
+     the menu instead of navigating. Click-driven only, via the shared
+     GGDropdown helper (DROPDOWN_JS) -- no hover-open/close anywhere, so
+     the menu never disappears just because the pointer left the tab.
+     The caret's click (and Enter/Space, native to <button>) toggles the
+     .open class; Escape / an outside click / an item click close it (see
+     the inline script in _nav_html). position:absolute + a scoped
+     z-index keeps it from ever affecting the sticky table headers
+     elsewhere on the page -- it lives entirely inside <header>, with no
+     overflow:hidden on any ancestor. */
   .gg-mydeals-nav { position: relative; display: inline-flex; align-items: center; }
   .gg-mydeals-caret {
     background: none;
@@ -6786,7 +6802,7 @@ NAV_CSS = """
     position: absolute;
     top: 100%;
     left: 0;
-    margin-top: 4px;
+    margin-top: 0;
     min-width: 220px;
     max-width: min(320px, 92vw);
     max-height: 60vh;
@@ -6798,7 +6814,6 @@ NAV_CSS = """
     z-index: 50;
     padding: 6px 0;
   }
-  .gg-mydeals-nav:hover .gg-mydeals-menu,
   .gg-mydeals-nav.open .gg-mydeals-menu { display: block; }
   .gg-mydeals-menu-group + .gg-mydeals-menu-group {
     border-top: 1px solid var(--line);
@@ -6916,6 +6931,12 @@ NAV_CSS = """
     white-space: nowrap;
   }
   .gg-copy-link-btn:hover { border-color: var(--accent); }
+  /* Click/focus-driven only, via the shared GGDropdown helper -- see the
+     My Deals nav dropdown comment above. Results are real <a href> rows
+     (full-width hit area, no click-intercepting JS); display is gated on
+     .gg-tenant-search.open rather than the old [hidden] attribute so the
+     same open/close class GGDropdown already manages elsewhere drives
+     this menu too. */
   .gg-tenant-search { position: relative; display: inline-flex; }
   .gg-tenant-search-input {
     border: 1px solid var(--line);
@@ -6927,10 +6948,11 @@ NAV_CSS = """
     background: var(--card);
   }
   .gg-tenant-search-results {
+    display: none;
     position: absolute;
     top: 100%;
     left: 0;
-    margin: 4px 0 0;
+    margin-top: 0;
     padding: 4px 0;
     min-width: 240px;
     max-width: min(320px, 92vw);
@@ -6943,9 +6965,16 @@ NAV_CSS = """
     z-index: 50;
     list-style: none;
   }
-  .gg-tenant-search-results[hidden] { display: none; }
-  .gg-tenant-search-results li { padding: 6px 12px; font-size: 13px; color: var(--ink); cursor: pointer; }
-  .gg-tenant-search-results li:hover { background: rgba(61,90,115,0.08); }
+  .gg-tenant-search.open .gg-tenant-search-results { display: block; }
+  .gg-tenant-search-results li { padding: 0; }
+  .gg-tenant-search-results li a {
+    display: block;
+    padding: 6px 12px;
+    font-size: 13px;
+    color: var(--ink);
+    text-decoration: none;
+  }
+  .gg-tenant-search-results li a:hover { background: rgba(61,90,115,0.08); }
   .gg-tenant-search-clear { color: var(--muted); border-bottom: 1px solid var(--line); }
   /* Shared .ei-msg (Saving…/Saved ✓/error) -- most pages already define
      this themselves, but _nav_html's own "Copy client link" feedback
@@ -6957,6 +6986,92 @@ NAV_CSS = """
   .ei-msg.saved { color: var(--qp); }
   .ei-msg.error { color: #b23b3b; }
 """
+
+# Shared click-driven dropdown helper -- the ONE toggle/close/keyboard
+# implementation for every dropdown in the app (My Deals nav menu, the
+# tenant search combobox, any future one), so none of them can drift back
+# into a per-menu hover hack. A menu is "open" purely via an .open class
+# on its wrap element (see each menu's own CSS) -- there is no mouseleave/
+# hover-close anywhere. Rendered once per page by _nav_html, before any
+# script that calls GGDropdown.register.
+#
+# register(wrap, trigger, menu, opts):
+#   wrap    - the positioning container (gets the .open class)
+#   trigger - the focusable element that opens/closes the menu
+#   menu    - the menu element itself (queried for itemSelector on arrow keys)
+#   opts.itemSelector  - selector for arrow-key-navigable items (default 'a')
+#   opts.toggleOnClick - trigger click toggles open/closed (default true;
+#                        set false for a text-input trigger, which opens on
+#                        focus instead and shouldn't close on a click that's
+#                        just repositioning the caret)
+#   opts.openOnFocus   - open the menu when the trigger receives focus
+#   opts.onOpen/onClose - callbacks for menu-specific side effects
+# Closing always happens on: outside click, Escape (which also returns
+# focus to the trigger), or navigating away via an item's own real href --
+# never on mouseleave. Opening a menu closes every other registered one,
+# so only one is ever open at a time.
+DROPDOWN_JS = """<script>
+window.GGDropdown = (function() {
+  var registry = [];
+  function register(wrap, trigger, menu, opts) {
+    opts = opts || {};
+    var itemSelector = opts.itemSelector || 'a';
+    var api = {};
+    function isOpen() { return wrap.classList.contains('open'); }
+    function close(refocus) {
+      if (!isOpen()) return;
+      wrap.classList.remove('open');
+      trigger.setAttribute('aria-expanded', 'false');
+      if (opts.onClose) opts.onClose();
+      if (refocus) trigger.focus();
+    }
+    function open() {
+      if (isOpen()) return;
+      registry.forEach(function(other) { if (other !== api) other.close(); });
+      wrap.classList.add('open');
+      trigger.setAttribute('aria-expanded', 'true');
+      if (opts.onOpen) opts.onOpen();
+    }
+    function toggle() { if (isOpen()) { close(false); } else { open(); } }
+    api.open = open;
+    api.close = close;
+    api.toggle = toggle;
+    api.isOpen = isOpen;
+    registry.push(api);
+
+    if (opts.toggleOnClick !== false) {
+      trigger.addEventListener('click', function(e) {
+        e.preventDefault();
+        toggle();
+      });
+    }
+    if (opts.openOnFocus) {
+      trigger.addEventListener('focus', open);
+    }
+    document.addEventListener('click', function(e) {
+      if (isOpen() && !wrap.contains(e.target)) close(false);
+    });
+    document.addEventListener('keydown', function(e) {
+      if (!isOpen()) return;
+      if (e.key === 'Escape') {
+        close(true);
+        return;
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        var items = Array.prototype.slice.call(menu.querySelectorAll(itemSelector));
+        if (!items.length) return;
+        e.preventDefault();
+        var idx = items.indexOf(document.activeElement);
+        if (e.key === 'ArrowDown') { idx = (idx + 1) % items.length; }
+        else { idx = idx <= 0 ? items.length - 1 : idx - 1; }
+        items[idx].focus();
+      }
+    });
+    return api;
+  }
+  return { register: register };
+})();
+</script>"""
 
 # Feature-request submit box + list, shared verbatim by render_my_deals_page
 # and render_company_page (both embed this via {FEATURE_CSS} the same way
@@ -7312,25 +7427,9 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
 (function() {
   var wrap = document.querySelector('.gg-mydeals-nav');
   var caret = wrap && wrap.querySelector('.gg-mydeals-caret');
-  if (!caret) return;
-  function closeMenu() {
-    wrap.classList.remove('open');
-    caret.setAttribute('aria-expanded', 'false');
-  }
-  function openMenu() {
-    wrap.classList.add('open');
-    caret.setAttribute('aria-expanded', 'true');
-  }
-  caret.addEventListener('click', function(e) {
-    e.preventDefault();
-    if (wrap.classList.contains('open')) { closeMenu(); } else { openMenu(); }
-  });
-  document.addEventListener('click', function(e) {
-    if (!wrap.contains(e.target)) closeMenu();
-  });
-  document.addEventListener('keydown', function(e) {
-    if (e.key === 'Escape') { closeMenu(); caret.blur(); }
-  });
+  var menu = wrap && wrap.querySelector('.gg-mydeals-menu');
+  if (!caret || !menu) return;
+  GGDropdown.register(wrap, caret, menu, {itemSelector: 'a[role="menuitem"]'});
 })();
 </script>"""
 
@@ -7353,6 +7452,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     <div class="gg-viewer">{viewer_html}</div>
   </div>
 </header>
+{DROPDOWN_JS}
 {mydeals_script}
 {view_toggle_script}"""
 
