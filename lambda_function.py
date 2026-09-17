@@ -5514,8 +5514,8 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
         # 3(c)(1): carry > 0 (or unknown) means Rule 205-3 Qualified Client
         # standard applies; only an explicit 0 carry keeps the accredited label.
         _carry_num = _deal_cf_number(deal, CARRY_FIELD)
-        exemption_label = ("3(c)(1) — accredited investors" if _carry_num == 0
-                           else "3(c)(1) — qualified clients & QPs")
+        exemption_label = ("3(c)(1) — accredited investors ($1M+ net worth) & QPs ($5M+ investments)" if _carry_num == 0
+                           else "3(c)(1) — qualified clients ($2.2M+ net worth) & QPs ($5M+ investments)")
     exemption_html = (f'<div class="dc-line">Exemption: {_esc(exemption_label)}</div>'
                        if exemption_label else "")
 
