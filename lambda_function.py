@@ -8075,7 +8075,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Active Intros</title>
+<title>Syndicate · Gracia Group</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤝</text></svg>">
 <style>
   * {{ box-sizing: border-box; }}
   :root {{
@@ -8742,7 +8743,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>My Deals</title>
+<title>Syndicate · Gracia Group</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤝</text></svg>">
 <style>
 {NAV_CSS}
 {FEATURE_CSS}
@@ -9554,7 +9556,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_esc(company)}</title>
+<title>Syndicate · Gracia Group</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤝</text></svg>">
 <style>
 {NAV_CSS}
 {FEATURE_CSS}
@@ -10567,7 +10570,8 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Buyer</title>
+<title>Syndicate · Gracia Group</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤝</text></svg>">
 <style>
   * {{ box-sizing: border-box; }}
   :root {{
@@ -10838,7 +10842,8 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_esc(title)}</title>
+<title>Syndicate · Gracia Group</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤝</text></svg>">
 <style>
   body {{
     margin: 0;
@@ -10901,7 +10906,8 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Demand Board</title>
+<title>Syndicate · Gracia Group</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤝</text></svg>">
 <style>
 {NAV_CSS}
 {FEATURE_CSS}
