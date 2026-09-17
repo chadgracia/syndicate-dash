@@ -5190,6 +5190,21 @@ check("classify_person: Substantive alone -> unknown",
 check("classify_person: no investor-level field, no IQF -> unknown",
       lf.classify_person({}) == "unknown")
 
+check("iqf_pending: QP without IQF on file -> True",
+      lf.iqf_pending({lf.INVESTOR_LEVEL_FIELD: [lf.QP_ID]}) is True)
+check("iqf_pending: accredited (via IQF Yes) without Investor Level -> False",
+      lf.iqf_pending({lf.IQF_FIELD: [6496840]}) is False)
+check("iqf_pending: QP with IQF Yes (6496840) on file -> False",
+      lf.iqf_pending({lf.INVESTOR_LEVEL_FIELD: [lf.QP_ID], lf.IQF_FIELD: [6496840]}) is False)
+check("iqf_pending: Accredited with IQF Unnecessary (6596073) on file -> False",
+      lf.iqf_pending({lf.INVESTOR_LEVEL_FIELD: [lf.ACCREDITED_ID], lf.IQF_FIELD: [6596073]}) is False)
+check("iqf_pending: QC without IQF on file -> True",
+      lf.iqf_pending({lf.INVESTOR_LEVEL_FIELD: [lf.QC_ID]}) is True)
+check("iqf_pending: unknown-tier (Substantive) person -> False regardless of IQF",
+      lf.iqf_pending({lf.INVESTOR_LEVEL_FIELD: [lf.SUBSTANTIVE_ID]}) is False)
+check("iqf_pending: no investor-level field at all -> False",
+      lf.iqf_pending({}) is False)
+
 
 # ======================================================================
 # Summary

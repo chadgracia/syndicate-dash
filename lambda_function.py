@@ -349,7 +349,7 @@ LAYERS_MAP = {7000228: "1-Layer", 7000229: "2-Layer", 7000230: "3-Layer"}
 EXEMPTION_FIELD = "custom_label_4006089"
 EXEMPTION_LABELS = {
     7200027: "3(c)(1) — accredited investors",
-    7200028: "3(c)(7) — qualified purchasers only",
+    7200028: "3(c)(7) — qualified purchasers only ($5M+ investments)",
     7201486: "Other",
 }
 
@@ -872,6 +872,14 @@ def classify_person(cf):
     if set(cf_list(cf, IQF_FIELD)) & IQF_OK_IDS:
         return "accredited"
     return "unknown"
+
+
+def iqf_pending(cf):
+    """True when the person tiers as qp/accredited from the Investor Level
+    field but has no cleared IQF (Yes/Unnecessary) on file."""
+    if classify_person(cf) == "unknown":
+        return False
+    return not (set(cf_list(cf, IQF_FIELD)) & IQF_OK_IDS)
 
 
 def _deal_cf_option_ids(deal, key):
@@ -2197,6 +2205,7 @@ def get_company_buyer_details(company):
         out.append({
             "person_id": pid,
             "tier": classify_person(cf),
+            "iqf_pending": iqf_pending(cf),
             "ticket_range": get_person_ticket_range(cf),
             "updated_at": rec.get("updated_at"),
         })
@@ -5653,7 +5662,7 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
         cf = rec.get("custom_fields") or {}
         code = _anon_buyer_code(anon_key_email, pid)
         tier = classify_person(cf)
-        tier_html = _tier_badge_html(tier)
+        tier_html = _tier_badge_html(tier, iqf_needed=iqf_pending(cf))
         min_v, max_v = get_person_ticket_range(cf)
         range_text = _fmt_ticket_range(min_v, max_v)
         range_html = f'<div class="buyer-range">{_esc(range_text)}</div>' if range_text else ""
@@ -7515,8 +7524,9 @@ def _investor_type_cell_html(buyer_recs):
     investor_type, _company_text = _investor_type_and_company(buyer_recs, disclosed=True)
     tier_html = ""
     if buyer_recs:
-        tier = classify_person(buyer_recs[0].get("custom_fields") or {})
-        badge = _tier_badge_html(tier)
+        cf = buyer_recs[0].get("custom_fields") or {}
+        tier = classify_person(cf)
+        badge = _tier_badge_html(tier, iqf_needed=iqf_pending(cf))
         tier_html = f'<div class="tier-badge-line">{badge}</div>' if badge else ""
     return f'{_esc(investor_type)}{tier_html}'
 
@@ -8212,6 +8222,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .tier-badge.tier-qp {{ background: var(--qp); }}
   .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--muted); }}
+  .iqf-flag {{ font-size: 10px; color: var(--muted); background: transparent; margin-left: 4px; }}
   .tier-badge-line {{ margin-top: 4px; }}
   tr.pending-row {{ opacity: 0.85; }}
   tr.grouped-row {{ box-shadow: inset 3px 0 0 var(--line); }}
@@ -9052,7 +9063,7 @@ TIER_LABELS = {"qp": "QP", "accredited": "Accredited", "unknown": "Unknown"}
 TIER_ORDER = {"qp": 0, "accredited": 1, "unknown": 2}
 
 
-def _tier_badge_html(tier):
+def _tier_badge_html(tier, iqf_needed=False):
     """Item 4 (turn 18): the QP/Accredited tier badge pill, wherever tier
     renders as a per-buyer badge (buyer rows, tiles, the buyer page) —
     Unknown renders as no badge at all, since "everyone we couldn't
@@ -9064,7 +9075,10 @@ def _tier_badge_html(tier):
     if tier == "unknown":
         return ""
     tier_label = TIER_LABELS.get(tier, "Unknown")
-    return f'<span class="tier-badge tier-{tier}">{_esc(tier_label)}</span>'
+    badge = f'<span class="tier-badge tier-{tier}">{_esc(tier_label)}</span>'
+    if iqf_needed:
+        badge += '<span class="iqf-flag">IQF needed</span>'
+    return badge
 
 
 def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None, company=None, tenant_email=None):
@@ -9089,7 +9103,7 @@ def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None
     sees real names but no controls -- there's no tenant yet to link
     the buyer to."""
     tier = buyer["tier"]
-    tier_html = _tier_badge_html(tier)
+    tier_html = _tier_badge_html(tier, iqf_needed=buyer.get("iqf_pending", False))
 
     min_v, max_v = buyer["ticket_range"]
     range_text = _fmt_ticket_range(min_v, max_v)
@@ -9723,6 +9737,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .tier-badge.tier-qp {{ background: var(--qp); }}
   .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--unknown); color: var(--ink); }}
+  .iqf-flag {{ font-size: 10px; color: var(--muted); background: transparent; margin-left: 4px; }}
   .buyer-range {{ font-size: 12px; color: var(--muted); }}
   .buyer-tile.admin {{
     grid-column: span 2;
@@ -10047,7 +10062,7 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None):
                                 '<span class="id-verified-chip">ID verified</span>' if id_verified else "") if h]
     badges_html = f'<div class="buyer-header-badges">{"".join(badge_parts)}</div>' if badge_parts else ""
 
-    tier_html = _tier_badge_html(classify_person(cf))
+    tier_html = _tier_badge_html(classify_person(cf), iqf_needed=iqf_pending(cf))
     min_v, max_v = get_person_ticket_range(cf)
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<span class="capacity-chip">{_esc(range_text)}</span>' if range_text else ""
@@ -10483,7 +10498,7 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
     Demand tiles, never a name, company, email, or phone."""
     cf = rec.get("custom_fields") or {}
     code = _anon_buyer_code(anon_key_email, buyer_id)
-    tier_html = _tier_badge_html(classify_person(cf))
+    tier_html = _tier_badge_html(classify_person(cf), iqf_needed=iqf_pending(cf))
     min_v, max_v = get_person_ticket_range(cf)
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<div class="buyer-page-row">{_esc(range_text)}</div>' if range_text else ""
@@ -10657,6 +10672,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .tier-badge.tier-qp {{ background: var(--qp); }}
   .tier-badge.tier-accredited {{ background: #c9a227; }}
   .tier-badge.tier-unknown {{ background: var(--muted); }}
+  .iqf-flag {{ font-size: 10px; color: var(--muted); background: transparent; margin-left: 4px; }}
   /* Closer chip and the ID-verified signal chip -- same pill shape,
      green fill, white text, used only where the underlying boolean is
      True (see _closer_chip_html / _buyer_header_html — the false/unset
