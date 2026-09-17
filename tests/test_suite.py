@@ -5175,6 +5175,23 @@ check("My Deals: Natoli's sell deal shows a 'via Natoli' chip on Kevin's page (s
 
 
 # ======================================================================
+# SECTION: classify_person tier coverage
+# ======================================================================
+# classify_person is a pure function of custom_fields -- no fixture needed.
+
+check("classify_person: QP alone -> qp",
+      lf.classify_person({lf.INVESTOR_LEVEL_FIELD: [lf.QP_ID]}) == "qp")
+check("classify_person: QC alone -> accredited",
+      lf.classify_person({lf.INVESTOR_LEVEL_FIELD: [lf.QC_ID]}) == "accredited")
+check("classify_person: Accredited alone -> accredited",
+      lf.classify_person({lf.INVESTOR_LEVEL_FIELD: [lf.ACCREDITED_ID]}) == "accredited")
+check("classify_person: Substantive alone -> unknown",
+      lf.classify_person({lf.INVESTOR_LEVEL_FIELD: [lf.SUBSTANTIVE_ID]}) == "unknown")
+check("classify_person: no investor-level field, no IQF -> unknown",
+      lf.classify_person({}) == "unknown")
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 

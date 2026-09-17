@@ -233,6 +233,8 @@ CLOSED_DEALS_KEY = "syndicate-dash/deals-closed.json"
 
 INVESTOR_LEVEL_FIELD = "custom_label_3923758"
 QP_ID = 6950564
+QC_ID = 7209227          # Qualified Client ($2.2M net worth) — option added 2026/09/17
+ACCREDITED_ID = 6950563  # Accredited Investor ($1M in assets)
 IQF_FIELD = "custom_label_3763008"
 IQF_OK_IDS = {6496840, 6596073}
 
@@ -863,6 +865,10 @@ def classify_person(cf):
         # is not a qualification tier, just a screening flag, and must
         # never be read as QP or Accredited.
         return "unknown"
+    if QC_ID in level_ids or ACCREDITED_ID in level_ids:
+        # Qualified Client and Accredited are qualification tiers in their
+        # own right; both display in the Accredited tier.
+        return "accredited"
     if set(cf_list(cf, IQF_FIELD)) & IQF_OK_IDS:
         return "accredited"
     return "unknown"
@@ -5495,6 +5501,12 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
 
     exemption_id = next(iter(_deal_cf_option_ids(deal, EXEMPTION_FIELD)), None)
     exemption_label = EXEMPTION_LABELS.get(exemption_id)
+    if exemption_id == 7200027:
+        # 3(c)(1): carry > 0 (or unknown) means Rule 205-3 Qualified Client
+        # standard applies; only an explicit 0 carry keeps the accredited label.
+        _carry_num = _deal_cf_number(deal, CARRY_FIELD)
+        exemption_label = ("3(c)(1) — accredited investors" if _carry_num == 0
+                           else "3(c)(1) — qualified clients & QPs")
     exemption_html = (f'<div class="dc-line">Exemption: {_esc(exemption_label)}</div>'
                        if exemption_label else "")
 
