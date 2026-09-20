@@ -11490,6 +11490,20 @@ def _handle_update_intro(event):
     return _json_response({"ok": True})
 
 
+def _handle_demand_list():
+    """?demand=list, admin-only (checked by the caller). Read-only JSON of the
+    same per-company table the Demand Board renders (get_company_table),
+    trimmed to what an external, client-facing consumer (chadgracia/
+    portfolio-deploy's Demand Board) is allowed to have: company name,
+    interested-buyer count, and seller count -- no QP/Accredited/Unknown
+    breakdown, no names, no emails, no dollar figures. Lets other tools
+    reuse this table instead of reimplementing the aggregation math."""
+    table = get_company_table()
+    rows = [{"company": r["company"], "buyers": r["total"], "sellers": r["sellers"]}
+            for r in table]
+    return _json_response({"companies_with_buyers": len(table), "rows": rows})
+
+
 def _handle_tenants_list():
     """?tenants=list, admin-only (checked by the caller). JSON
     {"count": N, "tenants": [{"name","firm","email"}]} using the exact
@@ -12103,6 +12117,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_tenants_list()
+
+    if query.get("demand") == "list":
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_demand_list()
 
     if query.get("duplicate_report"):
         if not is_admin_key:
