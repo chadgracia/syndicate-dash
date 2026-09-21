@@ -1341,6 +1341,46 @@ def _verify_sso_handoff(token):
         return None
 
 
+# This dash's own canonical URL -- the same Lambda Function URL
+# chadgracia/trades hands out as SYNDICATE_DASH_URL for its nav's "My
+# Dashboard" link and the ?sso= handoff above. Used only to build the
+# permanent tenant link below; every other absolute link to this app in
+# the codebase already points here.
+DASH_SELF_URL = "https://ws4stw4iul75a7yx5dra2wmnq40kipav.lambda-url.us-east-1.on.aws"
+
+
+def _make_tenant_link_token(email):
+    """Permanent per-tenant magic-link token: HMAC-SHA256(HMAC_SECRET,
+    "tenant-link:<email>"), urlsafe base64 no padding -- same construction
+    and secret as _deal_update_form_url's per-deal token, domain-separated
+    by the "tenant-link:" prefix so the two token types can never be
+    confused for one another even though they share a secret. Unlike the
+    SSO handoff above, this token never expires: it's the durable link an
+    admin hands a tenant who may never have signed in before. None when
+    HMAC_SECRET isn't configured (same fail-soft as _deal_update_form_url)."""
+    secret = os.environ.get("HMAC_SECRET")
+    if not (secret and email):
+        return None
+    sig = hmac.new(secret.encode(), f"tenant-link:{email}".encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+
+def _verify_tenant_link_token(email, token):
+    expected = _make_tenant_link_token(email)
+    return bool(expected) and hmac.compare_digest(expected, token or "")
+
+
+def _tenant_link_url(email):
+    """Full permanent magic link for this tenant: opens signed in as them
+    (via the same durable gg_id cookie the SSO handoff sets), no admin key,
+    no view_as, no expiry. None when HMAC_SECRET isn't configured."""
+    token = _make_tenant_link_token(email)
+    if not token:
+        return None
+    return (f"{DASH_SELF_URL}/?tenant={urllib.parse.quote(email, safe='')}"
+            f"&token={token}")
+
+
 # Perf fix 5: one boto3 S3 client (and, below, one Dynamo Table binding)
 # reused across every call in the container's lifetime, instead of a
 # fresh boto3.client("s3")/boto3.resource("dynamodb") construction per
@@ -6952,6 +6992,15 @@ NAV_CSS = """
     white-space: nowrap;
   }
   .gg-copy-link-btn:hover { border-color: var(--accent); }
+  .gg-copy-link-fallback { display: inline-block; margin-left: 6px; }
+  .gg-copy-link-fallback input {
+    font-size: 12px;
+    padding: 5px 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    width: 260px;
+    font-family: ui-monospace, monospace;
+  }
   /* Click/focus-driven only, via the shared GGDropdown helper -- see the
      My Deals nav dropdown comment above. Results are real <a href> rows
      (full-width hit area, no click-intercepting JS); display is gated on
@@ -7391,38 +7440,58 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
 
         # "Copy client link" (item 3): only once a tenant is actually
         # selected (view_as truthy) -- there's no tenant-facing link to
-        # copy for the admin-without-&view_as aggregate view. Pure
-        # client-side URL surgery on window.location.href (never a
-        # server-constructed URL, so it works identically behind the
-        # raw Function URL, a custom domain, or localhost) -- strips
-        # key/view_as/edit, keeps every other param (tab, company, ref,
-        # buyer, ...) so the copied link lands on this SAME page, ready
-        # for that tenant to open once they've signed in themselves.
+        # copy for the admin-without-&view_as aggregate view.
+        #
+        # Bug fix: this used to do pure client-side URL surgery on
+        # window.location.href, stripping key/view_as/edit off the
+        # ADMIN'S OWN preview URL. Those three params were the only
+        # credential on that URL -- nothing else in it, and no cookie in
+        # the admin's browser, authenticates the TENANT -- so the "copied"
+        # link had no credential left at all and the tenant hit "Access
+        # denied - Sign in to view the Demand Board." A tenant link has to
+        # carry ITS OWN credential, not the admin's, so this is now a real
+        # server-built permanent magic link (_tenant_link_url, verified in
+        # _lambda_handler_impl next to the SSO handoff) embedded as a data
+        # attribute; the button just copies that fixed string. None when
+        # HMAC_SECRET isn't configured -- render without the button rather
+        # than a broken link, same fail-soft as _deal_update_form_url.
         if view_as:
-            copy_link_html = ('<button type="button" class="gg-copy-link-btn" id="gg-copy-link-btn">'
-                               'Copy client link</button><span class="ei-msg" id="gg-copy-link-msg"></span>')
-            view_toggle_script += """<script>
+            _client_link = _tenant_link_url(view_as.strip().lower())
+            if _client_link:
+                copy_link_html = (
+                    '<button type="button" class="gg-copy-link-btn" id="gg-copy-link-btn" '
+                    f'data-link="{_esc(_client_link)}">Copy client link</button>'
+                    '<span class="ei-msg" id="gg-copy-link-msg"></span>'
+                    '<span class="gg-copy-link-fallback" id="gg-copy-link-fallback" hidden>'
+                    f'<input type="text" readonly id="gg-copy-link-input" value="{_esc(_client_link)}"></span>'
+                )
+                view_toggle_script += """<script>
 (function() {
   var btn = document.getElementById('gg-copy-link-btn');
   var msg = document.getElementById('gg-copy-link-msg');
+  var fallback = document.getElementById('gg-copy-link-fallback');
+  var input = document.getElementById('gg-copy-link-input');
   if (!btn) return;
   btn.addEventListener('click', function() {
-    var url = new URL(window.location.href);
-    ['key', 'view_as', 'edit'].forEach(function(p) { url.searchParams.delete(p); });
-    var text = url.toString();
+    var text = btn.getAttribute('data-link');
     function showCopied() {
       msg.className = 'ei-msg saved';
       msg.textContent = 'Copied ✓';
       setTimeout(function() { msg.className = 'ei-msg'; msg.textContent = ''; }, 2000);
     }
-    function showError(err) {
+    function showFallback() {
       msg.className = 'ei-msg error';
-      msg.textContent = 'Copy failed: ' + err;
+      msg.textContent = 'Copy failed — link below';
+      if (fallback) {
+        fallback.hidden = false;
+        input.focus();
+        input.select();
+      }
     }
     if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(showCopied, function(err) { showError(err); });
+      navigator.clipboard.writeText(text).then(showCopied, showFallback);
     } else {
-      showError('clipboard unavailable');
+      showFallback();
     }
   });
 })();
@@ -12143,6 +12212,26 @@ def _lambda_handler_impl(event, context):
                 "statusCode": 302,
                 "headers": {"Location": location},
                 "cookies": [_make_identity_cookie(email)],
+                "body": "",
+            }
+
+    # Permanent tenant link (the "Copy client link" button's URL): verify,
+    # set the same durable identity cookie the SSO handoff sets above,
+    # redirect to a clean URL. Unlike sso, this token never expires -- see
+    # _make_tenant_link_token. An invalid/tampered token falls through to
+    # normal identity resolution, same as a bad sso token above.
+    tenant_link_email = (query.get("tenant") or "").strip().lower()
+    tenant_link_token = query.get("token")
+    if tenant_link_email and tenant_link_token:
+        if _verify_tenant_link_token(tenant_link_email, tenant_link_token):
+            location = event.get("rawPath") or "/"
+            tab = query.get("tab")
+            if tab:
+                location += f"?tab={urllib.parse.quote(tab, safe='')}"
+            return {
+                "statusCode": 302,
+                "headers": {"Location": location},
+                "cookies": [_make_identity_cookie(tenant_link_email)],
                 "body": "",
             }
 

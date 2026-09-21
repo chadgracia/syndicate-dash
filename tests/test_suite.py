@@ -4427,9 +4427,48 @@ check("nav toggle: 'Admin view' is present but NOT active",
       in resp_bare_company["body"])
 check("'Copy client link' renders whenever a tenant is selected, regardless of tenant/admin view mode",
       'id="gg-copy-link-btn"' in resp_bare_company["body"])
-check("Copy client link script strips key/view_as/edit, keeping every other param",
-      "url.searchParams.delete(p)" in resp_bare_company["body"]
-      and "['key', 'view_as', 'edit']" in resp_bare_company["body"])
+# Bug fix: the button used to strip key/view_as/edit off the ADMIN's own
+# window.location.href client-side -- those three params were the only
+# credential on that URL, so the "copied" link had none left and a tenant
+# opening it hit "Access denied." The button now carries a real, permanent,
+# server-built per-tenant magic link (_tenant_link_url) in a data attribute;
+# the script just copies that fixed string, with a visible-input fallback
+# on clipboard failure.
+check("Copy client link button carries the real permanent per-tenant link, "
+      "not the admin's own URL with params stripped",
+      f'data-link="{lf._esc(lf._tenant_link_url(VT_TENANT_EMAIL))}"' in resp_bare_company["body"])
+check("Copy client link's permanent link verifies server-side back to this exact tenant",
+      lf._verify_tenant_link_token(
+          VT_TENANT_EMAIL,
+          lf._tenant_link_url(VT_TENANT_EMAIL).rsplit("token=", 1)[1]))
+check("Copy client link's permanent link carries no admin key, no view_as, no sso param",
+      "key=" not in lf._tenant_link_url(VT_TENANT_EMAIL)
+      and "view_as=" not in lf._tenant_link_url(VT_TENANT_EMAIL)
+      and "sso=" not in lf._tenant_link_url(VT_TENANT_EMAIL))
+check("Copy client link script reads data-link and copies it verbatim",
+      "btn.getAttribute('data-link')" in resp_bare_company["body"])
+check("Copy client link fallback input pre-filled with the same link, hidden until clipboard fails",
+      f'id="gg-copy-link-input" value="{lf._esc(lf._tenant_link_url(VT_TENANT_EMAIL))}"'
+      in resp_bare_company["body"]
+      and 'id="gg-copy-link-fallback" hidden' in resp_bare_company["body"])
+
+# The permanent link itself must actually sign the tenant in: GET it with no
+# cookie, no admin key, nothing else -- same as a tenant pasting it cold into
+# a fresh browser.
+_tlink = lf._tenant_link_url(VT_TENANT_EMAIL)
+_tlink_qs = dict(p.split("=", 1) for p in _tlink.split("?", 1)[1].split("&"))
+resp_tenant_link = lf.lambda_handler(vt_get_event(
+    {"tenant": lf.urllib.parse.unquote(_tlink_qs["tenant"]), "token": _tlink_qs["token"]}), None)
+check("Permanent tenant link: fresh GET (no cookie) redirects (signs in), not 403",
+      resp_tenant_link["statusCode"] == 302)
+check("Permanent tenant link: sets the same durable gg_id identity cookie the SSO handoff sets",
+      any(c.startswith("gg_id=") for c in (resp_tenant_link.get("cookies") or [])))
+resp_tenant_link_bad = lf.lambda_handler(vt_get_event(
+    {"tenant": VT_TENANT_EMAIL, "token": "not-a-real-token"}), None)
+check("Permanent tenant link: tampered token falls through to normal identity "
+      "resolution (403, no cookie) rather than signing anyone in",
+      resp_tenant_link_bad["statusCode"] == 403
+      and not (resp_tenant_link_bad.get("cookies") or []))
 check("toggle script writes the gg_admin_view cookie client-side, Path=/, no HttpOnly (JS must be able to set it)",
       "document.cookie = 'gg_admin_view=' + mode" in resp_bare_company["body"]
       and "Path=/" in resp_bare_company["body"])
