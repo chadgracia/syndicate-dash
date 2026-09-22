@@ -753,7 +753,8 @@ check("My Deals has no leftover dark-mode bg literal", "#14161a" not in page and
 
 company_table_page = lf.render_page([{"company": "Alpha Co", "total": 1, "qp": 1, "accredited": 0,
                                        "unknown": 0, "sellers": 1, "ticket_min_sum": 0, "ticket_max_sum": 0,
-                                       "ticket_plus": False, "ticket_count": 0}], "Sella", key=None, view_as=None,
+                                       "ticket_plus": False, "ticket_count": 0, "latest_interest_ts": 0,
+                                       "latest_interest_display": None}], "Sella", key=None, view_as=None,
                                      anon_key_email=TENANT_EMAIL, tenant_picker=False)
 check("Demand Board uses the light --bg token", "--bg: #f4f2ee;" in company_table_page)
 check("Demand Board has no leftover dark-mode literal", "#14161a" not in company_table_page)
@@ -2511,8 +2512,15 @@ page_intros_wrap = lf.render_intros_page("Sella Seller", tenant=tenant_a, tenant
                                           key=None, view_as=None, edit_mode=False)
 check("Active Intros .wrap has the shared top margin", ".wrap { max-width: 1000px; margin: 28px auto 0; }" in page_intros_wrap)
 
-page_demand_wrap = lf.render_page([], "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin", tenant_picker=True)
-check("Demand Board .wrap has the shared top margin", ".wrap { max-width: 1000px; margin: 28px auto 0; }" in page_demand_wrap)
+page_demand_wrap = lf.render_page([], "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",
+                                   tenant_picker=True, edit_mode=True)
+check("Demand Board admin .wrap keeps the shared 1000px/top margin",
+      ".wrap { max-width: 1000px; margin: 28px auto 0; }" in page_demand_wrap)
+
+page_demand_wrap_tenant = lf.render_page([], "Sella Seller", key=None, view_as=None,
+                                          anon_key_email=TENANT_A_EMAIL, tenant_picker=False)
+check("Demand Board TENANT .wrap is tightened to 760px (same top margin)",
+      ".wrap { max-width: 760px; margin: 28px auto 0; }" in page_demand_wrap_tenant)
 
 page_company_wrap = lf.render_company_page("Multi Co", "Sella Seller", tenant_a, TENANT_A_EMAIL, "mydeals",
                                             key=None, view_as=None, edit_mode=False)
@@ -5247,23 +5255,68 @@ check("iqf_pending: no investor-level field at all -> False",
 
 
 # ======================================================================
-# SECTION: Demand Board tenant layout (ticket aggregation, 3-column
-# tenant table vs. unchanged 6-column admin table, _handle_demand_list
-# untouched)
+# SECTION: Demand Board tenant layout (5-column tenant table vs.
+# unchanged 6-column admin table, _handle_demand_list untouched)
 # ======================================================================
 
+# --- _fmt_tenant_money: rounding boundaries, TENANT-ONLY (never _fmt_money).
+check("_fmt_tenant_money: <$100M rounds to nearest $5M (23.95M -> $25M)",
+      lf._fmt_tenant_money(23_950_000) == "$25M")
+check("_fmt_tenant_money: <$100M rounds DOWN to nearest $5M when closer (22M -> $20M)",
+      lf._fmt_tenant_money(22_000_000) == "$20M")
+check("_fmt_tenant_money: $100M-$1B rounds to nearest $25M (703.5M -> $700M)",
+      lf._fmt_tenant_money(703_500_000) == "$700M")
+check("_fmt_tenant_money: exactly $100M sits in the $25M-rounding band ($100M -> $100M)",
+      lf._fmt_tenant_money(100_000_000) == "$100M")
+check("_fmt_tenant_money: $1B-$1T renders as billions, one decimal ($2,303M -> $2.3B)",
+      lf._fmt_tenant_money(2_303_000_000) == "$2.3B")
+check("_fmt_tenant_money: a whole-billion value drops the trailing .0 ($2,000M -> $2B)",
+      lf._fmt_tenant_money(2_000_000_000) == "$2B")
+check("_fmt_tenant_money: exactly $1B sits in the billions band ($1B -> $1B)",
+      lf._fmt_tenant_money(1_000_000_000) == "$1B")
+check("_fmt_tenant_money: >=$1T renders as trillions, one decimal ($2.5T -> $2.5T)",
+      lf._fmt_tenant_money(2_500_000_000_000) == "$2.5T")
+check("_fmt_tenant_money: a whole-trillion value drops the trailing .0 ($1T -> $1T)",
+      lf._fmt_tenant_money(1_000_000_000_000) == "$1T")
+
+# --- _potential_demand_cell_html: "+" preservation and rounded-equal collapse.
+check("_potential_demand_cell_html: ticket_count 0 -> em dash",
+      lf._potential_demand_cell_html({"ticket_count": 0, "ticket_min_sum": 0, "ticket_max_sum": 0,
+                                       "ticket_plus": False}) == "—")
+check("_potential_demand_cell_html: distinct rounded values -> a range",
+      lf._potential_demand_cell_html({"ticket_count": 2, "ticket_min_sum": 26_000_000,
+                                       "ticket_max_sum": 55_000_000, "ticket_plus": False}) == "$25M – $55M")
+check("_potential_demand_cell_html: raw min != max but ROUNDED values match -> single value, no dash",
+      lf._potential_demand_cell_html({"ticket_count": 2, "ticket_min_sum": 23_000_000,
+                                       "ticket_max_sum": 24_000_000, "ticket_plus": False}) == "$25M")
+check("_potential_demand_cell_html: rounded-equal but ticket_plus True -> stays a range with trailing '+'",
+      lf._potential_demand_cell_html({"ticket_count": 1, "ticket_min_sum": 100_000_000,
+                                       "ticket_max_sum": 100_000_000, "ticket_plus": True}) == "$100M – $100M+")
+
+# --- Fixture-driven table: qualified-buyer sums + latest-interest parsing
+# (both Pipeline date shapes, plus an unparseable value and a missing one).
 people_ticket = {"people": [
     {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
-    # Alpha Co: two bounded-tier buyers -> min/max sums both bounded, no "+".
-    {"id": 201, "full_name": "Alpha Buyer One", "custom_fields": {lf.TICKET_SIZE_FIELD: [5014555]}},  # 1M-5M
-    {"id": 202, "full_name": "Alpha Buyer Two", "custom_fields": {lf.TICKET_SIZE_FIELD: [5014564]}},  # 25M-50M
-    # Beta Co: one unbounded top-tier buyer (100M+) plus one buyer with no
-    # ticket size set at all (excluded from the aggregation entirely).
-    {"id": 203, "full_name": "Beta Buyer One", "custom_fields": {lf.TICKET_SIZE_FIELD: [5014570]}},  # 100M+
+    # Alpha Co: QP buyer (slash date) + unknown-tier buyer (ISO date, later) ->
+    # qualified=1, latest interest = the ISO one (Sep 2026).
+    {"id": 201, "full_name": "Alpha Buyer One", "updated_at": "2026/08/15",
+     "custom_fields": {lf.TICKET_SIZE_FIELD: [5014555],  # 1M-5M
+                        lf.INVESTOR_LEVEL_FIELD: [lf.QP_ID]}},
+    {"id": 202, "full_name": "Alpha Buyer Two", "updated_at": "2026-09-01T00:00:00Z",
+     "custom_fields": {lf.TICKET_SIZE_FIELD: [5014564]}},  # 25M-50M, no investor level -> unknown
+    # Beta Co: accredited buyer w/ unbounded ticket but an UNPARSEABLE date,
+    # plus an unknown-tier buyer with NO ticket size and no updated_at at
+    # all -> qualified=1, but latest interest has no parseable date anywhere.
+    {"id": 203, "full_name": "Beta Buyer One", "updated_at": "not-a-date",
+     "custom_fields": {lf.TICKET_SIZE_FIELD: [5014570],  # 100M+
+                        lf.INVESTOR_LEVEL_FIELD: [lf.ACCREDITED_ID]}},
     {"id": 204, "full_name": "Beta Buyer Two", "custom_fields": {}},
-    # Gamma Co: no buyer has a ticket size on file -> zero-ticket em dash.
-    {"id": 205, "full_name": "Gamma Buyer One", "custom_fields": {}},
-    {"id": 206, "full_name": "Gamma Buyer Two", "custom_fields": {}},
+    # Gamma Co: no buyer has a ticket size (zero-ticket em dash), but both
+    # have parseable dates in the OTHER format from Alpha's, proving both
+    # Pipeline date shapes parse regardless of which company uses which.
+    {"id": 205, "full_name": "Gamma Buyer One", "updated_at": "2026/01/10",
+     "custom_fields": {lf.INVESTOR_LEVEL_FIELD: [lf.QC_ID]}},  # accredited tier
+    {"id": 206, "full_name": "Gamma Buyer Two", "updated_at": "2025-12-25T10:00:00Z", "custom_fields": {}},
 ]}
 interest_ticket = {"buy": {
     "Alpha Co": [201, 202],
@@ -5277,53 +5330,73 @@ alpha_row = next(r for r in ticket_table if r["company"] == "Alpha Co")
 beta_row = next(r for r in ticket_table if r["company"] == "Beta Co")
 gamma_row = next(r for r in ticket_table if r["company"] == "Gamma Co")
 
-check("_build_table: Alpha ticket_min_sum = 1M + 25M = 26M", alpha_row["ticket_min_sum"] == 26_000_000)
+check("_build_table: Alpha ticket_min_sum = 1M + 25M = 26M (unrounded, field meaning unchanged)",
+      alpha_row["ticket_min_sum"] == 26_000_000)
 check("_build_table: Alpha ticket_max_sum = 5M + 50M = 55M", alpha_row["ticket_max_sum"] == 55_000_000)
-check("_build_table: Alpha ticket_plus is False (both tiers bounded)", alpha_row["ticket_plus"] is False)
+check("_build_table: Alpha ticket_plus is False", alpha_row["ticket_plus"] is False)
 check("_build_table: Alpha ticket_count = 2", alpha_row["ticket_count"] == 2)
-check("_build_table: Alpha existing fields untouched (total=2)", alpha_row["total"] == 2)
+check("_build_table: Alpha qualified sum (qp=1 + accredited=0) = 1", alpha_row["qp"] + alpha_row["accredited"] == 1)
+check("_build_table: Alpha latest_interest_display = 'Sep 2026' (ISO date is the later one)",
+      alpha_row["latest_interest_display"] == "Sep 2026")
+check("_build_table: Alpha latest_interest_ts is a positive epoch", alpha_row["latest_interest_ts"] > 0)
 
-check("_build_table: Beta ticket_min_sum = 100M (unbounded buyer only; no-ticket buyer excluded)",
-      beta_row["ticket_min_sum"] == 100_000_000)
-check("_build_table: Beta ticket_max_sum falls back to person_min for the unbounded tier",
-      beta_row["ticket_max_sum"] == 100_000_000)
-check("_build_table: Beta ticket_plus is True (unbounded top tier present)", beta_row["ticket_plus"] is True)
-check("_build_table: Beta ticket_count = 1 (only one of its two buyers has a ticket size)",
-      beta_row["ticket_count"] == 1)
-check("_build_table: Beta existing total field untouched (still counts both buyers, 2)",
-      beta_row["total"] == 2)
+check("_build_table: Beta qualified sum (qp=0 + accredited=1) = 1", beta_row["qp"] + beta_row["accredited"] == 1)
+check("_build_table: Beta ticket_plus is True (unbounded top tier)", beta_row["ticket_plus"] is True)
+check("_build_table: Beta latest_interest_ts = 0 (unparseable + missing dates only)",
+      beta_row["latest_interest_ts"] == 0)
+check("_build_table: Beta latest_interest_display is None (renderer supplies the em dash)",
+      beta_row["latest_interest_display"] is None)
 
-check("_build_table: Gamma ticket_min_sum = 0 (no buyer has a ticket size)", gamma_row["ticket_min_sum"] == 0)
-check("_build_table: Gamma ticket_max_sum = 0", gamma_row["ticket_max_sum"] == 0)
-check("_build_table: Gamma ticket_plus is False", gamma_row["ticket_plus"] is False)
-check("_build_table: Gamma ticket_count = 0", gamma_row["ticket_count"] == 0)
+check("_build_table: Gamma ticket_count = 0 (zero-ticket em dash case)", gamma_row["ticket_count"] == 0)
+check("_build_table: Gamma qualified sum (qp=0 + accredited=1) = 1", gamma_row["qp"] + gamma_row["accredited"] == 1)
+check("_build_table: Gamma latest_interest_display = 'Jan 2026' (slash date parses and is the later one)",
+      gamma_row["latest_interest_display"] == "Jan 2026")
 
-# --- Tenant layout: exactly 3 columns, no QP/Accredited/Unknown/Sellers,
-# no legend, search box + sortable Ticket range column (numeric data-sort).
+# --- Tenant layout: exactly 5 columns in the new order, header renamed,
+# 'unknown' the word gone entirely, search + numeric data-sort intact.
 tenant_demand_page = lf.render_page(ticket_table, "Sella Seller", key=None, view_as=None,
                                      anon_key_email=TENANT_A_EMAIL, tenant_picker=False)
 tenant_thead = tenant_demand_page[tenant_demand_page.find("<thead>"):tenant_demand_page.find("</thead>")]
-check("Tenant Demand Board: exactly 3 <th> columns", tenant_thead.count("<th ") == 3)
-check("Tenant Demand Board: header order is Company / Total buyer interest / Ticket range",
-      [tenant_thead.find(f">{h}<") for h in ["Company", "Total buyer interest", "Ticket range"]]
-      == sorted(tenant_thead.find(f">{h}<") for h in ["Company", "Total buyer interest", "Ticket range"])
-      and all(tenant_thead.find(f">{h}<") != -1 for h in ["Company", "Total buyer interest", "Ticket range"]))
-check("Tenant Demand Board: no QP/Accredited/Unknown/Sellers headers",
-      not any(h in tenant_thead for h in [">QP<", ">Accredited<", ">Unknown<", ">Sellers<"]))
+check("Tenant Demand Board: exactly 5 <th> columns", tenant_thead.count("<th ") == 5)
+expected_tenant_headers = ["Company", "Total buyer interest", "Qualified buyers",
+                            "Total Potential Demand", "Latest interest"]
+tenant_header_positions = [tenant_thead.find(f">{h}<") for h in expected_tenant_headers]
+check("Tenant Demand Board: header order is Company / Total buyer interest / Qualified buyers / "
+      "Total Potential Demand / Latest interest",
+      tenant_header_positions == sorted(tenant_header_positions) and all(p != -1 for p in tenant_header_positions))
+check("Tenant Demand Board: old 'Ticket range' header is gone", "Ticket range" not in tenant_demand_page)
+check("Tenant Demand Board: no QP/Accredited/Sellers headers",
+      not any(h in tenant_thead for h in [">QP<", ">Accredited<", ">Sellers<"]))
+check("Tenant Demand Board: the word 'unknown' never appears anywhere on the page",
+      "unknown" not in tenant_demand_page.lower())
 check("Tenant Demand Board: legend is gone entirely", 'class="legend"' not in tenant_demand_page)
 check("Tenant Demand Board: search box still present", '<input id="search"' in tenant_demand_page)
-check("Tenant Demand Board: Alpha's bounded ticket range renders as '$26M – $55M'",
-      "$26M – $55M" in tenant_demand_page)
-check("Tenant Demand Board: Alpha's Ticket range cell carries a numeric data-sort (26000000)",
-      'data-sort="26000000">$26M – $55M' in tenant_demand_page)
-check("Tenant Demand Board: Beta's unbounded ticket range renders with a trailing '+'",
-      "$100M – $100M+" in tenant_demand_page)
+
+alpha_cell = tenant_demand_page[tenant_demand_page.find(">Alpha Co<"):]
+alpha_cell = alpha_cell[:alpha_cell.find("</tr>")]
+check("Tenant Demand Board: Alpha's Qualified buyers cell shows 1 (qp+accredited)",
+      '<td class="num">1</td>' in alpha_cell)
+check("Tenant Demand Board: Alpha's Total Potential Demand renders the ROUNDED range '$25M – $55M'",
+      "$25M – $55M" in alpha_cell)
+check("Tenant Demand Board: Alpha's demand cell carries a numeric data-sort of the unrounded ticket_min_sum",
+      'data-sort="26000000">$25M – $55M' in alpha_cell)
+check("Tenant Demand Board: Alpha's Latest interest shows 'Sep 2026' with a numeric data-sort",
+      "Sep 2026" in alpha_cell and f'data-sort="{alpha_row["latest_interest_ts"]}">Sep 2026' in alpha_cell)
+
+beta_cell = tenant_demand_page[tenant_demand_page.find(">Beta Co<"):]
+beta_cell = beta_cell[:beta_cell.find("</tr>")]
+check("Tenant Demand Board: Beta's demand cell keeps the trailing '+' despite a rounded-equal range",
+      "$100M – $100M+" in beta_cell)
+check("Tenant Demand Board: Beta's Latest interest is an em dash with data-sort=\"0\"",
+      'data-sort="0">—' in beta_cell)
+
 gamma_cell = tenant_demand_page[tenant_demand_page.find(">Gamma Co<"):]
 gamma_cell = gamma_cell[:gamma_cell.find("</tr>")]
-check("Tenant Demand Board: Gamma (zero ticket buyers) renders an em dash",
-      ">—<" in gamma_cell and 'data-sort="0"' in gamma_cell)
+check("Tenant Demand Board: Gamma's Total Potential Demand is an em dash (zero ticket buyers)",
+      'data-sort="0">—' in gamma_cell)
+check("Tenant Demand Board: Gamma's Latest interest shows 'Jan 2026'", "Jan 2026" in gamma_cell)
 
-# --- Admin layout: unchanged 6-column table + legend.
+# --- Admin layout: unchanged 6-column table + legend + 1000px wrap.
 admin_demand_page = lf.render_page(ticket_table, "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",
                                     tenant_picker=True, edit_mode=True)
 admin_thead = admin_demand_page[admin_demand_page.find("<thead>"):admin_demand_page.find("</thead>")]
@@ -5335,16 +5408,20 @@ check("Admin Demand Board: header order is Company/Total buyers/QP/Accredited/Un
 check("Admin Demand Board: legend still present with all three tiers",
       'class="legend"' in admin_demand_page and ">QP &mdash;" in admin_demand_page
       and ">Accredited &mdash;" in admin_demand_page and ">Unknown &mdash;" in admin_demand_page)
-check("Admin Demand Board: no 'Ticket range' column at all", "Ticket range" not in admin_demand_page)
+check("Admin Demand Board: no 'Total Potential Demand'/'Qualified buyers'/'Latest interest' columns",
+      not any(h in admin_demand_page for h in ["Total Potential Demand", "Qualified buyers", "Latest interest"]))
+check("Admin Demand Board: still the 1000px wrap (unaffected by the tenant 760px change)",
+      ".wrap { max-width: 1000px; margin: 28px auto 0; }" in admin_demand_page)
 alpha_admin_row = admin_demand_page[admin_demand_page.find(">Alpha Co<"):]
 alpha_admin_row = alpha_admin_row[:alpha_admin_row.find("</tr>")]
 check("Admin Demand Board: Alpha's row still shows total/qp/accredited/unknown/sellers numerics",
       f'<td class="num">{alpha_row["total"]}</td>' in alpha_admin_row
       and f'<td class="num">{alpha_row["qp"]}</td>' in alpha_admin_row
+      and f'<td class="num">{alpha_row["unknown"]}</td>' in alpha_admin_row
       and f'<td class="num">{alpha_row["sellers"]}</td>' in alpha_admin_row)
 
 # --- _handle_demand_list JSON endpoint: unchanged shape (company/buyers/
-# sellers only -- no ticket fields, no QP/Accredited/Unknown breakdown).
+# sellers only -- no ticket/qualified/latest-interest fields at all).
 demand_list_resp = lf._handle_demand_list()
 check("_handle_demand_list: 200 OK", demand_list_resp["statusCode"] == 200)
 demand_list_data = json.loads(demand_list_resp["body"])

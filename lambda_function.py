@@ -1144,16 +1144,39 @@ def _fmt_ticket_range(min_v, max_v):
     return f"{_fmt_money(min_v)} – {_fmt_money(max_v)}"
 
 
-def _ticket_range_cell_html(r):
-    """Demand Board tenant layout's Ticket range cell text, aggregated
-    across a company's buy-interest people (_build_table's ticket_min_sum/
-    ticket_max_sum/ticket_plus/ticket_count)."""
+def _fmt_tenant_money(v):
+    """Rounded money formatting for the Demand Board TENANT layout only
+    (Total Potential Demand column) -- never used anywhere else, and
+    _fmt_money itself is untouched. Coarser than _fmt_money by design:
+    < $100M rounds to the nearest $5M, $100M-$1B to the nearest $25M,
+    and $1B+ (or $1T+) renders as billions/trillions with one decimal,
+    dropping a trailing '.0' ($2,303M -> '$2.3B', $2,000M -> '$2B')."""
+    if v < 100_000_000:
+        millions = round(v / 5_000_000) * 5
+    elif v < 1_000_000_000:
+        millions = round(v / 25_000_000) * 25
+    elif v < 1_000_000_000_000:
+        n = f"{v / 1_000_000_000:.1f}".rstrip("0").rstrip(".")
+        return f"${n}B"
+    else:
+        n = f"{v / 1_000_000_000_000:.1f}".rstrip("0").rstrip(".")
+        return f"${n}T"
+    return f"${millions:,}M"
+
+
+def _potential_demand_cell_html(r):
+    """Demand Board tenant layout's Total Potential Demand cell text,
+    aggregated across a company's buy-interest people (_build_table's
+    ticket_min_sum/ticket_max_sum/ticket_plus/ticket_count), rendered
+    through the coarser _fmt_tenant_money rounding rather than
+    _fmt_money."""
     if r["ticket_count"] == 0:
         return "—"
-    min_v, max_v = r["ticket_min_sum"], r["ticket_max_sum"]
-    if min_v == max_v and not r["ticket_plus"]:
-        return _fmt_money(min_v)
-    return f'{_fmt_money(min_v)} – {_fmt_money(max_v)}{"+" if r["ticket_plus"] else ""}'
+    min_text = _fmt_tenant_money(r["ticket_min_sum"])
+    max_text = _fmt_tenant_money(r["ticket_max_sum"])
+    if min_text == max_text and not r["ticket_plus"]:
+        return min_text
+    return f'{min_text} – {max_text}{"+" if r["ticket_plus"] else ""}'
 
 
 def _person_has_won(rec):
@@ -1524,6 +1547,7 @@ def _build_table():
 
     tier_by_id = {}
     ticket_by_id = {}
+    updated_ts_by_id = {}
     for rec in people_list:
         pid = rec.get("id")
         if pid is None:
@@ -1531,6 +1555,8 @@ def _build_table():
         cf = rec.get("custom_fields") or {}
         tier_by_id[str(pid)] = classify_person(cf)
         ticket_by_id[str(pid)] = get_person_ticket_range(cf)
+        updated_dt = _parse_dt(rec.get("updated_at"))
+        updated_ts_by_id[str(pid)] = updated_dt.timestamp() if updated_dt is not None else None
 
     buy = _interest_buy_map()
     deals_list = get_deals_list()
@@ -1555,18 +1581,23 @@ def _build_table():
         ticket_max_sum = 0
         ticket_plus = False
         ticket_count = 0
+        latest_ts = None
         for pid in ids:
             counts[tier_by_id.get(str(pid), "unknown")] += 1
             person_min, person_max = ticket_by_id.get(str(pid), (None, None))
-            if person_min is None:
-                continue
-            ticket_count += 1
-            ticket_min_sum += person_min
-            if person_max is None:
-                ticket_plus = True
-                ticket_max_sum += person_min
-            else:
-                ticket_max_sum += person_max
+            if person_min is not None:
+                ticket_count += 1
+                ticket_min_sum += person_min
+                if person_max is None:
+                    ticket_plus = True
+                    ticket_max_sum += person_min
+                else:
+                    ticket_max_sum += person_max
+            person_ts = updated_ts_by_id.get(str(pid))
+            if person_ts is not None and (latest_ts is None or person_ts > latest_ts):
+                latest_ts = person_ts
+        latest_interest_display = (datetime.fromtimestamp(latest_ts, tz=timezone.utc).strftime("%b %Y")
+                                    if latest_ts is not None else None)
         table.append({
             "company": company,
             "total": len(ids),
@@ -1578,6 +1609,8 @@ def _build_table():
             "ticket_max_sum": ticket_max_sum,
             "ticket_plus": ticket_plus,
             "ticket_count": ticket_count,
+            "latest_interest_ts": int(latest_ts) if latest_ts is not None else 0,
+            "latest_interest_display": latest_interest_display,
         })
     table.sort(key=lambda r: (-r["total"], r["company"].lower()))
     return table
@@ -11077,6 +11110,11 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
                                                                    page="demand", edit_mode=edit_mode)
     tenant_picker_html = _tenant_picker_html() if tenant_picker else ""
     raised_headline_html = _raised_headline_html(edit_mode=edit_mode)
+    # The word "unknown" (CSS var + selector) is kept out of the tenant
+    # layout's markup entirely, not just visually hidden -- both only
+    # back the admin-only tier legend/dot below.
+    unknown_css_var = "    --unknown: #6b7280;\n" if edit_mode else ""
+    dot_unknown_css = "  .dot.unknown { background: var(--unknown); }\n" if edit_mode else ""
     if edit_mode:
         rows_html = "".join(
             f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
@@ -11106,19 +11144,26 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
         rows_html = "".join(
             f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
             f'{_esc(r["company"])}</a></td>'
-            f'<td class="num">{r["total"]}</td>'
-            f'<td class="num" data-sort="{r["ticket_min_sum"]}">{_esc(_ticket_range_cell_html(r))}</td></tr>'
+            f'<td class="num">{r["total"]:,}</td>'
+            f'<td class="num">{r["qp"] + r["accredited"]:,}</td>'
+            f'<td class="num" data-sort="{r["ticket_min_sum"]}">{_esc(_potential_demand_cell_html(r))}</td>'
+            f'<td class="num" data-sort="{r["latest_interest_ts"]}">{_esc(r["latest_interest_display"] or "—")}</td></tr>'
             for r in table
         )
         thead_html = """
         <tr>
           <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
           <th class="num" data-key="total" data-type="number">Total buyer interest<span class="arrow"></span></th>
-          <th class="num" data-key="ticket" data-type="number">Ticket range<span class="arrow"></span></th>
+          <th class="num" data-key="qualified" data-type="number">Qualified buyers<span class="arrow"></span></th>
+          <th class="num" data-key="demand" data-type="number">Total Potential Demand<span class="arrow"></span></th>
+          <th class="num" data-key="latest" data-type="number">Latest interest<span class="arrow"></span></th>
         </tr>"""
         legend_html = ""
     nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
                      person_id=person_id)
+    # Tenant layout tightened to ~760px (5 lean columns) so it doesn't
+    # float in whitespace; admin's wider 6-column table keeps 1000px.
+    wrap_max_width = "1000px" if edit_mode else "760px"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -11138,8 +11183,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     --accent: #3d5a73;
     --qp: #1f7a4d;
     --accredited: #8a6d1f;
-    --unknown: #6b7280;
-  }}
+{unknown_css_var}  }}
   .feature-section-heading {{ font-size: 16px; font-weight: 600; margin: 32px 0 12px; }}
   * {{ box-sizing: border-box; }}
   body {{
@@ -11149,7 +11193,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     padding: 32px 24px 64px;
   }}
-  .wrap {{ max-width: 1000px; margin: 28px auto 0; }}
+  .wrap {{ max-width: {wrap_max_width}; margin: 28px auto 0; }}
   .header-row {{
     display: flex;
     align-items: flex-start;
@@ -11219,8 +11263,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
   .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
   .dot.qp {{ background: var(--qp); }}
   .dot.accredited {{ background: var(--accredited); }}
-  .dot.unknown {{ background: var(--unknown); }}
-  .empty {{ padding: 40px; text-align: center; color: var(--muted); }}
+{dot_unknown_css}  .empty {{ padding: 40px; text-align: center; color: var(--muted); }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
