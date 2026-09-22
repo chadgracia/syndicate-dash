@@ -1144,6 +1144,18 @@ def _fmt_ticket_range(min_v, max_v):
     return f"{_fmt_money(min_v)} – {_fmt_money(max_v)}"
 
 
+def _ticket_range_cell_html(r):
+    """Demand Board tenant layout's Ticket range cell text, aggregated
+    across a company's buy-interest people (_build_table's ticket_min_sum/
+    ticket_max_sum/ticket_plus/ticket_count)."""
+    if r["ticket_count"] == 0:
+        return "—"
+    min_v, max_v = r["ticket_min_sum"], r["ticket_max_sum"]
+    if min_v == max_v and not r["ticket_plus"]:
+        return _fmt_money(min_v)
+    return f'{_fmt_money(min_v)} – {_fmt_money(max_v)}{"+" if r["ticket_plus"] else ""}'
+
+
 def _person_has_won(rec):
     """won_deals_total > 0 — the raw signal behind both the closer chip
     and the closed-dot. Never raises on a missing/malformed field."""
@@ -1511,12 +1523,14 @@ def _build_table():
     people_list = _people_list()
 
     tier_by_id = {}
+    ticket_by_id = {}
     for rec in people_list:
         pid = rec.get("id")
         if pid is None:
             continue
         cf = rec.get("custom_fields") or {}
         tier_by_id[str(pid)] = classify_person(cf)
+        ticket_by_id[str(pid)] = get_person_ticket_range(cf)
 
     buy = _interest_buy_map()
     deals_list = get_deals_list()
@@ -1537,8 +1551,22 @@ def _build_table():
         if company.strip().lower() in _EXCLUDED_COMPANIES_LOWER:
             continue
         counts = {"qp": 0, "accredited": 0, "unknown": 0}
+        ticket_min_sum = 0
+        ticket_max_sum = 0
+        ticket_plus = False
+        ticket_count = 0
         for pid in ids:
             counts[tier_by_id.get(str(pid), "unknown")] += 1
+            person_min, person_max = ticket_by_id.get(str(pid), (None, None))
+            if person_min is None:
+                continue
+            ticket_count += 1
+            ticket_min_sum += person_min
+            if person_max is None:
+                ticket_plus = True
+                ticket_max_sum += person_min
+            else:
+                ticket_max_sum += person_max
         table.append({
             "company": company,
             "total": len(ids),
@@ -1546,6 +1574,10 @@ def _build_table():
             "accredited": counts["accredited"],
             "unknown": counts["unknown"],
             "sellers": sellers_by_company.get(company, 0),
+            "ticket_min_sum": ticket_min_sum,
+            "ticket_max_sum": ticket_max_sum,
+            "ticket_plus": ticket_plus,
+            "ticket_count": ticket_count,
         })
     table.sort(key=lambda r: (-r["total"], r["company"].lower()))
     return table
@@ -11045,16 +11077,46 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
                                                                    page="demand", edit_mode=edit_mode)
     tenant_picker_html = _tenant_picker_html() if tenant_picker else ""
     raised_headline_html = _raised_headline_html(edit_mode=edit_mode)
-    rows_html = "".join(
-        f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
-        f'{_esc(r["company"])}</a></td>'
-        f'<td class="num">{r["total"]}</td>'
-        f'<td class="num">{r["qp"]}</td>'
-        f'<td class="num">{r["accredited"]}</td>'
-        f'<td class="num">{r["unknown"]}</td>'
-        f'<td class="num">{r["sellers"]}</td></tr>'
-        for r in table
-    )
+    if edit_mode:
+        rows_html = "".join(
+            f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
+            f'{_esc(r["company"])}</a></td>'
+            f'<td class="num">{r["total"]}</td>'
+            f'<td class="num">{r["qp"]}</td>'
+            f'<td class="num">{r["accredited"]}</td>'
+            f'<td class="num">{r["unknown"]}</td>'
+            f'<td class="num">{r["sellers"]}</td></tr>'
+            for r in table
+        )
+        thead_html = """
+        <tr>
+          <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
+          <th class="num" data-key="total" data-type="number">Total buyers<span class="arrow"></span></th>
+          <th class="num" data-key="qp" data-type="number">QP<span class="arrow"></span></th>
+          <th class="num" data-key="accredited" data-type="number">Accredited<span class="arrow"></span></th>
+          <th class="num" data-key="unknown" data-type="number">Unknown<span class="arrow"></span></th>
+          <th class="num" data-key="sellers" data-type="number">Sellers<span class="arrow"></span></th>
+        </tr>"""
+        legend_html = """  <div class="legend">
+    <span><span class="dot qp"></span>QP &mdash; Investor Level = Qualified Purchaser</span>
+    <span><span class="dot accredited"></span>Accredited &mdash; IQF Status Yes / Unnecessary</span>
+    <span><span class="dot unknown"></span>Unknown &mdash; unclassified</span>
+  </div>"""
+    else:
+        rows_html = "".join(
+            f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
+            f'{_esc(r["company"])}</a></td>'
+            f'<td class="num">{r["total"]}</td>'
+            f'<td class="num" data-sort="{r["ticket_min_sum"]}">{_esc(_ticket_range_cell_html(r))}</td></tr>'
+            for r in table
+        )
+        thead_html = """
+        <tr>
+          <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
+          <th class="num" data-key="total" data-type="number">Total buyer interest<span class="arrow"></span></th>
+          <th class="num" data-key="ticket" data-type="number">Ticket range<span class="arrow"></span></th>
+        </tr>"""
+        legend_html = ""
     nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
                      person_id=person_id)
     return f"""<!DOCTYPE html>
@@ -11198,15 +11260,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
   </div>
   <div class="card">
     <table id="board">
-      <thead>
-        <tr>
-          <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
-          <th class="num" data-key="total" data-type="number">Total buyers<span class="arrow"></span></th>
-          <th class="num" data-key="qp" data-type="number">QP<span class="arrow"></span></th>
-          <th class="num" data-key="accredited" data-type="number">Accredited<span class="arrow"></span></th>
-          <th class="num" data-key="unknown" data-type="number">Unknown<span class="arrow"></span></th>
-          <th class="num" data-key="sellers" data-type="number">Sellers<span class="arrow"></span></th>
-        </tr>
+      <thead>{thead_html}
       </thead>
       <tbody id="board-body">
         {rows_html}
@@ -11214,11 +11268,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     </table>
     <div class="empty" id="empty-state" hidden>No matching companies.</div>
   </div>
-  <div class="legend">
-    <span><span class="dot qp"></span>QP &mdash; Investor Level = Qualified Purchaser</span>
-    <span><span class="dot accredited"></span>Accredited &mdash; IQF Status Yes / Unnecessary</span>
-    <span><span class="dot unknown"></span>Unknown &mdash; unclassified</span>
-  </div>
+{legend_html}
   <h2 class="feature-section-heading">Feature requests</h2>
   <div class="card">
     {feature_list_html}
@@ -11235,6 +11285,12 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
 
   function cellText(row, colIndex) {{
     return row.children[colIndex].textContent.trim();
+  }}
+
+  function cellSortValue(row, colIndex) {{
+    var cell = row.children[colIndex];
+    var sortAttr = cell.getAttribute('data-sort');
+    return sortAttr !== null ? sortAttr : cell.textContent.trim();
   }}
 
   function applyFilter() {{
@@ -11262,11 +11318,13 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     if (arrow) arrow.textContent = dir === 1 ? '\\u25B2' : '\\u25BC';
 
     rows.sort(function(a, b) {{
-      var av = cellText(a, colIndex);
-      var bv = cellText(b, colIndex);
       if (type === 'number') {{
+        var av = cellSortValue(a, colIndex);
+        var bv = cellSortValue(b, colIndex);
         return (parseFloat(av) - parseFloat(bv)) * dir;
       }}
+      var av = cellText(a, colIndex);
+      var bv = cellText(b, colIndex);
       return av.localeCompare(bv) * dir;
     }});
     rows.forEach(function(row) {{ tbody.appendChild(row); }});

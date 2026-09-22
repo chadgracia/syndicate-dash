@@ -752,7 +752,8 @@ check("My Deals uses the light --card token", "--card: #ffffff;" in page)
 check("My Deals has no leftover dark-mode bg literal", "#14161a" not in page and "#1c1f26" not in page)
 
 company_table_page = lf.render_page([{"company": "Alpha Co", "total": 1, "qp": 1, "accredited": 0,
-                                       "unknown": 0, "sellers": 1}], "Sella", key=None, view_as=None,
+                                       "unknown": 0, "sellers": 1, "ticket_min_sum": 0, "ticket_max_sum": 0,
+                                       "ticket_plus": False, "ticket_count": 0}], "Sella", key=None, view_as=None,
                                      anon_key_email=TENANT_EMAIL, tenant_picker=False)
 check("Demand Board uses the light --bg token", "--bg: #f4f2ee;" in company_table_page)
 check("Demand Board has no leftover dark-mode literal", "#14161a" not in company_table_page)
@@ -5243,6 +5244,118 @@ check("iqf_pending: unknown-tier (Substantive) person -> False regardless of IQF
       lf.iqf_pending({lf.INVESTOR_LEVEL_FIELD: [lf.SUBSTANTIVE_ID]}) is False)
 check("iqf_pending: no investor-level field at all -> False",
       lf.iqf_pending({}) is False)
+
+
+# ======================================================================
+# SECTION: Demand Board tenant layout (ticket aggregation, 3-column
+# tenant table vs. unchanged 6-column admin table, _handle_demand_list
+# untouched)
+# ======================================================================
+
+people_ticket = {"people": [
+    {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
+    # Alpha Co: two bounded-tier buyers -> min/max sums both bounded, no "+".
+    {"id": 201, "full_name": "Alpha Buyer One", "custom_fields": {lf.TICKET_SIZE_FIELD: [5014555]}},  # 1M-5M
+    {"id": 202, "full_name": "Alpha Buyer Two", "custom_fields": {lf.TICKET_SIZE_FIELD: [5014564]}},  # 25M-50M
+    # Beta Co: one unbounded top-tier buyer (100M+) plus one buyer with no
+    # ticket size set at all (excluded from the aggregation entirely).
+    {"id": 203, "full_name": "Beta Buyer One", "custom_fields": {lf.TICKET_SIZE_FIELD: [5014570]}},  # 100M+
+    {"id": 204, "full_name": "Beta Buyer Two", "custom_fields": {}},
+    # Gamma Co: no buyer has a ticket size on file -> zero-ticket em dash.
+    {"id": 205, "full_name": "Gamma Buyer One", "custom_fields": {}},
+    {"id": 206, "full_name": "Gamma Buyer Two", "custom_fields": {}},
+]}
+interest_ticket = {"buy": {
+    "Alpha Co": [201, 202],
+    "Beta Co": [203, 204],
+    "Gamma Co": [205, 206],
+}}
+use_fixture({lf.PEOPLE_KEY: people_ticket, lf.INTEREST_KEY: interest_ticket, lf.DEALS_KEY: {"deals": []}})
+
+ticket_table = lf.get_company_table()
+alpha_row = next(r for r in ticket_table if r["company"] == "Alpha Co")
+beta_row = next(r for r in ticket_table if r["company"] == "Beta Co")
+gamma_row = next(r for r in ticket_table if r["company"] == "Gamma Co")
+
+check("_build_table: Alpha ticket_min_sum = 1M + 25M = 26M", alpha_row["ticket_min_sum"] == 26_000_000)
+check("_build_table: Alpha ticket_max_sum = 5M + 50M = 55M", alpha_row["ticket_max_sum"] == 55_000_000)
+check("_build_table: Alpha ticket_plus is False (both tiers bounded)", alpha_row["ticket_plus"] is False)
+check("_build_table: Alpha ticket_count = 2", alpha_row["ticket_count"] == 2)
+check("_build_table: Alpha existing fields untouched (total=2)", alpha_row["total"] == 2)
+
+check("_build_table: Beta ticket_min_sum = 100M (unbounded buyer only; no-ticket buyer excluded)",
+      beta_row["ticket_min_sum"] == 100_000_000)
+check("_build_table: Beta ticket_max_sum falls back to person_min for the unbounded tier",
+      beta_row["ticket_max_sum"] == 100_000_000)
+check("_build_table: Beta ticket_plus is True (unbounded top tier present)", beta_row["ticket_plus"] is True)
+check("_build_table: Beta ticket_count = 1 (only one of its two buyers has a ticket size)",
+      beta_row["ticket_count"] == 1)
+check("_build_table: Beta existing total field untouched (still counts both buyers, 2)",
+      beta_row["total"] == 2)
+
+check("_build_table: Gamma ticket_min_sum = 0 (no buyer has a ticket size)", gamma_row["ticket_min_sum"] == 0)
+check("_build_table: Gamma ticket_max_sum = 0", gamma_row["ticket_max_sum"] == 0)
+check("_build_table: Gamma ticket_plus is False", gamma_row["ticket_plus"] is False)
+check("_build_table: Gamma ticket_count = 0", gamma_row["ticket_count"] == 0)
+
+# --- Tenant layout: exactly 3 columns, no QP/Accredited/Unknown/Sellers,
+# no legend, search box + sortable Ticket range column (numeric data-sort).
+tenant_demand_page = lf.render_page(ticket_table, "Sella Seller", key=None, view_as=None,
+                                     anon_key_email=TENANT_A_EMAIL, tenant_picker=False)
+tenant_thead = tenant_demand_page[tenant_demand_page.find("<thead>"):tenant_demand_page.find("</thead>")]
+check("Tenant Demand Board: exactly 3 <th> columns", tenant_thead.count("<th ") == 3)
+check("Tenant Demand Board: header order is Company / Total buyer interest / Ticket range",
+      [tenant_thead.find(f">{h}<") for h in ["Company", "Total buyer interest", "Ticket range"]]
+      == sorted(tenant_thead.find(f">{h}<") for h in ["Company", "Total buyer interest", "Ticket range"])
+      and all(tenant_thead.find(f">{h}<") != -1 for h in ["Company", "Total buyer interest", "Ticket range"]))
+check("Tenant Demand Board: no QP/Accredited/Unknown/Sellers headers",
+      not any(h in tenant_thead for h in [">QP<", ">Accredited<", ">Unknown<", ">Sellers<"]))
+check("Tenant Demand Board: legend is gone entirely", 'class="legend"' not in tenant_demand_page)
+check("Tenant Demand Board: search box still present", '<input id="search"' in tenant_demand_page)
+check("Tenant Demand Board: Alpha's bounded ticket range renders as '$26M – $55M'",
+      "$26M – $55M" in tenant_demand_page)
+check("Tenant Demand Board: Alpha's Ticket range cell carries a numeric data-sort (26000000)",
+      'data-sort="26000000">$26M – $55M' in tenant_demand_page)
+check("Tenant Demand Board: Beta's unbounded ticket range renders with a trailing '+'",
+      "$100M – $100M+" in tenant_demand_page)
+gamma_cell = tenant_demand_page[tenant_demand_page.find(">Gamma Co<"):]
+gamma_cell = gamma_cell[:gamma_cell.find("</tr>")]
+check("Tenant Demand Board: Gamma (zero ticket buyers) renders an em dash",
+      ">—<" in gamma_cell and 'data-sort="0"' in gamma_cell)
+
+# --- Admin layout: unchanged 6-column table + legend.
+admin_demand_page = lf.render_page(ticket_table, "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",
+                                    tenant_picker=True, edit_mode=True)
+admin_thead = admin_demand_page[admin_demand_page.find("<thead>"):admin_demand_page.find("</thead>")]
+check("Admin Demand Board: unchanged 6 <th> columns", admin_thead.count("<th ") == 6)
+check("Admin Demand Board: header order is Company/Total buyers/QP/Accredited/Unknown/Sellers",
+      [admin_thead.find(f">{h}<") for h in ["Company", "Total buyers", "QP", "Accredited", "Unknown", "Sellers"]]
+      == sorted(admin_thead.find(f">{h}<")
+                for h in ["Company", "Total buyers", "QP", "Accredited", "Unknown", "Sellers"]))
+check("Admin Demand Board: legend still present with all three tiers",
+      'class="legend"' in admin_demand_page and ">QP &mdash;" in admin_demand_page
+      and ">Accredited &mdash;" in admin_demand_page and ">Unknown &mdash;" in admin_demand_page)
+check("Admin Demand Board: no 'Ticket range' column at all", "Ticket range" not in admin_demand_page)
+alpha_admin_row = admin_demand_page[admin_demand_page.find(">Alpha Co<"):]
+alpha_admin_row = alpha_admin_row[:alpha_admin_row.find("</tr>")]
+check("Admin Demand Board: Alpha's row still shows total/qp/accredited/unknown/sellers numerics",
+      f'<td class="num">{alpha_row["total"]}</td>' in alpha_admin_row
+      and f'<td class="num">{alpha_row["qp"]}</td>' in alpha_admin_row
+      and f'<td class="num">{alpha_row["sellers"]}</td>' in alpha_admin_row)
+
+# --- _handle_demand_list JSON endpoint: unchanged shape (company/buyers/
+# sellers only -- no ticket fields, no QP/Accredited/Unknown breakdown).
+demand_list_resp = lf._handle_demand_list()
+check("_handle_demand_list: 200 OK", demand_list_resp["statusCode"] == 200)
+demand_list_data = json.loads(demand_list_resp["body"])
+check("_handle_demand_list: companies_with_buyers = 3", demand_list_data["companies_with_buyers"] == 3)
+demand_list_alpha = next(r for r in demand_list_data["rows"] if r["company"] == "Alpha Co")
+check("_handle_demand_list: row shape is exactly {company, buyers, sellers}",
+      set(demand_list_alpha.keys()) == {"company", "buyers", "sellers"})
+check("_handle_demand_list: buyers count unchanged (still r['total'], not ticket-filtered)",
+      demand_list_alpha["buyers"] == 2)
+check("_handle_demand_list: sellers count unchanged (0, no live sell deals in this fixture)",
+      demand_list_alpha["sellers"] == 0)
 
 
 # ======================================================================
