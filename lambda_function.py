@@ -340,18 +340,27 @@ LAYERS_FIELD = "custom_label_3938743"
 
 STRUCTURE_LABELS = {6250090: "Direct", 5077906: "Fund"}
 LAYERS_MAP = {7000228: "1-Layer", 7000229: "2-Layer", 7000230: "3-Layer"}
+# SPV/Fund structure option id (STRUCTURE_FIELD) — named separately from
+# STRUCTURE_LABELS' bare literal for _deal_terms_missing's SPV-aware branch.
+SPV_STRUCTURE_ID = 5077906
 
 # Fund Exemption: no repo this org's code lives in reads
 # custom_label_4006089, but the field id and all three option labels were
 # given directly (same trust basis as the earlier bare "In Process" option
 # ids) — implemented as instructed since a missing/differently-shaped
 # field just omits the line rather than showing anything wrong.
-EXEMPTION_FIELD = "custom_label_4006089"
+EXEMPTION_FIELD = "custom_label_4006089"  # == FUND_EXEMPT_FIELD
 EXEMPTION_LABELS = {
     7200027: "3(c)(1) — accredited investors",
     7200028: "3(c)(7) — qualified purchasers only ($5M+ investments)",
     7201486: "Other",
 }
+
+# Full-terms audit fields (_deal_terms_missing) with no other reader in this
+# file yet — same trust basis as every other bare field id given directly.
+SHARE_CLASS_FIELD = "custom_label_3064330"
+SELLER_ROLE_FIELD = "custom_label_3938748"
+DATA_ROOM_FIELD = "custom_label_3952402"
 
 # Person-level Ticket Size multi-select, for the company page's Buyer Demand
 # tiles. Field id and every entry id -> (min, max) dollar tier verified
@@ -400,40 +409,54 @@ def _deal_update_form_url(deal_id):
 
 
 def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibility_state,
-                               key=None, view_as=None):
+                               key=None, view_as=None, terms_missing=None):
     """Next Steps: ONE specific action chip per row, chosen by priority
     (highest first): a) deadline passed (red, Update link) > b) terms
     incomplete (red, Update link) > c) nudge buyers (amber: a stalled
     intro — turn 22 dropped the overdue-follow-up half of this
     condition, see _company_stats) > d) ID required (red, CEF form
-    link) > e) sign agreement (amber, agreement template link). At most
+    link) > e) sign agreement (amber, agreement template link) > f)
+    complete deal terms (amber, advisory — a "live" deal missing one or
+    more fields from _deal_terms_missing's fuller audit; never affects
+    which deals are live, see that function's own docstring). At most
     one of {b, d, e} ever applies — they're three of the "not live"
     visibility_state values and that state machine is first-match-wins
-    (see _my_deal_visibility_state) — while a/c are independent
-    conditions that can co-occur with any of them or each other. When
-    more than one candidate applies, the top-priority chip carries a
-    title/tooltip naming the rest."""
+    (see _my_deal_visibility_state) — while a/c/f are independent
+    conditions that can co-occur with any of them or each other (f only
+    ever co-occurs with a/c, since it requires visibility_state ==
+    "live"). When more than one candidate applies, the top-priority chip
+    carries a title/tooltip naming the rest."""
     candidates = []
     if is_overdue:
         update_url = _deal_update_form_url(deal_id)
         if update_url:
-            candidates.append(("update deadline", "overdue", "Update deadline or cancel &rarr;", update_url, True))
+            candidates.append(("update deadline", "overdue", "Update deadline or cancel &rarr;", update_url, True, None))
     if visibility_state == "terms_incomplete":
         update_url = _deal_update_form_url(deal_id)
         if update_url:
-            candidates.append(("provide deal terms", "terms", "Provide deal terms &rarr;", update_url, True))
+            candidates.append(("provide deal terms", "terms", "Provide deal terms &rarr;", update_url, True, None))
     if stalled:
         href = _company_href(company_name, "mydeals", key, view_as)
-        candidates.append(("nudge buyers", "nudge", "Nudge buyers &rarr;", href, False))
+        candidates.append(("nudge buyers", "nudge", "Nudge buyers &rarr;", href, False, None))
     if visibility_state == "id_required":
-        candidates.append(("id required", "id-required", "ID required &rarr;", CEF_FORM_URL, True))
+        candidates.append(("id required", "id-required", "ID required &rarr;", CEF_FORM_URL, True, None))
     if visibility_state == "agreement_unsigned":
-        candidates.append(("sign agreement", "sign", "Sign agreement &rarr;", AGENT_AGREEMENT_DOC_URL, True))
+        candidates.append(("sign agreement", "sign", "Sign agreement &rarr;", AGENT_AGREEMENT_DOC_URL, True, None))
+    if visibility_state == "live" and terms_missing:
+        update_url = _deal_update_form_url(deal_id)
+        if update_url:
+            candidates.append(("complete deal terms", "terms-nudge", "Complete deal terms &rarr;", update_url, True,
+                                "Missing: " + ", ".join(terms_missing)))
     if not candidates:
         return ""
-    phrase, css_class, label, href, new_tab = candidates[0]
+    phrase, css_class, label, href, new_tab, custom_title = candidates[0]
     rest = [c[0] for c in candidates[1:]]
-    title_attr = f' title="{_esc("Also: " + ", ".join(rest))}"' if rest else ""
+    if custom_title:
+        title_attr = f' title="{_esc(custom_title)}"'
+    elif rest:
+        title_attr = f' title="{_esc("Also: " + ", ".join(rest))}"'
+    else:
+        title_attr = ""
     target_attr = ' target="_blank" rel="noopener noreferrer"' if new_tab else ""
     return f'<a class="action-chip {css_class}"{title_attr} href="{href}"{target_attr}>{label}</a>'
 
@@ -5439,6 +5462,41 @@ def _deal_terms_complete(deal):
                for field in (MGMT_FEE_FIELD, CARRY_FIELD, SELLER_FEE_FIELD))
 
 
+def _deal_terms_missing(deal):
+    """Full required-terms audit mirroring the desk update form's required
+    set (SPV-aware, sell-aware). Returns human labels for every missing
+    field; empty list = fully captured. Advisory only —
+    _deal_terms_complete still gates visibility."""
+    missing = []
+    if not _deal_cf_option_ids(deal, SHARE_CLASS_FIELD):
+        missing.append("Share Class")
+    if _deal_cf_number(deal, TICKET_MIN_FIELD) is None:
+        missing.append("Minimum Size")
+    if _deal_cf_number(deal, TICKET_MAX_FIELD) is None:
+        missing.append("Maximum Size")
+    if SPV_STRUCTURE_ID in _deal_cf_option_ids(deal, STRUCTURE_FIELD):
+        if not _deal_cf_option_ids(deal, LAYERS_FIELD):
+            missing.append("Number of Layers")
+        if not _deal_cf_option_ids(deal, EXEMPTION_FIELD):
+            missing.append("Fund Exemption")
+        if _deal_cf_number(deal, SELLER_FEE_FIELD) is None:
+            missing.append("One-Time Fee")
+        if _deal_cf_number(deal, MGMT_FEE_FIELD) is None:
+            missing.append("Mgmt Fee")
+        if _deal_cf_number(deal, CARRY_FIELD) is None:
+            missing.append("Carry")
+        if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
+            if not _deal_cf_option_ids(deal, SELLER_ROLE_FIELD):
+                missing.append("Seller Role")
+            if not _deal_cf_option_ids(deal, DATA_ROOM_FIELD):
+                missing.append("Data Room")
+            # Same raw-field read _deal_deadline_text uses (before any
+            # deadline_override) -- empty/None = missing.
+            if _deal_deadline_text(deal) is None:
+                missing.append("Deadline to Commit")
+    return missing
+
+
 def _my_deal_visibility_state(deal, cef_state, is_held, is_won=False):
     """Strict state machine, first match wins: (0, turn 26) is_won (the
     row's resolved stage is in WON_STAGE_IDS — the caller derives this
@@ -8518,7 +8576,8 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # nothing left to nudge/update/sign on a deal that's already sold.
     action_chip_html = ("" if is_won else
                          _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
-                                                    visibility_state, key=key, view_as=view_as))
+                                                    visibility_state, key=key, view_as=view_as,
+                                                    terms_missing=_deal_terms_missing(deal)))
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
     # Bug fix: Hold/Cancel/Reactivate are tenant self-service (see
@@ -9046,7 +9105,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .action-chip.overdue, .action-chip.terms, .action-chip.id-required {{
     background: rgba(178,59,59,0.12); color: #b23b3b;
   }}
-  .action-chip.nudge, .action-chip.sign {{
+  .action-chip.nudge, .action-chip.sign, .action-chip.terms-nudge {{
     background: rgba(201,162,39,0.15); color: var(--accredited);
   }}
   .ei-deadline {{
