@@ -5352,18 +5352,18 @@ check("_build_table: Gamma qualified sum (qp=0 + accredited=1) = 1", gamma_row["
 check("_build_table: Gamma latest_interest_display = 'Jan 2026' (slash date parses and is the later one)",
       gamma_row["latest_interest_display"] == "Jan 2026")
 
-# --- Tenant layout: exactly 5 columns in the new order, header renamed,
-# 'unknown' the word gone entirely, search + numeric data-sort intact.
+# --- Tenant layout: exactly 4 columns (Latest interest removed), header
+# renamed, 'unknown' the word gone entirely, search + numeric data-sort intact.
 tenant_demand_page = lf.render_page(ticket_table, "Sella Seller", key=None, view_as=None,
                                      anon_key_email=TENANT_A_EMAIL, tenant_picker=False)
 tenant_thead = tenant_demand_page[tenant_demand_page.find("<thead>"):tenant_demand_page.find("</thead>")]
-check("Tenant Demand Board: exactly 5 <th> columns", tenant_thead.count("<th ") == 5)
-expected_tenant_headers = ["Company", "Total buyer interest", "Qualified buyers",
-                            "Total Potential Demand", "Latest interest"]
+check("Tenant Demand Board: exactly 4 <th> columns", tenant_thead.count("<th ") == 4)
+expected_tenant_headers = ["Company", "Total buyer interest", "Qualified buyers", "Total Potential Demand"]
 tenant_header_positions = [tenant_thead.find(f">{h}<") for h in expected_tenant_headers]
 check("Tenant Demand Board: header order is Company / Total buyer interest / Qualified buyers / "
-      "Total Potential Demand / Latest interest",
+      "Total Potential Demand",
       tenant_header_positions == sorted(tenant_header_positions) and all(p != -1 for p in tenant_header_positions))
+check("Tenant Demand Board: 'Latest interest' column is gone", "Latest interest" not in tenant_demand_page)
 check("Tenant Demand Board: old 'Ticket range' header is gone", "Ticket range" not in tenant_demand_page)
 check("Tenant Demand Board: no QP/Accredited/Sellers headers",
       not any(h in tenant_thead for h in [">QP<", ">Accredited<", ">Sellers<"]))
@@ -5371,6 +5371,8 @@ check("Tenant Demand Board: the word 'unknown' never appears anywhere on the pag
       "unknown" not in tenant_demand_page.lower())
 check("Tenant Demand Board: legend is gone entirely", 'class="legend"' not in tenant_demand_page)
 check("Tenant Demand Board: search box still present", '<input id="search"' in tenant_demand_page)
+check("Tenant Demand Board: .wrap width unchanged at 760px (not widened by removing a column)",
+      ".wrap { max-width: 760px; margin: 28px auto 0; }" in tenant_demand_page)
 
 alpha_cell = tenant_demand_page[tenant_demand_page.find(">Alpha Co<"):]
 alpha_cell = alpha_cell[:alpha_cell.find("</tr>")]
@@ -5380,21 +5382,20 @@ check("Tenant Demand Board: Alpha's Total Potential Demand renders the ROUNDED r
       "$25M – $55M" in alpha_cell)
 check("Tenant Demand Board: Alpha's demand cell carries a numeric data-sort of the unrounded ticket_min_sum",
       'data-sort="26000000">$25M – $55M' in alpha_cell)
-check("Tenant Demand Board: Alpha's Latest interest shows 'Sep 2026' with a numeric data-sort",
-      "Sep 2026" in alpha_cell and f'data-sort="{alpha_row["latest_interest_ts"]}">Sep 2026' in alpha_cell)
+check("Tenant Demand Board: Alpha's row has no leftover latest-interest data-sort/text",
+      "Sep 2026" not in alpha_cell)
 
 beta_cell = tenant_demand_page[tenant_demand_page.find(">Beta Co<"):]
 beta_cell = beta_cell[:beta_cell.find("</tr>")]
 check("Tenant Demand Board: Beta's demand cell keeps the trailing '+' despite a rounded-equal range",
       "$100M – $100M+" in beta_cell)
-check("Tenant Demand Board: Beta's Latest interest is an em dash with data-sort=\"0\"",
-      'data-sort="0">—' in beta_cell)
 
 gamma_cell = tenant_demand_page[tenant_demand_page.find(">Gamma Co<"):]
 gamma_cell = gamma_cell[:gamma_cell.find("</tr>")]
 check("Tenant Demand Board: Gamma's Total Potential Demand is an em dash (zero ticket buyers)",
       'data-sort="0">—' in gamma_cell)
-check("Tenant Demand Board: Gamma's Latest interest shows 'Jan 2026'", "Jan 2026" in gamma_cell)
+check("Tenant Demand Board: Gamma's row has no leftover latest-interest text",
+      "Jan 2026" not in gamma_cell)
 
 # --- Admin layout: unchanged 6-column table + legend + 1000px wrap.
 admin_demand_page = lf.render_page(ticket_table, "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",

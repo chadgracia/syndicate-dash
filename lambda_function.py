@@ -11146,8 +11146,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
             f'{_esc(r["company"])}</a></td>'
             f'<td class="num">{r["total"]:,}</td>'
             f'<td class="num">{r["qp"] + r["accredited"]:,}</td>'
-            f'<td class="num" data-sort="{r["ticket_min_sum"]}">{_esc(_potential_demand_cell_html(r))}</td>'
-            f'<td class="num" data-sort="{r["latest_interest_ts"]}">{_esc(r["latest_interest_display"] or "—")}</td></tr>'
+            f'<td class="num" data-sort="{r["ticket_min_sum"]}">{_esc(_potential_demand_cell_html(r))}</td></tr>'
             for r in table
         )
         thead_html = """
@@ -11156,12 +11155,11 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
           <th class="num" data-key="total" data-type="number">Total buyer interest<span class="arrow"></span></th>
           <th class="num" data-key="qualified" data-type="number">Qualified buyers<span class="arrow"></span></th>
           <th class="num" data-key="demand" data-type="number">Total Potential Demand<span class="arrow"></span></th>
-          <th class="num" data-key="latest" data-type="number">Latest interest<span class="arrow"></span></th>
         </tr>"""
         legend_html = ""
     nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
                      person_id=person_id)
-    # Tenant layout tightened to ~760px (5 lean columns) so it doesn't
+    # Tenant layout tightened to ~760px (4 lean columns) so it doesn't
     # float in whitespace; admin's wider 6-column table keeps 1000px.
     wrap_max_width = "1000px" if edit_mode else "760px"
     return f"""<!DOCTYPE html>
