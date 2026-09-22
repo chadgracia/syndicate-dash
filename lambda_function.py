@@ -5921,9 +5921,9 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
     in each row-builder rather than here -- this function exists only
     because columns 1/2 are the ONE place the two surfaces genuinely
     differ: surface="intros" shows the deal's TARGET company (a link,
-    with company-repeat grouping and an Update-deal link) then the buyer
-    cell (_intro_buyer_cell_html, the richer multi-line layout with the
-    closer dot); surface="company" shows the buyer's own NAME
+    plus an Update-deal link, on every row -- no repeat-suppression) then
+    the buyer cell (_intro_buyer_cell_html, the richer multi-line layout
+    with the closer dot); surface="company" shows the buyer's own NAME
     (_buyer_name_cell_html + contact detail -- the page is already
     scoped to one target company, so no company link is needed there)
     then the buyer's own firm name as plain text. resolved_or_disclosed
@@ -5931,9 +5931,12 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
     bool, so this same helper covers both the live-row and closed-out
     disclosure gates. Returns (col1_td_open, col1_html, col2_html,
     extra_row_cls, buyer_recs, investor_type_cell) -- extra_row_cls is a
-    bare class token ("" or "grouped-row"), not a formatted attribute;
-    each caller composes its own class="..." with whatever base class
-    that row type needs (pending-row, closed-out-row, ...).
+    bare class token (always "" here; callers may still add their own
+    base class, e.g. pending-row/closed-out-row), not a formatted
+    attribute; each caller composes its own class="..." with whatever
+    base class that row type needs. company_repeated is accepted but no
+    longer changes this function's rendering -- _buy_deal_row_edit_html
+    still reads its own copy of it to decide where "+ Add buyer" goes.
 
     CRITICAL FIX (firm-level tenancy, item 3): buyer_recs excludes every
     person in firm_person_ids (defaults to {tenant_person_id}, the old
@@ -5955,17 +5958,13 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
     if surface == "intros":
         col1_td_open = '<td class="company">'
         company_name = _deal_company_name(deal)
-        if company_repeated:
-            col1_html = ""
-            extra_cls = "grouped-row"
-        elif company_name:
+        extra_cls = ""
+        if company_name:
             col1_html = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
                          f'{_esc(company_name)}</a>{via_html}')
             col1_html += _company_update_link_html(tenant_person_id, company_name)
-            extra_cls = ""
         else:
             col1_html = "—"
-            extra_cls = ""
         if disclosed:
             primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
             col2_html = _intro_buyer_cell_html(primary, secondary, more_count, firm_won_index,
@@ -8417,8 +8416,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .iqf-flag {{ font-size: 10px; color: var(--muted); background: transparent; margin-left: 4px; }}
   .tier-badge-line {{ margin-top: 4px; }}
   tr.pending-row {{ opacity: 0.85; }}
-  tr.grouped-row {{ box-shadow: inset 3px 0 0 var(--line); }}
   tr.closed-out-row {{ opacity: 0.7; }}
+  .via-colleague-chip {{ display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }}
   /* Nav pass, item 2: a soft amber left-border accent on Stalled rows so
      the top of the triage queue visibly differs from healthy rows. */
   tr.stalled-row {{ box-shadow: inset 3px 0 0 #c9a227; }}

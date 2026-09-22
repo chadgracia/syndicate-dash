@@ -1077,10 +1077,68 @@ intro_section = page[page.find(">Introduced<"):page.find("Pending introductions"
 pos_beta = intro_section.find("Beta Holdings")
 pos_gamma = intro_section.find("Gamma Co")
 check("Stalled (Beta Holdings) sorts ahead of non-stalled rows", 0 <= pos_beta < pos_gamma)
-check("grouped-row class applied to the repeat Gamma Co row", "grouped-row" in page)
+# Company repeat-suppression removed (fix #1): Gamma Co has two rows
+# (804, 805) in the Introduced table -- both now render the full company
+# cell, no blank "grouped-row" follow-on row.
+check("no leftover 'grouped-row' class anywhere on the page", "grouped-row" not in page)
+check("both of Gamma Co's rows render the full company link (repeat-suppression removed)",
+      intro_section.count(">Gamma Co<") == 2)
 
 check("pending-introductions explanatory note present", "We're preparing these introductions" in page)
 check("Pending introductions header present (801 is Matched-only)", "Pending introductions" in page)
+
+
+# ======================================================================
+# SECTION: Active Intros -- company repeat-suppression removed (fix #1)
+# ======================================================================
+# A tenant with a real Sell deal on file for the repeated company, so
+# _company_update_link_html actually renders something on BOTH rows,
+# not just the company link/via-chip.
+
+REPEAT_TENANT_PID = 701001
+REPEAT_BUYER_A_PID = 701002
+REPEAT_BUYER_B_PID = 701003
+
+people_repeat = {"people": [
+    {"id": REPEAT_TENANT_PID, "full_name": "Rhea Repeat", "email": "rhea@example.com", "custom_fields": {}},
+    {"id": REPEAT_BUYER_A_PID, "full_name": "Buyer A", "email": "a@example.com", "custom_fields": {}},
+    {"id": REPEAT_BUYER_B_PID, "full_name": "Buyer B", "email": "b@example.com", "custom_fields": {}},
+]}
+deal_repeat_sell = {"id": 940001, "name": "Repeat Co Sell", "company": {"name": "Repeat Co"},
+                     "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                     "people": [{"id": REPEAT_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+deal_repeat_a = {"id": 940002, "name": "Repeat Buy A", "company": {"name": "Repeat Co"},
+                 "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),
+                 "people": [{"id": REPEAT_TENANT_PID}, {"id": REPEAT_BUYER_A_PID}],
+                 "updated_at": "2026-08-02T00:00:00Z"}
+deal_repeat_b = {"id": 940003, "name": "Repeat Buy B", "company": {"name": "Repeat Co"},
+                 "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207583),
+                 "people": [{"id": REPEAT_TENANT_PID}, {"id": REPEAT_BUYER_B_PID}],
+                 "updated_at": "2026-08-03T00:00:00Z"}
+use_fixture({lf.PEOPLE_KEY: people_repeat, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [deal_repeat_sell, deal_repeat_a, deal_repeat_b]}})
+repeat_tenant = lf._resolve_tenant("rhea@example.com")
+assert repeat_tenant is not None
+
+page_repeat_full = lf.render_intros_page("Rhea Repeat", tenant=repeat_tenant, tenant_email="rhea@example.com",
+                                          key=None, view_as=None, edit_mode=False)
+# body_only: the nav's own My Deals quick-jump dropdown also legitimately
+# names "Repeat Co" once (its badge count) -- strip it so counts below
+# are scoped to the actual Buyers table rows.
+page_repeat = body_only(page_repeat_full)
+check("Active Intros: no 'grouped-row' class left in the page CSS/markup", "grouped-row" not in page_repeat_full)
+check("Active Intros: both same-company rows render the full company link (2 occurrences)",
+      page_repeat.count(">Repeat Co<") == 2)
+check("Active Intros: both same-company rows also render the Update-deal link (2 occurrences)",
+      page_repeat.count('<div class="company-update-link">') == 2 and page_repeat.count("Update deal") == 2)
+
+admin_page_repeat = body_only(lf.render_intros_page(
+    "Rhea Repeat", tenant=repeat_tenant, tenant_email="rhea@example.com",
+    key=ADMIN_KEY, view_as="rhea@example.com", edit_mode=True))
+check("Admin Active Intros: repeat-suppression is gone for admin too (both rows show the company)",
+      admin_page_repeat.count(">Repeat Co<") == 2)
+check("Admin Active Intros: '+ Add buyer' still appears once per company group (untouched admin behavior)",
+      admin_page_repeat.count('data-company="Repeat Co"') == 1)
 
 # Empty state -- a tenant auto-enrolled via their own Sell deal, but with
 # no Buy-side matches at all.
@@ -5165,9 +5223,18 @@ deal_kevin_buy_ami = {"id": 930004, "name": "Kevin buys AMI Labs", "company": {"
                        "custom_fields": cf_status(7207579),
                        "people": [{"id": MANGUSTA_KEVIN_PID}, {"id": MANGUSTA_OUTSIDE_SELLER_PID}],
                        "updated_at": "2026-08-04T00:00:00Z"}
+# 5) A buyer matched against Kevin's OWN sell company -- an intro that
+#    reached Natoli's Active Intros view only via firm-level sharing, so
+#    it must carry the "via Kevin" attribution chip (ATTRIBUTION, item 2).
+deal_matched_intro_via_kevin = {"id": 930005, "name": "Kevin Ventures Match", "company": {"name": "Kevin Ventures Co"},
+                                 "deal_stage": {"id": lf.STAGE_MATCHED},
+                                 "custom_fields": cf_status(7207579),
+                                 "people": [{"id": MANGUSTA_BUYER_PID}, {"id": MANGUSTA_KEVIN_PID}],
+                                 "updated_at": "2026-08-05T00:00:00Z"}
 
 use_fixture({lf.PEOPLE_KEY: people_mangusta, lf.INTEREST_KEY: {"buy": {}},
-             lf.DEALS_KEY: {"deals": [deal_natoli_sell, deal_kevin_sell, deal_matched_intro, deal_kevin_buy_ami]}})
+             lf.DEALS_KEY: {"deals": [deal_natoli_sell, deal_kevin_sell, deal_matched_intro, deal_kevin_buy_ami,
+                                       deal_matched_intro_via_kevin]}})
 natoli_tenant = lf._resolve_tenant("natoli@mangustacap.com")
 assert natoli_tenant is not None
 kevin_tenant = lf._resolve_tenant("kevin@mangustacap.com")
@@ -5202,9 +5269,30 @@ intros_natoli_full = lf.render_intros_page("Natoli Silva", tenant=natoli_tenant,
 intros_natoli = body_only(intros_natoli_full)
 check("Active Intros: the legit buyer's row is present", "Prime Capital" in intros_natoli or "Mangusta HoldCo" in intros_natoli)
 check("Active Intros: Kevin's own AMI Labs purchase never appears at all", "AMI Labs" not in intros_natoli)
-check("Active Intros: Kevin never rendered as a buyer identity on Natoli's page", "Kevin" not in intros_natoli)
+check("Active Intros: Kevin never rendered as a buyer identity on Natoli's page (his last name never "
+      "appears -- 'Kevin' itself only legitimately shows up via the Kevin Ventures Co company name and "
+      "the 'via Kevin' attribution chip, both checked below)",
+      "Jiang" not in intros_natoli)
 check("Active Intros: the outside AMI Labs seller never leaks onto Natoli's page either",
       "AMI Labs Founder" not in intros_natoli)
+
+# --- Active Intros ATTRIBUTION (fix #2): the colleague-owned row (930005,
+# matched against Kevin's own Kevin Ventures Co sell deal) still shows
+# the FULL company name (no repeat-suppression, fix #1 applies here too)
+# and the "via Kevin" chip is its own block-level line right after the
+# company link -- never glued inline to it. Anchored on the intros-page
+# href (ref=intros), not the bare company name, so this can't accidentally
+# match the nav's own My Deals quick-jump entry for the same company.
+via_anchor = '<a href="?company=Kevin%20Ventures%20Co&ref=intros">'
+via_row = intros_natoli[intros_natoli.find(via_anchor):]
+via_row = via_row[:via_row.find("</tr>")]
+check("Active Intros: colleague-owned row's company cell has both the full company name and the via-chip",
+      via_row != "" and 'via-colleague-chip">via Kevin</span>' in via_row)
+check("Active Intros: via-chip text/logic unchanged -- immediately after the company <a>, same markup shape",
+      f'{via_anchor}Kevin Ventures Co</a><span class="via-colleague-chip">via Kevin</span>' in via_row)
+check("Active Intros CSS: .via-colleague-chip is now block-level with a small top margin (fix #2)",
+      ".via-colleague-chip { display: block;" in intros_natoli_full
+      and "margin-top: 2px;" in intros_natoli_full)
 
 # --- ATTRIBUTION (item 2): the shared sell deal carries a "via Kevin" --
 mydeals_natoli = body_only(lf.render_my_deals_page(
