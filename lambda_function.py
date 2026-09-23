@@ -79,6 +79,7 @@ import json
 import os
 import time
 import urllib.error
+import uuid
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -3451,6 +3452,8 @@ def get_intro_details(tenant_email):
                 "next_steps": item.get("next_steps"),
                 "notes": item.get("notes"),
                 "notes_updated_at": item.get("notes_updated_at"),
+                **({NOTES_HISTORY_ATTR: list(item.get(NOTES_HISTORY_ATTR) or [])}
+                   if NOTES_HISTORY_ATTR in item else {}),
                 "follow_up": item.get("follow_up"),
                 "status_override": item.get("status_override"),
                 "override_at": item.get("override_at"),
@@ -3682,31 +3685,225 @@ def _get_buyer_note_item(tenant_email, buyer_id):
         return None
 
 
-def _dynamo_write_buyer_note(tenant_email, buyer_id, note, actor):
-    """Upsert the private-notes Dynamo item (table syndicate-dash,
-    tenant=<viewing tenant>, sk="buyer-note#<person_id>"), then append
-    an audit item -- same two-write shape _dynamo_write_manual_intro
-    uses, no Pipeline call of any kind (no CRM field backs this)."""
+def _dynamo_write_buyer_note(tenant_email, buyer_id, note, actor, author_name=""):
+    """APPEND a person note (table syndicate-dash, tenant=<viewing
+    tenant>, sk="buyer-note#<person_id>" -- same item as always) to that
+    item's notes_history list, never overwriting an earlier entry; "note"
+    still mirrors the latest text. Any legacy single-value note is seeded
+    as the first history entry first (_migrated_note_history), then an
+    audit item is appended. Dynamo only -- no Pipeline field backs this.
+    Returns (ok, error_message, new_entry_or_None)."""
     now = time.time()
-    old_item = _get_buyer_note_item(tenant_email, buyer_id)
-    old_note = (old_item or {}).get("note")
+    sk = _buyer_note_sk(buyer_id)
+    old_item = _get_buyer_note_item(tenant_email, buyer_id) or {}
+    history, _ = _migrated_note_history(old_item, "person", sk)
+    entry = _append_note_entry(history, "person", note, actor, author_name)
+    if entry is None:
+        return True, None, None
     try:
         table = _dynamo_table()
         table.update_item(
-            Key={"tenant": tenant_email, "sk": _buyer_note_sk(buyer_id)},
-            UpdateExpression="SET note = :n, buyer_id = :b, updated_at = :ua",
-            ExpressionAttributeValues={":n": note, ":b": buyer_id, ":ua": now},
+            Key={"tenant": tenant_email, "sk": sk},
+            UpdateExpression="SET note = :n, buyer_id = :b, updated_at = :ua, notes_history = :nh",
+            ExpressionAttributeValues={":n": note, ":b": buyer_id, ":ua": int(now), ":nh": history},
         )
         table.put_item(Item={
             "tenant": tenant_email,
             "sk": f"audit#buyer-note#{buyer_id}#{int(now * 1000)}",
             "actor": actor,
-            "old": {"note": old_note},
-            "new": {"note": note},
+            "old": {"note": old_item.get("note")},
+            "new": {"note": note, "history_entry_id": entry["id"]},
         })
-        return True, None
+        return True, None, entry
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return False, f"{type(e).__name__}: {e}", None
+
+
+# ── Append-only notes history ────────────────────────────────────────────────
+# Both note types keep their existing Dynamo item and gain a
+# "notes_history" list attribute on that same item:
+#   person note: tenant=<tenant email>, sk="buyer-note#<person_id>"
+#   deal note:   tenant=<deal's owning tenant email>, sk="intro#<deal_id>"
+# Entry: {id, type ("person"|"deal"), company, deal_id, text, author_email,
+# author_name, created_at (ISO UTC)} -- company/deal_id are "" on person
+# notes. The legacy single-value attribute ("note" / "notes") still mirrors
+# the latest text so Active Intros' and the Company page's Notes columns
+# keep working unchanged.
+NOTES_HISTORY_ATTR = "notes_history"
+ADMIN_AUTHOR_NAME = "Gracia Group"
+MIGRATED_AUTHOR_NAME = "Earlier note"
+
+
+def _iso_utc(ts=None):
+    dt = datetime.now(timezone.utc) if ts is None else datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _legacy_note_entry(item, kind, sk, company="", deal_id="", migrated_at=None):
+    """The history entry a pre-history single-value note becomes: its
+    stored timestamp (updated_at / notes_updated_at) when there is one,
+    else migrated_at. Deterministic id "legacy-<sk>" so re-running a
+    migration can never add it twice. None when there's no text."""
+    if kind == "person":
+        text, ts = item.get("note"), item.get("updated_at")
+    else:
+        text = item.get("notes")
+        if text is None:
+            text = item.get("next_steps")
+        ts = item.get("notes_updated_at")
+    text = str(text or "")
+    if not text.strip():
+        return None
+    created_at = ""
+    if ts is not None:
+        try:
+            created_at = _iso_utc(ts)
+        except (TypeError, ValueError, OSError, OverflowError):
+            created_at = ""
+    return {
+        "id": f"legacy-{sk}",
+        "type": kind,
+        "company": company or "",
+        "deal_id": str(deal_id or ""),
+        "text": text,
+        "author_email": "",
+        "author_name": MIGRATED_AUTHOR_NAME,
+        "created_at": created_at or migrated_at or "",
+    }
+
+
+def _migrated_note_history(item, kind, sk, company="", deal_id="", migrated_at=None):
+    """(history_list, changed). An item that already carries
+    notes_history is returned as-is (changed=False) -- that is what makes
+    the migration idempotent. Otherwise the legacy note (if any) becomes
+    the first entry."""
+    item = item or {}
+    if NOTES_HISTORY_ATTR in item:
+        return list(item.get(NOTES_HISTORY_ATTR) or []), False
+    legacy = _legacy_note_entry(item, kind, sk, company, deal_id, migrated_at or _iso_utc())
+    return ([legacy] if legacy else []), legacy is not None
+
+
+def _append_note_entry(history, kind, text, author_email, author_name, company="", deal_id=""):
+    """Append one entry to history in place and return it. Blank text, or
+    text identical to the latest entry of the same deal (Active Intros'
+    blur-autosave re-posting an unchanged field), appends nothing and
+    returns None."""
+    text = str(text or "")
+    if not text.strip():
+        return None
+    if history and str(history[-1].get("text") or "") == text:
+        return None
+    entry = {
+        "id": uuid.uuid4().hex,
+        "type": kind,
+        "company": company or "",
+        "deal_id": str(deal_id or ""),
+        "text": text,
+        "author_email": author_email or "",
+        "author_name": author_name or "",
+        "created_at": _iso_utc(),
+    }
+    history.append(entry)
+    return entry
+
+
+def _note_author(is_admin, tenant_email):
+    """(author_email, author_name) for a save: admin -> ("admin", "Gracia
+    Group"); a tenant -> their login email and resolved display name."""
+    if is_admin:
+        return "admin", ADMIN_AUTHOR_NAME
+    tenant = _resolve_tenant(tenant_email) if tenant_email else None
+    return tenant_email or "", (tenant or {}).get("name") or tenant_email or ""
+
+
+def migrate_notes_history(tenant_email, deals_by_id=None):
+    """Seed notes_history on every intro#/buyer-note# item in one tenant's
+    partition that has a legacy note but no history yet. Idempotent:
+    items already carrying notes_history are skipped, and the seeded
+    entry's id is deterministic. Returns the number of items migrated."""
+    if deals_by_id is None:
+        deals_by_id = {str(d.get("id")): d for d in get_deals_list()}
+    table = _dynamo_table()
+    migrated_at = _iso_utc()
+    items = []
+    kwargs = {"KeyConditionExpression": Key("tenant").eq(tenant_email)}
+    while True:
+        resp = table.query(**kwargs)
+        items.extend(resp.get("Items", []))
+        if not resp.get("LastEvaluatedKey"):
+            break
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    count = 0
+    for item in items:
+        if item.get("tenant") != tenant_email:
+            continue
+        sk = str(item.get("sk") or "")
+        if sk.startswith("buyer-note#"):
+            history, changed = _migrated_note_history(item, "person", sk, migrated_at=migrated_at)
+        elif sk.startswith("intro#"):
+            deal_id = sk[len("intro#"):]
+            company = _deal_company_name(deals_by_id.get(deal_id) or {}) or ""
+            history, changed = _migrated_note_history(item, "deal", sk, company, deal_id, migrated_at)
+        else:
+            continue
+        if not changed:
+            continue
+        table.update_item(
+            Key={"tenant": tenant_email, "sk": sk},
+            UpdateExpression="SET notes_history = :nh",
+            ExpressionAttributeValues={":nh": history},
+        )
+        table.put_item(Item={
+            "tenant": tenant_email,
+            "sk": f"audit#migrate-notes#{sk}#{int(time.time() * 1000)}",
+            "actor": "migration",
+            "old": {},
+            "new": {"history_entry_id": history[0]["id"]},
+        })
+        count += 1
+    return count
+
+
+def _handle_migrate_notes():
+    """?migrate_notes=1, admin-only (checked by the caller). Runs
+    migrate_notes_history over every tenant partition; safe to re-run."""
+    deals_by_id = {str(d.get("id")): d for d in get_deals_list()}
+    results, errors = {}, {}
+    for email in sorted(_tenant_index()):
+        try:
+            n = migrate_notes_history(email, deals_by_id)
+            if n:
+                results[email] = n
+        except Exception as e:
+            errors[email] = f"{type(e).__name__}: {e}"
+    return _json_response({"ok": not errors, "migrated_items": sum(results.values()),
+                           "by_tenant": results, "errors": errors})
+
+
+def _fmt_note_date(iso_str):
+    """"Sep 23, 2026" from an ISO UTC string; "" if unparsable."""
+    try:
+        dt = datetime.strptime(str(iso_str)[:19], "%Y-%m-%dT%H:%M:%S")
+    except (TypeError, ValueError):
+        return ""
+    return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+
+
+def _note_text_html(text):
+    return "<br>".join(_esc(line) for line in str(text or "").replace("\r\n", "\n").split("\n"))
+
+
+def _note_entry_payload(entry):
+    """JSON the save endpoints return so the page can prepend the new
+    row without a reload."""
+    return {
+        "id": entry["id"],
+        "date": _fmt_note_date(entry["created_at"]),
+        "tag": "Person" if entry["type"] == "person" else (entry.get("company") or "Deal"),
+        "author_name": entry.get("author_name") or "",
+        "text": entry.get("text") or "",
+    }
 
 
 # ── Public Bio (Person custom_label_3801446) ────────────────────────────────
@@ -5500,7 +5697,8 @@ def _tenant_email_for_deal(deal):
 
 
 def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
-                                old_values, actor, milestones=None, loss_reason_shared=None):
+                                old_values, actor, milestones=None, loss_reason_shared=None, notes_history=None,
+                                history_entry=None):
     """Update the intro item's Dynamo-owned attributes (status_override/
     override_at when status_id is not None, next_steps/notes/follow_up
     when they are not None, deadline_override/deadline_override_at when
@@ -5547,6 +5745,13 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         update_parts.append("notes_updated_at = :nua")
         expr_values[":nua"] = int(now)
         new_values["notes_updated_at"] = int(now)
+    if notes_history is not None:
+        # Append-only notes history (see NOTES_HISTORY_ATTR): the caller
+        # built the full list (legacy note seeded + one new entry).
+        update_parts.append("notes_history = :nh")
+        expr_values[":nh"] = notes_history
+        if history_entry is not None:
+            new_values["history_entry_id"] = history_entry["id"]
     if follow_up is not None:
         update_parts.append("follow_up = :fu")
         expr_values[":fu"] = follow_up
@@ -10835,7 +11040,7 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
         # and never wrong enough to be worth fetching every colleague's
         # own Dynamo partition here (same cost this turn declines
         # elsewhere -- see get_firm_deals's docstring). Contrast with
-        # _buyer_notes_ledger_html below, which stays person_id-scoped:
+        # _buyer_deal_note_inputs_html, which stays person_id-scoped:
         # that surface is EDITABLE, so a colleague's blank-looking entry
         # there would invite a write that just 403s -- worse than simply
         # not listing it.
@@ -10860,48 +11065,44 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
     return f'<div class="card buyer-track-card"><h2 class="buyer-section-heading">Track with you</h2>{body}</div>'
 
 
-def _notes_ledger_entry_html(deal_id, label_prefix, notes_value, notes_updated_at):
-    """One NOTES LEDGER entry: company name, the note itself (same
-    2-line auto-saving textarea Active Intros' own Notes column uses —
-    _ei_notes_textarea_html, same .ei-notes save path), and a
-    last-edited date when notes_updated_at is on record (stamped by
-    _dynamo_write_intro_update whenever notes is written — absent for
-    any note that predates turn 23, which simply omits the date rather
-    than showing something wrong)."""
-    field_html = _ei_notes_textarea_html(deal_id, _esc(notes_value), placeholder="Add a note…")
-    edited_text = _fmt_epoch_short_date(notes_updated_at)
-    edited_html = f'<span class="ledger-entry-edited">Last edited {_esc(edited_text)}</span>' if edited_text else ""
-    return (f'<div class="ledger-entry">'
-            f'<div class="ledger-entry-head"><span class="ledger-entry-company">{label_prefix}</span>'
-            f'{edited_html}</div>{field_html}</div>')
+NOTE_VISIBILITY_TEXT = "Only you and Gracia Group can see these."
 
 
-def _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode):
-    """Turn 23, block 4 (NOTES LEDGER, the page's centerpiece): every
-    Dynamo intro note for this buyer across the viewing tenant's deals,
-    one entry per company — company name, the note, last-edited date,
-    editable inline via the same auto-save path Active Intros' own
-    Notes column uses (.ei-notes, keyed by THAT deal's own deal_id --
-    notes are stored per intro item, not per buyer, so each entry saves
-    to a different Dynamo record).
+def _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode):
+    """[(entry, owner_tenant_email), ...] newest first -- every notes-
+    history entry about this buyer the viewer may see.
 
-    Tenant view (edit_mode=False, whether a real tenant session or an
-    admin &view_as preview without &edit=1 -- the same tenant_edit_mode
-    signal every other page uses): only the viewing tenant's own notes,
-    scoped to their Introduced-or-later deals with this buyer (mirrors
-    the page's own disclosure gate -- never a pending/anonymized deal,
-    which is exactly what makes every listed entry here safe to render
-    as an editable field unconditionally). Admin edit mode: every
-    tenant's notes on every matched-or-later buy deal linking this
-    buyer, disclosed or not, each entry labeled by tenant then company.
-    Only ever called after the page's own full_access check already
-    passed -- there is nothing to show otherwise."""
-    entries = []
+    Tenant view: the viewing tenant's OWN partition only -- their person
+    note item (buyer-note#<buyer_id>) plus their own intro items for
+    deals linking this buyer that are disclosed to them (matched-or-later
+    via _resolve_intro_status, closed-out via _closed_out_disclosed).
+    Never a firm colleague's or another tenant's partition.
+
+    Admin view (edit_mode): every tenant's person note on this buyer and
+    every tenant's deal notes on any deal linking this buyer, disclosed
+    or not. Unmigrated legacy notes are shown via the same seeding rule
+    the migration uses (_migrated_note_history)."""
+    out = []
+
+    def _add_person(owner_email):
+        item = _get_buyer_note_item(owner_email, buyer_id)
+        if item is None:
+            return
+        history, _ = _migrated_note_history(item, "person", _buyer_note_sk(buyer_id))
+        out.extend((e, owner_email, i) for i, e in enumerate(history))
+
+    def _add_deal(owner_email, deal, entry):
+        deal_id = str(deal.get("id"))
+        history, _ = _migrated_note_history(entry, "deal", f"intro#{deal_id}",
+                                            _deal_company_name(deal) or "", deal_id)
+        out.extend((e, owner_email, i) for i, e in enumerate(history))
+
     if edit_mode:
-        tenant_index = _tenant_index()
+        for owner_email in sorted(_tenant_index()):
+            _add_person(owner_email)
         intro_cache = {}
         for d in get_deals_list():
-            if not _is_matched_or_later_buy_deal(d):
+            if not (_is_matched_or_later_buy_deal(d) or _is_closed_out_buy_deal(d)):
                 continue
             if buyer_id not in _deal_linked_person_ids(d):
                 continue
@@ -10910,69 +11111,182 @@ def _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode):
                 continue
             if owner_email not in intro_cache:
                 intro_cache[owner_email], _ = get_intro_details(owner_email)
-            entry = intro_cache[owner_email].get(str(d.get("id"))) or {}
-            notes_value = entry.get("notes")
-            if notes_value is None:
-                notes_value = entry.get("next_steps") or ""
-            company_name = _deal_company_name(d) or "—"
+            entry = intro_cache[owner_email].get(str(d.get("id")))
+            if entry:
+                _add_deal(owner_email, d, entry)
+    else:
+        person_id = tenant.get("person_id")
+        _add_person(anon_key_email)
+        intro_details, _ = get_intro_details(anon_key_email)
+        seen = set()
+        for d in get_my_matched_buy_deals(person_id):
+            deal_id = str(d.get("id"))
+            if buyer_id not in _deal_linked_person_ids(d) or deal_id in seen:
+                continue
+            entry = intro_details.get(deal_id)
+            if entry and _resolve_intro_status(d, entry)["disclosed"]:
+                seen.add(deal_id)
+                _add_deal(anon_key_email, d, entry)
+        for d in get_my_closed_out_buy_deals(person_id):
+            deal_id = str(d.get("id"))
+            if buyer_id not in _deal_linked_person_ids(d) or deal_id in seen:
+                continue
+            entry = intro_details.get(deal_id)
+            if entry and _closed_out_disclosed(d):
+                seen.add(deal_id)
+                _add_deal(anon_key_email, d, entry)
+
+    # Newest first; within one item, list position breaks same-second ties.
+    out.sort(key=lambda t: (str(t[0].get("created_at") or ""), t[2]), reverse=True)
+    return [(e, owner) for e, owner, _i in out]
+
+
+def _note_history_row_html(entry, owner_label=""):
+    tag = "Person" if entry.get("type") == "person" else (entry.get("company") or "Deal")
+    tag_cls = "nh-tag nh-tag-person" if entry.get("type") == "person" else "nh-tag"
+    owner_html = f' <span class="nh-owner">· {_esc(owner_label)}</span>' if owner_label else ""
+    return (
+        f'<div class="nh-row"><div class="nh-meta">'
+        f'<span class="nh-date">{_esc(_fmt_note_date(entry.get("created_at")))}</span>'
+        f'<span class="{tag_cls}">{_esc(tag)}</span>'
+        f'<span class="nh-author">{_esc(entry.get("author_name") or "")}</span>{owner_html}</div>'
+        f'<div class="nh-text">{_note_text_html(entry.get("text"))}</div></div>'
+    )
+
+
+def _buyer_notes_history_html(pairs, edit_mode):
+    """The left column's "Notes history" card, or "" when empty. Admin
+    view labels each row with the tenant whose record it sits on."""
+    if not pairs:
+        return ""
+    tenant_index = _tenant_index() if edit_mode else {}
+    rows = []
+    for entry, owner_email in pairs:
+        owner_label = (tenant_index.get(owner_email) or {}).get("name", owner_email) if edit_mode else ""
+        rows.append(_note_history_row_html(entry, owner_label))
+    return ('<div class="card nh-card"><h2 class="buyer-section-heading">Notes history</h2>'
+            f'<div class="nh-list" id="nh-list">{"".join(rows)}</div></div>')
+
+
+def _note_input_card_html(title, subtitle, attrs):
+    return (
+        f'<div class="card nh-input-card"><h2 class="buyer-section-heading">{_esc(title)}</h2>'
+        f'<div class="nh-subtitle">{_esc(subtitle)}</div>'
+        f'<textarea class="nh-input" {attrs} placeholder="Add a note…"></textarea>'
+        '<div class="nh-actions"><button type="button" class="nh-save">Save</button>'
+        '<span class="ei-msg"></span></div></div>'
+    )
+
+
+def _buyer_person_note_input_html(rec, buyer_id):
+    first = _first_name(rec) or "this person"
+    return _note_input_card_html(
+        f"Your notes on {first}",
+        f"About this person, across all deals. {NOTE_VISIBILITY_TEXT}",
+        f'data-kind="person" data-buyer-id="{_esc(str(buyer_id))}"')
+
+
+def _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode):
+    """One "Deal notes: <Company>" input per intro the viewer may write a
+    note on -- the same deal set the old Notes ledger offered: tenant
+    view, their own disclosed deals with this buyer; admin view, every
+    matched-or-later deal linking this buyer (labelled with its tenant)."""
+    cards = []
+    if edit_mode:
+        tenant_index = _tenant_index()
+        for d in get_deals_list():
+            if not _is_matched_or_later_buy_deal(d) or buyer_id not in _deal_linked_person_ids(d):
+                continue
+            owner_email = _tenant_email_for_deal(d)
+            if owner_email is None:
+                continue
             tenant_name = (tenant_index.get(owner_email) or {}).get("name", owner_email)
-            label = f'{_esc(tenant_name)} &middot; {_esc(company_name)}'
-            entries.append(_notes_ledger_entry_html(str(d.get("id")), label, notes_value,
-                                                      entry.get("notes_updated_at")))
+            cards.append(_note_input_card_html(
+                f"Deal notes: {_deal_company_name(d) or '—'} · {tenant_name}",
+                f"About this intro only. {NOTE_VISIBILITY_TEXT}",
+                f'data-kind="deal" data-deal-id="{_esc(str(d.get("id")))}"'))
     else:
         person_id = tenant.get("person_id")
         intro_details, _ = get_intro_details(anon_key_email)
-        # Deliberately NOT broadened to get_firm_matched_buy_deals: Notes
-        # are stored per-deal under the OWNING tenant's own Dynamo
-        # partition (intro_details above only ever reads the VIEWING
-        # tenant's own partition), so a colleague's deal pulled in here
-        # would show as a blank, seemingly-empty note (wrong) rather than
-        # their real one -- worse than just leaving this list scoped to
-        # the deals this partition actually has notes for. Reading every
-        # firm colleague's own Dynamo partition to do this properly is
-        # the same added cost/complexity this turn already declined for
-        # manual intros (see get_firm_deals's docstring).
         for d in get_my_matched_buy_deals(person_id):
             if buyer_id not in _deal_linked_person_ids(d):
                 continue
             entry = intro_details.get(str(d.get("id"))) or {}
             if not _resolve_intro_status(d, entry)["disclosed"]:
                 continue
-            notes_value = entry.get("notes")
-            if notes_value is None:
-                notes_value = entry.get("next_steps") or ""
-            company_name = _deal_company_name(d) or "—"
-            entries.append(_notes_ledger_entry_html(str(d.get("id")), _esc(company_name), notes_value,
-                                                      entry.get("notes_updated_at")))
-
-    body = ("".join(entries) if entries
-            else '<div class="gg-placeholder small">No notes yet — add one from Active Intros or right here.</div>')
-    return f'<div class="card buyer-notes-card"><h2 class="buyer-section-heading">Notes</h2>{body}</div>'
+            cards.append(_note_input_card_html(
+                f"Deal notes: {_deal_company_name(d) or '—'}",
+                f"About this intro only. {NOTE_VISIBILITY_TEXT}",
+                f'data-kind="deal" data-deal-id="{_esc(str(d.get("id")))}"'))
+    return "".join(cards)
 
 
-def _buyer_private_notes_html(tenant_email, buyer_id):
-    """Item 4: the buyer page's "Private notes" card, beside the name
-    card at the top. One free-text note per (tenant, buyer) pair, stored
-    in Dynamo (_get_buyer_note_item/_dynamo_write_buyer_note, table
-    syndicate-dash, tenant=<viewing tenant>, sk="buyer-note#<person_id>"
-    -- never a Pipeline field, nothing here is ever sent to the CRM).
-    tenant_email is always anon_key_email from the caller -- the real
-    tenant this page is showing, whether they're logged in as
-    themselves or an admin is previewing via &view_as -- so admin and
-    that one tenant read/write the SAME note; no other tenant ever
-    reaches this partition. Autosaved on blur via the SAME
-    _edit_script_html machinery every other inline note field uses
-    (.bn-notes, data-buyer-id, posting to ?action=update_buyer_note)."""
-    item = _get_buyer_note_item(tenant_email, buyer_id)
-    note_text = (item or {}).get("note") or ""
-    return (
-        '<div class="card buyer-private-notes-card">'
-        '<h2 class="buyer-section-heading">Private notes — only you and Gracia Group see these.</h2>'
-        f'<textarea class="bn-notes" data-buyer-id="{_esc(str(buyer_id))}" '
-        f'placeholder="Add a private note…">{_esc(note_text)}</textarea>'
-        '<span class="ei-msg"></span>'
-        '</div>'
-    )
+def _notes_history_script_html(key, tenant_email=None):
+    """Save buttons for the note input cards: person notes post to
+    ?action=update_buyer_note, deal notes to ?action=update_intro (the
+    same endpoints and auth as before). On success the textarea clears
+    and the returned entry is prepended to the Notes history list (built
+    with textContent -- never innerHTML); if the card isn't on the page
+    yet (no entries before this one) the page reloads instead."""
+    key_json = json.dumps(key or "")
+    tenant_json = json.dumps(tenant_email or "")
+    return f"""<script>
+(function() {{
+  var ADMIN_KEY = {key_json};
+  var TENANT_EMAIL = {tenant_json};
+  function prepend(e) {{
+    var list = document.getElementById('nh-list');
+    if (!list) {{ window.location.reload(); return; }}
+    var row = document.createElement('div'); row.className = 'nh-row';
+    var meta = document.createElement('div'); meta.className = 'nh-meta';
+    [['nh-date', e.date], [e.tag === 'Person' ? 'nh-tag nh-tag-person' : 'nh-tag', e.tag],
+     ['nh-author', e.author_name]].forEach(function(p) {{
+      var s = document.createElement('span'); s.className = p[0]; s.textContent = p[1] || ''; meta.appendChild(s);
+    }});
+    var text = document.createElement('div'); text.className = 'nh-text';
+    String(e.text || '').split('\\n').forEach(function(line, i) {{
+      if (i) text.appendChild(document.createElement('br'));
+      text.appendChild(document.createTextNode(line));
+    }});
+    row.appendChild(meta); row.appendChild(text);
+    list.insertBefore(row, list.firstChild);
+  }}
+  document.querySelectorAll('.nh-input-card').forEach(function(card) {{
+    var ta = card.querySelector('.nh-input');
+    var btn = card.querySelector('.nh-save');
+    var msg = card.querySelector('.ei-msg');
+    btn.addEventListener('click', function() {{
+      if (!ta.value.trim()) return;
+      var action, payload;
+      if (ta.getAttribute('data-kind') === 'person') {{
+        action = 'update_buyer_note';
+        payload = {{ key: ADMIN_KEY, buyer_id: ta.getAttribute('data-buyer-id'), note: ta.value }};
+        if (TENANT_EMAIL) payload.tenant_email = TENANT_EMAIL;
+      }} else {{
+        action = 'update_intro';
+        payload = {{ key: ADMIN_KEY, deal_id: ta.getAttribute('data-deal-id'), notes: ta.value }};
+      }}
+      btn.disabled = true; msg.className = 'ei-msg saving'; msg.textContent = 'Saving…';
+      fetch('?action=' + action, {{ method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+                                     body: JSON.stringify(payload) }})
+        .then(function(r) {{ return r.json().then(function(d) {{ return {{ ok: r.ok, data: d }}; }}); }})
+        .then(function(res) {{
+          btn.disabled = false;
+          if (res.ok) {{
+            ta.value = '';
+            msg.className = 'ei-msg saved'; msg.textContent = 'Saved ✓';
+            setTimeout(function() {{ msg.className = 'ei-msg'; msg.textContent = ''; }}, 2000);
+            if (res.data && res.data.entry) prepend(res.data.entry);
+          }} else {{
+            msg.className = 'ei-msg error'; msg.textContent = (res.data && res.data.error) || 'Error';
+          }}
+        }}).catch(function(err) {{
+          btn.disabled = false; msg.className = 'ei-msg error'; msg.textContent = 'Error: ' + err;
+        }});
+    }});
+  }});
+}})();
+</script>"""
 
 
 def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
@@ -11068,21 +11382,33 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 deal_team_html = _buyer_deal_team_html(buyer_id, rec, firm_name, tenant, anon_key_email,
                                                         key=key, view_as=view_as)
 
-                left_html = _buyer_about_firm_html(firm_name, company_rec, edit_mode)
-                right_html = (
-                    _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode)
-                    + _buyer_notes_ledger_html(buyer_id, tenant, anon_key_email, edit_mode)
-                )
-                private_notes_html = _buyer_private_notes_html(anon_key_email, buyer_id)
+                # Two columns whose tops align with the header card.
+                # Left: header, Before your call, Notes history (then the
+                # firm/deal-team cards). Right: Track with you, then the
+                # person-note and deal-note input cards. Each slot carries
+                # an order class so the narrow-screen single column reads
+                # header, Track with you, Before your call, note inputs,
+                # Notes history (see .bp-o* in the page CSS).
+                about_html = _buyer_about_firm_html(firm_name, company_rec, edit_mode) + deal_team_html
+                history_html = _buyer_notes_history_html(
+                    _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode), edit_mode)
+                inputs_html = (_buyer_person_note_input_html(rec, buyer_id)
+                               + _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode))
+                track_html = _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode)
                 body_html = (
-                    f'<div class="buyer-top-row"><div class="buyer-top-left">{header_html}'
-                    f'{_bio_points_card_html(bio_points)}</div>{private_notes_html}</div>'
-                    + deal_team_html
-                    + f'<div class="buyer-columns"><div class="buyer-col-left">{left_html}</div>'
-                    + f'<div class="buyer-col-right">{right_html}</div></div>'
+                    '<div class="buyer-columns">'
+                    f'<div class="buyer-col-left"><div class="bp-slot bp-o1">{header_html}</div>'
+                    f'<div class="bp-slot bp-o3">{_bio_points_card_html(bio_points)}</div>'
+                    f'<div class="bp-slot bp-o5">{history_html}</div>'
+                    f'<div class="bp-slot bp-o6">{about_html}</div></div>'
+                    f'<div class="buyer-col-right"><div class="bp-slot bp-o2">{track_html}</div>'
+                    f'<div class="bp-slot bp-o4">{inputs_html}</div></div>'
+                    '</div>'
                 )
                 edit_script_html = _edit_script_html(key if edit_mode else None,
                                                        tenant_email=anon_key_email if edit_mode else None)
+                edit_script_html += _notes_history_script_html(key if edit_mode else None,
+                                                               tenant_email=anon_key_email if edit_mode else None)
                 if bio_edit_on:
                     edit_script_html += _bio_edit_script_html(key)
             else:
@@ -11191,15 +11517,39 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     font-size: 15px;
   }}
   .gg-placeholder.small {{ margin: 0; padding: 6px 0; text-align: left; font-size: 13px; }}
-  /* Turn 24: header card, then a two-column body (single column under
-     680px) -- About the firm on the left; the buyer's tracked deals
-     and Notes on the right (see render_buyer_page). Cards within a
-     column stack with a tight gap; an empty column (nothing to show
-     in either of its cards) just collapses to nothing, never a
-     visible empty box. */
-  .buyer-top-row {{ display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 14px; }}
-  .buyer-top-left {{ flex: 1 1 420px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }}
-  .buyer-top-row .buyer-header {{ margin-bottom: 0; }}
+  /* Two columns whose tops align; slot order and contents are
+     documented in render_buyer_page. Under 680px the columns dissolve
+     (display: contents) and the .bp-o* order classes set the single-
+     column order. Empty slots collapse. */
+  .buyer-columns {{ display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 14px; align-items: start; }}
+  .buyer-col-left, .buyer-col-right, .bp-slot {{ display: flex; flex-direction: column; gap: 14px; min-width: 0; }}
+  .bp-slot:empty {{ display: none; }}
+  .bp-slot > .card {{ width: 100%; margin: 0; box-sizing: border-box; }}
+  @media (max-width: 680px) {{
+    .buyer-columns {{ display: flex; flex-direction: column; }}
+    .buyer-col-left, .buyer-col-right {{ display: contents; }}
+    .bp-o1 {{ order: 1; }} .bp-o2 {{ order: 2; }} .bp-o3 {{ order: 3; }}
+    .bp-o4 {{ order: 4; }} .bp-o5 {{ order: 5; }} .bp-o6 {{ order: 6; }}
+  }}
+  .nh-subtitle {{ font-size: 12px; color: var(--muted); margin: -6px 0 8px; }}
+  .nh-input {{
+    background: var(--bg); border: 1px solid var(--line); color: var(--ink); border-radius: 6px;
+    padding: 6px 9px; font-size: 13px; font-family: inherit; line-height: 1.35;
+    width: 100%; box-sizing: border-box; resize: vertical; min-height: 60px;
+  }}
+  .nh-actions {{ margin-top: 6px; display: flex; align-items: center; gap: 6px; }}
+  .nh-save {{ background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 4px 12px;
+             font-size: 12px; font-weight: 600; cursor: pointer; }}
+  .nh-save:disabled {{ opacity: 0.6; cursor: default; }}
+  .nh-row {{ padding: 10px 0; border-top: 1px solid var(--line); }}
+  .nh-row:first-child {{ padding-top: 0; border-top: none; }}
+  .nh-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; color: var(--muted);
+             margin-bottom: 4px; }}
+  .nh-tag {{ font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px;
+            background: rgba(61,90,115,0.12); color: var(--accent); }}
+  .nh-tag-person {{ background: rgba(22,24,29,0.06); color: var(--ink); }}
+  .nh-author {{ font-weight: 600; color: var(--ink); }}
+  .nh-text {{ font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }}
   .bio-points {{ margin: 0; padding-left: 0; list-style: none; font-size: 14px; line-height: 1.5; }}
   .bio-points li {{ margin-top: 6px; }}
   .bio-points li:first-child {{ margin-top: 0; }}
@@ -11207,12 +11557,6 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .bio-edit {{ margin-top: 12px; }}
   .bio-edit-text {{ width: 100%; min-height: 90px; box-sizing: border-box; font-family: inherit; font-size: 13px;
                    border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; resize: vertical; }}
-  .buyer-private-notes-card {{ flex: 1 1 280px; max-width: 360px; }}
-  .buyer-columns {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }}
-  .buyer-col-left, .buyer-col-right {{ display: flex; flex-direction: column; gap: 14px; min-width: 0; }}
-  @media (max-width: 680px) {{
-    .buyer-columns {{ grid-template-columns: 1fr; }}
-  }}
   .track-row {{ margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }}
   .track-row:first-of-type {{ margin-top: 0; padding-top: 0; border-top: none; }}
   .track-row-tenant {{
@@ -11290,21 +11634,6 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     box-sizing: border-box;
   }}
   textarea.ei-notes {{ resize: vertical; min-height: 44px; font-family: inherit; line-height: 1.35; }}
-  .buyer-private-notes-card .buyer-section-heading {{ font-size: 13px; color: var(--muted); font-weight: 600; }}
-  .bn-notes {{
-    background: var(--bg);
-    border: 1px solid var(--line);
-    color: var(--ink);
-    border-radius: 6px;
-    padding: 6px 9px;
-    font-size: 13px;
-    font-family: inherit;
-    line-height: 1.35;
-    width: 100%;
-    box-sizing: border-box;
-    resize: vertical;
-    min-height: 60px;
-  }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
@@ -12019,12 +12348,31 @@ def _handle_update_intro(event):
             return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
     actor = "admin" if is_admin else tenant_identity_email
+
+    # Deal notes are append-only: every non-blank notes save adds one
+    # history entry on this same intro item (legacy "notes" seeded first);
+    # "notes" itself keeps mirroring the latest text for Active Intros /
+    # the Company page.
+    notes_history = None
+    history_entry = None
+    if notes is not None:
+        history, seeded = _migrated_note_history(old_entry, "deal", f"intro#{deal_id}",
+                                                 _deal_company_name(deal) or "", deal_id)
+        author_email, author_name = _note_author(is_admin, tenant_identity_email)
+        history_entry = _append_note_entry(history, "deal", notes, author_email, author_name,
+                                           _deal_company_name(deal) or "", deal_id)
+        if history_entry is not None or seeded:
+            notes_history = history
+
     ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
                                           old_values, actor, milestones=milestones_update,
-                                          loss_reason_shared=share_loss_reason)
+                                          loss_reason_shared=share_loss_reason, notes_history=notes_history,
+                                          history_entry=history_entry)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
 
+    if history_entry is not None:
+        return _json_response({"ok": True, "entry": _note_entry_payload(history_entry)})
     return _json_response({"ok": True})
 
 
@@ -12535,12 +12883,18 @@ def _handle_update_buyer_note(event):
     if note is None:
         return _json_response({"error": "nothing to update"}, 400)
     note = str(note)
+    if not note.strip():
+        return _json_response({"error": "Note is empty"}, 400)
     if len(note) > MAX_INTRO_TEXT_LEN:
         return _json_response({"error": "note too long"}, 400)
 
-    ok, err = _dynamo_write_buyer_note(tenant_email, buyer_id, note, actor=("admin" if is_admin else tenant_email))
+    author_email, author_name = _note_author(is_admin, tenant_email)
+    ok, err, entry = _dynamo_write_buyer_note(tenant_email, buyer_id, note, actor=author_email,
+                                               author_name=author_name)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
+    if entry is not None:
+        return _json_response({"ok": True, "entry": _note_entry_payload(entry)})
     return _json_response({"ok": True})
 
 
@@ -12680,6 +13034,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_duplicate_report()
+
+    if query.get("migrate_notes"):
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_migrate_notes()
 
     # SSO handoff: verify, set the durable identity cookie, redirect to a
     # clean URL. An invalid/expired token just falls through to normal

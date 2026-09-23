@@ -1433,31 +1433,46 @@ check("tenant CANNOT write notes on a non-disclosed (Matched-only) row -> 403", 
 resp3 = lf.lambda_handler(post_event({"deal_id": "802", "deadline": "2026-12-01"}, cookies=[tenant_cookie(TENANT_A_EMAIL)]), None)
 check("tenant still CANNOT write a deadline -> 403 (unchanged)", resp3["statusCode"] == 403)
 
-notes_a = lf._buyer_notes_ledger_html(2, tenant_a, TENANT_A_EMAIL, False)
-check("tenant view: 'Notes' heading present", ">Notes</h2>" in notes_a)
-check("tenant view: 802 shows its (now tenant-authored) note", "Alpha Industries" in notes_a and "Tenant-authored note" in notes_a)
-check("tenant view: 803 shows its explicit notes", "Beta Holdings" in notes_a and "Great call yesterday" in notes_a)
-check("tenant view: a pending/non-disclosed deal (805) is NOT shown (privacy)", "Delta Corp" not in notes_a)
+def _hist_texts(buyer_id, tenant, email, edit_mode):
+    return [e["text"] for e, _owner in lf._buyer_note_history_entries(buyer_id, tenant, email, edit_mode)]
 
-notes_b = lf._buyer_notes_ledger_html(2, tenant_b, TENANT_B_EMAIL, False)
-check("tenant B view: their own note on 804 shown", "Gamma Co" in notes_b and "Following up next week" in notes_b)
-check("tenant B view: tenant A's notes are NOT shown", "Alpha Industries" not in notes_b and "Beta Holdings" not in notes_b)
+hist_a = _hist_texts(2, tenant_a, TENANT_A_EMAIL, False)
+check("tenant A history: the new deal note is an entry", "Tenant-authored note" in hist_a)
+check("tenant A history: the legacy next_steps value on 802 was kept as an earlier entry (nothing lost)",
+      "Legacy action item" in hist_a)
+check("tenant A history: 803's legacy note migrated in", "Great call yesterday" in hist_a)
+check("tenant A history: tenant B's 804 note is NOT visible", "Following up next week" not in hist_a)
+item_802 = next(i for i in fake_table.items if i["tenant"] == TENANT_A_EMAIL and i["sk"] == "intro#802")
+check("802 notes_history: legacy seed first, then the tenant's entry, with author fields",
+      [e["text"] for e in item_802["notes_history"]] == ["Legacy action item", "Tenant-authored note"]
+      and item_802["notes_history"][1]["author_email"] == TENANT_A_EMAIL
+      and item_802["notes_history"][1]["author_name"] == "Sella Seller"
+      and item_802["notes_history"][1]["type"] == "deal" and item_802["notes_history"][1]["deal_id"] == "802"
+      and item_802["notes_history"][1]["company"] == "Alpha Industries")
+check("802: notes still mirrors the latest text (Active Intros column unchanged)", item_802["notes"] == "Tenant-authored note")
 
-notes_admin = lf._buyer_notes_ledger_html(2, tenant_a, TENANT_A_EMAIL, True)
-check("admin edit mode: tenant A's 802 note shown", "Alpha Industries" in notes_admin and "Tenant-authored note" in notes_admin)
-check("admin edit mode: tenant A's 803 note shown", "Beta Holdings" in notes_admin and "Great call yesterday" in notes_admin)
-check("admin edit mode: tenant B's 804 note ALSO shown (cross-tenant aggregate)",
-      "Gamma Co" in notes_admin and "Following up next week" in notes_admin)
-check("admin edit mode: entries labeled by tenant name", "Sella Seller" in notes_admin and "Tabor Seller" in notes_admin)
+hist_b = _hist_texts(2, tenant_b, TENANT_B_EMAIL, False)
+check("tenant B history: their own 804 note shown", "Following up next week" in hist_b)
+check("tenant B history: none of tenant A's notes shown",
+      not any(t in hist_b for t in ("Tenant-authored note", "Legacy action item", "Great call yesterday")))
 
-notes_empty = lf._buyer_notes_ledger_html(999, tenant_a, TENANT_A_EMAIL, False)
-check("no matched deals with a buyer -> the exact empty-state placeholder",
-      "No notes yet — add one from Active Intros or right here." in notes_empty)
+hist_admin_pairs = lf._buyer_note_history_entries(2, tenant_a, TENANT_A_EMAIL, True)
+hist_admin = [e["text"] for e, _o in hist_admin_pairs]
+check("admin history: every tenant's notes shown",
+      all(t in hist_admin for t in ("Tenant-authored note", "Great call yesterday", "Following up next week")))
+admin_hist_html = lf._buyer_notes_history_html(hist_admin_pairs, True)
+check("admin history card labels rows with the owning tenant", "Sella Seller" in admin_hist_html
+      and "Tabor Seller" in admin_hist_html)
+check("no notes about a buyer -> Notes history card hidden entirely",
+      lf._buyer_notes_history_html(lf._buyer_note_history_entries(999, tenant_a, TENANT_A_EMAIL, False), False) == "")
 
 page_buyer_full = lf.render_buyer_page(2, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
-check("full-access buyer page includes the Notes section", ">Notes</h2>" in page_buyer_full)
-check("full-access buyer page includes an editable ei-notes field", 'class="ei-notes"' in page_buyer_full)
-check("full-access buyer page includes the auto-save edit script", "saveField" in page_buyer_full)
+check("full-access buyer page includes the Notes history card", ">Notes history</h2>" in page_buyer_full)
+check("full-access buyer page: deal-note input per disclosed intro",
+      ">Deal notes: Alpha Industries</h2>" in page_buyer_full and ">Deal notes: Beta Holdings</h2>" in page_buyer_full)
+check("full-access buyer page: no deal-note input for the undisclosed 805", "Deal notes: Delta Corp" not in page_buyer_full)
+check("full-access buyer page: person-note input titled with the first name", ">Your notes on Alice</h2>" in page_buyer_full)
+check("full-access buyer page includes the note save script", "?action=' + action" in page_buyer_full)
 
 page_buyer_anon = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("anonymized (no disclosed deal) buyer page has no Notes section", ">Notes</h2>" not in page_buyer_anon)
@@ -1693,16 +1708,16 @@ check("admin edit mode: Tabor Seller's tenant label present", "Tabor Seller" in 
 check("admin edit mode: Gamma Co (pending) IS shown (admin sees pending too)", "Gamma Co" in page_alice_admin)
 check("admin edit mode: Delta LLC (tenant B's deal) shown", "Delta LLC" in page_alice_admin)
 
-check("Notes ledger: heading present", ">Notes</h2" in page_alice)
-check("Notes ledger: 802's note shown in a textarea", ">Chasing signature</textarea>" in page_alice)
-check("Notes ledger: 803's note shown", ">Great call yesterday</textarea>" in page_alice)
-check("Notes ledger: a last-edited date shown for 802 (has notes_updated_at)", "Last edited" in page_alice)
+check("Notes history: heading present", ">Notes history</h2" in page_alice)
+check("Notes history: 802's legacy note shown as a history row", ">Chasing signature</div>" in page_alice)
+check("Notes history: 803's legacy note shown", ">Great call yesterday</div>" in page_alice)
+check("Notes history: 802's row dated from its stored notes_updated_at (1750000000 -> Jun 15, 2025)",
+      "Jun 15, 2025" in page_alice)
 
 page_nodeals_admin = lf.render_buyer_page(6, "Admin", tenant_a, TENANT_A_EMAIL, key=ADMIN_KEY, view_as=None, edit_mode=True)
-check("Notes ledger empty state text matches exactly",
-      "No notes yet — add one from Active Intros or right here." in page_nodeals_admin)
-check("admin notes ledger: tenant B's note (805) shown too", "Following up next week" in page_alice_admin)
-check("admin notes ledger: entries labeled by tenant then company", "Tabor Seller &middot; Delta LLC" in page_alice_admin)
+check("Notes history card hidden when there are no entries", ">Notes history</h2" not in page_nodeals_admin)
+check("admin notes history: tenant B's note (805) shown too", "Following up next week" in page_alice_admin)
+check("admin deal-note inputs labeled by company then tenant", ">Deal notes: Delta LLC · Tabor Seller</h2>" in page_alice_admin)
 
 lf.urllib.request.urlopen = fake_urlopen2
 resp = lf.lambda_handler(post_event({"deal_id": "802", "notes": "Updated note"}, cookies=[tenant_cookie(TENANT_A_EMAIL)]), None)
@@ -1795,7 +1810,8 @@ check("About the firm card is in the LEFT column", "About Alice Capital" in left
 check("Process signals card is gone entirely, not just moved (left column no longer carries it)",
       "Process signals" not in left_html)
 check("Track with you card is in the RIGHT column", "Track with you" in right_html)
-check("Notes card is in the RIGHT column", ">Notes</h2" in right_html)
+check("note input cards are in the RIGHT column", ">Deal notes: Alpha Industries</h2>" in right_html
+      and "Your notes on Alice" in right_html)
 
 header_html = page_alice.split('class="card buyer-header"')[1].split('class="buyer-columns"')[0]
 check("header: name present", "Alice Buyer" in header_html)
@@ -5082,20 +5098,16 @@ assert pn_tenant is not None and pn_other_tenant is not None
 
 pn_page = lf.render_buyer_page(PN_BUYER_PID, "Tessa Seller", pn_tenant, PN_TENANT_EMAIL,
                                 key=None, view_as=None, edit_mode=False)
-check("Private notes: card renders with the exact required label",
-      '<h2 class="buyer-section-heading">Private notes — only you and Gracia Group see these.</h2>' in pn_page)
-check("Private notes: textarea present, keyed by buyer_id, empty when no note on record",
-      f'<textarea class="bn-notes" data-buyer-id="{PN_BUYER_PID}" placeholder="Add a private note…"></textarea>'
+check("Person note: input card titled with the buyer's first name",
+      '<h2 class="buyer-section-heading">Your notes on Barry</h2>' in pn_page)
+check("Person note: subtitle states the verified visibility",
+      "About this person, across all deals. Only you and Gracia Group can see these." in pn_page)
+check("Person note: empty input keyed by buyer_id, short placeholder",
+      f'<textarea class="nh-input" data-kind="person" data-buyer-id="{PN_BUYER_PID}" placeholder="Add a note…"></textarea>'
       in pn_page)
-# Slice past the <style> block first -- .buyer-private-notes-card is
-# also a CSS selector defined in <head>, so an ordering check against
-# the raw page would false-positive on that definition rather than the
-# actual body markup.
-pn_page_body = pn_page[pn_page.find("</style>"):]
-check("Private notes: card sits beside the name card (buyer-top-row wraps both)",
-      '<div class="buyer-top-row">' in pn_page_body
-      and pn_page_body.find('<div class="buyer-top-row">') < pn_page_body.find('class="card buyer-header"')
-      < pn_page_body.find('buyer-private-notes-card'))
+check("Deal note: subtitle states the verified visibility",
+      ">Deal notes: PN Buy Co</h2>" in pn_page
+      and "About this intro only. Only you and Gracia Group can see these." in pn_page)
 
 pn_anon_page = lf.render_buyer_page(PN_BUYER_PID, "Nora Seller", pn_other_tenant, PN_OTHER_TENANT_EMAIL,
                                      key=None, view_as=None, edit_mode=False)
@@ -5104,9 +5116,8 @@ pn_anon_page = lf.render_buyer_page(PN_BUYER_PID, "Nora Seller", pn_other_tenant
 # defined once in the page's <style> block regardless of which branch
 # renders (same as every other CSS rule on this page), so a bare
 # "bn-notes" in page check would false-positive on the stylesheet.
-check("Private notes: never rendered on the anonymized (not-yet-disclosed) card",
-      '<textarea class="bn-notes"' not in pn_anon_page
-      and '<h2 class="buyer-section-heading">Private notes' not in pn_anon_page)
+check("Person note input never rendered on the anonymized (not-yet-disclosed) card",
+      '<textarea class="nh-input"' not in pn_anon_page and "Your notes on" not in pn_anon_page)
 
 def buyer_note_event(body_dict, cookies=None):
     return {"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
@@ -5134,15 +5145,20 @@ pn_written = pn_table.updates[-1]
 check("Private notes write: Dynamo key is (tenant=<tenant email>, sk='buyer-note#<person_id>')",
       pn_written["Key"] == {"tenant": PN_TENANT_EMAIL, "sk": f"buyer-note#{PN_BUYER_PID}"})
 check("Private notes write: note text written correctly",
-      pn_written["ExpressionAttributeValues"].get(":n") == "Wants a 2-layer SPV, follow up in Q3")
+      pn_written["ExpressionAttributeValues"].get(":n") == "Wants a 2-layer SPV, follow up in Q3"
+      and pn_written["ExpressionAttributeValues"][":nh"][-1]["text"] == "Wants a 2-layer SPV, follow up in Q3")
+check("Private notes write: response carries the new entry for the no-reload prepend",
+      json.loads(resp_tenant_write["body"])["entry"]["tag"] == "Person"
+      and json.loads(resp_tenant_write["body"])["entry"]["author_name"] == "Tessa Seller")
 check("Private notes write: audit item appended", any(
     it and it.get("actor") == PN_TENANT_EMAIL and str(it.get("sk", "")).startswith(f"audit#buyer-note#{PN_BUYER_PID}#")
     for it in pn_table.puts))
 
 pn_page_after = lf.render_buyer_page(PN_BUYER_PID, "Tessa Seller", pn_tenant, PN_TENANT_EMAIL,
                                       key=None, view_as=None, edit_mode=False)
-check("Private notes: textarea pre-fills with the saved note on next render",
-      "Wants a 2-layer SPV, follow up in Q3</textarea>" in pn_page_after)
+check("Private notes: saved note appears in Notes history (input stays empty)",
+      ">Wants a 2-layer SPV, follow up in Q3</div>" in pn_page_after
+      and "Wants a 2-layer SPV, follow up in Q3</textarea>" not in pn_page_after)
 
 resp_admin_no_tenant = lf.lambda_handler(
     buyer_note_event({"key": ADMIN_KEY, "buyer_id": PN_BUYER_PID, "note": "admin note"}), None)
@@ -5159,8 +5175,15 @@ check("Private notes write: admin WITH tenant_email -> 200, writes into that sam
 
 pn_page_admin = lf.render_buyer_page(PN_BUYER_PID, "Admin", pn_tenant, PN_TENANT_EMAIL,
                                       key=ADMIN_KEY, view_as=PN_TENANT_EMAIL, edit_mode=True)
-check("Private notes: admin (view_as this tenant) sees the SAME note the tenant wrote",
-      "Admin follow-up: sent updated deck</textarea>" in pn_page_admin)
+check("Private notes: admin (view_as this tenant) sees both entries, authored by tenant and Gracia Group",
+      ">Admin follow-up: sent updated deck</div>" in pn_page_admin
+      and ">Wants a 2-layer SPV, follow up in Q3</div>" in pn_page_admin
+      and '<span class="nh-author">Gracia Group</span>' in pn_page_admin
+      and '<span class="nh-author">Tessa Seller</span>' in pn_page_admin)
+pn_page_tenant_after_admin = lf.render_buyer_page(PN_BUYER_PID, "Tessa Seller", pn_tenant, PN_TENANT_EMAIL,
+                                                   key=None, view_as=None, edit_mode=False)
+check("Private notes: the tenant sees Gracia Group's note on their own record too",
+      ">Admin follow-up: sent updated deck</div>" in pn_page_tenant_after_admin)
 
 check("Private notes: never leaked into Nora's (other tenant's) own partition",
       lf._get_buyer_note_item(PN_OTHER_TENANT_EMAIL, PN_BUYER_PID) is None)
@@ -5587,8 +5610,9 @@ check("display: headline sits right after the location line",
       bio_page.find("Boston") < bio_page.find("Dynamo head") < bio_page.find("mailto:alice@example.com"))
 check("display: 'Before your call' card with escaped points",
       "Before your call" in bio_page and "<li>Point one</li>" in bio_page and "<li>Point &lt;two&gt;</li>" in bio_page)
-check("display: 'Before your call' card sits below the header card, before Private notes",
-      bio_page.find('class="card buyer-header"') < bio_page.find("Before your call") < bio_page.find("Private notes"))
+check("display: 'Before your call' card sits below the header card, before the right column",
+      bio_page.find('class="card buyer-header"') < bio_page.find("Before your call")
+      < bio_page.find('class="buyer-col-right"'))
 check("tenant view: no bio edit textarea", 'id="bio-edit-text"' not in bio_page and "save_bio" not in bio_page)
 
 carol_page = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None, view_as=None, edit_mode=False)
@@ -5718,6 +5742,161 @@ check("bulk POST: invalid batch -> 400, nothing written",
       bad_bulk["statusCode"] == 400 and bio_calls == [] and "not a numeric person_id" in bad_bulk["body"])
 check("bulk POST: wrong key -> 403",
       lf.lambda_handler(_bio_bulk_post("{}", key="nope"), None)["statusCode"] == 403)
+lf.urllib.request.urlopen = fake_urlopen
+
+
+# ======================================================================
+# SECTION: Notes history -- append-only person/deal notes, migration,
+# visibility, escaping, buyer-page layout order
+# ======================================================================
+NH_A_EMAIL, NH_A_PID = "nha@example.com", 701
+NH_B_EMAIL, NH_B_PID = "nhb@example.com", 702
+NH_BUYER = 703
+nh_people = {"people": [
+    {"id": NH_A_PID, "full_name": "Ana Seller", "email": NH_A_EMAIL, "custom_fields": {}},
+    {"id": NH_B_PID, "full_name": "Ben Seller", "email": NH_B_EMAIL, "custom_fields": {}},
+    {"id": NH_BUYER, "first_name": "Quinn", "name": "Quinn Buyer", "email": "quinn@example.com",
+     "custom_fields": {lf.PUBLIC_BIO_FIELD: "Partner at Q • Point one"}},
+]}
+nh_sell_a = {"id": 970001, "name": "A sell", "company": {"name": "A Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+             "custom_fields": cf_sell(), "people": [{"id": NH_A_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+nh_sell_b = {"id": 970002, "name": "B sell", "company": {"name": "B Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+             "custom_fields": cf_sell(), "people": [{"id": NH_B_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+nh_buy_a = {"id": 970003, "name": "A buy", "company": {"name": "Orbit Labs"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+            "custom_fields": cf_status(7207579), "people": [{"id": NH_A_PID}, {"id": NH_BUYER}],
+            "updated_at": "2026-08-02T00:00:00Z"}
+nh_buy_b = {"id": 970004, "name": "B buy", "company": {"name": "Nova Inc"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+            "custom_fields": cf_status(7207579), "people": [{"id": NH_B_PID}, {"id": NH_BUYER}],
+            "updated_at": "2026-08-02T00:00:00Z"}
+nh_legacy_items = [
+    {"tenant": NH_A_EMAIL, "sk": f"buyer-note#{NH_BUYER}", "note": "Old person note", "buyer_id": NH_BUYER,
+     "updated_at": 1757000000},
+    {"tenant": NH_A_EMAIL, "sk": "intro#970003", "notes": "Old deal note", "milestones": {}},
+    {"tenant": NH_B_EMAIL, "sk": "intro#970004", "notes": "B private deal note", "milestones": {}},
+    {"tenant": NH_B_EMAIL, "sk": f"buyer-note#{NH_BUYER}", "note": "B private person note", "buyer_id": NH_BUYER},
+]
+_, nh_table = use_fixture({lf.PEOPLE_KEY: nh_people, lf.INTEREST_KEY: {"buy": {}},
+                           lf.DEALS_KEY: {"deals": [nh_sell_a, nh_sell_b, nh_buy_a, nh_buy_b]}},
+                          table_items=[dict(i) for i in nh_legacy_items])
+nh_a = lf._resolve_tenant(NH_A_EMAIL)
+nh_b = lf._resolve_tenant(NH_B_EMAIL)
+
+def _nh_item(tenant, sk):
+    return next((i for i in nh_table.items if i["tenant"] == tenant and i["sk"] == sk), None)
+
+# --- Migration: legacy -> first entry; idempotent
+n1 = lf.migrate_notes_history(NH_A_EMAIL)
+pn_hist = _nh_item(NH_A_EMAIL, f"buyer-note#{NH_BUYER}")["notes_history"]
+dn_hist = _nh_item(NH_A_EMAIL, "intro#970003")["notes_history"]
+check("migration: two legacy items migrated in tenant A's partition", n1 == 2)
+check("migration: person note became the first entry, stored timestamp kept",
+      len(pn_hist) == 1 and pn_hist[0]["text"] == "Old person note" and pn_hist[0]["type"] == "person"
+      and pn_hist[0]["created_at"] == "2025-09-04T15:33:20Z" and pn_hist[0]["id"] == f"legacy-buyer-note#{NH_BUYER}")
+check("migration: deal note with no timestamp gets the migration time + company/deal_id",
+      len(dn_hist) == 1 and dn_hist[0]["text"] == "Old deal note" and dn_hist[0]["company"] == "Orbit Labs"
+      and dn_hist[0]["deal_id"] == "970003" and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", dn_hist[0]["created_at"]))
+check("migration: legacy single-value fields left in place (nothing lost)",
+      _nh_item(NH_A_EMAIL, "intro#970003")["notes"] == "Old deal note")
+n2 = lf.migrate_notes_history(NH_A_EMAIL)
+check("migration idempotency: second run migrates nothing", n2 == 0)
+check("migration idempotency: no duplicate entries after re-run",
+      len(_nh_item(NH_A_EMAIL, f"buyer-note#{NH_BUYER}")["notes_history"]) == 1
+      and len(_nh_item(NH_A_EMAIL, "intro#970003")["notes_history"]) == 1)
+mig_route = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                               "queryStringParameters": {"migrate_notes": "1", "key": ADMIN_KEY}, "cookies": []}, None)
+mig_route2 = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                "queryStringParameters": {"migrate_notes": "1", "key": ADMIN_KEY}, "cookies": []}, None)
+check("migration route: admin run migrates tenant B, re-run migrates 0",
+      json.loads(mig_route["body"])["migrated_items"] == 2 and json.loads(mig_route2["body"])["migrated_items"] == 0)
+check("migration route: tenant cookie -> 403",
+      lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                         "queryStringParameters": {"migrate_notes": "1"},
+                         "cookies": [tenant_cookie(NH_A_EMAIL)]}, None)["statusCode"] == 403)
+
+# --- Append: two saves -> two new entries, newest first
+lf.urllib.request.urlopen = fake_urlopen2
+def _nh_note_post(action, body, email):
+    return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": action}, "cookies": [tenant_cookie(email)],
+                              "body": json.dumps(body)}, None)
+r1 = _nh_note_post("update_buyer_note", {"buyer_id": NH_BUYER, "note": "First save"}, NH_A_EMAIL)
+r2 = _nh_note_post("update_buyer_note", {"buyer_id": NH_BUYER, "note": "Second save"}, NH_A_EMAIL)
+pn_hist = _nh_item(NH_A_EMAIL, f"buyer-note#{NH_BUYER}")["notes_history"]
+check("append (person): two saves -> 200 each, two new entries after the migrated one",
+      r1["statusCode"] == 200 and r2["statusCode"] == 200
+      and [e["text"] for e in pn_hist] == ["Old person note", "First save", "Second save"])
+check("append (person): entry fields complete",
+      set(pn_hist[-1]) == {"id", "type", "company", "deal_id", "text", "author_email", "author_name", "created_at"}
+      and pn_hist[-1]["author_email"] == NH_A_EMAIL and pn_hist[-1]["author_name"] == "Ana Seller")
+d1 = _nh_note_post("update_intro", {"deal_id": "970003", "notes": "Deal save one"}, NH_A_EMAIL)
+d2 = _nh_note_post("update_intro", {"deal_id": "970003", "notes": "Deal save two"}, NH_A_EMAIL)
+dn_hist = _nh_item(NH_A_EMAIL, "intro#970003")["notes_history"]
+check("append (deal): two saves -> two entries, earlier ones kept",
+      d1["statusCode"] == 200 and d2["statusCode"] == 200
+      and [e["text"] for e in dn_hist] == ["Old deal note", "Deal save one", "Deal save two"])
+check("append (deal): response carries the entry (company tag) for the no-reload prepend",
+      json.loads(d2["body"])["entry"]["tag"] == "Orbit Labs" and json.loads(d2["body"])["entry"]["text"] == "Deal save two")
+check("append (deal): an audit item written per save",
+      sum(1 for p in nh_table.puts if p and str(p.get("sk", "")).startswith("audit#970003#")) == 2)
+d_dup = _nh_note_post("update_intro", {"deal_id": "970003", "notes": "Deal save two"}, NH_A_EMAIL)
+check("append (deal): re-posting the unchanged latest text (Active Intros blur) adds no entry",
+      d_dup["statusCode"] == 200 and len(_nh_item(NH_A_EMAIL, "intro#970003")["notes_history"]) == 3)
+check("append (person): blank note rejected, nothing appended",
+      _nh_note_post("update_buyer_note", {"buyer_id": NH_BUYER, "note": "   "}, NH_A_EMAIL)["statusCode"] == 400
+      and len(_nh_item(NH_A_EMAIL, f"buyer-note#{NH_BUYER}")["notes_history"]) == 3)
+
+nh_hist_a = [e["text"] for e, _o in lf._buyer_note_history_entries(NH_BUYER, nh_a, NH_A_EMAIL, False)]
+check("history order: newest first",
+      nh_hist_a.index("Deal save two") < nh_hist_a.index("Deal save one")
+      and nh_hist_a.index("Second save") < nh_hist_a.index("First save")
+      and nh_hist_a[-1] == "Old person note")
+
+# --- Visibility
+check("visibility: tenant A sees none of tenant B's person/deal notes",
+      "B private deal note" not in nh_hist_a and "B private person note" not in nh_hist_a)
+nh_hist_b = [e["text"] for e, _o in lf._buyer_note_history_entries(NH_BUYER, nh_b, NH_B_EMAIL, False)]
+check("visibility: tenant B sees only their own notes",
+      set(nh_hist_b) == {"B private deal note", "B private person note"})
+nh_hist_admin = [e["text"] for e, _o in lf._buyer_note_history_entries(NH_BUYER, nh_a, NH_A_EMAIL, True)]
+check("visibility: admin sees every author's entries",
+      all(t in nh_hist_admin for t in ("B private deal note", "B private person note", "Second save", "Deal save two",
+                                        "Old person note")))
+nh_page_a = lf.render_buyer_page(NH_BUYER, "Ana Seller", nh_a, NH_A_EMAIL, key=None, view_as=None, edit_mode=False)
+check("visibility: tenant A's rendered page leaks nothing of tenant B's",
+      "B private" not in nh_page_a and "Nova Inc" not in nh_page_a)
+nh_page_admin = lf.render_buyer_page(NH_BUYER, "Admin", nh_a, NH_A_EMAIL, key=ADMIN_KEY, view_as=NH_A_EMAIL,
+                                     edit_mode=True)
+check("visibility: admin page shows tenant B's notes, labelled with tenant B",
+      "B private deal note" in nh_page_admin and '<span class="nh-owner">· Ben Seller</span>' in nh_page_admin)
+check("tenant B cannot append to tenant A's deal note -> 403",
+      _nh_note_post("update_intro", {"deal_id": "970003", "notes": "hijack"}, NH_B_EMAIL)["statusCode"] == 403
+      and len(_nh_item(NH_A_EMAIL, "intro#970003")["notes_history"]) == 3)
+
+# --- Escaping and line breaks
+esc_row = lf._note_history_row_html({"type": "deal", "company": "<Co>", "author_name": "A & B",
+                                     "text": "line <one>\nline \"two\"", "created_at": "2026-09-23T12:00:00Z"})
+check("escaping: text, tag and author escaped; newline -> <br>",
+      "line &lt;one&gt;<br>line &quot;two&quot;" in esc_row and "&lt;Co&gt;" in esc_row and "A &amp; B" in esc_row
+      and "<one>" not in esc_row)
+check("date format: 'Sep 23, 2026'", "Sep 23, 2026" in esc_row)
+check("type tag: person entries tagged 'Person'",
+      ">Person</span>" in lf._note_history_row_html({"type": "person", "text": "x", "created_at": ""}))
+
+# --- Layout order
+nh_body = nh_page_a[nh_page_a.find('<div class="buyer-columns">'):]
+nh_left = nh_body.split('<div class="buyer-col-left">')[1].split('<div class="buyer-col-right">')[0]
+nh_right = nh_body.split('<div class="buyer-col-right">')[1]
+check("layout: header card is the first left-column card", nh_left.find('class="card buyer-header"') == nh_left.find('class="card'))
+check("layout: left column order header -> Before your call -> Notes history",
+      0 <= nh_left.find('class="card buyer-header"') < nh_left.find("Before your call") < nh_left.find(">Notes history</h2>"))
+check("layout: Track with you is the first right-column card",
+      nh_right.find('class="card') == nh_right.find('class="card buyer-track-card"'))
+check("layout: right column order Track with you -> person note -> deal note",
+      nh_right.find("Track with you") < nh_right.find("Your notes on Quinn") < nh_right.find("Deal notes: Orbit Labs"))
+check("layout: mobile order classes present (header 1, track 2, bio 3, inputs 4, history 5)",
+      all(c in nh_body for c in ('bp-slot bp-o1', 'bp-slot bp-o2', 'bp-slot bp-o3', 'bp-slot bp-o4', 'bp-slot bp-o5'))
+      and ".bp-o5 {{" not in nh_page_a and ".bp-o5 { order: 5; }" in nh_page_a)
+check("layout: old side-by-side private-notes card is gone", "buyer-top-row" not in nh_page_a)
 lf.urllib.request.urlopen = fake_urlopen
 
 
