@@ -702,34 +702,32 @@ page = lf.render_my_deals_page("Sella", deals=deals, key=None, view_as=None,
 check("no leftover 'Open Hold' text", "Open Hold" not in page)
 check("no leftover request-chip text", "Cancel requests" not in page)
 check("Active section present (Active Deal)", "Active Deal" in page)
-check("On Hold section heading present", "On Hold" in page)
 check("Held Deal row present", "Held Deal" in page)
-check("Cancelled section heading present", '<h2 class="mydeals-section-heading cancelled">Cancelled' in page)
-check("Cancelled Deal row present (via its company name -- terminal rows carry no action buttons)",
-      "Gamma Co" in page)
+check("Cancelled (Obsolete) Deal row present (via its company name)", "Gamma Co" in page)
 
-# body_only: person_id is set, so the nav's My Deals dropdown also lists
-# an "On Hold" group for this same tenant -- slice the header off before
-# splitting on "On Hold" so these sections read the actual table.
+# body_only: slice the nav (its My Deals dropdown also lists companies)
+# off first. Hold now stays in the MAIN table; dead deals go to the
+# collapsed Archived section below it.
 page_body = body_only(page)
-hold_section = page_body.split("On Hold")[1].split("Cancelled")[0]
-check("Reactivate button present in the Hold section (tenant)", 'data-target="reactivate"' in hold_section)
-check("no Hold/Cancel buttons in the Hold section", 'data-target="hold"' not in hold_section
-      and 'data-target="cancel"' not in hold_section)
-active_section = page_body.split("On Hold")[0]
-check("Hold/Cancel buttons present in the active section", 'data-target="hold"' in active_section
-      and 'data-target="cancel"' in active_section)
+main_table = page_body.split('<details class="closed-out-section mydeals-archived">')[0]
+archived_section = page_body.split('<details class="closed-out-section mydeals-archived">')[1]
+row_held = row_for(page_body, "102") or ""
+check("Held Deal sits in the main table (Hold is not archived)", "Beta Co" in main_table and "Beta Co" not in archived_section)
+check("Reactivate button present on the held row (tenant)", 'data-target="reactivate"' in main_table)
+check("Hold/Cancel buttons present in the main table", 'data-target="hold"' in main_table
+      and 'data-target="cancel"' in main_table)
+check("Obsolete deal only in the Archived section", "Gamma Co" in archived_section and "Gamma Co" not in main_table)
+check("Archived section carries no stage actions and no Update link",
+      "deal-stage-btn" not in archived_section.split("</details>")[0]
+      and "update-cancel-btn" not in archived_section.split("</details>")[0])
 
 page_admin = body_only(lf.render_my_deals_page("Admin", deals=deals, key=ADMIN_KEY, view_as=TENANT_EMAIL,
                                                 person_id=TENANT_PID, anon_key_email=TENANT_EMAIL))
-hold_section_admin = page_admin.split("On Hold")[1].split("Cancelled")[0]
-check("Reactivate button present in the Hold section (admin)", 'data-target="reactivate"' in hold_section_admin)
+check("Reactivate button present on the held row (admin)", 'data-target="reactivate"' in page_admin)
 
 page_active_only = body_only(lf.render_my_deals_page("Sella", deals=[deal_active], key=None, view_as=None,
                                                       person_id=TENANT_PID, anon_key_email=TENANT_EMAIL))
-check("On Hold section omitted entirely when empty", "On Hold" not in page_active_only)
-check("Cancelled section omitted entirely when empty (heading markup, not just the bare word)",
-      'mydeals-section-heading cancelled"' not in page_active_only)
+check("Archived section omitted entirely when there are no dead deals", "Archived deals" not in page_active_only)
 
 # Reactivate write path: a tenant can reactivate their own held deal
 orig_read_identity = lf._read_identity_email
@@ -773,7 +771,7 @@ check("_message_page has no leftover dark bg", "#14161a" not in msg_page)
 # Item: Deal ID moved under the company name (own sub-line, not a
 # standalone column), Size column removed entirely, header order.
 head = page[page.find("<thead>"):page.find("</thead>")]
-expected_order = ["Company", "Visibility", "Interested buyers", "Active intros", "Deadline", "Next Steps"]
+expected_order = ["Deal", "Visibility", "Interested buyers", "Intros", "Deadline", "Next Steps"]
 positions = [head.find(f">{h}<") for h in expected_order]
 check("header columns present in the exact expected order", positions == sorted(positions) and all(p != -1 for p in positions))
 check("Deal ID column header removed", "<th>Deal ID</th>" not in page)
@@ -794,9 +792,11 @@ check("sticky thead offset (top:0) present", "position: sticky;" in page and "to
 check("actions-stack still renders (Update/Hold/Cancel stacked)", 'class="actions-stack"' in page)
 check("action-chip column header is 'Next Steps'", "<th>Next Steps</th>" in page)
 check("table uses table-layout:fixed", "table-layout: fixed;" in page)
-check("num columns centered (Interested buyers/Active intros use the .num class)",
+check("num columns centered (Interested buyers/Intros use the .num class)",
       '<th class="num">Interested buyers</th>' in page
-      and '<th class="num" title="Introductions still in progress -- not yet Won or Lost">Active intros</th>' in page)
+      and '<th class="num" title="Introductions still in progress -- not yet Won or Lost">Intros</th>' in page)
+check("headers renamed: DEAL and INTROS (old Company/Active intros headers gone)",
+      "<th>Deal</th>" in page and "<th>Company</th>" not in page and ">Active intros</th>" not in page)
 check("deal-id-sub has a clear tap gap (margin-top)", "margin-top: 7px;" in page)
 
 # _fmt_short_date
@@ -846,20 +846,19 @@ sell_deals = [d for d in lf.get_my_deals(TENANT_PID) if lf.DEAL_SIDE_SELL_ID in 
 page = body_only(lf.render_my_deals_page("Sella Seller", deals=sell_deals, key=None, view_as=None,
                                           edit_mode=False, person_id=TENANT_PID, anon_key_email=TENANT_EMAIL))
 
-check("'Closed' section heading present", '<h2 class="mydeals-section-heading closed">Closed' in page)
-check("Closed section count is 2 (Won Deal A + Won Deal B)",
-      '<h2 class="mydeals-section-heading closed">Closed <span class="count">(2)</span>' in page)
-check("Closed sits AFTER Cancelled on the page", page.find('mydeals-section-heading cancelled') < page.find('mydeals-section-heading closed'))
+check("Archived section: collapsed by default, counts all 5 dead deals (Obsolete + 2 Lost + 2 Won)",
+      '<details class="closed-out-section mydeals-archived"><summary>Archived deals <span class="count">(5)</span></summary>'
+      in page)
 
 row_won_a = row_for(page, "606") or page[page.find("Won Co A"):]
 check("Closed row: green 'Sold' badge", 'class="visibility-badge sold"' in row_won_a and "Sold" in row_won_a)
 check("Closed row: no Next Steps action chip", "action-chip" not in row_won_a)
-check("Closed row: no Hold/Cancel/Reactivate buttons", 'data-target="hold"' not in row_won_a
-      and 'data-target="cancel"' not in row_won_a and 'data-target="reactivate"' not in row_won_a)
-check("Closed row: Update link still present", "update-cancel-btn" in row_won_a)
+check("Closed row: no Update/Hold/Cancel/Reactivate", 'data-target="hold"' not in row_won_a
+      and 'data-target="cancel"' not in row_won_a and 'data-target="reactivate"' not in row_won_a
+      and "update-cancel-btn" not in row_won_a)
 
 check("Active table still shows the genuinely live deal", 'class="visibility-badge live"' in page)
-check("Won Co A appears exactly once (only in Closed, not the active table too)", page.count("Won Co A") == 1)
+check("Won Co A appears exactly once (only in Archived, not the main table too)", page.count("Won Co A") == 1)
 check("Won Co B appears exactly once too", page.count("Won Co B") == 1)
 check("summary strip shows '1 live' (won deals excluded from the live count)", "1 live" in page)
 check("summary strip's pipeline total excludes the won deals' sizes",
@@ -867,11 +866,11 @@ check("summary strip's pipeline total excludes the won deals' sizes",
 check("summary strip shows 'Total closed' summing both won deals ($3M+$4.5M=$7.5M)",
       "Total closed" in page and "$7.5M" in page)
 
-check("'Cancelled' section count is 3 (Obsolete + 2x Lost)",
-      '<h2 class="mydeals-section-heading cancelled">Cancelled <span class="count">(3)</span>' in page)
 row_lost_a = row_for(page, "604") or page[page.find("Lost Co A"):]
-check("Lost Deal (111801) sits in Cancelled (Update-only actions)",
-      "update-cancel-btn" in row_lost_a and 'data-target="hold"' not in row_lost_a and 'data-target="cancel"' not in row_lost_a)
+check("Lost Deal (111801) sits in Archived with no actions",
+      "update-cancel-btn" not in row_lost_a and 'data-target="hold"' not in row_lost_a
+      and 'data-target="cancel"' not in row_lost_a
+      and page.find("Archived deals") < page.find("Lost Co A"))
 check("neither Lost deal appears in the active table too", page.count("Lost Co A") == 1 and page.count("Lost Co B") == 1)
 
 
@@ -2862,8 +2861,8 @@ firm_sell_deals = lf.get_firm_sell_deals(TENANT_A_PID)
 page_mydeals_firm = body_only(lf.render_my_deals_page("Sella Seller", deals=firm_sell_deals, key=None, view_as=None,
                                                        edit_mode=False, person_id=TENANT_A_PID,
                                                        anon_key_email=TENANT_A_EMAIL))
-check("My Deals: Closed section count includes BOTH the personal (910) and firm (911) won deals",
-      '<h2 class="mydeals-section-heading closed">Closed <span class="count">(2)</span></h2>' in page_mydeals_firm)
+check("My Deals: Archived section count includes BOTH the personal (910) and firm (911) won deals",
+      '<summary>Archived deals <span class="count">(2)</span></summary>' in page_mydeals_firm)
 check("My Deals: the firm-wide row shows a 'via Marco' chip", "via Marco" in page_mydeals_firm)
 check("My Deals: exactly one via-chip (only the firm row gets one, not the personal row)",
       page_mydeals_firm.count("via Marco") == 1)
@@ -6057,7 +6056,8 @@ r_alice_deal = _tt_post("update_intro", {"deal_id": "980101", "notes": "Alice de
 r_bob_person = _tt_post("update_buyer_note", {"buyer_id": TT_BUYER, "note": "Bob person note"}, "bob@acmecap.com")
 r_bob_deal = _tt_post("update_intro", {"deal_id": "980101", "notes": "Bob deal note on Alice's intro"},
                       "bob@acmecap.com")
-r_bob_status = _tt_post("update_intro", {"deal_id": "980101", "flag": "stalled"}, "bob@acmecap.com")
+r_bob_status = _tt_post("update_intro", {"deal_id": "980101", "milestone_step": "NDA", "milestone_checked": True},
+                        "bob@acmecap.com")
 r_zed_person = _tt_post("update_buyer_note", {"buyer_id": TT_BUYER, "note": "Zed private"}, "zed@zeta.io")
 r_zed_deal = _tt_post("update_intro", {"deal_id": "980108", "notes": "Zed deal note"}, "zed@zeta.io")
 r_gina_person = _tt_post("update_buyer_note", {"buyer_id": TT_BUYER, "note": "Gina private"}, "gina@gmail.com")
@@ -6065,8 +6065,11 @@ r_zed_hijack = _tt_post("update_intro", {"deal_id": "980101", "notes": "Zed hija
 check("notes: all legitimate saves -> 200",
       all(r["statusCode"] == 200 for r in (r_alice_deal, r_bob_person, r_bob_deal, r_zed_person, r_zed_deal,
                                            r_gina_person)))
-check("notes: a teammate can add a deal note but NOT change status on another member's intro",
-      r_bob_status["statusCode"] == 403)
+check("firm/team writes: a teammate can also change status on another member's intro, audited as the teammate",
+      r_bob_status["statusCode"] == 200
+      and any(p and p.get("actor") == "bob@acmecap.com" and p.get("tenant") == "alice@acmecap.com"
+              and str(p.get("sk", "")).startswith("audit#980101#") and (p.get("new") or {}).get("milestones")
+              for p in tt_table.puts))
 check("notes: another team cannot write a note on this team's intro", r_zed_hijack["statusCode"] == 403)
 tt_item = next(i for i in tt_table.items if i["tenant"] == "alice@acmecap.com" and i["sk"] == "intro#980101")
 check("notes: Bob's deal note lands on the owning item with Bob as author",
@@ -6111,6 +6114,127 @@ lf.urllib.request.urlopen = fake_urlopen
 lf.DOMAIN_SHARING_BLOCKLIST = _saved_domain_blocklist
 lf.TENANT_BLOCKLIST = _saved_tenant_blocklist
 reset_caches()
+
+
+# ======================================================================
+# SECTION: My Deals fixes -- team-level ID status (shared with the
+# company page), actions on every team row + firm/team write auth,
+# Archived deals section
+# ======================================================================
+MD_TERMS = {lf.TICKET_MIN_FIELD: 1_000_000, lf.TICKET_MAX_FIELD: 5_000_000, lf.MGMT_FEE_FIELD: 2,
+            lf.CARRY_FIELD: 20, lf.SELLER_FEE_FIELD: 4, lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_YES]}
+
+def _md_fixture(bob_cef):
+    people_md = {"people": [
+        {"id": 1601, "full_name": "Alice Hark", "email": "alice@harkcap.com", "company_id": 7001,
+         "custom_fields": {lf.CEF_FIELD: [lf.CEF_NO_ID]}},
+        {"id": 1602, "full_name": "Bob Hark", "email": "bob@harkcap.com", "company_id": 7002,
+         "custom_fields": ({lf.CEF_FIELD: [bob_cef]} if bob_cef else {})},
+        {"id": 1610, "full_name": "Gina Solo", "email": "gina.solo@gmail.com",
+         "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
+        {"id": 1650, "full_name": "Buyer One", "email": "b1@buyerco.com", "custom_fields": {}},
+    ]}
+    deals_md = [
+        {"id": 54779042, "name": "Hark Labs Block", "company": {"name": "Hark Labs"},
+         "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(MD_TERMS),
+         "people": [{"id": 1601}], "is_archived": False, "updated_at": "2026-08-01T00:00:00Z"},
+        {"id": 54779050, "name": "Dead Co Block", "company": {"name": "Dead Co"},
+         "deal_stage": {"id": lf.OBSOLETE_STAGE_ID},
+         "custom_fields": cf_sell({lf.TICKET_MIN_FIELD: 70_000_000, lf.TICKET_MAX_FIELD: 90_000_000}),
+         "people": [{"id": 1601}], "is_archived": True, "updated_at": "2026-08-01T00:00:00Z"},
+        {"id": 54779051, "name": "Broken Co Block", "company": {"name": "Broken Co"},
+         "deal_stage": {"id": lf.STAGE_TRADE_BROKEN}, "custom_fields": cf_sell(),
+         "people": [{"id": 1601}], "is_archived": False, "updated_at": "2026-08-01T00:00:00Z"},
+        {"id": 54779060, "name": "Dead Co buy", "company": {"name": "Dead Co"},
+         "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),
+         "people": [{"id": 1601}, {"id": 1650}], "updated_at": "2026-08-02T00:00:00Z"},
+        {"id": 54779070, "name": "Solo Block", "company": {"name": "Solo Co"},
+         "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(MD_TERMS),
+         "people": [{"id": 1610}], "is_archived": False, "updated_at": "2026-08-01T00:00:00Z"},
+    ]
+    return use_fixture({lf.PEOPLE_KEY: people_md, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_md}},
+                       ses=FakeSES())
+
+def _md_get(email, extra):
+    q = {"tab": "mydeals"}
+    q.update(extra)
+    return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": q, "cookies": [tenant_cookie(email)]}, None)
+
+# --- ID status: team-level, one decision shared by table + company page
+_md_fixture(lf.CEF_YES_ID)
+md_deal = next(d for d in lf.get_deals_list() if d["id"] == 54779042)
+check("ID status: a teammate (Bob, no deals) with CEF Yes satisfies it for Alice's deal",
+      lf._deal_id_status(md_deal, "alice@harkcap.com", 1601) == "verified"
+      and lf._deal_id_status(md_deal, "bob@harkcap.com", 1602) == "verified")
+alice_md = body_only(_md_get("alice@harkcap.com", {})["body"])
+alice_row = row_for(alice_md, "54779042") or ""
+check("ID status: My Deals row is not 'ID required' when a teammate has CEF Yes",
+      "Not live · ID required" not in alice_row and 'class="visibility-badge live"' in alice_row)
+alice_co = _md_get("alice@harkcap.com", {"company": "Hark Labs"})["body"]
+check("ID status: company page Deal Details shows the same 'verified' status", "&#10003; ID verified</span>" in alice_co)
+
+_md_fixture(lf.CEF_NA_ID)
+check("ID status: CEF N/A also satisfies the requirement",
+      lf._deal_id_status(md_deal, "alice@harkcap.com", 1601) == "verified")
+
+_md_fixture(None)
+check("ID status: no qualifying team member -> required",
+      lf._deal_id_status(md_deal, "alice@harkcap.com", 1601) == "required")
+alice_md_req = body_only(_md_get("alice@harkcap.com", {})["body"])
+check("ID status: My Deals row shows 'Not live · ID required'",
+      "Not live · ID required" in (row_for(alice_md_req, "54779042") or ""))
+alice_co_req = _md_get("alice@harkcap.com", {"company": "Hark Labs"})["body"]
+check("ID status: company page shows the same 'required' status", "&#10007; ID required</a>" in alice_co_req
+      and "&#10003; ID verified</span>" not in alice_co_req)
+check("ID status: an individual tenant's own CEF Yes still satisfies their own deals",
+      lf._deal_id_status({}, "gina.solo@gmail.com", 1610) == "verified")
+
+# --- Actions on every team row + write auth
+_md_fixture(lf.CEF_YES_ID)
+bob_md = body_only(_md_get("bob@harkcap.com", {})["body"])
+bob_row = row_for(bob_md, "54779042") or ""
+check("actions: a teammate's row shows Update, Hold and Cancel",
+      "update-cancel-btn" in bob_row and 'data-target="hold"' in bob_row and 'data-target="cancel"' in bob_row)
+
+def _md_post(action, body, email):
+    return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": action}, "cookies": [tenant_cookie(email)],
+                              "body": json.dumps(body)}, None)
+_, md_table = _md_fixture(lf.CEF_YES_ID)
+md_stage_ok = _md_post("deal_stage", {"deal_id": "54779042", "target": "hold"}, "bob@harkcap.com")
+check("write auth: team member's Hold on a teammate's deal -> 200", md_stage_ok["statusCode"] == 200)
+check("write auth: stage override lands in the owner's partition, actor = the authenticated email",
+      any(p and p.get("tenant") == "alice@harkcap.com" and p.get("actor") == "bob@harkcap.com" for p in md_table.puts))
+md_stage_no = _md_post("deal_stage", {"deal_id": "54779042", "target": "cancel"}, "gina.solo@gmail.com")
+check("write auth: non-member's stage POST -> 403", md_stage_no["statusCode"] == 403)
+lf.urllib.request.urlopen = fake_urlopen2
+md_upd_ok = _md_post("update_intro", {"deal_id": "54779060", "notes": "Bob on Dead Co intro"}, "bob@harkcap.com")
+md_upd_no = _md_post("update_intro", {"deal_id": "54779060", "notes": "Gina hijack"}, "gina.solo@gmail.com")
+check("write auth: team member's update_intro -> 200; non-member -> 403",
+      md_upd_ok["statusCode"] == 200 and md_upd_no["statusCode"] == 403)
+lf.urllib.request.urlopen = fake_urlopen
+
+# --- Archived deals
+_md_fixture(lf.CEF_YES_ID)
+arch_page = body_only(_md_get("alice@harkcap.com", {})["body"])
+arch_main = arch_page.split('<details class="closed-out-section mydeals-archived">')[0]
+arch_sec = arch_page.split('<details class="closed-out-section mydeals-archived">')[1].split("</details>")[0]
+check("archive: Obsolete and Trade Broken deals render only in the Archived section",
+      "Dead Co" in arch_sec and "Broken Co" in arch_sec and "Dead Co" not in arch_main and "Broken Co" not in arch_main)
+check("archive: section is collapsed by default and titled 'Archived deals (2)'",
+      '<details class="closed-out-section mydeals-archived"><summary>Archived deals <span class="count">(2)</span>'
+      in arch_page and "mydeals-archived\" open" not in arch_page)
+check("archive: archived rows have no Update/Hold/Cancel", "update-cancel-btn" not in arch_sec
+      and "deal-stage-btn" not in arch_sec)
+check("archive: ▸ marker comes from the shared closed-out-section style",
+      'details.closed-out-section summary::before { content: "\\25B8 "' in _md_get("alice@harkcap.com", {})["body"])
+arch_summary = arch_page[arch_page.find('class="mydeals-summary"'):]
+arch_summary = arch_summary[:arch_summary.find("</p>")]
+check("archive: 'Total in pipeline' excludes the archived $90M Obsolete deal (live Hark Labs only: $5M)",
+      "Total in pipeline" in arch_summary and "$5M" in arch_summary and "$95M" not in arch_summary)
+check("archive: 'introduced total' still counts the archived Dead Co intro", "1 introduced total" in arch_summary)
+check("archive: 'in motion' counts live deals only (Dead Co's intro is not in motion)", "in motion" not in arch_summary)
 
 
 # ======================================================================

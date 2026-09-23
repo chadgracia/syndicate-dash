@@ -118,7 +118,7 @@ _req_cache = {
     "my_deals": {}, "matched_buy_deals": {}, "company_stats": {},
     "firm_person_ids": {}, "firm_sell_by_company": {}, "firm_deals": {},
     "firm_matched_buy_deals": {}, "firm_closed_out_buy_deals": {},
-    "tenant_index": None,
+    "tenant_index": None, "id_status": {},
 }
 
 
@@ -139,6 +139,7 @@ def _req_cache_reset():
     _req_cache["firm_matched_buy_deals"] = {}
     _req_cache["firm_closed_out_buy_deals"] = {}
     _req_cache["tenant_index"] = None
+    _req_cache["id_status"] = {}
 
 
 def _perf_start(page):
@@ -3033,6 +3034,52 @@ def _tenant_cef_state(person_id):
     return ids[0] if ids else None
 
 
+# ID (FINRA) requirement: the Client Engagement Form person field
+# (CEF_FIELD, custom_label_3796440). Yes and N/A satisfy it.
+CEF_QUALIFYING_IDS = {CEF_YES_ID, CEF_NA_ID}
+
+
+def _id_holder_person_ids(tenant_email, person_id):
+    """Whose CEF counts for this viewer's deals: every current member of
+    their domain team (persons with a CRM record at the team domain), or
+    just the tenant themselves for an individual tenant."""
+    team = _tenant_team(tenant_email) if tenant_email else None
+    if team is not None:
+        return set(team["person_ids"])
+    return {person_id} if person_id is not None else set()
+
+
+def _deal_id_status(deal, tenant_email, person_id):
+    """THE single ID-status decision, shared by the My Deals table and the
+    company page's Deal Details card: "verified" when ANY ID holder
+    (_id_holder_person_ids -- the whole team for a domain team, else the
+    tenant) has CEF Yes or N/A, else "required". Team-level by design, so
+    every deal a viewer sees gets the same answer; `deal` is accepted so
+    callers ask per deal."""
+    cache = _req_cache.setdefault("id_status", {})
+    ck = (str(tenant_email or "").strip().lower(), person_id)
+    if ck not in cache:
+        holders = _id_holder_person_ids(tenant_email, person_id)
+        people = get_people_by_ids(holders) if holders else {}
+        ok = any(set(cf_list((rec.get("custom_fields") or {}), CEF_FIELD)) & CEF_QUALIFYING_IDS
+                 for rec in people.values())
+        cache[ck] = "verified" if ok else "required"
+    return cache[ck]
+
+
+def _id_status_ok(id_status):
+    """Accepts _deal_id_status's "verified"/"required", or a raw CEF option
+    id (legacy callers): Yes/N/A satisfy."""
+    return id_status == "verified" or id_status in CEF_QUALIFYING_IDS
+
+
+def _deal_id_status_badge_html(id_status):
+    if _id_status_ok(id_status):
+        return '<span class="id-status-badge id-ok">&#10003; ID verified</span>'
+    return (f'<a class="id-status-badge id-missing" href="{CEF_FORM_URL}" target="_blank" '
+            'rel="noopener noreferrer">&#10007; ID required</a>')
+
+
 def _cef_badge_html(cef_option_id, tenant_name):
     """Nav-bar badge for the tenant view (and admin &view_as preview),
     one state per CEF option: Yes -> green "ID verified"; Pending ->
@@ -4989,6 +5036,28 @@ def _dynamo_write_deal_stage_override(tenant_email, deal_id, stage_id, actor, ol
         return False, f"{type(e).__name__}: {e}"
 
 
+def _tenant_can_act_on_deal(identity_email, deal):
+    """Firm/team write rights (Sep 22 firm-level-writes decision): a
+    tenant may act on any deal in their firm/team scope, not just deals
+    personally linked to them. SELL deal: any linked person is in the
+    viewer's scope (_firm_person_ids -- the same set My Deals renders
+    from). BUY deal: its owning seller (_tenant_email_for_deal) is in
+    scope. Callers still write to the deal's own partition and record
+    the authenticated email as the audit actor."""
+    tenant = _resolve_tenant(identity_email) if identity_email else None
+    if tenant is None:
+        return False
+    scope = _firm_person_ids(tenant.get("person_id"))
+    if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
+        return bool(_deal_linked_person_ids(deal) & scope)
+    owner = _tenant_email_for_deal(deal)
+    if owner is None:
+        return False
+    if owner == str(identity_email).strip().lower():
+        return True
+    return (_resolve_tenant(owner) or {}).get("person_id") in scope
+
+
 def _handle_deal_stage(event):
     """POST ?action=deal_stage — Hold, Cancel, or Reactivate a deal via a DIRECT
     Pipeline stage write (never a request/ask — see the replacement note
@@ -5033,7 +5102,7 @@ def _handle_deal_stage(event):
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
         if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
-        if tenant_identity_email != tenant_email:
+        if tenant_identity_email != tenant_email and not _tenant_can_act_on_deal(tenant_identity_email, deal):
             return _json_response({"error": "forbidden"}, 403)
         actor = tenant_identity_email
 
@@ -6356,7 +6425,9 @@ def _my_deal_visibility_state(deal, cef_state, is_held, is_won=False):
     distinct visibility state; only "sold" gets one."""
     if is_won:
         return "sold"
-    if cef_state != CEF_YES_ID:
+    # cef_state: _deal_id_status's "verified"/"required" (or a raw CEF
+    # option id) -- team-level, see _deal_id_status.
+    if not _id_status_ok(cef_state):
         return "id_required"
     opts = _deal_cf_option_ids(deal, AGENT_AGREEMENT_FIELD)
     if not (opts & AGENT_ENGAGED_OPTS):
@@ -6386,7 +6457,7 @@ def _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=False):
     return '<span class="visibility-badge live">Live · shown to buyers</span>'
 
 
-def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
+def _deal_card_html(deal, company, override_entry=None, edit_mode=False, id_status=None):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
     render_company_page), used to resolve any deadline_override. edit_mode
@@ -6461,6 +6532,10 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False):
     fees_html = f'<div class="dc-line">{_esc(fees)}</div>' if fees else ""
 
     badge_html = _engagement_badge_html(deal, company) + _update_cancel_button_html(deal_id)
+    # ID status: the same _deal_id_status decision the My Deals table uses
+    # (None only when there is no tenant context to decide it for).
+    if id_status is not None:
+        badge_html = f'<div class="dc-line">{_deal_id_status_badge_html(id_status)}</div>' + badge_html
 
     return f"""<div class="{card_cls}">
       {overdue_html}
@@ -9327,7 +9402,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 
 
 def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section,
-                       key=None, view_as=None, edit_mode=False, colleague_name=None):
+                       key=None, view_as=None, edit_mode=False, colleague_name=None, archived=False):
     deal_id = str(deal.get("id"))
     if company_name:
         company_link = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
@@ -9430,16 +9505,16 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # is treated as an admin write server-side -- so it must not carry
     # the real ADMIN_KEY into a Tenant-view preview.
     #
-    # Firm-level tenancy: a colleague's own row (colleague_name set) never
-    # gets the stage-change buttons for a real tenant session -- the
-    # backend would 403 anyway (_tenant_email_for_deal resolves writes to
-    # the deal's OWN linked tenant, not the viewer), so showing them would
-    # just be a button that fails. Falls back to "cancelled"/"closed"'s
-    # own Update-only behavior. Admin edit_mode is unaffected -- an admin
-    # can still act on any deal.
-    actions_section = section if (edit_mode or colleague_name is None) else "closed"
-    actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, actions_section,
-                                       key=(key if edit_mode else None))
+    # Firm/team write rights (Sep 22 decision): every live row the viewer
+    # can see -- a colleague's/teammate's included -- gets Update/Hold/
+    # Cancel (or Reactivate when held); _handle_deal_stage authorizes by
+    # firm/team scope (_tenant_can_act_on_deal). Archived rows (Obsolete/
+    # Lost/Won/Trade Broken) get no actions at all.
+    if archived:
+        actions_html = ""
+    else:
+        actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section,
+                                           key=(key if edit_mode else None))
 
     return (
         f'<tr><td class="company">{company_link}{deal_id_sub}{via_html}</td>'
@@ -9476,7 +9551,6 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         buyer_counts = {row["company"].strip().lower(): row["total"] for row in company_table}
 
         intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
-        cef_state = _tenant_cef_state(person_id)
 
         # ATTRIBUTION (item 2): every row that came via a colleague's own
         # Sell deal (not one the viewing tenant is personally linked to)
@@ -9516,7 +9590,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 # section — the trophy shelf — and is excluded from
                 # "active" outright, same footing as Hold/Cancelled.
                 section = "closed"
-            elif resolved_stage == OBSOLETE_STAGE_ID or resolved_stage in LOST_STAGE_IDS:
+            elif (resolved_stage == OBSOLETE_STAGE_ID or resolved_stage in LOST_STAGE_IDS
+                  or resolved_stage == STAGE_TRADE_BROKEN):
                 # Item 4: Lost (111801/2379322) sits alongside Obsolete
                 # in Cancelled -- previously Lost wasn't checked here at
                 # all, so a Lost-stage sell deal fell into the "else"
@@ -9537,6 +9612,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 "resolved_stage": resolved_stage,
                 "section": section,
                 "colleague_name": _colleague_name_for(d),
+                "id_status": _deal_id_status(d, anon_key_email, person_id),
             })
 
         # Deadline ascending (ISO yyyy-mm-dd sorts correctly as a string),
@@ -9547,11 +9623,16 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         live_count = 0
         not_engaged_count = 0
         terms_incomplete_count = 0
-        intros_total = 0
         intros_live_total = 0
         attention_count = 0
         deadlines = []
         section_row_htmls = {"active": [], "hold": [], "cancelled": [], "closed": []}
+        # "introduced total" is history: every company across ALL rows,
+        # archived included, each company counted once.
+        intro_companies = {}
+        for r in rows:
+            intro_companies.setdefault((r["company_name"] or "").strip().lower(), r["stats"]["intro_count"])
+        intros_total = sum(intro_companies.values())
         for r in rows:
             d = r["deal"]
             deadline = r["deadline"]
@@ -9576,12 +9657,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 
                 if is_overdue or stats["stalled"]:
                     attention_count += 1
-                intros_total += stats["intro_count"]
                 intros_live_total += stats["live_intro_count"]
 
                 # is_held=False: this loop is already gated to the active
                 # section, which by construction never holds a Held deal.
-                state = _my_deal_visibility_state(d, cef_state, False)
+                state = _my_deal_visibility_state(d, r["id_status"], False)
                 if state == "live":
                     live_count += 1
                 elif state == "id_required":
@@ -9590,9 +9670,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                     terms_incomplete_count += 1
 
             section_row_htmls[section].append(
-                _my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], cef_state,
+                _my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], r["id_status"],
                                    section, key=key, view_as=view_as, edit_mode=edit_mode,
-                                   colleague_name=r["colleague_name"]))
+                                   colleague_name=r["colleague_name"],
+                                   archived=section in ("cancelled", "closed")))
 
         today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         future_deadlines = [dl for dl in deadlines if dl >= today_iso]
@@ -9693,10 +9774,10 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
       </colgroup>
       <thead>
         <tr>
-          <th>Company</th>
+          <th>Deal</th>
           <th>Visibility</th>
           <th class="num">Interested buyers</th>
-          <th class="num" title="Introductions still in progress -- not yet Won or Lost">Active intros</th>
+          <th class="num" title="Introductions still in progress -- not yet Won or Lost">Intros</th>
           <th>Deadline</th>
           <th>Next Steps</th>
           <th></th>
@@ -9708,28 +9789,22 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     </table>
   </div>"""
 
-        # Four stacked sections; a section with no rows is omitted
-        # entirely (item 2) rather than rendered empty. Closed (turn 26)
-        # is last, below Cancelled — the trophy shelf comes after the
-        # graveyard, not before it.
+        # Main table: live deals, Hold included (Held rows keep their
+        # Held badge and Reactivate). Dead deals (Obsolete, Lost, Won,
+        # Trade Broken) move to a collapsed "Archived deals (N)" section
+        # below -- the same <details class="closed-out-section"> pattern
+        # the company page uses -- with no stage actions.
         sections_html = []
-        if section_row_htmls["active"]:
-            sections_html.append(_section_table_html("".join(section_row_htmls["active"])))
-        if section_row_htmls["hold"]:
+        main_rows_html = section_row_htmls["active"] + section_row_htmls["hold"]
+        if main_rows_html:
+            sections_html.append(_section_table_html("".join(main_rows_html)))
+        archived_rows_html = section_row_htmls["cancelled"] + section_row_htmls["closed"]
+        if archived_rows_html:
             sections_html.append(
-                f'<h2 class="mydeals-section-heading hold">On Hold '
-                f'<span class="count">({len(section_row_htmls["hold"])})</span></h2>'
-                + _section_table_html("".join(section_row_htmls["hold"]), "section-hold"))
-        if section_row_htmls["cancelled"]:
-            sections_html.append(
-                f'<h2 class="mydeals-section-heading cancelled">Cancelled '
-                f'<span class="count">({len(section_row_htmls["cancelled"])})</span></h2>'
-                + _section_table_html("".join(section_row_htmls["cancelled"]), "section-cancelled"))
-        if section_row_htmls["closed"]:
-            sections_html.append(
-                f'<h2 class="mydeals-section-heading closed">Closed '
-                f'<span class="count">({len(section_row_htmls["closed"])})</span></h2>'
-                + _section_table_html("".join(section_row_htmls["closed"]), "section-closed"))
+                '<details class="closed-out-section mydeals-archived">'
+                f'<summary>Archived deals <span class="count">({len(archived_rows_html)})</span></summary>'
+                + _section_table_html("".join(archived_rows_html), "section-archived")
+                + '</details>')
         body_html = "".join(sections_html)
         edit_script = _edit_script_html(key) if edit_mode else ""
 
@@ -9917,6 +9992,25 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .card.section-closed {{ border-color: rgba(31,122,77,0.3); }}
   .card.section-closed thead th {{ background: rgba(31,122,77,0.06); }}
   .mydeals-section-heading.closed {{ color: var(--qp); }}
+  details.closed-out-section {{ margin-top: 20px; }}
+  details.closed-out-section summary {{
+    cursor: pointer;
+    font-size: 15px;
+    font-weight: 600;
+    color: var(--ink);
+    list-style: none;
+    padding: 4px 0;
+  }}
+  details.closed-out-section summary::-webkit-details-marker {{ display: none; }}
+  details.closed-out-section summary::before {{ content: "\\25B8 "; color: var(--muted); font-size: 12px; }}
+  details.closed-out-section[open] summary::before {{ content: "\\25BE "; }}
+  details.closed-out-section summary .count {{ color: var(--muted); font-weight: 500; font-size: 12px; }}
+  details.mydeals-archived > .card {{ margin-top: 10px; }}
+  .card.section-archived {{ opacity: 0.8; }}
+  .id-status-badge {{ display: inline-block; font-size: 12px; font-weight: 600; padding: 3px 10px;
+                     border-radius: 14px; text-decoration: none; }}
+  .id-status-badge.id-ok {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
+  .id-status-badge.id-missing {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .visibility-badge {{
     display: inline-block;
     font-size: 12px;
@@ -10245,7 +10339,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         sell_deals = get_firm_sell_deals(person_id, company) if person_id is not None else []
         if sell_deals:
             deals_body = "".join(
-                _deal_card_html(d, company, intro_details.get(str(d.get("id"))), edit_mode=edit_mode)
+                _deal_card_html(d, company, intro_details.get(str(d.get("id"))), edit_mode=edit_mode,
+                                id_status=_deal_id_status(d, anon_key_email, person_id))
                 for d in sell_deals
             )
         else:
@@ -10812,6 +10907,10 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   a.buyer-link {{ color: var(--accent); text-decoration: none; }}
   a.buyer-link:hover {{ text-decoration: underline; }}
   .buyer-link-suffix {{ font-weight: 400; font-size: 11px; color: var(--muted); }}
+  .id-status-badge {{ display: inline-block; font-size: 12px; font-weight: 600; padding: 3px 10px;
+                     border-radius: 14px; text-decoration: none; }}
+  .id-status-badge.id-ok {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
+  .id-status-badge.id-missing {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .engagement-badge {{
     display: inline-block;
     font-size: 12px;
@@ -12589,12 +12688,11 @@ def _handle_update_intro(event):
         return _json_response({"error": "deal has no linked tenant"}, 400)
 
     if not is_admin and tenant_email != tenant_identity_email:
-        # Domain teams: a teammate may add a DEAL NOTE to another member's
-        # intro (notes are team-shared); every other field -- status,
-        # milestones, flags, next steps, follow-up -- stays owner-only.
-        notes_only = (not has_status_intent and next_steps is None and follow_up is None
-                      and deadline is None and share_loss_reason is None and notes is not None)
-        if not (notes_only and _same_team(tenant_email, tenant_identity_email)):
+        # Firm/team write rights (Sep 22 decision): any tenant whose
+        # firm/team scope covers this intro's owning seller may write it
+        # (_tenant_can_act_on_deal); the write still lands in the owner's
+        # partition, with the authenticated email as the audit actor.
+        if not _tenant_can_act_on_deal(tenant_identity_email, deal):
             return _json_response({"error": "forbidden"}, 403)
 
     # The owning partition only (expand_team=False): this is the item the
