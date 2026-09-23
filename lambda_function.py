@@ -76,6 +76,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import os
 import time
 import urllib.error
@@ -387,7 +388,7 @@ TICKET_SIZE_MAP = {
 # on screen).
 ANON_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
-REF_LABELS = {"mydeals": "My Deals", "intros": "Active Intros", "demand": "Demand Board"}
+REF_LABELS = {"overview": "Overview", "mydeals": "My Deals", "intros": "Active Intros", "demand": "Demand Board"}
 
 FEATURE_REQUEST_EMAIL = "cgracia@rainmakersecurities.com"
 
@@ -7821,13 +7822,6 @@ NAV_CSS = """
     align-items: center;
     gap: 24px;
   }
-  .gg-brand {
-    color: var(--accent);
-    font-weight: 700;
-    font-size: 14px;
-    letter-spacing: 0.02em;
-    white-space: nowrap;
-  }
   .gg-tabs {
     display: flex;
     gap: 4px;
@@ -8389,6 +8383,8 @@ def _mydeals_dropdown_html(person_id, key=None, view_as=None):
 def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True, edit_flag=False, cef_html="",
               person_id=None):
     suffix = _tab_qs_suffix(key, view_as)
+    overview_href = f"?tab=overview{suffix}"
+    overview_cls = "gg-tab active" if active_tab == "overview" else "gg-tab"
     mydeals_href = f"?tab=mydeals{suffix}"
     intros_href = f"?tab=intros{suffix}"
     demand_href = f"?tab=demand{suffix}"
@@ -8543,8 +8539,8 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
 
     return f"""<header class="gg-nav">
   <div class="gg-nav-inner">
-    <div class="gg-brand">Gracia Group</div>
     <nav class="gg-tabs">
+      <a class="{overview_cls}" href="{overview_href}">Overview</a>
       <div class="gg-mydeals-nav">
         <a class="{mydeals_cls}" href="{mydeals_href}">My Deals</a>
         {mydeals_menu_html}
@@ -8824,6 +8820,81 @@ def _manual_intro_box_html(key, tenant_email, company):
 </script>"""
 
 
+def _active_intros_model(person_id, tenant_email, intro_details, edit_mode=False):
+    """Active Intros' row selection, shared with the Overview tab so both
+    list the same intros with the same disclosure: kept_deals (live,
+    non-terminal intros incl. manual ones), resolved_by_deal_id,
+    closed_out_deals, closed_out_disclosed_by_id, manual_failed."""
+    deals = get_firm_matched_buy_deals(person_id) if person_id is not None else []
+    deals = _augment_with_dynamo_linked_deals(deals, intro_details)
+
+    # Manual intros (Dynamo-only, no backing Pipeline deal -- see
+    # _manual_intro_as_deal), across every company this tenant has
+    # one for (company=None), merged in the same way as the augment
+    # step above and BEFORE any per-deal disclosure/routing runs, so
+    # they flow through every existing loop unchanged. Suppressed
+    # when a REAL deal-derived intro already covers the same
+    # buyer+company -- the deal-derived row wins.
+    manual_intros, manual_failed = get_manual_intros(tenant_email) if person_id is not None else ({}, False)
+    if manual_intros:
+        manual_deals = [
+            _manual_intro_as_deal(item) for (m_company, buyer_pid), item in manual_intros.items()
+            if not _tenant_has_deal_derived_intro(person_id, m_company, buyer_pid)
+        ]
+        deals = deals + manual_deals
+    # Turn 27, item 1: stage-level exits — a dead-stage (Lost/Trade
+    # Broken/Obsolete) BUY deal never reaches get_my_matched_buy_deals,
+    # so it simply vanished instead of showing as a closed-out intro.
+    # Fetched separately, keyed off the deal's own Pipeline stage
+    # rather than the Intro Status field — see get_my_closed_out_buy_deals.
+    closed_out_deals = get_firm_closed_out_buy_deals(person_id) if person_id is not None else []
+
+    # Item 3: closed-out rows use their own, simpler disclosure rule
+    # (_closed_out_disclosed — raw Intro Status explicitly Introduced-
+    # or-later, no milestone fallback), computed once per deal here.
+    # Edit mode never anonymizes (same convention as every other row
+    # on this page) — the admin sees the real buyer regardless.
+    closed_out_disclosed_by_id = {str(d.get("id")): (edit_mode or _closed_out_disclosed(d))
+                                   for d in closed_out_deals}
+
+    # Bug fix: a matched-or-later BUY deal whose Intro Status field
+    # itself is explicitly Passed/Withdrawn/Closed (an exit or a win
+    # expressed via status rather than a Pipeline stage move -- e.g.
+    # an admin/tenant flags it dead, or closes it, without the deal
+    # ever leaving Matched) was being `continue`'d out of the loop
+    # below entirely -- kept out of Introduced (correctly, it's
+    # terminal) but never routed anywhere else either, since
+    # get_my_closed_out_buy_deals only catches STAGE-level exits and
+    # a Closed deal isn't a "closed-out" stage at all. It rendered
+    # nowhere. Fixed by merging it into the SAME closed_out_deals/
+    # closed_out_disclosed_by_id the stage-based path already feeds
+    # -- _closed_out_status_chip_html derives its outcome text (and,
+    # for Closed specifically, its positive green styling instead of
+    # the gray Passed/Withdrawn one) from _deal_exit_outcome_name,
+    # which now checks the raw Intro Status field for exactly these
+    # cases. Each row's disclosed flag is resolved["disclosed"] (the
+    # milestone-or-raw-Introduced-or-later carve-out
+    # _resolve_intro_status already implements for exit statuses,
+    # and simply "not Matched" -> always True for Closed) — this
+    # deal WAS already correctly gated by that logic before it fell
+    # off the page; only where it renders changes.
+    resolved_by_deal_id = {}
+    kept_deals = []
+    for d in deals:
+        resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
+        if resolved["name"] in ("Passed", "Withdrawn", "Closed"):
+            deal_id = str(d.get("id"))
+            closed_out_deals.append(d)
+            closed_out_disclosed_by_id[deal_id] = edit_mode or resolved["disclosed"]
+            continue
+        resolved_by_deal_id[str(d.get("id"))] = resolved
+        kept_deals.append(d)
+
+    return {"kept_deals": kept_deals, "resolved_by_deal_id": resolved_by_deal_id,
+            "closed_out_deals": closed_out_deals, "closed_out_disclosed_by_id": closed_out_disclosed_by_id,
+            "manual_failed": manual_failed}
+
+
 def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None, edit_mode=False,
                         cef_html=""):
     """tenant is None only for admin-without-view_as — the same
@@ -8870,70 +8941,12 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         # feature not part of this instruction.
         firm_person_ids = _firm_person_ids(person_id)
         intro_details, dynamo_failed = get_intro_details(tenant_email)
-        deals = get_firm_matched_buy_deals(person_id) if person_id is not None else []
-        deals = _augment_with_dynamo_linked_deals(deals, intro_details)
-
-        # Manual intros (Dynamo-only, no backing Pipeline deal -- see
-        # _manual_intro_as_deal), across every company this tenant has
-        # one for (company=None), merged in the same way as the augment
-        # step above and BEFORE any per-deal disclosure/routing runs, so
-        # they flow through every existing loop unchanged. Suppressed
-        # when a REAL deal-derived intro already covers the same
-        # buyer+company -- the deal-derived row wins.
-        manual_intros, manual_failed = get_manual_intros(tenant_email) if person_id is not None else ({}, False)
-        if manual_intros:
-            manual_deals = [
-                _manual_intro_as_deal(item) for (m_company, buyer_pid), item in manual_intros.items()
-                if not _tenant_has_deal_derived_intro(person_id, m_company, buyer_pid)
-            ]
-            deals = deals + manual_deals
-        # Turn 27, item 1: stage-level exits — a dead-stage (Lost/Trade
-        # Broken/Obsolete) BUY deal never reaches get_my_matched_buy_deals,
-        # so it simply vanished instead of showing as a closed-out intro.
-        # Fetched separately, keyed off the deal's own Pipeline stage
-        # rather than the Intro Status field — see get_my_closed_out_buy_deals.
-        closed_out_deals = get_firm_closed_out_buy_deals(person_id) if person_id is not None else []
-
-        # Item 3: closed-out rows use their own, simpler disclosure rule
-        # (_closed_out_disclosed — raw Intro Status explicitly Introduced-
-        # or-later, no milestone fallback), computed once per deal here.
-        # Edit mode never anonymizes (same convention as every other row
-        # on this page) — the admin sees the real buyer regardless.
-        closed_out_disclosed_by_id = {str(d.get("id")): (edit_mode or _closed_out_disclosed(d))
-                                       for d in closed_out_deals}
-
-        # Bug fix: a matched-or-later BUY deal whose Intro Status field
-        # itself is explicitly Passed/Withdrawn/Closed (an exit or a win
-        # expressed via status rather than a Pipeline stage move -- e.g.
-        # an admin/tenant flags it dead, or closes it, without the deal
-        # ever leaving Matched) was being `continue`'d out of the loop
-        # below entirely -- kept out of Introduced (correctly, it's
-        # terminal) but never routed anywhere else either, since
-        # get_my_closed_out_buy_deals only catches STAGE-level exits and
-        # a Closed deal isn't a "closed-out" stage at all. It rendered
-        # nowhere. Fixed by merging it into the SAME closed_out_deals/
-        # closed_out_disclosed_by_id the stage-based path already feeds
-        # -- _closed_out_status_chip_html derives its outcome text (and,
-        # for Closed specifically, its positive green styling instead of
-        # the gray Passed/Withdrawn one) from _deal_exit_outcome_name,
-        # which now checks the raw Intro Status field for exactly these
-        # cases. Each row's disclosed flag is resolved["disclosed"] (the
-        # milestone-or-raw-Introduced-or-later carve-out
-        # _resolve_intro_status already implements for exit statuses,
-        # and simply "not Matched" -> always True for Closed) — this
-        # deal WAS already correctly gated by that logic before it fell
-        # off the page; only where it renders changes.
-        resolved_by_deal_id = {}
-        kept_deals = []
-        for d in deals:
-            resolved = _resolve_intro_status(d, intro_details.get(str(d.get("id"))))
-            if resolved["name"] in ("Passed", "Withdrawn", "Closed"):
-                deal_id = str(d.get("id"))
-                closed_out_deals.append(d)
-                closed_out_disclosed_by_id[deal_id] = edit_mode or resolved["disclosed"]
-                continue
-            resolved_by_deal_id[str(d.get("id"))] = resolved
-            kept_deals.append(d)
+        _aim = _active_intros_model(person_id, tenant_email, intro_details, edit_mode=edit_mode)
+        kept_deals = _aim["kept_deals"]
+        resolved_by_deal_id = _aim["resolved_by_deal_id"]
+        closed_out_deals = _aim["closed_out_deals"]
+        closed_out_disclosed_by_id = _aim["closed_out_disclosed_by_id"]
+        manual_failed = _aim["manual_failed"]
 
         wanted_ids = set()
         for d in kept_deals:
@@ -9438,6 +9451,32 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 </html>"""
 
 
+def _my_deal_is_overdue(deadline, section):
+    """A row's deadline has passed (never for a won/"closed" row)."""
+    if section == "closed" or not deadline:
+        return False
+    deadline_dt = _parse_dt(deadline)
+    return bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
+
+
+def _my_deal_row_chip_html(deal, company_name, deadline, stats, paperwork, section, archived, key=None,
+                           view_as=None):
+    """The exact Next Steps cell a My Deals row renders -- shared with the
+    Overview tab's "Needs your attention" list so both show the same red
+    chips with the same targets."""
+    is_held = section == "hold"
+    is_won = section == "closed"
+    visibility_state = _my_deal_visibility_state(deal, paperwork, is_held, is_won=is_won)
+    return _my_deal_action_chip_html(str(deal.get("id")), company_name, _my_deal_is_overdue(deadline, section),
+                                      stats["stalled"], visibility_state, key=key, view_as=view_as,
+                                      terms_missing=_deal_terms_missing(deal),
+                                      paperwork_missing=_coerce_paperwork(deal, paperwork)["missing"],
+                                      archived=archived)
+
+
+RED_ACTION_CHIP_RE = re.compile(r'<a class="action-chip (?:overdue|reopen|paperwork)"[^>]*>.*?</a>', re.S)
+
+
 def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section,
                        key=None, view_as=None, edit_mode=False, colleague_name=None, archived=False):
     deal_id = str(deal.get("id"))
@@ -9531,12 +9570,8 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         else:
             deadline_html = "—"
 
-    # Item 1: no Next Steps chip either on a Closed row — there's
-    # nothing left to nudge/update/sign on a deal that's already sold.
-    action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
-                                                  visibility_state, key=key, view_as=view_as,
-                                                  terms_missing=_deal_terms_missing(deal),
-                                                  paperwork_missing=paperwork["missing"], archived=archived)
+    action_chip_html = _my_deal_row_chip_html(deal, company_name, deadline, stats, cef_state, section,
+                                               archived, key=key, view_as=view_as)
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
     # Bug fix: Hold/Cancel/Reactivate are tenant self-service (see
@@ -9568,6 +9603,528 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     )
 
 
+# ── Overview tab (tenant default landing page) ─────────────────────────────
+# Team-scoped exactly like My Deals / Active Intros: every figure comes from
+# the same shared models (_my_deals_model, _active_intros_model,
+# _company_buy_stats, deal_paperwork_status) so nothing can drift, and
+# buyers only ever render through the existing disclosure rules.
+OVERVIEW_LIST_LIMIT = 10
+
+
+def _deal_date_field(deal, field):
+    """A date carried on the deal record itself (e.g. "closed_time",
+    "created_at") parsed with _parse_dt, or None when the snapshot doesn't
+    carry it -- callers show "—" rather than substituting another date."""
+    return _parse_dt(deal.get(field)) if deal.get(field) else None
+
+
+def _fmt_dt_short(dt):
+    return f"{dt.strftime('%b')} {dt.day}, {dt.year}" if dt else "—"
+
+
+def _introduced_buyer_ids(person_id, companies, intro_details, tenant_email, firm_person_ids):
+    """Unique buyer person ids behind every disclosed introduction counted
+    in _company_buy_stats' intro_count, across `companies` -- the same
+    population (live matched + closed-out + manual), only counted."""
+    ids = set()
+    for company in companies:
+        for d in get_firm_matched_buy_deals(person_id, company):
+            if _resolve_intro_status(d, intro_details.get(str(d.get("id"))) or {})["disclosed"]:
+                ids |= _deal_linked_person_ids(d) - set(firm_person_ids)
+        for d in get_firm_closed_out_buy_deals(person_id, company):
+            if _closed_out_disclosed(d):
+                ids |= _deal_linked_person_ids(d) - set(firm_person_ids)
+        if tenant_email:
+            manual_intros, _ = get_manual_intros(tenant_email, company)
+            for (_m_company, buyer_pid), item in manual_intros.items():
+                if _tenant_has_deal_derived_intro(person_id, company, buyer_pid):
+                    continue
+                if _resolve_intro_status(_manual_intro_as_deal(item), None)["disclosed"]:
+                    ids.add(buyer_pid)
+    return ids
+
+
+def _intro_last_update_epoch(deal, entry):
+    """Most recent activity on an intro: any Dynamo stamp (status
+    override, notes, milestones, stage/deadline overrides) or the deal's
+    own Pipeline updated_at."""
+    stamps = [_intro_entry_freshness(entry or {})]
+    dt = _parse_dt(deal.get("updated_at"))
+    if dt:
+        stamps.append(dt.timestamp())
+    return max(stamps)
+
+
+def _overview_company_link(company_name, key, view_as):
+    if not company_name:
+        return "—"
+    return f'<a href="{_company_href(company_name, "overview", key, view_as)}">{_esc(company_name)}</a>'
+
+
+def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
+    """All Overview figures/rows (see render_overview_page)."""
+    md = _my_deals_model(deals, person_id, anon_key_email) if deals else None
+    rows = md["rows"] if md else []
+    stats_by_company = {}
+    for r in rows:
+        stats_by_company.setdefault((r["company_name"] or "").strip().lower(), (r["company_name"], r["stats"]))
+    intro_total = sum(st["intro_count"] for _c, st in stats_by_company.values())
+    won_intros = sum(st["won_count"] for _c, st in stats_by_company.values())
+    intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
+    firm_person_ids = _firm_person_ids(person_id)
+    buyer_ids = _introduced_buyer_ids(person_id, [c for c, _st in stats_by_company.values() if c],
+                                      intro_details, anon_key_email, firm_person_ids)
+    closed_rows = md["closed_rows"] if md else []
+    tiles = {
+        "live_deals": md["live_count"] if md else 0,
+        "pipeline_total": md["pipeline_total"] if md else 0,
+        "active_intros": sum(st["non_terminal_count"] for _c, st in stats_by_company.values()),
+        "won_count": len(closed_rows),
+        "won_total": md["closed_total"] if md else 0,
+        "buyers_introduced": len(buyer_ids),
+        "intro_total": intro_total,
+        "won_intros": won_intros,
+        "intro_won_pct": (round(100 * won_intros / intro_total) if intro_total else None),
+    }
+    return {"md": md, "rows": rows, "tiles": tiles, "intro_details": intro_details,
+            "firm_person_ids": firm_person_ids}
+
+
+def _overview_attention_items(rows, key=None, view_as=None):
+    """[(row, red_chip_html)] -- exactly the red chips My Deals renders in
+    Next Steps (same helper, same targets), one entry per chip."""
+    items = []
+    for r in rows:
+        archived = r["section"] in ("cancelled", "closed")
+        chip_html = _my_deal_row_chip_html(r["deal"], r["company_name"], r["deadline"], r["stats"], r["id_status"],
+                                           r["section"], archived, key=key, view_as=view_as)
+        for red in RED_ACTION_CHIP_RE.findall(chip_html):
+            items.append((r, red))
+    return items
+
+
+def _overview_recent_intros(person_id, anon_key_email, intro_details, firm_person_ids, edit_mode=False):
+    """[(deal, resolved, epoch)] newest first, from the SAME row set
+    Active Intros lists (_active_intros_model's kept_deals)."""
+    aim = _active_intros_model(person_id, anon_key_email, intro_details, edit_mode=edit_mode)
+    out = []
+    for d in aim["kept_deals"]:
+        resolved = aim["resolved_by_deal_id"][str(d.get("id"))]
+        out.append((d, resolved, _intro_last_update_epoch(d, intro_details.get(str(d.get("id"))))))
+    out.sort(key=lambda t: -t[2])
+    return out
+
+
+def _overview_buyer_html(deal, resolved, person_id, firm_person_ids, anon_key_email, edit_mode, key, view_as):
+    """Buyer cell under the existing disclosure rules: a disclosed intro
+    (or admin edit view) shows the primary buyer's name linking to the
+    buyer page, exactly as Active Intros does; a pending one shows only
+    the anonymized "Buyer <code>" Active Intros shows."""
+    exclude = set(firm_person_ids or {person_id})
+    linked = [pid for pid in _deal_linked_person_ids_ordered(deal) if pid not in exclude]
+    people = get_people_by_ids(set(linked)) if linked else {}
+    buyer_recs = [people[pid] for pid in linked if pid in people]
+    if not buyer_recs:
+        return "—"
+    if resolved["disclosed"] or edit_mode:
+        primary, _secondary, more = _select_display_buyers(deal, buyer_recs)
+        name = _esc(_person_display_name(primary) or "—")
+        more_html = f' <span class="ov-muted">+{more + (1 if _secondary else 0)}</span>' if (more or _secondary) else ""
+        return f'<a href="{_buyer_href(primary.get("id"), key, view_as)}">{name}</a>{more_html}'
+    return f'<span class="buyer-code">Buyer {_esc(_anon_buyer_code(anon_key_email, buyer_recs[0].get("id")))}</span>'
+
+
+OVERVIEW_CSS = """
+  .ov-tiles { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .ov-tile { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+  .ov-tile-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
+                   color: var(--muted); }
+  .ov-tile-value { font-size: 20px; font-weight: 700; margin-top: 4px; }
+  .ov-tile-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  @media (max-width: 760px) { .ov-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  .ov-section { margin-bottom: 18px; }
+  .ov-section h2 { font-size: 15px; font-weight: 600; margin: 0 0 10px; }
+  .ov-section .card { padding: 6px 16px; }
+  .ov-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0;
+            border-top: 1px solid var(--line); font-size: 13px; }
+  .ov-row:first-child { border-top: none; }
+  .ov-muted { color: var(--muted); font-size: 12px; }
+  .ov-deal-id { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  .ov-all-clear { color: var(--qp); font-weight: 600; font-size: 13px; padding: 10px 0; }
+  .ov-see-all { display: inline-block; margin-top: 8px; font-size: 13px; font-weight: 600; color: var(--accent);
+                text-decoration: none; }
+  .ov-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .ov-table th { text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase; color: var(--muted);
+                 padding: 8px 6px; border-bottom: 1px solid var(--line); }
+  .ov-table td { padding: 9px 6px; border-top: 1px solid var(--line); vertical-align: top; }
+  .ov-table tr:first-child td { border-top: none; }
+  .ov-table td.num, .ov-table th.num { text-align: center; }
+  .ov-history { font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  .buyer-code { font-weight: 600; }
+  .visibility-badge { display: inline-block; font-size: 12px; font-weight: 600; line-height: 1.3; padding: 4px 10px;
+                      border-radius: 14px; }
+  .visibility-badge.live, .visibility-badge.sold { background: rgba(31,122,77,0.15); color: var(--qp); }
+  .visibility-badge.held { background: rgba(201,162,39,0.15); color: var(--accredited); }
+  .visibility-badge.id-required, .visibility-badge.agreement-unsigned, .visibility-badge.terms-incomplete {
+    background: rgba(178,59,59,0.12); color: #b23b3b; }
+  .paperwork-note-line { margin-top: 4px; }
+  .paperwork-note.buy-side { font-size: 11px; font-weight: 600; color: var(--qp); }
+  .action-chip { display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3; padding: 3px 9px;
+                 border-radius: 12px; text-decoration: none; }
+  .action-chip.overdue, .action-chip.reopen, .action-chip.paperwork { background: rgba(178,59,59,0.12); color: #b23b3b; }
+  .status-pill { display: inline-block; font-size: 11px; font-weight: 600; color: var(--muted);
+                 background: rgba(22,24,29,0.06); border-radius: 999px; padding: 2px 8px; }
+  .status-chip { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 3px 9px; }
+  .status-chip.stalled { background: rgba(201,162,39,0.15); color: #8a6d1f; }
+  .status-chip.exit { background: rgba(178,59,59,0.15); color: #b23b3b; }
+  .status-chip.closed { background: rgba(31,122,77,0.15); color: var(--qp); }
+  details.closed-out-section { margin-top: 10px; }
+  details.closed-out-section summary { cursor: pointer; font-size: 14px; font-weight: 600; list-style: none; padding: 4px 0; }
+  details.closed-out-section summary::-webkit-details-marker { display: none; }
+  details.closed-out-section summary::before { content: "\\25B8 "; color: var(--muted); font-size: 12px; }
+  details.closed-out-section[open] summary::before { content: "\\25BE "; }
+  details.closed-out-section summary .count { color: var(--muted); font-weight: 500; font-size: 12px; }
+"""
+
+
+def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None, cef_html="",
+                         edit_mode=False, person_id=None, anon_key_email=None):
+    """?tab=overview -- the tenant's default landing page (see
+    lambda_handler). Five sections: summary tiles, "Needs your
+    attention" (My Deals' red chips), "Open deals", "Active intros"
+    (most recent updates), "Track record". deals is the same Sell-deal
+    list My Deals gets (get_firm_sell_deals -- team/firm scoped)."""
+    nav = _nav_html("overview", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                    person_id=person_id)
+    suffix = _tab_qs_suffix(key, view_as)
+    if tenant_picker:
+        body_html = _tenant_picker_html()
+    else:
+        ov = _overview_model(deals or [], person_id, anon_key_email, edit_mode=edit_mode)
+        t = ov["tiles"]
+        rows = ov["rows"]
+
+        def _tile(label, value, sub=""):
+            sub_html = f'<div class="ov-tile-sub">{sub}</div>' if sub else ""
+            return (f'<div class="ov-tile"><div class="ov-tile-label">{_esc(label)}</div>'
+                    f'<div class="ov-tile-value">{value}</div>{sub_html}</div>')
+
+        pct = f'{t["intro_won_pct"]}%' if t["intro_won_pct"] is not None else "—"
+        tiles_html = (
+            '<div class="ov-tiles">'
+            + _tile("Live deals", _esc(str(t["live_deals"])))
+            + _tile("$ in pipeline (live)", _esc(_fmt_money(t["pipeline_total"]) if t["pipeline_total"] else "$0"))
+            + _tile("Active intros", _esc(str(t["active_intros"])))
+            + _tile("Won", _esc(str(t["won_count"])),
+                    _esc(_fmt_money(t["won_total"])) if t["won_total"] else "")
+            + _tile("Buyers introduced", _esc(str(t["buyers_introduced"])))
+            + _tile("Intro → won", _esc(pct),
+                    _esc(f'{t["won_intros"]} of {t["intro_total"]}') if t["intro_total"] else "")
+            + '</div>')
+
+        # 2) Needs your attention
+        items = _overview_attention_items(rows, key=key, view_as=view_as)
+        if items:
+            att_rows = "".join(
+                f'<div class="ov-row ov-attention-row"><div>{_overview_company_link(r["company_name"], key, view_as)}'
+                f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></div><div>{chip}</div></div>'
+                for r, chip in items)
+        else:
+            att_rows = '<div class="ov-all-clear">All paperwork in order, no deadlines past.</div>'
+        attention_html = (f'<section class="ov-section ov-attention"><h2>Needs your attention</h2>'
+                          f'<div class="card">{att_rows}</div></section>')
+
+        # 3) Open deals
+        live_rows = [r for r in rows if r["section"] in ("active", "hold")]
+        open_body = "".join(
+            f'<tr><td>{_overview_company_link(r["company_name"], key, view_as)}'
+            f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></td>'
+            f'<td>{_my_deal_visibility_badge_html(r["deal"], r["id_status"], r["section"] == "hold")}</td>'
+            f'<td class="num">{r["buyer_count"]}</td><td class="num">{r["stats"]["non_terminal_count"] or "—"}</td>'
+            f'<td>{_esc(_fmt_short_date(r["deadline"]) or r["deadline"]) if r["deadline"] else "—"}</td></tr>'
+            for r in live_rows[:OVERVIEW_LIST_LIMIT])
+        open_table = (('<table class="ov-table"><thead><tr><th>Deal</th><th>Visibility</th>'
+                       '<th class="num">Interested buyers</th><th class="num">Intros</th><th>Deadline</th></tr></thead>'
+                       f'<tbody>{open_body}</tbody></table>') if live_rows
+                      else '<div class="ov-muted" style="padding:10px 0">No open deals.</div>')
+        open_html = (f'<section class="ov-section ov-open"><h2>Open deals</h2><div class="card">{open_table}</div>'
+                     f'<a class="ov-see-all" href="?tab=mydeals{suffix}">See all in My Deals &rarr;</a></section>')
+
+        # 4) Active intros (most recent updates)
+        recent = (_overview_recent_intros(person_id, anon_key_email, ov["intro_details"], ov["firm_person_ids"],
+                                          edit_mode=edit_mode) if person_id is not None else [])
+        intro_body = "".join(
+            f'<tr><td>{_overview_buyer_html(d, res, person_id, ov["firm_person_ids"], anon_key_email, edit_mode, key, view_as)}</td>'
+            f'<td>{_overview_company_link(_deal_company_name(d), key, view_as)}</td>'
+            f'<td>{_status_display_html(res, compact=True)}</td>'
+            f'<td>{_esc(_fmt_dt_short(datetime.fromtimestamp(ep, tz=timezone.utc)) if ep else "—")}</td></tr>'
+            for d, res, ep in recent[:OVERVIEW_LIST_LIMIT])
+        intro_table = (('<table class="ov-table"><thead><tr><th>Buyer</th><th>Company</th><th>Status</th>'
+                        f'<th>Updated</th></tr></thead><tbody>{intro_body}</tbody></table>') if recent
+                       else '<div class="ov-muted" style="padding:10px 0">No active introductions yet.</div>')
+        intros_html = (f'<section class="ov-section ov-intros"><h2>Active intros</h2><div class="card">{intro_table}</div>'
+                       f'<a class="ov-see-all" href="?tab=intros{suffix}">See all in Active Intros &rarr;</a></section>')
+
+        # 5) Track record
+        won_rows = [r for r in rows if r["section"] == "closed"]
+        dead_rows = [r for r in rows if r["section"] == "cancelled"]
+        listed = [dt for dt in (_deal_date_field(r["deal"], "created_at") for r in rows) if dt]
+        since = f' since {_fmt_dt_short(min(listed))}' if listed else ""
+        history = (f'{len(rows)} deal{"" if len(rows) == 1 else "s"} listed · {len(won_rows)} won · '
+                   f'{len(dead_rows)} lost/obsolete{since}')
+        won_body = "".join(
+            f'<tr><td>{_overview_company_link(r["company_name"], key, view_as)}</td>'
+            f'<td class="num">{_esc(_fmt_money(_deal_pipeline_size(r["deal"])) if _deal_pipeline_size(r["deal"]) else "—")}</td>'
+            f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "closed_time")))}</td></tr>'
+            for r in won_rows)
+        won_table = (('<table class="ov-table"><thead><tr><th>Won deal</th><th class="num">Size</th>'
+                      f'<th>Closed</th></tr></thead><tbody>{won_body}</tbody></table>') if won_rows
+                     else '<div class="ov-muted" style="padding:10px 0">No won deals yet.</div>')
+        archived_rows = won_rows + dead_rows
+        all_closed_html = ""
+        if archived_rows:
+            closed_body = "".join(
+                f'<tr><td>{_overview_company_link(r["company_name"], key, view_as)}'
+                f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></td>'
+                f'<td>{_esc(_deal_stage_label(r["resolved_stage"]))}</td>'
+                f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "created_at")))}</td>'
+                f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "closed_time")))}</td></tr>'
+                for r in archived_rows)
+            all_closed_html = (
+                '<details class="closed-out-section ov-all-closed">'
+                f'<summary>All closed deals <span class="count">({len(archived_rows)})</span></summary>'
+                '<div class="card"><table class="ov-table"><thead><tr><th>Deal</th><th>Stage</th><th>Listed</th>'
+                f'<th>Closed</th></tr></thead><tbody>{closed_body}</tbody></table></div></details>')
+        track_html = (f'<section class="ov-section ov-track"><h2>Track record</h2><div class="card">{won_table}</div>'
+                      f'<p class="ov-history">{_esc(history)}</p>{all_closed_html}</section>')
+
+        body_html = tiles_html + attention_html + open_html + intros_html + track_html
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syndicate · Gracia Group</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤝</text></svg>">
+<style>
+{NAV_CSS}
+  :root {{
+    --bg: #f4f2ee;
+    --card: #ffffff;
+    --line: #e7e5e0;
+    --ink: #16181d;
+    --muted: #6b7280;
+    --accent: #3d5a73;
+    --qp: #1f7a4d;
+    --accredited: #8a6d1f;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; background: var(--bg); color: var(--ink);
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; padding: 32px 24px 64px; }}
+  .wrap {{ max-width: 1000px; margin: 28px auto 0; }}
+  .card {{ background: var(--card); border: 1px solid var(--line); border-radius: 10px; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+  .gg-placeholder {{ max-width: 640px; margin: 96px auto; padding: 0 24px; text-align: center; color: var(--muted);
+                    font-size: 15px; }}
+{OVERVIEW_CSS}
+</style>
+</head>
+<body>
+{nav}
+<div class="wrap">
+  {body_html}
+</div>
+</body>
+</html>"""
+
+
+def _my_deals_model(deals, person_id, anon_key_email):
+    """Every per-row fact and summary figure My Deals renders, computed
+    once and shared with the Overview tab so their numbers can never
+    drift: rows (deal, company_name, deadline, stats, buyer_count,
+    resolved_stage, section, colleague_name, id_status=paperwork) sorted
+    exactly as My Deals shows them, plus live_count, not_engaged_count,
+    terms_incomplete_count, intros_live_total, intros_total,
+    attention_count, deadlines, pipeline_total, closed_total,
+    active_rows, closed_rows."""
+    company_table = get_company_table()
+    buyer_counts = {row["company"].strip().lower(): row["total"] for row in company_table}
+
+    intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
+
+    # ATTRIBUTION (item 2): every row that came via a colleague's own
+    # Sell deal (not one the viewing tenant is personally linked to)
+    # carries the "via <colleague>" chip. firm_person_ids/people_by_id
+    # are only needed at all once `deals` actually contains a
+    # colleague's deal, but the lookup is cheap (people.json is
+    # already request-cached) and simplest done unconditionally here.
+    firm_person_ids = _firm_person_ids(person_id)
+    colleague_wanted_ids = set()
+    for d in deals:
+        colleague_wanted_ids |= _deal_linked_person_ids(d) - {person_id}
+    colleague_people_by_id = get_people_by_ids(colleague_wanted_ids) if colleague_wanted_ids else {}
+
+    def _colleague_name_for(d):
+        owner = _deal_colleague_owner(d, person_id, firm_person_ids, colleague_people_by_id)
+        return _first_name(owner) if owner else None
+
+    # Per-company buy-side aggregation (Intros count, Stalled flag).
+    # Turn 22: follow_up is no longer read here — see _my_deal_action_chip_html.
+    # Perf fix 3: _company_buy_stats' own request-scoped cache is
+    # shared with the nav dropdown's badge computation, so a company
+    # touched by both (routine -- the dropdown renders on this same
+    # page too) computes once, not via two independent local caches.
+    def _company_stats(company_name):
+        return _company_buy_stats(person_id, company_name, intro_details, tenant_email=anon_key_email)
+
+    rows = []
+    for d in deals:
+        company_name = _deal_company_name(d)
+        override_entry = intro_details.get(str(d.get("id"))) or {}
+        deadline = _resolve_deal_deadline(d, override_entry)
+        resolved_stage = _resolve_deal_stage(d, override_entry)
+        if resolved_stage == HOLD_STAGE_ID:
+            section = "hold"
+        elif _is_won_stage(resolved_stage):
+            # Item 1 (turn 26): a won deal gets its own "Closed"
+            # section — the trophy shelf — and is excluded from
+            # "active" outright, same footing as Hold/Cancelled.
+            section = "closed"
+        elif (resolved_stage == OBSOLETE_STAGE_ID or resolved_stage in LOST_STAGE_IDS
+              or resolved_stage == STAGE_TRADE_BROKEN):
+            # Item 4: Lost (111801/2379322) sits alongside Obsolete
+            # in Cancelled -- previously Lost wasn't checked here at
+            # all, so a Lost-stage sell deal fell into the "else"
+            # branch below and rendered in the ACTIVE table exactly
+            # like a normal live deal: full visibility-state ladder
+            # (frequently landing on the "Live" badge), deadline
+            # overdue warnings, a Next Steps chip, and Hold/Cancel
+            # buttons -- all wrong for a deal that's already dead.
+            section = "cancelled"
+        else:
+            section = "active"
+        rows.append({
+            "deal": d,
+            "company_name": company_name,
+            "deadline": deadline,
+            "stats": _company_stats(company_name),
+            "buyer_count": buyer_counts.get((company_name or "").strip().lower(), 0),
+            "resolved_stage": resolved_stage,
+            "section": section,
+            "colleague_name": _colleague_name_for(d),
+            "id_status": deal_paperwork_status(d, anon_key_email, person_id),
+        })
+
+    # Deadline ascending (ISO yyyy-mm-dd sorts correctly as a string),
+    # no-deadline rows last, then company A-Z.
+    rows.sort(key=lambda r: ((0, r["deadline"]) if r["deadline"] else (1, ""),
+                              (r["company_name"] or "").lower()))
+
+    live_count = 0
+    not_engaged_count = 0
+    terms_incomplete_count = 0
+    intros_live_total = 0
+    attention_count = 0
+    deadlines = []
+    # "introduced total" is history: every company across ALL rows,
+    # archived included, each company counted once.
+    intro_companies = {}
+    for r in rows:
+        intro_companies.setdefault((r["company_name"] or "").strip().lower(), r["stats"]["intro_count"])
+    intros_total = sum(intro_companies.values())
+    for r in rows:
+        d = r["deal"]
+        deadline = r["deadline"]
+        stats = r["stats"]
+        section = r["section"]
+
+        # Summary-strip counts and totals cover the active section
+        # only — Held, Cancelled, and (turn 26) Closed deals get their
+        # own sections below and no longer contribute here (see item
+        # 2). This is also what fixes "live"/"Total in pipeline"
+        # actually excluding won deals: before turn 26 a won-stage
+        # deal fell into this same "active" branch (there was no
+        # separate Closed section to route it to), so it silently
+        # counted toward live_count/pipeline_total same as any other
+        # live deal -- now it never reaches this branch at all.
+        if section == "active":
+            is_overdue = False
+            if deadline:
+                deadline_dt = _parse_dt(deadline)
+                is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
+                deadlines.append(deadline)
+
+            if is_overdue or stats["stalled"]:
+                attention_count += 1
+            intros_live_total += stats["live_intro_count"]
+
+            # is_held=False: this loop is already gated to the active
+            # section, which by construction never holds a Held deal.
+            state = _my_deal_visibility_state(d, r["id_status"], False)
+            if state == "live":
+                live_count += 1
+            elif state == "paperwork_missing":
+                not_engaged_count += 1
+            elif state == "terms_incomplete":
+                terms_incomplete_count += 1
+
+
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    future_deadlines = [dl for dl in deadlines if dl >= today_iso]
+
+    # Resolved (override-aware) stage, not the deal's own raw
+    # deal_stage — so a same-session Hold/Cancel/Reactivate moves the
+    # deal in or out of "Total in pipeline" immediately, without
+    # waiting for deals.json to resync. Scoped to the active section
+    # only (see above) — Held/Cancelled/Closed deals no longer count
+    # here.
+    active_rows = [r for r in rows if r["section"] == "active"]
+    pipeline_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in active_rows
+                                      if not r["deal"].get("is_archived"))
+                          if v is not None)
+    # Turn 26: sourced from the new "closed" section's own rows, not
+    # active_rows -- before this turn, closed_total summed won-stage
+    # deals out of active_rows because that was the only place a won
+    # deal could ever land (there was no separate Closed section).
+    # Once won-stage deals got their own section they stopped
+    # appearing in active_rows at all, so this sum would have gone
+    # silently to zero (or, worse, "Total closed" would simply never
+    # render, since it's only shown `if closed_total`) had it not
+    # been repointed here. The old _is_won_stage filter is now
+    # redundant and dropped -- every row already in "closed" is won
+    # by construction (see the section-assignment loop above) — and
+    # the size math itself was never the problem: _deal_pipeline_size
+    # already falls back from ticket min/max to the deal's own
+    # "value" field when neither custom field is set, exactly as
+    # asked to verify.
+    # Firm-level tenancy: `rows`/`deals` (get_firm_sell_deals) already
+    # includes every firm colleague's own won Sell deals -- unlike
+    # before, when only closed colleague deals were bolted on
+    # separately here (get_firm_closed_sell_deals), everything from
+    # Active through Closed is now the SAME shared firm-wide view, so
+    # closed_total is already the firm-wide figure -- no separate
+    # "Firm total closed" number needed anymore (that distinction
+    # only made sense when personal and firm views were different
+    # things; item 2's "via <colleague>" chip on each row is now
+    # what tells a personal deal from a colleague's).
+    closed_rows = [r for r in rows if r["section"] == "closed"]
+    closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in closed_rows) if v is not None)
+
+    # Each part is escaped individually rather than the joined string as
+    # a whole, so the dollar totals can carry their own <span> for
+    # medium-weight emphasis (item 4) without that markup being
+    # escaped away.
+    return {
+        "rows": rows, "live_count": live_count, "not_engaged_count": not_engaged_count,
+        "terms_incomplete_count": terms_incomplete_count, "intros_live_total": intros_live_total,
+        "intros_total": intros_total, "attention_count": attention_count, "deadlines": deadlines,
+        "future_deadlines": future_deadlines, "pipeline_total": pipeline_total, "closed_total": closed_total,
+        "active_rows": active_rows, "closed_rows": closed_rows,
+    }
+
+
 def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None, cef_html="",
                           edit_mode=False, person_id=None, anon_key_email=None):
     """deals is always Sell-order-tagged only (see lambda_handler's mydeals
@@ -9588,179 +10145,26 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     elif not deals:
         body_html = '<div class="gg-placeholder">No deals yet.</div>'
     else:
-        company_table = get_company_table()
-        buyer_counts = {row["company"].strip().lower(): row["total"] for row in company_table}
-
-        intro_details, _ = get_intro_details(anon_key_email) if anon_key_email else ({}, True)
-
-        # ATTRIBUTION (item 2): every row that came via a colleague's own
-        # Sell deal (not one the viewing tenant is personally linked to)
-        # carries the "via <colleague>" chip. firm_person_ids/people_by_id
-        # are only needed at all once `deals` actually contains a
-        # colleague's deal, but the lookup is cheap (people.json is
-        # already request-cached) and simplest done unconditionally here.
-        firm_person_ids = _firm_person_ids(person_id)
-        colleague_wanted_ids = set()
-        for d in deals:
-            colleague_wanted_ids |= _deal_linked_person_ids(d) - {person_id}
-        colleague_people_by_id = get_people_by_ids(colleague_wanted_ids) if colleague_wanted_ids else {}
-
-        def _colleague_name_for(d):
-            owner = _deal_colleague_owner(d, person_id, firm_person_ids, colleague_people_by_id)
-            return _first_name(owner) if owner else None
-
-        # Per-company buy-side aggregation (Intros count, Stalled flag).
-        # Turn 22: follow_up is no longer read here — see _my_deal_action_chip_html.
-        # Perf fix 3: _company_buy_stats' own request-scoped cache is
-        # shared with the nav dropdown's badge computation, so a company
-        # touched by both (routine -- the dropdown renders on this same
-        # page too) computes once, not via two independent local caches.
-        def _company_stats(company_name):
-            return _company_buy_stats(person_id, company_name, intro_details, tenant_email=anon_key_email)
-
-        rows = []
-        for d in deals:
-            company_name = _deal_company_name(d)
-            override_entry = intro_details.get(str(d.get("id"))) or {}
-            deadline = _resolve_deal_deadline(d, override_entry)
-            resolved_stage = _resolve_deal_stage(d, override_entry)
-            if resolved_stage == HOLD_STAGE_ID:
-                section = "hold"
-            elif _is_won_stage(resolved_stage):
-                # Item 1 (turn 26): a won deal gets its own "Closed"
-                # section — the trophy shelf — and is excluded from
-                # "active" outright, same footing as Hold/Cancelled.
-                section = "closed"
-            elif (resolved_stage == OBSOLETE_STAGE_ID or resolved_stage in LOST_STAGE_IDS
-                  or resolved_stage == STAGE_TRADE_BROKEN):
-                # Item 4: Lost (111801/2379322) sits alongside Obsolete
-                # in Cancelled -- previously Lost wasn't checked here at
-                # all, so a Lost-stage sell deal fell into the "else"
-                # branch below and rendered in the ACTIVE table exactly
-                # like a normal live deal: full visibility-state ladder
-                # (frequently landing on the "Live" badge), deadline
-                # overdue warnings, a Next Steps chip, and Hold/Cancel
-                # buttons -- all wrong for a deal that's already dead.
-                section = "cancelled"
-            else:
-                section = "active"
-            rows.append({
-                "deal": d,
-                "company_name": company_name,
-                "deadline": deadline,
-                "stats": _company_stats(company_name),
-                "buyer_count": buyer_counts.get((company_name or "").strip().lower(), 0),
-                "resolved_stage": resolved_stage,
-                "section": section,
-                "colleague_name": _colleague_name_for(d),
-                "id_status": deal_paperwork_status(d, anon_key_email, person_id),
-            })
-
-        # Deadline ascending (ISO yyyy-mm-dd sorts correctly as a string),
-        # no-deadline rows last, then company A-Z.
-        rows.sort(key=lambda r: ((0, r["deadline"]) if r["deadline"] else (1, ""),
-                                  (r["company_name"] or "").lower()))
-
-        live_count = 0
-        not_engaged_count = 0
-        terms_incomplete_count = 0
-        intros_live_total = 0
-        attention_count = 0
-        deadlines = []
+        model = _my_deals_model(deals, person_id, anon_key_email)
+        rows = model["rows"]
+        live_count = model["live_count"]
+        not_engaged_count = model["not_engaged_count"]
+        terms_incomplete_count = model["terms_incomplete_count"]
+        intros_live_total = model["intros_live_total"]
+        intros_total = model["intros_total"]
+        attention_count = model["attention_count"]
+        future_deadlines = model["future_deadlines"]
+        pipeline_total = model["pipeline_total"]
+        closed_total = model["closed_total"]
         section_row_htmls = {"active": [], "hold": [], "cancelled": [], "closed": []}
-        # "introduced total" is history: every company across ALL rows,
-        # archived included, each company counted once.
-        intro_companies = {}
         for r in rows:
-            intro_companies.setdefault((r["company_name"] or "").strip().lower(), r["stats"]["intro_count"])
-        intros_total = sum(intro_companies.values())
-        for r in rows:
-            d = r["deal"]
-            deadline = r["deadline"]
-            stats = r["stats"]
             section = r["section"]
-
-            # Summary-strip counts and totals cover the active section
-            # only — Held, Cancelled, and (turn 26) Closed deals get their
-            # own sections below and no longer contribute here (see item
-            # 2). This is also what fixes "live"/"Total in pipeline"
-            # actually excluding won deals: before turn 26 a won-stage
-            # deal fell into this same "active" branch (there was no
-            # separate Closed section to route it to), so it silently
-            # counted toward live_count/pipeline_total same as any other
-            # live deal -- now it never reaches this branch at all.
-            if section == "active":
-                is_overdue = False
-                if deadline:
-                    deadline_dt = _parse_dt(deadline)
-                    is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
-                    deadlines.append(deadline)
-
-                if is_overdue or stats["stalled"]:
-                    attention_count += 1
-                intros_live_total += stats["live_intro_count"]
-
-                # is_held=False: this loop is already gated to the active
-                # section, which by construction never holds a Held deal.
-                state = _my_deal_visibility_state(d, r["id_status"], False)
-                if state == "live":
-                    live_count += 1
-                elif state == "paperwork_missing":
-                    not_engaged_count += 1
-                elif state == "terms_incomplete":
-                    terms_incomplete_count += 1
-
             section_row_htmls[section].append(
-                _my_deal_row_html(d, r["company_name"], deadline, stats, r["buyer_count"], r["id_status"],
-                                   section, key=key, view_as=view_as, edit_mode=edit_mode,
+                _my_deal_row_html(r["deal"], r["company_name"], r["deadline"], r["stats"], r["buyer_count"],
+                                   r["id_status"], section, key=key, view_as=view_as, edit_mode=edit_mode,
                                    colleague_name=r["colleague_name"],
                                    archived=section in ("cancelled", "closed")))
 
-        today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        future_deadlines = [dl for dl in deadlines if dl >= today_iso]
-
-        # Resolved (override-aware) stage, not the deal's own raw
-        # deal_stage — so a same-session Hold/Cancel/Reactivate moves the
-        # deal in or out of "Total in pipeline" immediately, without
-        # waiting for deals.json to resync. Scoped to the active section
-        # only (see above) — Held/Cancelled/Closed deals no longer count
-        # here.
-        active_rows = [r for r in rows if r["section"] == "active"]
-        pipeline_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in active_rows
-                                          if not r["deal"].get("is_archived"))
-                              if v is not None)
-        # Turn 26: sourced from the new "closed" section's own rows, not
-        # active_rows -- before this turn, closed_total summed won-stage
-        # deals out of active_rows because that was the only place a won
-        # deal could ever land (there was no separate Closed section).
-        # Once won-stage deals got their own section they stopped
-        # appearing in active_rows at all, so this sum would have gone
-        # silently to zero (or, worse, "Total closed" would simply never
-        # render, since it's only shown `if closed_total`) had it not
-        # been repointed here. The old _is_won_stage filter is now
-        # redundant and dropped -- every row already in "closed" is won
-        # by construction (see the section-assignment loop above) — and
-        # the size math itself was never the problem: _deal_pipeline_size
-        # already falls back from ticket min/max to the deal's own
-        # "value" field when neither custom field is set, exactly as
-        # asked to verify.
-        # Firm-level tenancy: `rows`/`deals` (get_firm_sell_deals) already
-        # includes every firm colleague's own won Sell deals -- unlike
-        # before, when only closed colleague deals were bolted on
-        # separately here (get_firm_closed_sell_deals), everything from
-        # Active through Closed is now the SAME shared firm-wide view, so
-        # closed_total is already the firm-wide figure -- no separate
-        # "Firm total closed" number needed anymore (that distinction
-        # only made sense when personal and firm views were different
-        # things; item 2's "via <colleague>" chip on each row is now
-        # what tells a personal deal from a colleague's).
-        closed_rows = [r for r in rows if r["section"] == "closed"]
-        closed_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in closed_rows) if v is not None)
-
-        # Each part is escaped individually rather than the joined string as
-        # a whole, so the dollar totals can carry their own <span> for
-        # medium-weight emphasis (item 4) without that markup being
-        # escaped away.
         summary_parts = []
         if live_count:
             summary_parts.append(f"{live_count} live")
@@ -13402,7 +13806,7 @@ def _perf_infer_page(query):
     if query.get("company"):
         return "company"
     tab = query.get("tab") or "mydeals"
-    return tab if tab in ("mydeals", "intros", "demand") else "mydeals"
+    return tab if tab in ("overview", "mydeals", "intros", "demand") else "mydeals"
 
 
 def lambda_handler(event, context):
@@ -13564,8 +13968,11 @@ def _lambda_handler_impl(event, context):
                 "body": "",
             }
 
-    tab = query.get("tab") or "mydeals"
-    if tab not in ("mydeals", "intros", "demand"):
+    # Default tab is resolved below, once we know whether there's a tenant
+    # context: Overview for tenants and admin &view_as, My Deals for
+    # admin-without-view_as (unchanged).
+    tab = query.get("tab") or None
+    if tab is not None and tab not in ("overview", "mydeals", "intros", "demand"):
         tab = "mydeals"
 
     # view_as is admin-only: never let a non-admin request steer whose view
@@ -13665,6 +14072,17 @@ def _lambda_handler_impl(event, context):
     photo_param = query.get("photo")
     if photo_param:
         return _handle_photo_request(photo_param, tenant, anon_key_email, edit_mode)
+
+    if tab is None:
+        tab = "overview" if tenant is not None else "mydeals"
+
+    if tab == "overview":
+        person_id = tenant.get("person_id") if tenant is not None else None
+        deals = get_firm_sell_deals(person_id) if person_id is not None else []
+        body = render_overview_page(viewer_name, deals=deals, tenant_picker=(tenant is None),
+                                    key=nav_key, view_as=nav_view_as, cef_html=cef_html, edit_mode=edit_mode,
+                                    person_id=person_id, anon_key_email=anon_key_email)
+        return _html_response(body)
 
     if tab == "demand":
         table = get_company_table()

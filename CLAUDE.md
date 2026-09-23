@@ -75,3 +75,13 @@ Stages: Inquiry 2109142, Firm 111800, Matched 2381534, LOI 2517909, Transfer Not
 - Wording: tenant-facing text (incl. admin view_as without &edit=1) NEVER says "CEF" (tested). Short chips (Visibility "Not live · …", Next Steps): "ID required" / "Agent agreement required". Nav badge and Deal Details card: "FINRA-mandated ID requirements unmet". Summary: "N missing paperwork". Nav badge uses the same team-level CEF.
 - Next Steps: paperwork missing -> one red chip per missing item (CEF form / agreement doc). In order -> red only for "Extend deadline →" (deadline 4006402 past); archived rows -> red "Reopen →"; Provide deal terms / Nudge buyers / Complete deal terms are amber. Extend/Reopen link the deal update form.
 - Actions: ONE "Update" button (desk.graciagroup.com/update/, HMAC-signed per deal — the form offers Put on Hold and Cancel) on every live row the viewer can see, teammates' and firm colleagues' included; none on archived rows. The in-dashboard POST ?action=deal_stage still exists (firm/team-scoped, 403 otherwise) but has no button.
+
+## Overview tab (?tab=overview)
+- Nav tabs: Overview · My Deals · Active Intros · Demand Board (the old "Gracia Group" brand text is gone). Every tab link carries key/view_as via _tab_qs_suffix.
+- Default landing: no ?tab -> Overview for tenants and admin view_as; admin without view_as -> My Deals (unchanged).
+- render_overview_page, team/firm-scoped (same get_firm_sell_deals list as My Deals). Figures come ONLY from shared models: _my_deals_model (also drives My Deals), _active_intros_model (also drives Active Intros), _company_buy_stats, deal_paperwork_status.
+  Tiles: Live deals (= My Deals "N live") · $ in pipeline (= "Total in pipeline") · Active intros (Σ non_terminal_count per company = INTROS column / company-page card) · Won (archived won rows + "Total closed") · Buyers introduced (unique buyers behind intro_count) · Intro → won (Σ won_count / Σ intro_count).
+  Needs your attention: exactly My Deals' red Next Steps chips (_my_deal_row_chip_html + RED_ACTION_CHIP_RE), else green "All paperwork in order, no deadlines past."
+  Open deals: first 10 main-table rows. Active intros: 10 most recently updated rows of Active Intros' own set; buyer name only when disclosed (or admin edit), else "Buyer <code>". Track record: won deals + "N deals listed · N won · N lost/obsolete since <date>" + collapsed "All closed deals (N)".
+- Dates: deal "closed_time" / "created_at" are read if the snapshot carries them, else "—" / no "since" clause. Field names NOT yet verified against live deals.json.
+- No Track Record tab ever existed; nothing to fold in.

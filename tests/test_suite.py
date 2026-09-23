@@ -6389,6 +6389,167 @@ lf.urllib.request.urlopen = fake_urlopen
 
 
 # ======================================================================
+# SECTION: Overview tab -- nav, default landing, figure parity with My
+# Deals / Active Intros / company page, attention list, disclosure,
+# team scoping, view_as on links
+# ======================================================================
+OV_FULL = {**MD_TERMS}
+
+def _ov_fixture(clean_only=False):
+    people_ov = {"people": [
+        {"id": 1801, "full_name": "Alice Ov", "email": "alice@ovcap.com", "company_id": 8801,
+         "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
+        {"id": 1802, "full_name": "Bob Ov", "email": "bob@ovcap.com", "company_id": 8801, "custom_fields": {}},
+        {"id": 1830, "full_name": "Zed Zov", "email": "zed@zetaov.io", "custom_fields": {}},
+        {"id": 1901, "full_name": "Dora Disclosed", "email": "dora@buy1.com", "custom_fields": {}},
+        {"id": 1902, "full_name": "Pat Pending", "email": "pat@buy2.com", "custom_fields": {}},
+        {"id": 1903, "full_name": "Wes Won", "email": "wes@buy3.com", "custom_fields": {}},
+    ]}
+
+    def sell(did, company, stage, cf, extra=None):
+        d = {"id": did, "name": f"{company} block", "company": {"name": company}, "deal_stage": {"id": stage},
+             "custom_fields": cf_sell(cf), "people": [{"id": 1801}], "is_archived": stage not in lf.LIVE_SELL_STAGE_IDS,
+             "updated_at": "2026-08-01T00:00:00Z", "created_at": "2026-03-02T00:00:00Z"}
+        d.update(extra or {})
+        return d
+
+    def buy(did, company, status, pid, stage=lf.STAGE_MATCHED, upd="2026-08-05T00:00:00Z"):
+        return {"id": did, "name": f"{company} buy", "company": {"name": company}, "deal_stage": {"id": stage},
+                "custom_fields": cf_status(status, {lf.TICKET_MAX_FIELD: 2_000_000}),
+                "people": [{"id": 1801}, {"id": pid}], "updated_at": upd}
+
+    deals_ov = [sell(89001, "Orion Co", lf.STAGE_FIRM, {**OV_FULL, lf.DEADLINE_FIELD: "2099/01/01"}),
+                buy(89101, "Orion Co", 7207579, 1901, upd="2026-08-09T00:00:00Z"),
+                buy(89102, "Orion Co", 7207578, 1902, upd="2026-08-07T00:00:00Z")]
+    if not clean_only:
+        deals_ov += [
+            sell(89002, "Pax Co", lf.STAGE_FIRM, {k: v for k, v in OV_FULL.items() if k != lf.AGENT_AGREEMENT_FIELD}),
+            sell(89003, "Quill Co", lf.STAGE_FIRM, {**OV_FULL, lf.DEADLINE_FIELD: "2020/01/01"}),
+            sell(89004, "Rex Co", 111802, {lf.TICKET_MAX_FIELD: 3_000_000}, {"closed_time": "2026-06-15T00:00:00Z"}),
+            sell(89005, "Sol Co", lf.OBSOLETE_STAGE_ID, {}),
+            buy(89103, "Rex Co", 7207587, 1903, stage=111802),
+            {"id": 89901, "name": "Zeta block", "company": {"name": "Zeta Private Co"},
+             "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(OV_FULL), "people": [{"id": 1830}],
+             "is_archived": False, "updated_at": "2026-08-01T00:00:00Z"},
+        ]
+    return use_fixture({lf.PEOPLE_KEY: people_ov, lf.INTEREST_KEY: {"buy": {"Orion Co": [1901, 1902, 1903]}},
+                        lf.DEALS_KEY: {"deals": deals_ov}}, ses=FakeSES())
+
+def _ov_get(email, q=None):
+    return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": q or {}, "cookies": [tenant_cookie(email)]}, None)
+
+def _ov_header(page):
+    return page[page.find('<header class="gg-nav">'):page.find("</header>")]
+
+_ov_fixture()
+ov_page = _ov_get("alice@ovcap.com")["body"]
+ov_hdr = _ov_header(ov_page)
+check("nav: Overview is the first tab and 'Gracia Group' is gone from the nav",
+      ov_hdr.find(">Overview</a>") != -1
+      and ov_hdr.find(">Overview</a>") < ov_hdr.find(">My Deals</a>") < ov_hdr.find(">Active Intros</a>")
+      < ov_hdr.find(">Demand Board</a>") and "Gracia Group" not in ov_hdr)
+check("default landing: a tenant with no ?tab gets Overview (active tab)",
+      '<a class="gg-tab active" href="?tab=overview">Overview</a>' in ov_hdr and "Needs your attention" in ov_page)
+ov_admin_va = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                 "queryStringParameters": {"key": ADMIN_KEY, "view_as": "alice@ovcap.com"},
+                                 "cookies": []}, None)["body"]
+check("default landing: admin view_as with no tab gets Overview", "Needs your attention" in ov_admin_va
+      and 'class="gg-tab active" href="?tab=overview' in _ov_header(ov_admin_va))
+ov_admin = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": {"key": ADMIN_KEY}, "cookies": []}, None)["body"]
+check("default landing: admin without view_as keeps My Deals",
+      'class="gg-tab active" href="?tab=mydeals' in _ov_header(ov_admin) and "Needs your attention" not in ov_admin)
+check("other tabs still highlight themselves (My Deals active on ?tab=mydeals)",
+      'class="gg-tab active" href="?tab=mydeals">My Deals' in _ov_header(_ov_get("alice@ovcap.com", {"tab": "mydeals"})["body"]))
+
+# --- Figures equal My Deals / Active Intros / company page
+ov_deals = lf.get_firm_sell_deals(1801)
+ov_model = lf._overview_model(ov_deals, 1801, "alice@ovcap.com")
+md_model = lf._my_deals_model(ov_deals, 1801, "alice@ovcap.com")
+md_page = body_only(_ov_get("alice@ovcap.com", {"tab": "mydeals"})["body"])
+md_summary = md_page[md_page.find('class="mydeals-summary"'):]
+md_summary = md_summary[:md_summary.find("</p>")]
+t = ov_model["tiles"]
+check("tiles: Live deals equals My Deals' 'N live'", f'{t["live_deals"]} live' in md_summary and t["live_deals"] == 2)
+check("tiles: $ in pipeline equals My Deals' 'Total in pipeline'",
+      lf._fmt_money(t["pipeline_total"]) in md_summary.split("Total in pipeline")[1][:80]
+      and t["pipeline_total"] == md_model["pipeline_total"])
+check("tiles: Won $ equals My Deals' 'Total closed' and Won count = archived won rows",
+      t["won_count"] == 1 and lf._fmt_money(t["won_total"]) in md_summary.split("Total closed")[1][:80])
+orion_stats = lf._company_buy_stats(1801, "Orion Co", lf.get_intro_details("alice@ovcap.com")[0],
+                                    tenant_email="alice@ovcap.com")
+rex_stats = lf._company_buy_stats(1801, "Rex Co", lf.get_intro_details("alice@ovcap.com")[0],
+                                  tenant_email="alice@ovcap.com")
+check("tiles: Active intros equals the INTROS column / company-page 'Active intros' figures summed",
+      t["active_intros"] == orion_stats["non_terminal_count"] + rex_stats["non_terminal_count"] == 1)
+ov_co_page = _ov_get("alice@ovcap.com", {"company": "Orion Co"})["body"]
+check("tiles: company page 'Active intros' card shows the same Orion figure",
+      f'<span>Active intros</span><span class="cd-stat-num">{orion_stats["non_terminal_count"]}</span>' in ov_co_page)
+check("tiles: Buyers introduced = unique disclosed buyers (Dora + Wes; Pat is pending)",
+      t["buyers_introduced"] == 2)
+check("tiles: Intro -> won % = company-stats won / introduced (1 of 2 -> 50%)",
+      t["won_intros"] == 1 and t["intro_total"] == md_model["intros_total"] == 2 and t["intro_won_pct"] == 50)
+ov_body = body_only(ov_page)
+check("tiles render in one row with the six labels in order",
+      [ov_body.find(f'<div class="ov-tile-label">{lbl}</div>') for lbl in
+       ("Live deals", "$ in pipeline (live)", "Active intros", "Won", "Buyers introduced", "Intro → won")]
+      == sorted(ov_body.find(f'<div class="ov-tile-label">{lbl}</div>') for lbl in
+                ("Live deals", "$ in pipeline (live)", "Active intros", "Won", "Buyers introduced", "Intro → won"))
+      and '<div class="ov-tile-value">50%</div>' in ov_body)
+
+# --- Needs your attention == My Deals' red chips
+md_red = sorted(lf.RED_ACTION_CHIP_RE.findall(md_page))
+ov_att = ov_body[ov_body.find("Needs your attention"):ov_body.find('<section class="ov-section ov-open">')]
+ov_red = sorted(lf.RED_ACTION_CHIP_RE.findall(ov_att))
+check("attention: exactly the red chips My Deals renders (same text + targets)", md_red == ov_red and len(ov_red) == 4)
+check("attention: covers Agent agreement required, Extend deadline and Reopen",
+      "Agent agreement required &rarr;" in ov_att and "Extend deadline &rarr;" in ov_att and ov_att.count("Reopen &rarr;") == 2)
+check("attention: each row names the deal (company + #id)", "Pax Co</a><span class=\"ov-deal-id\">#89002</span>" in ov_att)
+check("attention: no all-clear line when there are items", "All paperwork in order" not in ov_att)
+
+# --- Open deals / Active intros / Track record
+ov_open = ov_body[ov_body.find('<section class="ov-section ov-open">'):ov_body.find('<section class="ov-section ov-intros">')]
+check("open deals: live deals only (no Rex/Sol), See all link to My Deals",
+      "Orion Co" in ov_open and "Pax Co" in ov_open and "Rex Co" not in ov_open and "Sol Co" not in ov_open
+      and 'href="?tab=mydeals">See all in My Deals &rarr;</a>' in ov_open)
+ov_intros = ov_body[ov_body.find('<section class="ov-section ov-intros">'):ov_body.find('<section class="ov-section ov-track">')]
+check("active intros: disclosed buyer by name, pending buyer only as its anon code",
+      "Dora Disclosed" in ov_intros and "Pat Pending" not in ov_intros
+      and f'Buyer {lf._anon_buyer_code("alice@ovcap.com", 1902)}' in ov_intros)
+check("active intros: newest update first, See all link", ov_intros.find("Dora Disclosed") < ov_intros.find("Buyer ")
+      and 'href="?tab=intros">See all in Active Intros &rarr;</a>' in ov_intros)
+check("disclosure: Pat Pending's name/email appear nowhere on Overview", "Pat Pending" not in ov_page and "pat@buy2.com" not in ov_page)
+ov_track = ov_body[ov_body.find('<section class="ov-section ov-track">'):]
+check("track record: won deal with size and close date; one-line history",
+      "Rex Co" in ov_track and "$3M" in ov_track and "Jun 15, 2026" in ov_track
+      and "5 deals listed · 1 won · 1 lost/obsolete since Mar 2, 2026" in ov_track)
+check("track record: collapsed 'All closed deals (2)' with stages",
+      '<details class="closed-out-section ov-all-closed"><summary>All closed deals <span class="count">(2)</span>' in ov_track
+      and "Obsolete" in ov_track)
+
+# --- Team scoping
+bob_ov = _ov_get("bob@ovcap.com")["body"]
+check("team: teammate Bob (no deals) sees the same Overview figures",
+      lf._overview_model(lf.get_firm_sell_deals(1802), 1802, "bob@ovcap.com")["tiles"] == t
+      and "Orion Co" in bob_ov)
+check("team: another team's deal never appears", "Zeta Private Co" not in ov_page and "Zeta Private Co" not in bob_ov)
+
+# --- view_as preserved on every Overview link
+va_body = body_only(ov_admin_va)
+va_links = re.findall(r'href="(\?[^"]*)"', va_body) + re.findall(r'href="(\?[^"]*)"', _ov_header(ov_admin_va))
+check("view_as: every in-app link on Overview (body + nav tabs) carries view_as and key",
+      va_links and all("view_as=alice%40ovcap.com" in h and "key=" in h for h in va_links))
+
+# --- All-clear
+_ov_fixture(clean_only=True)
+ov_clean = body_only(_ov_get("alice@ovcap.com")["body"])
+check("attention: the green all-clear line when nothing is red",
+      '<div class="ov-all-clear">All paperwork in order, no deadlines past.</div>' in ov_clean
+      and not lf.RED_ACTION_CHIP_RE.findall(ov_clean))
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 
