@@ -124,7 +124,7 @@ _req_cache = {
     "firm_matched_buy_deals": {}, "firm_closed_out_buy_deals": {},
     "tenant_index": None, "id_status": {},
     "intro_details": {}, "manual_intros": {}, "models": {}, "memo_dynamo": False,
-    "feature_requests": {},
+    "feature_requests": {}, "manual_intro_calls": {}, "aggregate_scan": None,
 }
 
 
@@ -151,6 +151,8 @@ def _req_cache_reset():
     _req_cache["models"] = {}
     _req_cache["memo_dynamo"] = False
     _req_cache["feature_requests"] = {}
+    _req_cache["manual_intro_calls"] = {}
+    _req_cache["aggregate_scan"] = None
 
 
 def _perf_start(page):
@@ -2417,9 +2419,16 @@ def _raised_headline_stats():
             counted.append(d)
     seen_manual = set()
     sellers = [email for email, info in _tenant_index().items() if info.get("is_seller", True)]
-    # One Query per seller partition (manual intros can't be batch-read by
-    # key), run concurrently rather than one after another.
-    for manual_intros, _failed in _memo_partition_reads("manual_intros", _get_manual_intros_one, sellers):
+    # Every seller's manual intros from the request's one shared aggregate
+    # Scan (manual intros can't be batch-read by key); per-partition
+    # Queries only if the Scan fails.
+    try:
+        by_partition = _aggregate_scan_by_partition("manual-intro#")
+        seller_manual = [(_manual_intro_items(by_partition.get(p, [])), False) for p in sellers]
+    except Exception as e:
+        print(f"manual intro aggregate scan failed, falling back to per-partition queries: {type(e).__name__}: {e}")
+        seller_manual = _memo_partition_reads("manual_intros", _get_manual_intros_one, sellers)
+    for manual_intros, _failed in seller_manual:
         for (m_company, buyer_pid), item in manual_intros.items():
             mkey = ((m_company or "").strip().lower(), buyer_pid)
             if mkey in seen_manual or mkey in real_pairs:
@@ -4373,7 +4382,20 @@ def get_manual_intros(tenant_email, company=None):
     """Domain teams: union across every team partition (_team_partitions);
     a (company, person_id) present twice keeps the most recently updated
     copy. Individual tenants: one partition, unchanged. See
-    _get_manual_intros_one for the item shape."""
+    _get_manual_intros_one for the item shape.
+
+    Memoized per GET request by (tenant_email, company)
+    (_req_cache["manual_intro_calls"]; POSTs never memoize); each call
+    returns its own dict copy."""
+    memo = _req_cache["manual_intro_calls"] if _req_cache.get("memo_dynamo") else {}
+    memo_key = (tenant_email, company)
+    if memo_key not in memo:
+        memo[memo_key] = _get_manual_intros_uncached(tenant_email, company)
+    out, failed = memo[memo_key]
+    return dict(out), failed
+
+
+def _get_manual_intros_uncached(tenant_email, company=None):
     partitions = _team_partitions(tenant_email)
     results = _memo_partition_reads("manual_intros", _get_manual_intros_one, partitions)
     if company is not None:
@@ -4409,33 +4431,40 @@ def _get_manual_intros_one(tenant_email, company=None):
             resp = table.query(
                 KeyConditionExpression=Key("tenant").eq(tenant_email) & Key("sk").begins_with("manual-intro#"),
             )
-        out = {}
-        for item in resp.get("Items", []):
-            sk = item.get("sk") or ""
-            if not sk.startswith("manual-intro#"):
-                continue
-            rest = sk[len("manual-intro#"):]
-            item_company, sep, person_id_str = rest.rpartition("#")
-            if not sep:
-                continue
-            try:
-                person_id = int(person_id_str)
-            except (TypeError, ValueError):
-                continue
-            if company is not None and item_company.strip().lower() != company.strip().lower():
-                continue
-            out[(item_company, person_id)] = {
-                "company": item_company,
-                "person_id": person_id,
-                "status": item.get("status"),
-                "note": item.get("note"),
-                "created_by": item.get("created_by"),
-                "created_at": item.get("created_at"),
-                "updated_at": item.get("updated_at"),
-            }
-        return out, False
+        return _manual_intro_items(resp.get("Items", []), company), False
     except Exception:
         return {}, True
+
+
+def _manual_intro_items(raw_items, company=None):
+    """Raw manual-intro Dynamo items of one partition ->
+    {(company, person_id): {...}} (see _get_manual_intros_one). Shared by
+    the per-partition Query and the admin aggregate Scan."""
+    out = {}
+    for item in raw_items:
+        sk = item.get("sk") or ""
+        if not sk.startswith("manual-intro#"):
+            continue
+        rest = sk[len("manual-intro#"):]
+        item_company, sep, person_id_str = rest.rpartition("#")
+        if not sep:
+            continue
+        try:
+            person_id = int(person_id_str)
+        except (TypeError, ValueError):
+            continue
+        if company is not None and item_company.strip().lower() != company.strip().lower():
+            continue
+        out[(item_company, person_id)] = {
+            "company": item_company,
+            "person_id": person_id,
+            "status": item.get("status"),
+            "note": item.get("note"),
+            "created_by": item.get("created_by"),
+            "created_at": item.get("created_at"),
+            "updated_at": item.get("updated_at"),
+        }
+    return out
 
 
 def _get_manual_intro_item(tenant_email, company, person_id):
@@ -5191,19 +5220,23 @@ def get_feature_requests(tenant_partition, page=None):
     return result
 
 
-# Admin aggregate read: one Scan (FEATURE_SCAN_SEGMENTS parallel segments,
-# each paginated) filtered to sk begins_with "feature#", instead of one
-# Query per tenant partition (~1.4k on the live desk).
-FEATURE_SCAN_SEGMENTS = 4
+# Admin aggregate reads (feature requests, desk Raised manual intros): ONE
+# shared Scan per request (AGGREGATE_SCAN_SEGMENTS parallel segments, each
+# paginated) filtered to the sk prefixes both need, instead of one Query per
+# tenant partition (~1.4k on the live desk).
+AGGREGATE_SCAN_SEGMENTS = 4
+AGGREGATE_SCAN_PREFIXES = ("feature#", "manual-intro#")
 
 
-def _scan_feature_segment(segment):
+def _scan_aggregate_segment(segment):
     table = _thread_dynamo_table()
-    kwargs = {"FilterExpression": Attr("sk").begins_with("feature#"),
-              "Segment": segment, "TotalSegments": FEATURE_SCAN_SEGMENTS}
+    filt = Attr("sk").begins_with(AGGREGATE_SCAN_PREFIXES[0])
+    for prefix in AGGREGATE_SCAN_PREFIXES[1:]:
+        filt = filt | Attr("sk").begins_with(prefix)
+    kwargs = {"FilterExpression": filt, "Segment": segment, "TotalSegments": AGGREGATE_SCAN_SEGMENTS}
     out = []
     while True:
-        _perf_count("feature_requests_scan")
+        _perf_count("aggregate_scan")
         with _perf_timer("dynamo"):
             resp = table.scan(**kwargs)
         out += resp.get("Items", [])
@@ -5213,14 +5246,30 @@ def _scan_feature_segment(segment):
         kwargs["ExclusiveStartKey"] = last
 
 
-def _scan_feature_items_by_partition():
-    """{partition: [raw feature items]} across the whole table. Raises on
-    failure -- the caller falls back to per-partition Queries."""
-    by_partition = {}
-    for seg_items in _dynamo_parallel_map(_scan_feature_segment, range(FEATURE_SCAN_SEGMENTS)):
-        for item in seg_items:
-            by_partition.setdefault(item.get("tenant"), []).append(item)
-    return by_partition
+def _aggregate_scan_by_partition(prefix):
+    """{partition: [raw items whose sk begins_with prefix]} across the whole
+    table, from the request's one shared Scan (memoized per GET request,
+    failure included, so a second consumer neither rescans nor retries).
+    Raises on failure -- callers fall back to per-partition Queries."""
+    scan = _req_cache["aggregate_scan"] if _req_cache.get("memo_dynamo") else None
+    if scan is None:
+        try:
+            grouped = {p: {} for p in AGGREGATE_SCAN_PREFIXES}
+            for seg_items in _dynamo_parallel_map(_scan_aggregate_segment, range(AGGREGATE_SCAN_SEGMENTS)):
+                for item in seg_items:
+                    sk = item.get("sk") or ""
+                    for p in AGGREGATE_SCAN_PREFIXES:
+                        if sk.startswith(p):
+                            grouped[p].setdefault(item.get("tenant"), []).append(item)
+                            break
+            scan = ("ok", grouped)
+        except Exception as e:
+            scan = ("failed", e)
+        if _req_cache.get("memo_dynamo"):
+            _req_cache["aggregate_scan"] = scan
+    if scan[0] == "failed":
+        raise scan[1]
+    return scan[1][prefix]
 
 
 # Admin feature aggregate (every tenant partition): cached per container
@@ -5237,7 +5286,7 @@ def _feature_agg_items(partitions):
             and now - c["at"] < FEATURE_AGG_TTL_SECONDS):
         return c["value"]
     try:
-        by_partition = _scan_feature_items_by_partition()
+        by_partition = _aggregate_scan_by_partition("feature#")
         value = [(p, _feature_request_items(p, by_partition.get(p, []))) for p in partitions]
     except Exception as e:
         print(f"feature aggregate scan failed, falling back to per-partition queries: {type(e).__name__}: {e}")

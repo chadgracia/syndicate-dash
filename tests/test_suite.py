@@ -7392,38 +7392,75 @@ check("perf: Overview reuses the Active Intros model instead of rebuilding it (b
 check("perf: each Dynamo partition is read once per request (intro items, manual intros)",
       _pf_ov_counts.get("calls_get_intro_details", "1") == "1" and _pf_ov_counts.get("calls_get_manual_intros", "1") == "1")
 
-# --- Feature requests: the admin Demand Board aggregate is one Scan, not one Query per tenant
+# --- Admin aggregates (feature requests + desk Raised manual intros): ONE shared Scan, not one Query per tenant
 _pf_table.items += [{"tenant": "pat@perfcap.com", "sk": "feature#1700000000000", "text": "Perf wish",
-                     "page": "demand", "done": False}]
-lf._feature_agg_cache["value"] = None
-_pf_table.scan_calls = 0
+                     "page": "demand", "done": False},
+                    {"tenant": "pat@perfcap.com", "sk": lf._manual_intro_sk("Perf Manual Co", 3101),
+                     "status": 7207583, "created_at": "2026-08-04T00:00:00Z", "updated_at": "2026-08-04T00:00:00Z"}]
 _pf_dq = {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
           "queryStringParameters": {"key": ADMIN_KEY, "tab": "demand"}}
-_pf_dbuf = io.StringIO()
-with contextlib.redirect_stdout(_pf_dbuf):
-    _pf_dresp = lf.lambda_handler(_pf_dq, None)
-_pf_dline = next((ln for ln in _pf_dbuf.getvalue().splitlines() if ln.startswith("TIMING ")), "")
-_pf_dcounts = dict(p.split("=", 1) for p in _pf_dline.split()[1:] if p.startswith("calls_"))
-check("perf: admin Demand Board reads feature requests with FEATURE_SCAN_SEGMENTS Scan calls, "
-      f"zero per-partition Queries ({_pf_dcounts.get('calls_feature_requests_scan')} scans, "
-      f"{_pf_dcounts.get('calls_get_feature_requests', '0')} queries)",
-      _pf_dresp["statusCode"] == 200 and _pf_table.scan_calls == lf.FEATURE_SCAN_SEGMENTS == 4
-      and _pf_dcounts.get("calls_feature_requests_scan") == str(lf.FEATURE_SCAN_SEGMENTS)
-      and "calls_get_feature_requests" not in _pf_dcounts)
+
+
+def _pf_admin_demand():
+    lf._feature_agg_cache["value"] = None
+    lf._raised_cache["version"] = None
+    _pf_table.scan_calls = 0
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        resp = lf.lambda_handler(_pf_dq, None)
+    out = buf.getvalue()
+    line = next((ln for ln in out.splitlines() if ln.startswith("TIMING ")), "")
+    return resp, dict(p.split("=", 1) for p in line.split()[1:] if p.startswith("calls_")), out
+
+
+_pf_dresp, _pf_dcounts, _pf_dout = _pf_admin_demand()
+_pf_raised_scan = dict(lf._raised_cache)
+check("perf: admin Demand Board runs ONE shared aggregate Scan (4 parts) for both feature requests and manual intros "
+      f"({_pf_dcounts.get('calls_aggregate_scan')} scan calls, {_pf_table.scan_calls} table scans)",
+      _pf_dresp["statusCode"] == 200 and _pf_table.scan_calls == lf.AGGREGATE_SCAN_SEGMENTS == 4
+      and _pf_dcounts.get("calls_aggregate_scan") == str(lf.AGGREGATE_SCAN_SEGMENTS))
+check("perf: admin Demand Board makes zero per-partition feature-request or manual-intro Queries "
+      f"(get_feature_requests={_pf_dcounts.get('calls_get_feature_requests', '0')}, "
+      f"get_manual_intros={_pf_dcounts.get('calls_get_manual_intros', '0')})",
+      "calls_get_feature_requests" not in _pf_dcounts and "calls_get_manual_intros" not in _pf_dcounts)
 check("perf: the scanned aggregate still lists a tenant's feature request on the admin Demand Board",
       "Perf wish" in _pf_dresp["body"])
-lf._feature_agg_cache["value"] = None
-_pf_table.scan_calls = 0
-with contextlib.redirect_stdout(io.StringIO()):
-    _pf_agg_scan = lf._feature_agg_items(["pat@perfcap.com", "admin"])
+check("perf: desk Raised counts the scanned seller manual intro (Wired)",
+      _pf_raised_scan["closed_count"] >= 1)
+# Scan denied -> both aggregates fall back to the per-partition path, same page, one warning each.
 _pf_orig_scan = _pf_table.scan
-_pf_table.scan = lambda **kw: (_ for _ in ()).throw(RuntimeError("AccessDenied"))
-lf._feature_agg_cache["value"] = None
-with contextlib.redirect_stdout(io.StringIO()):
-    _pf_agg_query = lf._feature_agg_items(["pat@perfcap.com", "admin"])
+
+
+def _pf_denied_scan(**kw):
+    _pf_table.scan_calls = getattr(_pf_table, "scan_calls", 0) + 1
+    raise RuntimeError("AccessDeniedException")
+
+
+_pf_table.scan = _pf_denied_scan
+_pf_fresp, _pf_fcounts, _pf_fout = _pf_admin_demand()
+_pf_raised_fallback = dict(lf._raised_cache)
 _pf_table.scan = _pf_orig_scan
-check("perf: Scan aggregate equals the per-partition Query aggregate (and Query is the fallback on Scan failure)",
-      _pf_agg_scan == _pf_agg_query and _pf_agg_scan[0][1]["open"][0]["text"] == "Perf wish")
+check("perf: Scan denied -> admin Demand Board still renders the same feature list via per-partition Queries",
+      _pf_fresp["statusCode"] == 200 and "Perf wish" in _pf_fresp["body"]
+      and int(_pf_fcounts.get("calls_get_feature_requests", "0")) >= 1
+      and int(_pf_fcounts.get("calls_get_manual_intros", "0")) >= 1)
+check("perf: Scan denied -> the failed shared scan is attempted once per request (not retried by the second consumer)",
+      _pf_table.scan_calls == lf.AGGREGATE_SCAN_SEGMENTS
+      and "feature aggregate scan failed, falling back to per-partition queries" in _pf_fout
+      and "manual intro aggregate scan failed, falling back to per-partition queries" in _pf_fout)
+check("perf: desk Raised from the Scan equals the per-partition fallback",
+      all(_pf_raised_scan[k] == _pf_raised_fallback[k]
+          for k in ("total", "closed_count", "zero_size_count", "companies_count")))
+check("perf: Scan and fallback render the same admin Demand Board body",
+      _pf_dresp["body"] == _pf_fresp["body"])
+lf._req_cache_reset()
+lf._req_cache["memo_dynamo"] = True
+_pf_m1 = lf.get_manual_intros("pat@perfcap.com", "Perf Manual Co")
+_pf_mq = lf._perf["counts"].get("get_manual_intros", 0)
+_pf_m2 = lf.get_manual_intros("pat@perfcap.com", "Perf Manual Co")
+check("perf: get_manual_intros is memoized per GET request by (tenant, company)",
+      _pf_m1 == _pf_m2 and _pf_m1[0] is not _pf_m2[0] and lf._perf["counts"].get("get_manual_intros", 0) == _pf_mq
+      and ("Perf Manual Co", 3101) in _pf_m1[0])
 lf._req_cache_reset()
 lf._req_cache["memo_dynamo"] = True
 _pf_f1 = lf.get_feature_requests("pat@perfcap.com", page="demand")
