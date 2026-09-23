@@ -414,13 +414,10 @@ def _deal_update_form_url(deal_id):
 
 
 def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibility_state,
-                               key=None, view_as=None, terms_missing=None, paperwork_missing=None,
-                               archived=False):
+                               key=None, view_as=None, terms_missing=None, archived=False):
     """Next Steps column. Archived row -> one red "Reopen ->" chip (update
-    form). Paperwork not in order (deal_paperwork_status) -> one red chip
-    per missing item: "ID required ->" (CEF form) and/or "Agent
-    agreement required ->" (agreement template). Paperwork in order ->
-    ONE chip by priority: "Extend deadline ->" (red, update form, only
+    form). Otherwise ONE chip by priority (paperwork is never a chip here
+    -- it renders under the Status pill, see _paperwork_lines_html): "Extend deadline ->" (red, update form, only
     when the deadline has passed) > "Provide deal terms ->" (amber) >
     "Nudge buyers ->" (amber) > "Complete deal terms ->" (amber,
     advisory). When more than one applies, the chip's tooltip names the
@@ -434,14 +431,8 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibi
             return ""
         return (f'<a class="action-chip reopen" href="{update_url}" target="_blank" '
                 'rel="noopener noreferrer">Reopen &rarr;</a>')
-    if visibility_state == "paperwork_missing":
-        # Paperwork not in order: one red chip per missing item.
-        links = {PAPERWORK_CEF_MISSING: CEF_FORM_URL, PAPERWORK_AGREEMENT_MISSING: AGENT_AGREEMENT_DOC_URL}
-        return " ".join(
-            f'<a class="action-chip paperwork" href="{links[m]}" target="_blank" rel="noopener noreferrer">'
-            f'{_esc(m)} &rarr;</a>' for m in (paperwork_missing or []) if m in links)
-    # Paperwork in order: "Extend deadline" is the only red chip; every
-    # other state keeps its non-red (amber) display.
+    # "Extend deadline" is the only red chip; every other state keeps its
+    # non-red (amber) display.
     candidates = []
     if is_overdue and update_url:
         candidates.append(("extend deadline", "overdue", "Extend deadline &rarr;", update_url, True, None))
@@ -3159,18 +3150,70 @@ def _buy_side_note_html():
     return f'<span class="paperwork-note buy-side">&#10003; {_esc(BUY_SIDE_AGREEMENT_TEXT)}</span>'
 
 
-def _paperwork_badge_html(paperwork):
-    """Deal Details card badge -- same status as the My Deals row, with the
-    full FINRA wording for a missing ID."""
+# Paperwork gates INTRODUCTIONS, not visibility: a deal's Status (live or
+# not) never depends on deal_paperwork_status. Each missing item renders
+# as an amber, actionable line under the Status pill (My Deals, Overview
+# Open deals) and in Overview's "Needs your attention".
+PAPERWORK_AGREEMENT_NEEDED_TEXT = "Agent agreement needed before introductions"
+PAPERWORK_ID_NEEDED_TEXT = "ID needed before introductions"
+
+
+def _agent_agreement_mailto(company_name, deal_id):
+    company = company_name or "this deal"
+    subject = urllib.parse.quote(f"Agent agreement — {company} (#{deal_id})", safe="")
+    body = urllib.parse.quote(f"Hi Chad, please send the agent agreement for {company} (#{deal_id}).", safe="")
+    return f"mailto:{FEATURE_REQUEST_EMAIL}?subject={subject}&body={body}"
+
+
+def _paperwork_needed_items(deal, paperwork):
+    """[(label, href, new_tab)] -- one per missing paperwork item, ID
+    first (deal_paperwork_status order). ID links to the existing
+    engagement form (CEF_FORM_URL); the agreement is a prefilled mailto."""
+    pw = _coerce_paperwork(deal, paperwork)
+    items = []
+    for m in pw["missing"]:
+        if m == PAPERWORK_CEF_MISSING:
+            items.append((PAPERWORK_ID_NEEDED_TEXT, CEF_FORM_URL, True))
+        elif m == PAPERWORK_AGREEMENT_MISSING:
+            items.append((PAPERWORK_AGREEMENT_NEEDED_TEXT,
+                          _agent_agreement_mailto(_deal_company_name(deal), deal.get("id")), False))
+    return items
+
+
+def _paperwork_needed_link_html(label, href, new_tab, css_class):
+    target = ' target="_blank" rel="noopener noreferrer"' if new_tab else ""
+    return f'<a class="{css_class}" href="{_esc(href)}"{target}>{_esc(label)}</a>'
+
+
+def _paperwork_lines_html(deal, paperwork):
+    """The lines under a Status pill: green "Buy-side agreement" note, or
+    one amber actionable line per missing item."""
+    pw = _coerce_paperwork(deal, paperwork)
+    if pw.get("buy_side"):
+        return f'<div class="paperwork-note-line">{_buy_side_note_html()}</div>'
+    return "".join(
+        f'<div class="paperwork-note-line">{_paperwork_needed_link_html(l, h, t, "paperwork-note needed")}</div>'
+        for l, h, t in _paperwork_needed_items(deal, pw))
+
+
+def _paperwork_badge_html(paperwork, deal=None):
+    """Deal Details card badge -- same paperwork status as the My Deals
+    row: a missing ID keeps the red FINRA wording; a missing agreement is
+    the amber "Agent agreement needed before introductions" mailto."""
     if paperwork.get("buy_side"):
         return f'<span class="id-status-badge id-ok">&#10003; {_esc(BUY_SIDE_AGREEMENT_TEXT)}</span>'
     if paperwork["in_order"]:
         return '<span class="id-status-badge id-ok">&#10003; Paperwork in order</span>'
-    links = {PAPERWORK_CEF_MISSING: CEF_FORM_URL, PAPERWORK_AGREEMENT_MISSING: AGENT_AGREEMENT_DOC_URL}
-    labels = {PAPERWORK_CEF_MISSING: FINRA_ID_UNMET_TEXT, PAPERWORK_AGREEMENT_MISSING: PAPERWORK_AGREEMENT_MISSING}
-    return " ".join(
-        f'<a class="id-status-badge id-missing" href="{links[m]}" target="_blank" rel="noopener noreferrer">'
-        f'&#10007; {_esc(labels[m])}</a>' for m in paperwork["missing"])
+    parts = []
+    for m in paperwork["missing"]:
+        if m == PAPERWORK_CEF_MISSING:
+            parts.append(f'<a class="id-status-badge id-missing" href="{CEF_FORM_URL}" target="_blank" '
+                         f'rel="noopener noreferrer">&#10007; {_esc(FINRA_ID_UNMET_TEXT)}</a>')
+        elif m == PAPERWORK_AGREEMENT_MISSING:
+            href = _agent_agreement_mailto(_deal_company_name(deal or {}), (deal or {}).get("id"))
+            parts.append(f'<a class="id-status-badge id-needed" href="{_esc(href)}">'
+                         f'{_esc(PAPERWORK_AGREEMENT_NEEDED_TEXT)}</a>')
+    return " ".join(parts)
 
 
 def _cef_badge_html(cef_option_id, tenant_name):
@@ -6508,23 +6551,20 @@ def _my_deal_visibility_state(deal, cef_state, is_held, is_won=False):
     already uses) -> "sold", short-circuiting every other check outright
     — a won deal is never "held" and never "live" regardless of its
     CEF/Agreement/Terms state, none of which mean anything once the deal
-    has actually closed; (1) ID/CEF not Yes -> "id_required"; (2) Agent
-    Agreement not Yes — In-Process counts as unsigned — ->
-    "agreement_unsigned"; (3) deal terms incomplete (see
-    _deal_terms_complete) -> "terms_incomplete"; (4) stage is Hold
-    (is_held, override-aware) -> "held"; (5) otherwise -> "live". Single
-    source of truth shared by the Visibility badge, the Next Steps chip,
+    has actually closed; (1) deal terms incomplete (see
+    _deal_terms_complete) -> "terms_incomplete"; (2) stage is Hold
+    (is_held, override-aware) -> "held"; (3) otherwise -> "live".
+    Paperwork never decides liveness -- it gates introductions and is
+    shown under the Status pill (_paperwork_lines_html). Single
+    source of truth shared by the Status badge, the Next Steps chip,
     and the summary-strip counts. Obsolete/Lost ("cancelled" section)
     rows run through this exact same ladder unchanged — their muted
     treatment is the Cancelled section's own card styling, not a
     distinct visibility state; only "sold" gets one."""
     if is_won:
         return "sold"
-    # cef_state: deal_paperwork_status's dict (or a legacy bare CEF
-    # status) -- paperwork = team-level CEF + this deal's sell-side agent
-    # agreement; see deal_paperwork_status.
-    if not _coerce_paperwork(deal, cef_state)["in_order"]:
-        return "paperwork_missing"
+    # cef_state (deal_paperwork_status) is accepted for callers' sake but
+    # never consulted: paperwork gates introductions, not visibility.
     if not _deal_terms_complete(deal):
         return "terms_incomplete"
     if is_held:
@@ -6532,15 +6572,15 @@ def _my_deal_visibility_state(deal, cef_state, is_held, is_won=False):
     return "live"
 
 
-def _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=False):
-    """State-only — no links (item 1); Next Steps carries the actionable
-    links for these same states now (item 2). Turn 26: "sold" is the
-    Closed section's own muted-but-positive green badge. A buy-side
-    agreement deal (paperwork in order regardless of CEF) gets a green
-    "Buy-side agreement" note under its badge."""
+def _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=False, show_paperwork=True):
+    """Status cell: the live-state pill (never paperwork-driven), then the
+    paperwork lines under it (_paperwork_lines_html: green "Buy-side
+    agreement", or amber actionable "... needed before introductions").
+    Turn 26: "sold" is the Closed section's own green badge; won and
+    archived rows (show_paperwork=False) get no paperwork lines."""
     html = _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won)
-    if not is_won and _coerce_paperwork(deal, cef_state).get("buy_side"):
-        html += f'<div class="paperwork-note-line">{_buy_side_note_html()}</div>'
+    if not is_won and show_paperwork:
+        html += _paperwork_lines_html(deal, cef_state)
     return html
 
 
@@ -6548,9 +6588,6 @@ def _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won=False):
     state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
     if state == "sold":
         return '<span class="visibility-badge sold">Sold &#10003;</span>'
-    if state == "paperwork_missing":
-        missing = " · ".join(_coerce_paperwork(deal, cef_state)["missing"])
-        return f'<span class="visibility-badge id-required">Not live · {_esc(missing)}</span>'
     if state == "terms_incomplete":
         return '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>'
     if state == "held":
@@ -6636,7 +6673,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     # (it covers the agent agreement too, so it replaces the older
     # Engaged badge). None only when there's no tenant context.
     if paperwork is not None:
-        badge_html = (f'<div class="dc-line">{_paperwork_badge_html(paperwork)}</div>'
+        badge_html = (f'<div class="dc-line">{_paperwork_badge_html(paperwork, deal)}</div>'
                       + _update_cancel_button_html(deal_id))
     else:
         badge_html = _engagement_badge_html(deal, company) + _update_cancel_button_html(deal_id)
@@ -9533,12 +9570,10 @@ def _my_deal_row_chip_html(deal, company_name, deadline, stats, paperwork, secti
     visibility_state = _my_deal_visibility_state(deal, paperwork, is_held, is_won=is_won)
     return _my_deal_action_chip_html(str(deal.get("id")), company_name, _my_deal_is_overdue(deadline, section),
                                       stats["stalled"], visibility_state, key=key, view_as=view_as,
-                                      terms_missing=_deal_terms_missing(deal),
-                                      paperwork_missing=_coerce_paperwork(deal, paperwork)["missing"],
-                                      archived=archived)
+                                      terms_missing=_deal_terms_missing(deal), archived=archived)
 
 
-RED_ACTION_CHIP_RE = re.compile(r'<a class="action-chip (?:overdue|reopen|paperwork)"[^>]*>.*?</a>', re.S)
+RED_ACTION_CHIP_RE = re.compile(r'<a class="action-chip (?:overdue|reopen)"[^>]*>.*?</a>', re.S)
 
 
 def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section,
@@ -9568,12 +9603,12 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # see _my_deal_visibility_state.
     is_won = section == "closed"
     # cef_state is this deal's deal_paperwork_status (or a legacy CEF
-    # status, coerced through the same rule).
-    paperwork = _coerce_paperwork(deal, cef_state)
-    badge_html = _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=is_won)
-    visibility_state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
+    # status, coerced through the same rule) -- shown under the Status
+    # pill, never deciding it.
+    badge_html = _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=is_won,
+                                                show_paperwork=not archived)
     # Item 5: net per-share, Closed rows only -- a subtle line under the
-    # Visibility badge.
+    # Status badge.
     per_share_html = ""
     if is_won:
         per_share_text = _deal_per_share_text(deal)
@@ -9825,8 +9860,10 @@ def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
 
 
 def _overview_attention_items(rows, key=None, view_as=None):
-    """[(row, red_chip_html)] -- exactly the red chips My Deals renders in
-    Next Steps (same helper, same targets), one entry per chip."""
+    """[(row, chip_html)] -- the red chips My Deals renders in Next Steps
+    (same helper, same targets; Reopen excluded), plus one amber item per
+    missing paperwork item on a live-table row (same links as the lines
+    under its Status pill)."""
     items = []
     for r in rows:
         archived = r["section"] in ("cancelled", "closed")
@@ -9836,6 +9873,9 @@ def _overview_attention_items(rows, key=None, view_as=None):
             if 'class="action-chip reopen"' in red:
                 continue  # Reopen never belongs in "Needs your attention"
             items.append((r, red))
+        if not archived:
+            for label, href, new_tab in _paperwork_needed_items(r["deal"], r["id_status"]):
+                items.append((r, _paperwork_needed_link_html(label, href, new_tab, "action-chip paperwork-needed")))
     return items
 
 
@@ -9911,6 +9951,9 @@ OVERVIEW_CSS = """
     background: rgba(178,59,59,0.12); color: #b23b3b; }
   .paperwork-note-line { margin-top: 4px; }
   .paperwork-note.buy-side { font-size: 11px; font-weight: 600; color: var(--qp); }
+  .paperwork-note.needed { font-size: 11px; font-weight: 600; color: var(--accredited); }
+  .action-chip.paperwork-needed { background: rgba(201,162,39,0.15); color: var(--accredited); }
+  .ov-empty-line { color: var(--muted); font-size: 13px; margin: -6px 0 18px; }
   .action-chip { display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3; padding: 3px 9px;
                  border-radius: 12px; text-decoration: none; }
   .action-chip.overdue, .action-chip.reopen, .action-chip.paperwork { background: rgba(178,59,59,0.12); color: #b23b3b; }
@@ -9987,7 +10030,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             f'<td class="num">{r["buyer_count"]}</td><td class="num">{r["stats"]["non_terminal_count"] or "—"}</td>'
             f'<td>{_esc(_fmt_short_date(r["deadline"]) or r["deadline"]) if r["deadline"] else "—"}</td></tr>'
             for r in live_rows[:OVERVIEW_LIST_LIMIT])
-        open_table = (('<table class="ov-table"><thead><tr><th>Deal</th><th>Visibility</th>'
+        open_table = (('<table class="ov-table"><thead><tr><th>Deal</th><th>Status</th>'
                        '<th class="num">Interested buyers</th><th class="num">Intros</th><th>Deadline</th></tr></thead>'
                        f'<tbody>{open_body}</tbody></table>') if live_rows
                       else '<div class="ov-muted" style="padding:10px 0">No open deals.</div>')
@@ -10006,8 +10049,12 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
         intro_table = (('<table class="ov-table"><thead><tr><th>Buyer</th><th>Company</th><th>Status</th>'
                         f'<th>Updated</th></tr></thead><tbody>{intro_body}</tbody></table>') if recent
                        else '<div class="ov-muted" style="padding:10px 0">No active introductions yet.</div>')
-        intros_html = (f'<section class="ov-section ov-intros"><h2>Active intros</h2><div class="card">{intro_table}</div>'
-                       f'<a class="ov-see-all" href="?tab=intros{suffix}">See all in Active Intros &rarr;</a></section>')
+        if recent:
+            intros_html = (f'<section class="ov-section ov-intros"><h2>Active intros</h2><div class="card">{intro_table}</div>'
+                           f'<a class="ov-see-all" href="?tab=intros{suffix}">See all in Active Intros &rarr;</a></section>')
+        else:
+            intros_html = ('<p class="ov-empty-line ov-intros-empty">No introductions yet. Buyers are introduced '
+                           "once there's interest and paperwork is in place.</p>")
 
         # 5) Track record
         won_rows = ov["won_rows"]
@@ -10040,8 +10087,12 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 f'<summary>All closed deals <span class="count">({len(archived_rows)})</span></summary>'
                 '<div class="card"><table class="ov-table"><thead><tr><th>Deal</th><th>Stage</th><th>Listed</th>'
                 f'<th>Closed</th></tr></thead><tbody>{closed_body}</tbody></table></div></details>')
-        track_html = (f'<section class="ov-section ov-track"><h2>Track record</h2><div class="card">{won_table}</div>'
-                      f'<p class="ov-history">{_esc(history)}</p>{all_closed_html}</section>')
+        if archived_rows:
+            track_html = (f'<section class="ov-section ov-track"><h2>Track record</h2><div class="card">{won_table}</div>'
+                          f'<p class="ov-history">{_esc(history)}</p>{all_closed_html}</section>')
+        else:
+            track_html = ('<section class="ov-section ov-track"><h2>Track record</h2>'
+                          '<p class="ov-empty-line">No closed deals yet.</p></section>')
 
         header_html = (f'<div class="ov-head"><h1 class="ov-title">Overview</h1>'
                        f'<p class="ov-subtitle">{_esc(_overview_subtitle(person_id, anon_key_email, viewer_name))}</p></div>')
@@ -10169,7 +10220,7 @@ def _my_deals_model(deals, person_id, anon_key_email):
     rows.sort(key=lambda r: ((0, r["deadline"]) if r["deadline"] else (1, ""),
                               (r["company_name"] or "").lower()))
 
-    live_count = 0
+    live_rows = []
     not_engaged_count = 0
     terms_incomplete_count = 0
     intros_live_total = 0
@@ -10210,12 +10261,13 @@ def _my_deals_model(deals, person_id, anon_key_email):
             # is_held=False: this loop is already gated to the active
             # section, which by construction never holds a Held deal.
             state = _my_deal_visibility_state(d, r["id_status"], False)
-            if state == "live":
-                live_count += 1
-            elif state == "paperwork_missing":
-                not_engaged_count += 1
+            if state == "live" and not d.get("is_archived"):
+                live_rows.append(r)
             elif state == "terms_incomplete":
                 terms_incomplete_count += 1
+            # Paperwork is independent of liveness ("N missing paperwork").
+            if not _coerce_paperwork(d, r["id_status"])["in_order"]:
+                not_engaged_count += 1
 
 
     today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -10227,10 +10279,11 @@ def _my_deals_model(deals, person_id, anon_key_email):
     # waiting for deals.json to resync. Scoped to the active section
     # only (see above) — Held/Cancelled/Closed deals no longer count
     # here.
+    # "Total in pipeline" / Overview "$ in pipeline" = exactly the deals
+    # counted in live_count (the same live_rows set), nothing else.
     active_rows = [r for r in rows if r["section"] == "active"]
-    pipeline_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in active_rows
-                                      if not r["deal"].get("is_archived"))
-                          if v is not None)
+    live_count = len(live_rows)
+    pipeline_total = sum(v for v in (_deal_pipeline_size(r["deal"]) for r in live_rows) if v is not None)
     # Turn 26: sourced from the new "closed" section's own rows, not
     # active_rows -- before this turn, closed_total summed won-stage
     # deals out of active_rows because that was the only place a won
@@ -10268,7 +10321,7 @@ def _my_deals_model(deals, person_id, anon_key_email):
         "terms_incomplete_count": terms_incomplete_count, "intros_live_total": intros_live_total,
         "intros_total": intros_total, "attention_count": attention_count, "deadlines": deadlines,
         "future_deadlines": future_deadlines, "pipeline_total": pipeline_total, "closed_total": closed_total,
-        "active_rows": active_rows, "closed_rows": closed_rows,
+        "active_rows": active_rows, "closed_rows": closed_rows, "live_rows": live_rows,
         # Won deals by the ONE definition (_sell_deal_is_won): stage Won,
         # or >= 1 won intro for the deal's company.
         "won_rows": [r for r in rows if _sell_deal_is_won(r["deal"], r["resolved_stage"], r["stats"])],
@@ -10372,7 +10425,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
       <thead>
         <tr>
           <th>Deal</th>
-          <th>Visibility</th>
+          <th>Status</th>
           <th class="num">Interested buyers</th>
           <th class="num" title="Introductions still in progress -- not yet Won or Lost">Intros</th>
           <th>Deadline</th>
@@ -10610,6 +10663,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .id-status-badge.id-missing {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .paperwork-note-line {{ margin-top: 4px; }}
   .paperwork-note.buy-side {{ font-size: 11px; font-weight: 600; color: var(--qp); }}
+  .paperwork-note.needed {{ font-size: 11px; font-weight: 600; color: var(--accredited); text-decoration: none; }}
+  .paperwork-note.needed:hover {{ text-decoration: underline; }}
+  .id-status-badge.id-needed {{ background: rgba(201,162,39,0.15); color: var(--accredited); text-decoration: none; }}
   .visibility-badge {{
     display: inline-block;
     font-size: 12px;
@@ -11510,6 +11566,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .id-status-badge.id-missing {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .paperwork-note-line {{ margin-top: 4px; }}
   .paperwork-note.buy-side {{ font-size: 11px; font-weight: 600; color: var(--qp); }}
+  .paperwork-note.needed {{ font-size: 11px; font-weight: 600; color: var(--accredited); text-decoration: none; }}
+  .paperwork-note.needed:hover {{ text-decoration: underline; }}
+  .id-status-badge.id-needed {{ background: rgba(201,162,39,0.15); color: var(--accredited); text-decoration: none; }}
   .engagement-badge {{
     display: inline-block;
     font-size: 12px;

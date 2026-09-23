@@ -568,24 +568,26 @@ check("admin badge stays a fixed high-contrast red (not palette-driven)",
 # SECTION: My Deals — visibility state machine & Next Steps action chips
 # ======================================================================
 # _my_deal_visibility_state(deal, cef_state, is_held, is_won=False) is a
-# strict, first-match-wins ladder: sold > id_required > agreement_unsigned
-# > terms_incomplete > held > live. _my_deal_action_chip_html renders at
+# strict, first-match-wins ladder: sold > terms_incomplete > held > live.
+# Paperwork never decides it (it gates introductions, shown under Status). _my_deal_action_chip_html renders at
 # most ONE chip per row by its own separate priority (overdue > terms >
 # nudge > id_required > agreement_unsigned), with a tooltip naming any
 # lower-priority candidates that also applied.
 
 deal_no_id = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_YES], **full_terms()})}
-check("state: CEF not Yes/N/A -> paperwork_missing",
-      lf._my_deal_visibility_state(deal_no_id, lf.CEF_NO_ID, False) == "paperwork_missing")
-check("paperwork_missing wins even with agreement signed + full terms (CEF Pending)",
-      lf._my_deal_visibility_state(deal_no_id, lf.CEF_PENDING_ID, False) == "paperwork_missing")
+check("state: CEF not Yes/N/A no longer makes a deal not live",
+      lf._my_deal_visibility_state(deal_no_id, lf.CEF_NO_ID, False) == "live")
+check("state: CEF Pending + agreement signed + full terms -> live",
+      lf._my_deal_visibility_state(deal_no_id, lf.CEF_PENDING_ID, False) == "live")
 
 deal_agreement_unsigned = {"custom_fields": cf_sell({**full_terms()})}
-check("state: agreement unset -> paperwork_missing",
-      lf._my_deal_visibility_state(deal_agreement_unsigned, lf.CEF_YES_ID, False) == "paperwork_missing")
+check("state: agreement unset -> still live (paperwork gates intros only)",
+      lf._my_deal_visibility_state(deal_agreement_unsigned, lf.CEF_YES_ID, False) == "live")
 deal_in_process = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_IN_PROCESS], **full_terms()})}
-check("state: In-Process agreement counts as missing",
-      lf._my_deal_visibility_state(deal_in_process, lf.CEF_YES_ID, False) == "paperwork_missing")
+check("state: In-Process agreement -> still live",
+      lf._my_deal_visibility_state(deal_in_process, lf.CEF_YES_ID, False) == "live")
+check("paperwork: In-Process agreement still counts as missing",
+      lf.PAPERWORK_AGREEMENT_MISSING in lf._coerce_paperwork(deal_in_process, lf.CEF_YES_ID)["missing"])
 deal_buyside_only = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [6354274], **full_terms()})}
 check("state: a BUY-side agreement (6354274) is in order even with no CEF",
       lf._my_deal_visibility_state(deal_buyside_only, lf.CEF_NO_ID, False) == "live")
@@ -617,28 +619,53 @@ check("is_won=False, everything unset -> falls through the normal ladder (not 's
 
 check("live badge exact text", lf._my_deal_visibility_badge_html(deal_full, lf.CEF_YES_ID, False)
       == '<span class="visibility-badge live">Live · shown to buyers</span>')
-check("ID-missing badge exact text", lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False)
-      == '<span class="visibility-badge id-required">Not live · ID required</span>')
-check("agreement-missing badge exact text", lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_YES_ID, False)
-      == '<span class="visibility-badge id-required">Not live · Agent agreement required</span>')
-check("both-missing badge names both",
-      lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_NO_ID, False)
-      == '<span class="visibility-badge id-required">Not live · ID required · Agent agreement required</span>')
+_id_badge = lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False)
+check("ID missing: Live pill plus amber 'ID needed before introductions' line to the engagement form",
+      _id_badge.startswith('<span class="visibility-badge live">Live · shown to buyers</span>')
+      and "Not live" not in _id_badge
+      and f'<a class="paperwork-note needed" href="{lf.CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">'
+          'ID needed before introductions</a>' in _id_badge)
+_agr_deal = {"id": 4242, "company": {"name": "Acme & Co"}, **deal_agreement_unsigned}
+_agr_badge = lf._my_deal_visibility_badge_html(_agr_deal, lf.CEF_YES_ID, False)
+check("agreement missing: Live pill plus amber 'Agent agreement needed before introductions' line",
+      _agr_badge.startswith('<span class="visibility-badge live">Live · shown to buyers</span>')
+      and 'class="paperwork-note needed"' in _agr_badge
+      and "Agent agreement needed before introductions</a>" in _agr_badge and "ID needed" not in _agr_badge)
+_mailto = lf._agent_agreement_mailto("Acme & Co", 4242)
+check("agreement mailto: recipient, subject and body",
+      _mailto == ("mailto:cgracia@rainmakersecurities.com?subject="
+                  + lf.urllib.parse.quote("Agent agreement \u2014 Acme & Co (#4242)", safe="")
+                  + "&body=" + lf.urllib.parse.quote("Hi Chad, please send the agent agreement for Acme & Co (#4242).", safe="")))
+_mt = lf.urllib.parse.urlparse(_mailto)
+_mq = lf.urllib.parse.parse_qs(_mt.query)
+check("agreement mailto decodes to the exact subject/body",
+      _mt.path == "cgracia@rainmakersecurities.com"
+      and _mq["subject"] == ["Agent agreement \u2014 Acme & Co (#4242)"]
+      and _mq["body"] == ["Hi Chad, please send the agent agreement for Acme & Co (#4242)."])
+check("agreement line links that mailto (HTML-escaped)", f'href="{lf._esc(_mailto)}"' in _agr_badge)
+_both_badge = lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_NO_ID, False)
+check("both missing: Live pill, ID line then agreement line",
+      'class="visibility-badge live"' in _both_badge
+      and 0 < _both_badge.find("ID needed before introductions")
+      < _both_badge.find("Agent agreement needed before introductions"))
+check("archived rows (show_paperwork=False) get no paperwork lines",
+      lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_NO_ID, False, show_paperwork=False)
+      == '<span class="visibility-badge live">Live · shown to buyers</span>')
 check("terms_incomplete badge exact text", lf._my_deal_visibility_badge_html(deal_no_terms, lf.CEF_YES_ID, False)
       == '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>')
 check("held badge exact text", lf._my_deal_visibility_badge_html(deal_full, lf.CEF_YES_ID, True)
       == '<span class="visibility-badge held">Held · not shown to buyers</span>')
 check("sold badge exact text", lf._my_deal_visibility_badge_html({}, None, False, is_won=True)
       == '<span class="visibility-badge sold">Sold &#10003;</span>')
-check("no 'CEF' wording in the Visibility badge",
+check("no 'CEF' wording in the Status badge",
       "CEF" not in lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False))
 _buyside_badge = lf._my_deal_visibility_badge_html(deal_buyside_only, lf.CEF_NO_ID, False)
-check("buy-side agreement: Visibility shows Live plus a green 'Buy-side agreement' note",
+check("buy-side agreement: Status shows Live plus a green 'Buy-side agreement' note",
       'class="visibility-badge live"' in _buyside_badge
       and '<span class="paperwork-note buy-side">&#10003; Buy-side agreement</span>' in _buyside_badge)
 
-# Next Steps: paperwork chips first (red, one per missing item); once in
-# order, "Extend deadline" is the only red chip; archived -> "Reopen".
+# Next Steps: "Extend deadline" is the only red chip; archived -> "Reopen".
+# Paperwork is never a Next Steps chip (it lives under the Status pill).
 chip = lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, view_as=None)
 check("in order + past deadline -> red 'Extend deadline ->' to the update form",
       'class="action-chip overdue"' in chip and "Extend deadline &rarr;" in chip
@@ -651,12 +678,11 @@ check("terms_incomplete beats nudge", 'class="action-chip terms"' in chip and "P
 chip = lf._my_deal_action_chip_html("1", "Co", False, True, "live", key=None, view_as=None)
 check("nudge shown alone when nothing else applies", 'class="action-chip nudge"' in chip and "Nudge buyers" in chip)
 
-chip = lf._my_deal_action_chip_html("1", "Co", True, False, "paperwork_missing", key=None, view_as=None,
-                                     paperwork_missing=["ID required", "Agent agreement required"])
-check("paperwork missing -> one red chip per missing item, linking CEF form / agreement doc",
-      chip.count('class="action-chip paperwork"') == 2 and "ID required &rarr;" in chip and "CEF" not in chip
-      and "Agent agreement required &rarr;" in chip and lf.CEF_FORM_URL in chip and lf.AGENT_AGREEMENT_DOC_URL in chip)
-check("paperwork missing -> no Extend deadline chip yet", "Extend deadline" not in chip)
+_pw_row_chip = lf._my_deal_row_chip_html(deal_agreement_unsigned, "Co", "2020-01-01",
+                                          {"stalled": False}, lf.CEF_NO_ID, "active", False)
+check("paperwork missing no longer blocks Extend deadline and adds no paperwork chip",
+      'class="action-chip overdue"' in _pw_row_chip and "paperwork" not in _pw_row_chip
+      and "ID required" not in _pw_row_chip and "Agent agreement" not in _pw_row_chip)
 
 chip = lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, view_as=None, archived=True)
 check("archived -> only the red 'Reopen ->' chip, to the update form",
@@ -791,7 +817,7 @@ check("_message_page has no leftover dark bg", "#14161a" not in msg_page)
 # Item: Deal ID moved under the company name (own sub-line, not a
 # standalone column), Size column removed entirely, header order.
 head = page[page.find("<thead>"):page.find("</thead>")]
-expected_order = ["Deal", "Visibility", "Interested buyers", "Intros", "Deadline", "Next Steps"]
+expected_order = ["Deal", "Status", "Interested buyers", "Intros", "Deadline", "Next Steps"]
 positions = [head.find(f">{h}<") for h in expected_order]
 check("header columns present in the exact expected order", positions == sorted(positions) and all(p != -1 for p in positions))
 check("Deal ID column header removed", "<th>Deal ID</th>" not in page)
@@ -6213,10 +6239,11 @@ check("ID status: no qualifying team member -> required",
       lf._deal_id_status(md_deal, "alice@harkcap.com", 1601) == "required")
 alice_md_req = body_only(_md_get("alice@harkcap.com", {})["body"])
 alice_row_req = row_for(alice_md_req, "54779042") or ""
-check("paperwork: sell-side agreement but no CEF anywhere on the team -> 'ID required' (Visibility + Next Steps)",
+check("paperwork: sell-side agreement but no CEF anywhere on the team -> Live + amber 'ID needed' line",
       lf.deal_paperwork_status(md_deal, "alice@harkcap.com", 1601)
       == {"in_order": False, "missing": ["ID required"], "buy_side": False}
-      and "Not live · ID required</span>" in alice_row_req and "ID required &rarr;" in alice_row_req)
+      and 'class="visibility-badge live"' in alice_row_req and "Not live" not in alice_row_req
+      and "ID needed before introductions</a>" in alice_row_req and "action-chip paperwork" not in alice_row_req)
 alice_co_req = _md_get("alice@harkcap.com", {"company": "Hark Labs"})["body"]
 check("paperwork: company page shows the full FINRA wording for the same status",
       "&#10007; FINRA-mandated ID requirements unmet</a>" in alice_co_req
@@ -6239,10 +6266,13 @@ md_noagr_row = lf._my_deal_row_html(md_noagr, "Hark Labs", None, {"non_terminal_
                                      0, lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602), "active")
 md_noagr_card = lf._deal_card_html(md_noagr, "Hark Labs",
                                    paperwork=lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602))
-check("paperwork: table row and detail card agree on 'Agent agreement required'",
-      "Not live · Agent agreement required</span>" in md_noagr_row
-      and "Agent agreement required &rarr;" in md_noagr_row
-      and "&#10007; Agent agreement required</a>" in md_noagr_card and "Paperwork in order" not in md_noagr_card)
+_noagr_mailto = lf._esc(lf._agent_agreement_mailto("Hark Labs", md_noagr["id"]))
+check("paperwork: table row and detail card agree on the amber agreement mailto",
+      'class="visibility-badge live"' in md_noagr_row and "Not live" not in md_noagr_row
+      and f'<a class="paperwork-note needed" href="{_noagr_mailto}">Agent agreement needed before introductions</a>'
+          in md_noagr_row
+      and f'<a class="id-status-badge id-needed" href="{_noagr_mailto}">Agent agreement needed before introductions</a>'
+          in md_noagr_card and "Paperwork in order" not in md_noagr_card)
 
 # --- Actions on every team row + write auth
 _md_fixture(lf.CEF_YES_ID)
@@ -6332,7 +6362,7 @@ pw_deal = next(d for d in lf.get_deals_list() if d["id"] == 88001)
 check("buy-side: 6354274 with no CEF on the team -> in order, buy_side flagged",
       lf.deal_paperwork_status(pw_deal, "ann@pwcap.com", 1701) == {"in_order": True, "missing": [], "buy_side": True})
 pw_row = row_for(body_only(_pw_get("ann@pwcap.com")["body"]), "88001") or ""
-check("buy-side: My Deals Visibility shows the green 'Buy-side agreement' note, no red paperwork",
+check("buy-side: My Deals Status shows the green 'Buy-side agreement' note, no red paperwork",
       '<span class="paperwork-note buy-side">&#10003; Buy-side agreement</span>' in pw_row
       and "Not live" not in pw_row and "action-chip paperwork" not in pw_row)
 pw_card = _pw_get("ann@pwcap.com", {"company": "Pw Target"})["body"]
@@ -6343,8 +6373,10 @@ check("buy-side: detail card shows the same green 'Buy-side agreement'",
 _pw_fixture([lf.AGENT_AGREEMENT_SELL_SIGNED_ID])
 pw_mydeals = _pw_get("ann@pwcap.com")["body"]
 pw_row = row_for(body_only(pw_mydeals), "88001") or ""
-check("sell-side without CEF: short chips say 'ID required'",
-      "Not live · ID required</span>" in pw_row and "ID required &rarr;" in pw_row)
+check("sell-side without CEF: Live pill + amber 'ID needed before introductions' to the engagement form",
+      'class="visibility-badge live"' in pw_row and "Not live" not in pw_row
+      and f'href="{lf.CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">ID needed before introductions</a>'
+          in pw_row)
 check("nav badge: full 'FINRA-mandated ID requirements unmet' wording",
       "&#10007; FINRA-mandated ID requirements unmet</a>" in pw_mydeals)
 pw_card = _pw_get("ann@pwcap.com", {"company": "Pw Target"})["body"]
@@ -6354,8 +6386,9 @@ check("detail card: full 'FINRA-mandated ID requirements unmet' wording",
 # In Process -> Agent agreement required
 _pw_fixture([6354283], bob_cef=lf.CEF_YES_ID)
 pw_row = row_for(body_only(_pw_get("ann@pwcap.com")["body"]), "88001") or ""
-check("In Process agreement -> 'Agent agreement required' (red)",
-      "Not live · Agent agreement required</span>" in pw_row and "Agent agreement required &rarr;" in pw_row)
+check("In Process agreement -> Live pill + amber 'Agent agreement needed before introductions'",
+      'class="visibility-badge live"' in pw_row and "Not live" not in pw_row
+      and "Agent agreement needed before introductions</a>" in pw_row)
 _pw_fixture([])
 check("blank agreement -> 'Agent agreement required'",
       lf.deal_paperwork_status(next(d for d in lf.get_deals_list() if d["id"] == 88001), "ann@pwcap.com", 1701)
@@ -6583,7 +6616,13 @@ md_red = sorted(c for c in lf.RED_ACTION_CHIP_RE.findall(md_page) if 'class="act
 ov_att = ov_body[ov_body.find('class="ov-section ov-attention"'):ov_body.find('class="ov-section ov-track"')]
 ov_red = sorted(lf.RED_ACTION_CHIP_RE.findall(ov_att))
 check("attention: exactly My Deals' red chips excluding Reopen (same text + targets)",
-      md_red == ov_red and len(ov_red) == 2)
+      md_red == ov_red and len(ov_red) == 1 and "Extend deadline" in ov_red[0])
+_pax_mailto = lf._esc(lf._agent_agreement_mailto("Pax Co", 89002))
+check("attention: includes the amber paperwork item with the same mailto as the Status line",
+      f'<a class="action-chip paperwork-needed" href="{_pax_mailto}">Agent agreement needed before introductions</a>'
+      in ov_att
+      and f'<a class="paperwork-note needed" href="{_pax_mailto}">Agent agreement needed before introductions</a>'
+      in (row_for(md_page, "89002") or ""))
 check("attention: never contains a Reopen chip", "Reopen" not in ov_att)
 check("attention: no all-clear line when there are items", "All paperwork in order" not in ov_att)
 
@@ -6598,6 +6637,28 @@ ov_open = ov_body[ov_body.find('class="ov-section ov-open"'):ov_body.find('class
 check("open deals: live deals only, See all link to My Deals",
       "Orion Co" in ov_open and "Rex Co" not in ov_open and "Sol Co" not in ov_open
       and 'href="?tab=mydeals">See all in My Deals &rarr;</a>' in ov_open)
+
+# --- Status: paperwork gates introductions, not visibility
+ov_open_head = ov_open[ov_open.find("<thead>"):ov_open.find("</thead>")]
+check("status: Overview Open deals header reads Status (rendered uppercase as STATUS), not Visibility",
+      "<th>Status</th>" in ov_open_head and "Visibility" not in ov_open_head
+      and "text-transform: uppercase" in lf.OVERVIEW_CSS)
+_md_head = md_page[md_page.find("<thead>"):md_page.find("</thead>")]
+check("status: My Deals header reads Status, not Visibility", "<th>Status</th>" in _md_head and "Visibility" not in _md_head)
+_pax_row = row_for(md_page, "89002") or ""
+check("status: Pax (no agent agreement) is 'Live · shown to buyers' plus the amber agreement line",
+      '<span class="visibility-badge live">Live · shown to buyers</span>' in _pax_row
+      and "Agent agreement needed before introductions</a>" in _pax_row and "Not live" not in _pax_row
+      and "Pax Co" in ov_open and "Agent agreement needed before introductions</a>" in ov_open)
+_live_ids = {r["deal"]["id"] for r in md_model["live_rows"]}
+check("status: Pax counts in Live deals and in $ in pipeline",
+      89002 in _live_ids and t["live_deals"] == len(_live_ids) == 3
+      and lf._deal_pipeline_size(next(d for d in ov_deals if d["id"] == 89002)) > 0)
+check("pipeline: $ in pipeline = sum of sizes over exactly the Live-deals set",
+      t["pipeline_total"] == sum(lf._deal_pipeline_size(r["deal"]) or 0 for r in md_model["live_rows"])
+      and t["pipeline_total"] == md_model["pipeline_total"]
+      and _live_ids == {r["deal"]["id"] for r in md_model["rows"] if r["section"] == "active"
+                        and lf._my_deal_visibility_state(r["deal"], r["id_status"], False) == "live"})
 
 # --- Team scoping
 _ov_fresh()
@@ -6619,6 +6680,41 @@ ov_clean = body_only(_ov_get("alice@ovcap.com")["body"])
 check("attention: the green all-clear line when nothing is red",
       '<div class="ov-all-clear">All paperwork in order, no deadlines past.</div>' in ov_clean
       and not lf.RED_ACTION_CHIP_RE.findall(ov_clean))
+
+# --- Zero live deals, no intros, nothing closed: $0 pipeline + compact empty states
+use_fixture({lf.PEOPLE_KEY: {"people": [
+                 {"id": 1851, "full_name": "Nia None", "email": "nia@nonecap.com", "company_id": 8851,
+                  "company_name": "None Capital", "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}}]},
+             lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [
+                 # Sized, but no fees -> "Not live · awaiting deal terms": not a live deal.
+                 {"id": 89501, "name": "Nova block", "company": {"name": "Nova Co"},
+                  "deal_stage": {"id": lf.STAGE_FIRM}, "people": [{"id": 1851}], "is_archived": False,
+                  "custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_YES], lf.TICKET_MAX_FIELD: 4_000_000}),
+                  "updated_at": "2026-08-01T00:00:00Z", "created_at": "2026-03-02T00:00:00Z"}]}},
+            ses=FakeSES())
+lf._closed_deals_cache["deals"] = []
+lf._closed_deals_cache["fetched_at"] = time.time()
+lf._req_cache_reset()
+_zero_tiles = lf._overview_model(lf.get_firm_sell_deals(1851), 1851, "nia@nonecap.com")["tiles"]
+ov_zero = body_only(_ov_get("nia@nonecap.com")["body"])
+check("pipeline: a fixture with 0 live deals shows $0 in pipeline",
+      _zero_tiles["live_deals"] == 0 and _zero_tiles["pipeline_total"] == 0
+      and '<div class="ov-tile-label">Live deals</div><div class="ov-tile-value">0</div>' in ov_zero
+      and '<div class="ov-tile-label">$ in pipeline</div><div class="ov-tile-value">$0</div>' in ov_zero)
+_empty_line = ('<p class="ov-empty-line ov-intros-empty">No introductions yet. Buyers are introduced '
+               "once there's interest and paperwork is in place.</p>")
+check("empty intros: one muted line replaces the Active intros card",
+      _empty_line in ov_zero and 'class="ov-section ov-intros"' not in ov_zero)
+_tiles_end = ov_zero.find('<div class="ov-tiles">')
+check("empty intros: the line sits under the tiles and Open deals comes first after it",
+      _tiles_end != -1 and _tiles_end < ov_zero.find(_empty_line) < ov_zero.find('class="ov-section ov-open"')
+      and ov_zero.find('class="ov-section ov-open"') < ov_zero.find('class="ov-section ov-attention"')
+      < ov_zero.find('class="ov-section ov-track"'))
+_zero_track = ov_zero[ov_zero.find('class="ov-section ov-track"'):]
+check("empty track record: compact 'No closed deals yet.' line, no table/history",
+      '<p class="ov-empty-line">No closed deals yet.</p>' in _zero_track and "ov-table" not in _zero_track
+      and "deals listed" not in _zero_track)
 
 
 # ======================================================================
