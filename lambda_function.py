@@ -413,51 +413,92 @@ def _deal_update_form_url(deal_id):
     return f"{DEAL_UPDATE_FORM_URL}?deal_id={deal_id}&token={token}"
 
 
+# Next Steps ownership -- THE map of who acts on each Next Steps item
+# (My Deals Next Steps, Overview "Needs your attention"). "gracia" items
+# read "Chad to do"; "seller" items "<team name> to do" for a domain team,
+# else "You to do" (_seller_owner_name).
+NEXT_STEP_OWNERS = {
+    "nudge": "gracia", "awaiting": "gracia",
+    "agreement": "seller", "id": "seller", "terms": "seller", "terms-nudge": "seller",
+    "overdue": "seller", "reopen": "seller", "waiting": "seller",
+}
+GRACIA_OWNER_TEXT = "Chad to do"
+
+
+def _seller_owner_name(tenant_email):
+    """The seller side's name in owner labels: the domain team's company
+    name, else "You" (individual tenants)."""
+    team = _tenant_team(tenant_email) if tenant_email else None
+    return (team or {}).get("name") or "You"
+
+
+def _next_step_owner_text(kind, seller_name="You"):
+    if NEXT_STEP_OWNERS[kind] == "gracia":
+        return GRACIA_OWNER_TEXT
+    return f"{seller_name or 'You'} to do"
+
+
+def _next_step_html(kind, chip_html, seller_name="You"):
+    """One Next Steps item: the chip plus its small muted owner line."""
+    return (f'<div class="next-step">{chip_html}'
+            f'<div class="next-step-owner">{_esc(_next_step_owner_text(kind, seller_name))}</div></div>')
+
+
 def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibility_state,
-                               key=None, view_as=None, terms_missing=None, archived=False):
-    """Next Steps column. Archived row -> one red "Reopen ->" chip (update
-    form). Otherwise ONE chip by priority (paperwork is never a chip here
-    -- it renders under the Status pill, see _paperwork_lines_html): "Extend deadline ->" (red, update form, only
-    when the deadline has passed) > "Provide deal terms ->" (amber) >
-    "Nudge buyers ->" (amber) > "Complete deal terms ->" (amber,
-    advisory). When more than one applies, the chip's tooltip names the
-    rest."""
+                               key=None, view_as=None, terms_missing=None, archived=False,
+                               paperwork_items=None, awaiting=False, seller_name="You"):
+    """Next Steps column: every applicable item, each with its owner line
+    (_next_step_html). Archived row -> the red "Reopen ->" (update form;
+    never on a Won/"sold" row). Otherwise, in order: paperwork (amber
+    "Agent agreement needed ->" mailto / "ID needed ->" ID form, from
+    paperwork_items = _pending_block_items) > deal terms ("Provide deal
+    terms ->" / "Complete deal terms ->", amber, update form) > "Extend
+    deadline ->" (red, update form, deadline passed) > "Nudge buyers ->"
+    (amber) > "Awaiting introduction by Gracia Group" (pending intros with
+    paperwork in order)."""
     update_url = _deal_update_form_url(deal_id)
     if archived:
-        # Archived deals: the one red "Reopen ->" chip, to the update form
-        # -- only on Lost / Obsolete / Trade Broken rows, never on a Won
-        # ("sold") row.
         if not update_url or visibility_state == "sold":
             return ""
-        return _reopen_chip_html(update_url)
-    # "Extend deadline" is the only red chip; every other state keeps its
-    # non-red (amber) display.
-    candidates = []
-    if is_overdue and update_url:
-        candidates.append(("extend deadline", "overdue", "Extend deadline &rarr;", update_url, True, None))
+        return _next_step_html("reopen", _reopen_chip_html(update_url), seller_name)
+    items = []
+    for label, href, new_tab in (paperwork_items or []):
+        kind = "agreement" if label == PENDING_AGREEMENT_TEXT else "id"
+        target = ' target="_blank" rel="noopener noreferrer"' if new_tab else ""
+        items.append((kind, f'<a class="action-chip paperwork-needed" href="{_esc(href)}"{target}>'
+                            f'{_esc(label)} &rarr;</a>'))
+    new_tab_attr = ' target="_blank" rel="noopener noreferrer"'
     if visibility_state == "terms_incomplete" and update_url:
-        candidates.append(("provide deal terms", "terms", "Provide deal terms &rarr;", update_url, True, None))
+        items.append(("terms", f'<a class="action-chip terms" href="{update_url}"{new_tab_attr}>'
+                               'Provide deal terms &rarr;</a>'))
+    elif visibility_state == "live" and terms_missing and update_url:
+        items.append(("terms-nudge", f'<a class="action-chip terms-nudge" '
+                                     f'title="{_esc("Missing: " + ", ".join(terms_missing))}" href="{update_url}"'
+                                     f'{new_tab_attr}>Complete deal terms &rarr;</a>'))
+    if is_overdue and update_url:
+        items.append(("overdue", f'<a class="action-chip overdue" href="{update_url}"{new_tab_attr}>'
+                                 'Extend deadline &rarr;</a>'))
     if stalled:
         href = _company_href(company_name, "mydeals", key, view_as)
-        candidates.append(("nudge buyers", "nudge", "Nudge buyers &rarr;", href, False, None))
-    if visibility_state == "live" and terms_missing and update_url:
-        candidates.append(("complete deal terms", "terms-nudge", "Complete deal terms &rarr;", update_url, True,
-                            "Missing: " + ", ".join(terms_missing)))
-    if not candidates:
-        return ""
-    phrase, css_class, label, href, new_tab, custom_title = candidates[0]
-    rest = [c[0] for c in candidates[1:]]
-    if custom_title:
-        title_attr = f' title="{_esc(custom_title)}"'
-    elif rest:
-        title_attr = f' title="{_esc("Also: " + ", ".join(rest))}"'
-    else:
-        title_attr = ""
-    target_attr = ' target="_blank" rel="noopener noreferrer"' if new_tab else ""
-    return f'<a class="action-chip {css_class}"{title_attr} href="{href}"{target_attr}>{label}</a>'
+        items.append(("nudge", f'<a class="action-chip nudge" href="{href}">Nudge buyers &rarr;</a>'))
+    if awaiting:
+        items.append(("awaiting", f'<span class="action-chip awaiting">{_esc(PENDING_AWAITING_TEXT)}</span>'))
+    return "".join(_next_step_html(kind, html, seller_name) for kind, html in items)
 
 
 DEAL_ACTION_LABEL = "Update, Pause or Cancel"
+ACTION_COL_PX = 76  # fixed width of every table's action column (stacked button fits inside)
+STACKED_ACTION_CSS = """
+  .update-cancel-btn.stacked { display: block; width: 64px; max-width: 100%; margin: 0 auto; box-sizing: border-box;
+                               text-align: center; line-height: 1.25; padding: 4px 2px; font-size: 11px;
+                               white-space: normal; overflow-wrap: anywhere; }
+  .update-cancel-btn.stacked span { display: block; }
+  .next-step { margin-bottom: 6px; }
+  .next-step:last-child { margin-bottom: 0; }
+  .next-step-owner { font-size: 10px; color: var(--muted); margin-top: 2px; }
+  .action-chip.paperwork-needed, .action-chip.awaiting { background: rgba(201,162,39,0.15); color: var(--accredited); }
+  .action-chip.awaiting { font-weight: 600; }
+"""
 
 
 def _is_closed_down_stage(stage_id):
@@ -472,19 +513,26 @@ def _reopen_chip_html(update_url):
             'rel="noopener noreferrer">Reopen &rarr;</a>')
 
 
-def _deal_action_html(deal_id, stage_id):
+def _deal_action_html(deal_id, stage_id, stacked=False):
     """THE per-deal action, shared by every place a sell deal renders (My
     Deals, Overview Open deals / Needs your attention / All closed deals,
     company-page Deal Details cards, Active Intros' company link): a live
     deal -> the "Update, Pause or Cancel" button; a closed-down deal
     (_is_closed_down_stage) -> red "Reopen ->"; a Won deal -> nothing.
     All link the same HMAC-signed update form (_deal_update_form_url);
-    "" when HMAC_SECRET isn't configured."""
+    "" when HMAC_SECRET isn't configured. stacked=True (every table cell)
+    renders the same single link compact, "Update" / "Pause" / "Cancel"
+    on three centered lines, so it fits its fixed-width column; cards keep
+    the one-line label."""
     url = _deal_update_form_url(deal_id)
     if not url or _is_won_stage(stage_id):
         return ""
     if _is_closed_down_stage(stage_id):
         return _reopen_chip_html(url)
+    if stacked:
+        return (f'<a class="update-cancel-btn stacked" href="{url}" target="_blank" rel="noopener noreferrer" '
+                f'aria-label="{_esc(DEAL_ACTION_LABEL)}" title="{_esc(DEAL_ACTION_LABEL)}">'
+                '<span>Update</span><span>Pause</span><span>Cancel</span></a>')
     return (f'<a class="update-cancel-btn" href="{url}" target="_blank" rel="noopener noreferrer">'
             f'{_esc(DEAL_ACTION_LABEL)}</a>')
 
@@ -8766,7 +8814,7 @@ def _company_update_link_html(person_id, company_name):
     sell_deals = get_my_sell_deals(person_id, company_name)
     if not sell_deals:
         return ""
-    action = _deal_action_html(str(sell_deals[0].get("id")), _deal_stage_id(sell_deals[0]))
+    action = _deal_action_html(str(sell_deals[0].get("id")), _deal_stage_id(sell_deals[0]), stacked=True)
     return f'<div class="company-update-link">{action}</div>' if action else ""
 
 
@@ -9424,6 +9472,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     padding: 32px 24px 64px;
   }}
 {NAV_CSS}
+{STACKED_ACTION_CSS}
 {FEATURE_CSS}
 {ADD_BUYER_CSS}
 {MANUAL_INTRO_CSS}
@@ -9676,16 +9725,20 @@ def _my_deal_is_overdue(deadline, section):
 
 
 def _my_deal_row_chip_html(deal, company_name, deadline, stats, paperwork, section, archived, key=None,
-                           view_as=None):
+                           view_as=None, seller_name="You"):
     """The exact Next Steps cell a My Deals row renders -- shared with the
     Overview tab's "Needs your attention" list so both show the same red
     chips with the same targets."""
     is_held = section == "hold"
     is_won = section == "closed"
     visibility_state = _my_deal_visibility_state(deal, paperwork, is_held, is_won=is_won)
+    paperwork_items = [] if archived else _pending_block_items(deal, paperwork)
+    awaiting = (not archived and bool(stats.get("pending_count")) and paperwork is not None
+                and _coerce_paperwork(deal, paperwork)["in_order"])
     return _my_deal_action_chip_html(str(deal.get("id")), company_name, _my_deal_is_overdue(deadline, section),
                                       stats["stalled"], visibility_state, key=key, view_as=view_as,
-                                      terms_missing=_deal_terms_missing(deal), archived=archived)
+                                      terms_missing=_deal_terms_missing(deal), archived=archived,
+                                      paperwork_items=paperwork_items, awaiting=awaiting, seller_name=seller_name)
 
 
 RED_ACTION_CHIP_RE = re.compile(r'<a class="action-chip (?:overdue|reopen)"[^>]*>.*?</a>', re.S)
@@ -9693,7 +9746,7 @@ RED_ACTION_CHIP_RE = re.compile(r'<a class="action-chip (?:overdue|reopen)"[^>]*
 
 def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section,
                        key=None, view_as=None, edit_mode=False, colleague_name=None, archived=False,
-                       resolved_stage=None):
+                       resolved_stage=None, seller_name="You"):
     deal_id = str(deal.get("id"))
     if company_name:
         company_link = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
@@ -9788,7 +9841,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
             deadline_html = "—"
 
     action_chip_html = _my_deal_row_chip_html(deal, company_name, deadline, stats, cef_state, section,
-                                               archived, key=key, view_as=view_as)
+                                               archived, key=key, view_as=view_as, seller_name=seller_name)
 
     # Bug fix: Hold/Cancel/Reactivate are tenant self-service (see
     # _handle_deal_stage), never admin-only, but the
@@ -9806,7 +9859,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # see. Archived rows get none -- their "Reopen ->" chip links to the
     # same form.
     actions_html = ("" if archived else
-                    f'<div class="actions-stack">{_deal_action_html(deal_id, resolved_stage)}</div>')
+                    f'<div class="actions-stack">{_deal_action_html(deal_id, resolved_stage, stacked=True)}</div>')
 
 
     return (
@@ -10011,8 +10064,9 @@ def _overview_waiting_html(n, block_items):
     return (f'<span class="ov-waiting">{n} buyer{"" if n == 1 else "s"} waiting — </span>{reasons}')
 
 
-def _overview_attention_items(rows, key=None, view_as=None, pending_intros=None):
-    """[(row, chip_html)] -- the red chips My Deals renders in Next Steps
+def _overview_attention_items(rows, key=None, view_as=None, pending_intros=None, seller_name="You"):
+    """[(row, item_html)] -- each item wrapped with its owner line
+    (_next_step_html / NEXT_STEP_OWNERS, same map as My Deals). The red chips My Deals renders in Next Steps
     (same helper, same targets; Reopen excluded), plus one amber item per
     missing paperwork item on a live-table row (same links as the lines
     under its Status pill), plus one "<N> buyers waiting — <reason>" line
@@ -10026,17 +10080,20 @@ def _overview_attention_items(rows, key=None, view_as=None, pending_intros=None)
     for r in rows:
         w = waiting.get(str(r["deal"].get("id")))
         if w:
-            items.append((r, _overview_waiting_html(*w)))
+            items.append((r, _next_step_html("waiting", _overview_waiting_html(*w), seller_name)))
         archived = r["section"] in ("cancelled", "closed")
         chip_html = _my_deal_row_chip_html(r["deal"], r["company_name"], r["deadline"], r["stats"], r["id_status"],
                                            r["section"], archived, key=key, view_as=view_as)
         for red in RED_ACTION_CHIP_RE.findall(chip_html):
             if 'class="action-chip reopen"' in red:
                 continue  # Reopen never belongs in "Needs your attention"
-            items.append((r, red))
+            items.append((r, _next_step_html("overdue", red, seller_name)))
         if not archived:
             for label, href, new_tab in _paperwork_needed_items(r["deal"], r["id_status"]):
-                items.append((r, _paperwork_needed_link_html(label, href, new_tab, "action-chip paperwork-needed")))
+                kind = "agreement" if label == PAPERWORK_AGREEMENT_NEEDED_TEXT else "id"
+                items.append((r, _next_step_html(
+                    kind, _paperwork_needed_link_html(label, href, new_tab, "action-chip paperwork-needed"),
+                    seller_name)))
     return items
 
 
@@ -10095,7 +10152,8 @@ OVERVIEW_CSS = """
   .ov-history { font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
   .deadline-overdue { color: #b23b3b; font-weight: 600; }
   .ov-row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
-  .ov-table td.ov-actions { text-align: right; white-space: nowrap; }
+  .ov-table td.ov-actions, .ov-table th.ov-actions { width: 76px; text-align: center; }
+  .ov-row-actions .update-cancel-btn.stacked { flex: 0 0 auto; }
   .update-cancel-btn { display: inline-block; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px;
                        text-decoration: none; background: rgba(31,122,77,0.15); color: var(--qp); }
   .update-cancel-btn:hover { text-decoration: underline; }
@@ -10170,12 +10228,13 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             + '</div>')
 
         # 2) Needs your attention
-        items = _overview_attention_items(rows, key=key, view_as=view_as, pending_intros=ov["pending_intros"])
+        items = _overview_attention_items(rows, key=key, view_as=view_as, pending_intros=ov["pending_intros"],
+                                          seller_name=_seller_owner_name(anon_key_email))
         if items:
             att_rows = "".join(
                 f'<div class="ov-row ov-attention-row"><div>{_overview_company_link(r["company_name"], key, view_as)}'
                 f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></div>'
-                f'<div class="ov-row-actions">{chip}{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"])}'
+                f'<div class="ov-row-actions">{chip}{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], stacked=True)}'
                 '</div></div>'
                 for r, chip in items)
         else:
@@ -10191,11 +10250,11 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             f'<td>{_my_deal_visibility_badge_html(r["deal"], r["id_status"], r["section"] == "hold")}</td>'
             f'<td class="num">{r["buyer_count"]}</td><td class="num">{r["stats"]["non_terminal_count"] or "—"}</td>'
             f'<td>{_overview_deadline_html(r, key, view_as)}</td>'
-            f'<td class="ov-actions">{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"])}</td></tr>'
+            f'<td class="ov-actions">{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], stacked=True)}</td></tr>'
             for r in live_rows[:OVERVIEW_LIST_LIMIT])
         open_table = (('<table class="ov-table"><thead><tr><th>Deal</th><th>Status</th>'
                        '<th class="num">Interested buyers</th><th class="num">Active intros</th><th>Deadline</th>'
-                       '<th></th></tr></thead>'
+                       '<th class="ov-actions"></th></tr></thead>'
                        f'<tbody>{open_body}</tbody></table>') if live_rows
                       else '<div class="ov-muted" style="padding:10px 0">No open deals.</div>')
         open_html = (f'<section class="ov-section ov-open"><h2>Open deals</h2><div class="card">{open_table}</div>'
@@ -10308,6 +10367,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
                     font-size: 15px; }}
 {OVERVIEW_CSS}
 {FEATURE_CSS}
+{STACKED_ACTION_CSS}
 </style>
 </head>
 <body>
@@ -10540,6 +10600,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         pipeline_total = model["pipeline_total"]
         closed_total = model["closed_total"]
         section_row_htmls = {"active": [], "hold": [], "cancelled": [], "closed": []}
+        seller_name = _seller_owner_name(anon_key_email)
         for r in rows:
             section = r["section"]
             section_row_htmls[section].append(
@@ -10547,7 +10608,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                                    r["id_status"], section, key=key, view_as=view_as, edit_mode=edit_mode,
                                    colleague_name=r["colleague_name"],
                                    archived=section in ("cancelled", "closed"),
-                                   resolved_stage=r["resolved_stage"]))
+                                   resolved_stage=r["resolved_stage"], seller_name=seller_name))
 
         summary_parts = []
         if live_count:
@@ -10595,13 +10656,13 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
             return f"""<div class="{card_cls}">
     <table>
       <colgroup>
-        <col style="width:17%">
-        <col style="width:21%">
+        <col>
+        <col style="width:20%">
         <col style="width:8%">
         <col style="width:8%">
-        <col style="width:12%">
-        <col style="width:22%">
-        <col style="width:12%">
+        <col style="width:11%">
+        <col style="width:20%">
+        <col class="col-actions" style="width:{ACTION_COL_PX}px">
       </colgroup>
       <thead>
         <tr>
@@ -10649,6 +10710,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 <style>
 {NAV_CSS}
 {FEATURE_CSS}
+{STACKED_ACTION_CSS}
   :root {{
     --bg: #f4f2ee;
     --card: #ffffff;

@@ -670,7 +670,8 @@ chip = lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, vie
 check("in order + past deadline -> red 'Extend deadline ->' to the update form",
       'class="action-chip overdue"' in chip and "Extend deadline &rarr;" in chip
       and lf.DEAL_UPDATE_FORM_URL in chip)
-check("overdue tooltip names the other applicable actions", 'title="Also: nudge buyers"' in chip)
+check("overdue + stalled: both items render, Extend deadline before Nudge buyers",
+      -1 < chip.find("Extend deadline") < chip.find("Nudge buyers"))
 
 chip = lf._my_deal_action_chip_html("1", "Co", False, True, "terms_incomplete", key=None, view_as=None)
 check("terms_incomplete beats nudge", 'class="action-chip terms"' in chip and "Provide deal terms" in chip)
@@ -680,9 +681,11 @@ check("nudge shown alone when nothing else applies", 'class="action-chip nudge"'
 
 _pw_row_chip = lf._my_deal_row_chip_html(deal_agreement_unsigned, "Co", "2020-01-01",
                                           {"stalled": False}, lf.CEF_NO_ID, "active", False)
-check("paperwork missing no longer blocks Extend deadline and adds no paperwork chip",
-      'class="action-chip overdue"' in _pw_row_chip and "paperwork" not in _pw_row_chip
-      and "ID required" not in _pw_row_chip and "Agent agreement" not in _pw_row_chip)
+check("paperwork missing: amber paperwork chips come first in Next Steps, then Extend deadline",
+      'class="action-chip overdue"' in _pw_row_chip
+      and -1 < _pw_row_chip.find("Agent agreement needed &rarr;") < _pw_row_chip.find("ID needed &rarr;")
+      < _pw_row_chip.find("Extend deadline")
+      and "ID required" not in _pw_row_chip)
 
 chip = lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, view_as=None, archived=True)
 check("archived -> only the red 'Reopen ->' chip, to the update form",
@@ -1181,7 +1184,7 @@ check("Active Intros: both same-company rows render the full company link (2 occ
       page_repeat.count(">Repeat Co<") == 2)
 check("Active Intros: both same-company rows also render the shared deal action (2 occurrences)",
       page_repeat.count('<div class="company-update-link">') == 2
-      and page_repeat.count(">Update, Pause or Cancel<") == 2)
+      and page_repeat.count('class="update-cancel-btn stacked"') == 2)
 
 admin_page_repeat = body_only(lf.render_intros_page(
     "Rhea Repeat", tenant=repeat_tenant, tenant_email="rhea@example.com",
@@ -6245,7 +6248,9 @@ check("paperwork: sell-side agreement but no CEF anywhere on the team -> Live + 
       lf.deal_paperwork_status(md_deal, "alice@harkcap.com", 1601)
       == {"in_order": False, "missing": ["ID required"], "buy_side": False}
       and 'class="visibility-badge live"' in alice_row_req and "Not live" not in alice_row_req
-      and "ID needed before introductions</a>" in alice_row_req and "action-chip paperwork" not in alice_row_req)
+      and "ID needed before introductions</a>" in alice_row_req
+      and '<a class="action-chip paperwork-needed" href="' + lf.CEF_FORM_URL in alice_row_req
+      and "Agent agreement needed &rarr;" not in alice_row_req)
 alice_co_req = _md_get("alice@harkcap.com", {"company": "Hark Labs"})["body"]
 check("paperwork: company page shows the full FINRA wording for the same status",
       "&#10007; FINRA-mandated ID requirements unmet</a>" in alice_co_req
@@ -6871,6 +6876,7 @@ def _ac_get(q):
 
 
 _AC_BTN = ">Update, Pause or Cancel<"
+_AC_STACK = 'class="update-cancel-btn stacked"'
 # --- The shared helper
 check("action helper: live stage -> the 'Update, Pause or Cancel' button to the signed update form",
       _AC_BTN in lf._deal_action_html("99201", lf.STAGE_FIRM)
@@ -6884,7 +6890,7 @@ check("action helper: Won -> no action at all",
 
 # --- My Deals
 _ac_md = body_only(_ac_get({"tab": "mydeals"}))
-check("my deals: live row has the shared button", _AC_BTN in (row_for(_ac_md, "99201") or ""))
+check("my deals: live row has the shared button (stacked variant)", _AC_STACK in (row_for(_ac_md, "99201") or ""))
 check("my deals: Obsolete/Lost rows have Reopen and no button",
       all("Reopen &rarr;" in (row_for(_ac_md, i) or "") and _AC_BTN not in (row_for(_ac_md, i) or "x")
           for i in ("99203", "99204")))
@@ -6902,12 +6908,12 @@ _ac_track = _ac_ov[_ac_ov.find('class="ov-section ov-track"'):]
 _ac_track = _ac_track[:_ac_track.find("</section>")]
 _ac_intros = _ac_ov[_ac_ov.find('class="ov-section ov-intros"'):]
 _ac_intros = _ac_intros[:_ac_intros.find("</section>")]
-check("overview: Open deals row has the shared button", _AC_BTN in _ac_open)
+check("overview: Open deals row has the shared button (stacked variant)", _AC_STACK in _ac_open)
 check("overview: a past deadline in Open deals renders red with the 'Extend deadline' chip",
       '<span class="deadline-overdue">' in _ac_open and 'class="action-chip overdue"' in _ac_open
       and "Extend deadline &rarr;" in _ac_open)
 check("overview: Needs your attention row (Extend) also carries the shared button",
-      "Extend deadline &rarr;" in _ac_att and _AC_BTN in _ac_att and "Reopen" not in _ac_att)
+      "Extend deadline &rarr;" in _ac_att and _AC_STACK in _ac_att and "Reopen" not in _ac_att)
 _ac_all_closed = _ac_track[_ac_track.find("ov-all-closed"):]
 check("overview: All closed deals -> Reopen on Obsolete and Lost, nothing on Won",
       _ac_all_closed.count("Reopen &rarr;") == 2 and _AC_BTN not in _ac_track)
@@ -6958,7 +6964,7 @@ check("company page: no 'Help shape this dashboard' box", 'id="feature-box"' not
       and "Help shape this dashboard" not in _ac_co)
 _ac_ai = body_only(_ac_get({"tab": "intros"}))
 check("feedback box: not on Active Intros", 'id="feature-box"' not in _ac_ai)
-check("active intros: the company link is the shared button", _AC_BTN in _ac_ai)
+check("active intros: the company link is the shared button (stacked variant)", _AC_STACK in _ac_ai)
 
 
 # ======================================================================
@@ -7126,6 +7132,126 @@ check("company page: 'Active intros' stat = 5 with '+3 pending'; sub-nav count =
       in _pn_co and ">Active intros (5)</a>" in _pn_co)
 _pn_open = _pn_ov[_pn_i_open:_pn_i_att]
 check("overview: Open deals column header is 'Active intros'", '<th class="num">Active intros</th>' in _pn_open)
+
+
+# ======================================================================
+# Next Steps ownership + paperwork chips; stacked action in tables
+# ======================================================================
+_ns_past = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y/%m/%d")
+_ns_people = {"people": [
+    {"id": 2801, "full_name": "Mia Mang", "email": "mia@mangusta.com", "company_id": 9801,
+     "company_name": "Mangusta Capital", "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
+    {"id": 2802, "full_name": "Ivy Solo", "email": "ivy.solo@gmail.com", "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
+    {"id": 2901, "full_name": "Nsbuyer Stalled", "email": "s@nsb1.com", "custom_fields": {}},
+    {"id": 2902, "full_name": "Nsbuyer Pending", "email": "p@nsb2.com", "custom_fields": {}},
+]}
+_ns_deals = [
+    # Mia (team "Mangusta Capital"): paperwork in order, Share Class missing -> Complete deal terms,
+    # past deadline -> Extend, a stalled intro -> Nudge, a pending intro -> Awaiting introduction.
+    {"id": 99801, "name": "Mang block", "company": {"name": "Mang Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+     "custom_fields": cf_sell({**MD_TERMS, lf.DEADLINE_FIELD: _ns_past}), "people": [{"id": 2801}],
+     "updated_at": "2026-08-01T00:00:00Z", "created_at": "2026/03/02 09:00:00 +0000"},
+    {"id": 99811, "name": "Mang buy", "company": {"name": "Mang Co"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+     "custom_fields": cf_status(lf.INTRO_STATUS_STALLED_ID), "people": [{"id": 2801}, {"id": 2901}],
+     "updated_at": "2026-08-02T00:00:00Z"},
+    {"id": 99812, "name": "Mang buy", "company": {"name": "Mang Co"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+     "custom_fields": cf_status(7207578), "people": [{"id": 2801}, {"id": 2902}], "updated_at": "2026-08-02T00:00:00Z"},
+    # Ivy (individual, gmail): no agent agreement -> agreement chip, "You to do".
+    {"id": 99802, "name": "Ivy block", "company": {"name": "Ivy Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+     "custom_fields": cf_sell({k: v for k, v in MD_TERMS.items() if k != lf.AGENT_AGREEMENT_FIELD}),
+     "people": [{"id": 2802}], "updated_at": "2026-08-01T00:00:00Z", "created_at": "2026/03/02 09:00:00 +0000"},
+]
+use_fixture({lf.PEOPLE_KEY: _ns_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": _ns_deals}},
+            table_items=[{"tenant": "mia@mangusta.com", "sk": "intro#99811", "milestones": {"NDA": 1}}])
+lf._closed_deals_cache["deals"] = []
+lf._closed_deals_cache["fetched_at"] = time.time()
+lf._req_cache_reset()
+
+
+def _ns_get(email, q):
+    lf._req_cache_reset()
+    return body_only(lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                        "queryStringParameters": q, "cookies": [tenant_cookie(email)]}, None)["body"])
+
+
+def _ns_owner_after(html, chip_text):
+    """The owner line of the Next Steps item whose chip contains chip_text."""
+    i = html.find(chip_text)
+    m = re.compile(r'<div class="next-step-owner">([^<]*)</div>').search(html, i) if i != -1 else None
+    return m.group(1) if m else None
+
+
+check("owner map: seller name = team company name, else 'You'",
+      lf._seller_owner_name("mia@mangusta.com") == "Mangusta Capital"
+      and lf._seller_owner_name("ivy.solo@gmail.com") == "You")
+check("owner map: Chad owns Nudge buyers and Awaiting introduction; the seller owns every other item",
+      all(lf._next_step_owner_text(k, "Mangusta Capital") == "Chad to do" for k in ("nudge", "awaiting"))
+      and all(lf._next_step_owner_text(k, "Mangusta Capital") == "Mangusta Capital to do"
+              for k in ("agreement", "id", "terms", "terms-nudge", "overdue", "reopen", "waiting")))
+_ns_mia = _ns_get("mia@mangusta.com", {"tab": "mydeals"})
+_ns_mia_row = row_for(_ns_mia, "99801") or ""
+_ns_mia_steps = _ns_mia_row[_ns_mia_row.find('<div class="next-step">'):]
+check("next steps (team): Complete deal terms -> 'Mangusta Capital to do'",
+      _ns_owner_after(_ns_mia_steps, "Complete deal terms") == "Mangusta Capital to do")
+check("next steps (team): Extend deadline -> 'Mangusta Capital to do'",
+      _ns_owner_after(_ns_mia_steps, "Extend deadline") == "Mangusta Capital to do")
+check("next steps: Nudge buyers -> 'Chad to do'", _ns_owner_after(_ns_mia_steps, "Nudge buyers") == "Chad to do")
+check("next steps: pending intro with paperwork in order -> 'Awaiting introduction by Gracia Group', 'Chad to do'",
+      _ns_owner_after(_ns_mia_steps, "Awaiting introduction by Gracia Group") == "Chad to do")
+check("next steps: order = deal terms, deadline, nudge, awaiting; no paperwork chip when in order",
+      -1 < _ns_mia_steps.find("Complete deal terms") < _ns_mia_steps.find("Extend deadline")
+      < _ns_mia_steps.find("Nudge buyers") < _ns_mia_steps.find("Awaiting introduction")
+      and "paperwork-needed" not in _ns_mia_steps)
+check("next steps: every chip carries an owner line",
+      _ns_mia_steps.count('<div class="next-step">') == _ns_mia_steps.count('<div class="next-step-owner">') == 4)
+_ns_ivy = _ns_get("ivy.solo@gmail.com", {"tab": "mydeals"})
+_ns_ivy_row = row_for(_ns_ivy, "99802") or ""
+_ns_ivy_mailto = lf._esc(lf._agent_agreement_mailto("Ivy Co", 99802))
+check("next steps: a deal missing its agreement shows the amber agreement chip (same mailto), first",
+      f'<a class="action-chip paperwork-needed" href="{_ns_ivy_mailto}">Agent agreement needed &rarr;</a>'
+      in _ns_ivy_row
+      and _ns_ivy_row.find("Agent agreement needed &rarr;") < _ns_ivy_row.find("Complete deal terms"))
+check("next steps (individual): agreement and deal terms -> 'You to do'",
+      _ns_owner_after(_ns_ivy_row, "Agent agreement needed &rarr;") == "You to do"
+      and _ns_owner_after(_ns_ivy_row, "Complete deal terms") == "You to do")
+
+# --- Overview Needs your attention uses the same owner labels
+_ns_mia_ov = _ns_get("mia@mangusta.com", {"tab": "overview"})
+_ns_mia_att = _ns_mia_ov[_ns_mia_ov.find('class="ov-section ov-attention"'):_ns_mia_ov.find('class="ov-section ov-track"')]
+check("attention (team): Extend deadline row labelled 'Mangusta Capital to do'",
+      _ns_owner_after(_ns_mia_att, "Extend deadline") == "Mangusta Capital to do")
+_ns_ivy_ov = _ns_get("ivy.solo@gmail.com", {"tab": "overview"})
+_ns_ivy_att = _ns_ivy_ov[_ns_ivy_ov.find('class="ov-section ov-attention"'):_ns_ivy_ov.find('class="ov-section ov-track"')]
+check("attention (individual): agreement row labelled 'You to do'",
+      _ns_owner_after(_ns_ivy_att, "Agent agreement needed before introductions") == "You to do")
+
+# --- Stacked action button: every table action cell uses the compact variant
+_ns_stack = lf._deal_action_html("99801", lf.STAGE_FIRM, stacked=True)
+check("stacked: one link, same target, 'Update' / 'Pause' / 'Cancel' on separate lines",
+      _ns_stack.count("<a ") == 1 and lf._deal_update_form_url("99801") in _ns_stack
+      and "<span>Update</span><span>Pause</span><span>Cancel</span>" in _ns_stack
+      and 'class="update-cancel-btn stacked"' in _ns_stack)
+check("stacked: CSS stacks the words, centers them and caps the width at the cell (no overflow)",
+      ".update-cancel-btn.stacked span { display: block; }" in lf.STACKED_ACTION_CSS
+      and "max-width: 100%" in lf.STACKED_ACTION_CSS and "text-align: center" in lf.STACKED_ACTION_CSS)
+
+
+def _ns_table_action_cells_stacked(html):
+    buttons = re.findall(r'<a class="update-cancel-btn[^"]*"', html)
+    return bool(buttons) and all(b == '<a class="update-cancel-btn stacked"' for b in buttons)
+
+
+check("stacked: My Deals table action cells only use the stacked variant, in a fixed-width column",
+      _ns_table_action_cells_stacked(_ns_mia)
+      and f'<col class="col-actions" style="width:{lf.ACTION_COL_PX}px">' in _ns_mia
+      and '<td class="actions"><div class="actions-stack"><a class="update-cancel-btn stacked"' in _ns_mia_row)
+_ns_mia_open = _ns_mia_ov[_ns_mia_ov.find('class="ov-section ov-open"'):_ns_mia_ov.find('class="ov-section ov-attention"')]
+check("stacked: Overview Open deals and Needs your attention use only the stacked variant",
+      _ns_table_action_cells_stacked(_ns_mia_open) and _ns_table_action_cells_stacked(_ns_mia_att)
+      and '<td class="ov-actions"><a class="update-cancel-btn stacked"' in _ns_mia_open)
+_ns_mia_co = _ns_get("mia@mangusta.com", {"company": "Mang Co"})
+check("company-page cards keep the one-line label",
+      '<a class="update-cancel-btn" href=' in _ns_mia_co and ">Update, Pause or Cancel</a>" in _ns_mia_co)
 
 
 # ======================================================================
