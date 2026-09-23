@@ -5525,6 +5525,203 @@ check("_handle_demand_list: sellers count unchanged (0, no live sell deals in th
 
 
 # ======================================================================
+# SECTION: Public Bio (custom_label_3801446) -- parser, display, inline
+# edit gating, bulk page validation, write order
+# ======================================================================
+
+# --- Parser
+check("bio parser: headline only", lf.parse_public_bio("Partner at Acme") == ("Partner at Acme", []))
+check("bio parser: headline plus points",
+      lf.parse_public_bio("Partner at Acme • MIT BS • Sails") == ("Partner at Acme", ["MIT BS", "Sails"]))
+check("bio parser: stray whitespace and empty segments dropped",
+      lf.parse_public_bio("  Head  •   one  • •  \n two \n •   ") == ("Head", ["one", "two"]))
+check("bio parser: empty string", lf.parse_public_bio("") == ("", []))
+check("bio parser: None", lf.parse_public_bio(None) == ("", []))
+check("bio parser: newlines but no bullet -> headline only",
+      lf.parse_public_bio("Line one\nLine two\nLine three") == ("Line one\nLine two\nLine three", []))
+
+# --- HTML escaping
+esc_head = lf._bio_headline_html('<script>x</script> & "q"')
+check("bio headline is HTML-escaped",
+      "<script>" not in esc_head and "&lt;script&gt;" in esc_head and "&amp;" in esc_head and "&quot;q&quot;" in esc_head)
+esc_card = lf._bio_points_card_html(['<b>bold</b>', 'a & b'])
+check("bio points are HTML-escaped",
+      "<b>" not in esc_card and "&lt;b&gt;bold&lt;/b&gt;" in esc_card and "a &amp; b" in esc_card)
+check("bio points card titled 'Before your call'", "Before your call" in esc_card)
+check("bio points card hidden when there are no points", lf._bio_points_card_html([]) == "")
+check("bio headline renders nothing when empty", lf._bio_headline_html("") == "")
+
+# --- Bulk validation
+def _vb(raw):
+    return lf.validate_bio_batch(raw)
+check("bulk validation: bad JSON rejected", _vb("{not json")[0] is None and "parse" in _vb("{not json")[1])
+check("bulk validation: non-numeric key rejected", _vb(json.dumps({"12a": "Head"}))[0] is None)
+check("bulk validation: empty value rejected", _vb(json.dumps({"12": "   "}))[0] is None)
+check("bulk validation: non-string value rejected", _vb(json.dumps({"12": 5}))[0] is None)
+check("bulk validation: value over 1500 chars rejected", _vb(json.dumps({"12": "x" * 1501}))[0] is None)
+check("bulk validation: value of exactly 1500 chars accepted", _vb(json.dumps({"12": "x" * 1500}))[0] is not None)
+check("bulk validation: more than 25 entries rejected",
+      _vb(json.dumps({str(i): "Head" for i in range(1, 27)}))[0] is None)
+check("bulk validation: 25 entries accepted", len(_vb(json.dumps({str(i): "Head" for i in range(1, 26)}))[0]) == 25)
+check("bulk validation: one bad entry rejects the whole batch",
+      _vb(json.dumps({"1": "ok", "2": "ok", "x": "bad"}))[0] is None)
+
+# --- Display fixture: tenant 1 disclosed on buyer 2 (deal 802); buyer 4
+# has a CRM bio only; buyer 2 has both (Dynamo wins).
+bio_people = {"people": [
+    {"id": TENANT_PID, "full_name": "Sella Seller", "email": TENANT_EMAIL, "custom_fields": {}},
+    {"id": 2, "name": "Alice Buyer", "email": "alice@example.com", "work_city": "Boston",
+     "custom_fields": {lf.PUBLIC_BIO_FIELD: "CRM headline • CRM point"}},
+    {"id": 4, "name": "Carol Buyer", "email": "carol@example.com",
+     "custom_fields": {lf.PUBLIC_BIO_FIELD: "Carol CRM headline"}},
+]}
+bio_items = [{"tenant": "__bios__", "sk": "bio#2", "bio": "Dynamo head <i> • Point one • Point <two>",
+              "updated_at": "2026-09-01T00:00:00Z"}]
+_, bio_table = use_fixture({lf.PEOPLE_KEY: bio_people, lf.INTEREST_KEY: {"buy": {}},
+                            lf.DEALS_KEY: {"deals": [deal_disc_802, deal_own_sell]}}, table_items=bio_items)
+bio_tenant = lf._resolve_tenant(TENANT_EMAIL)
+bio_page = lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None, view_as=None, edit_mode=False)
+check("display: Dynamo bio wins over the CRM field", "Dynamo head" in bio_page and "CRM headline" not in bio_page)
+check("display: headline escaped on the page", "Dynamo head &lt;i&gt;" in bio_page and "Dynamo head <i>" not in bio_page)
+check("display: headline sits right after the location line",
+      bio_page.find("Boston") < bio_page.find("Dynamo head") < bio_page.find("mailto:alice@example.com"))
+check("display: 'Before your call' card with escaped points",
+      "Before your call" in bio_page and "<li>Point one</li>" in bio_page and "<li>Point &lt;two&gt;</li>" in bio_page)
+check("display: 'Before your call' card sits below the header card, before Private notes",
+      bio_page.find('class="card buyer-header"') < bio_page.find("Before your call") < bio_page.find("Private notes"))
+check("tenant view: no bio edit textarea", 'id="bio-edit-text"' not in bio_page and "save_bio" not in bio_page)
+
+carol_page = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None, view_as=None, edit_mode=False)
+check("display: CRM field used when no Dynamo record", "Carol CRM headline" in carol_page)
+check("display: headline-only bio hides the 'Before your call' card", "Before your call" not in carol_page)
+
+bio_table.items.append({"tenant": "__bios__", "sk": "bio#4", "bio": "", "updated_at": "2026-09-02T00:00:00Z"})
+carol_cleared = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None, view_as=None, edit_mode=False)
+check("display: an empty Dynamo bio renders nothing (no CRM fallback)",
+      "Carol CRM headline" not in carol_cleared and "bio-headline" not in carol_cleared)
+
+admin_noedit = lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
+                                    view_as=TENANT_EMAIL, edit_mode=True, bio_edit=False)
+check("admin view without &edit=1: bio shown, no edit textarea",
+      "Dynamo head" in admin_noedit and 'id="bio-edit-text"' not in admin_noedit)
+admin_edit = lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
+                                  view_as=TENANT_EMAIL, edit_mode=True, bio_edit=True)
+check("admin view with &edit=1: bio textarea prefilled (escaped) + Save",
+      'id="bio-edit-text"' in admin_edit and "Dynamo head &lt;i&gt; • Point one • Point &lt;two&gt;" in admin_edit
+      and 'id="bio-edit-save"' in admin_edit and "?action=save_bio" in admin_edit)
+check("bio_edit without edit_mode/key (tenant) never renders the editor",
+      'id="bio-edit-text"' not in lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None,
+                                                   view_as=None, edit_mode=False, bio_edit=True))
+
+def _bio_get(query, cookies=None):
+    return {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+            "queryStringParameters": query, "cookies": cookies or []}
+
+tenant_edit_resp = lf.lambda_handler(_bio_get({"buyer": "2", "edit": "1"}, [tenant_cookie(TENANT_EMAIL)]), None)
+check("tenant with &edit=1: page renders but no bio editor",
+      tenant_edit_resp["statusCode"] == 200 and "Dynamo head" in tenant_edit_resp["body"]
+      and 'id="bio-edit-text"' not in tenant_edit_resp["body"])
+admin_edit_resp = lf.lambda_handler(_bio_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL, "edit": "1"}), None)
+check("admin &view_as&edit=1 via handler: bio editor shown", 'id="bio-edit-text"' in admin_edit_resp["body"])
+tenant_bulk = lf.lambda_handler(_bio_get({"view": "bios"}, [tenant_cookie(TENANT_EMAIL)]), None)
+check("tenant: bulk bios route is 403 and renders no form",
+      tenant_bulk["statusCode"] == 403 and "bios" not in tenant_bulk["body"])
+wrongkey_bulk = lf.lambda_handler(_bio_get({"view": "bios", "key": "nope"}), None)
+check("wrong key: bulk bios route is 403", wrongkey_bulk["statusCode"] == 403)
+admin_bulk = lf.lambda_handler(_bio_get({"view": "bios", "key": ADMIN_KEY}), None)
+check("admin: bulk bios page renders textarea + Save",
+      admin_bulk["statusCode"] == 200 and '<textarea name="bios">' in admin_bulk["body"] and ">Save<" in admin_bulk["body"])
+
+# --- Write path: Pipeline PUT first; failed PUT -> no Dynamo write
+bio_calls = []
+
+def _bio_urlopen_ok(req, timeout=15):
+    bio_calls.append((req.get_method(), req.full_url, json.loads(req.data.decode())))
+    return FakeHTTPResponse(200)
+
+def _bio_urlopen_fail(req, timeout=15):
+    bio_calls.append((req.get_method(), req.full_url, json.loads(req.data.decode())))
+    raise lf.urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+
+_, bio_table = use_fixture({lf.PEOPLE_KEY: bio_people, lf.INTEREST_KEY: {"buy": {}},
+                            lf.DEALS_KEY: {"deals": [deal_disc_802, deal_own_sell]}})
+lf.urllib.request.urlopen = _bio_urlopen_fail
+bio_fail = lf.write_public_bio("2", "Head • pt")
+check("write order: failed Pipeline PUT -> error surfaced, no Dynamo attempt",
+      bio_fail["pipeline_ok"] is False and bio_fail["dynamo_ok"] is None and "Pipeline" in bio_fail["error"])
+check("write order: failed Pipeline PUT -> zero Dynamo writes", bio_table.puts == [] and bio_table.updates == [])
+
+bio_calls.clear()
+lf.urllib.request.urlopen = _bio_urlopen_ok
+bio_ok = lf.write_public_bio("2", "Head • pt")
+check("write: Pipeline PUT to /people/2.json with ONLY the bio field",
+      bio_calls and bio_calls[0][0] == "PUT" and "/people/2.json?" in bio_calls[0][1]
+      and "api_key=pk" in bio_calls[0][1] and "app_key=ak" in bio_calls[0][1]
+      and bio_calls[0][2] == {"person": {"custom_fields": {lf.PUBLIC_BIO_FIELD: "Head • pt"}}})
+bio_rec = next((i for i in bio_table.items if i.get("tenant") == "__bios__" and i.get("sk") == "bio#2"), None)
+check("write: Dynamo __bios__ record upserted with bio + ISO UTC updated_at",
+      bio_ok["pipeline_ok"] and bio_ok["dynamo_ok"] and bio_rec is not None and bio_rec["bio"] == "Head • pt"
+      and re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", bio_rec["updated_at"]))
+
+# Inline save endpoint
+def _bio_post(body):
+    return {"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+            "queryStringParameters": {"action": "save_bio"}, "cookies": [], "body": json.dumps(body)}
+check("save_bio: no admin key -> 403",
+      lf.lambda_handler(_bio_post({"person_id": "2", "bio": "x"}), None)["statusCode"] == 403)
+check("save_bio: tenant cookie without key -> 403",
+      lf.lambda_handler(dict(_bio_post({"person_id": "2", "bio": "x"}), cookies=[tenant_cookie(TENANT_EMAIL)]),
+                        None)["statusCode"] == 403)
+check("save_bio: over-length bio -> 400",
+      lf.lambda_handler(_bio_post({"key": ADMIN_KEY, "person_id": "2", "bio": "x" * 1501}), None)["statusCode"] == 400)
+lf.urllib.request.urlopen = _bio_urlopen_fail
+_, bio_table = use_fixture({lf.PEOPLE_KEY: bio_people, lf.INTEREST_KEY: {"buy": {}},
+                            lf.DEALS_KEY: {"deals": [deal_disc_802, deal_own_sell]}})
+save_fail = lf.lambda_handler(_bio_post({"key": ADMIN_KEY, "person_id": "2", "bio": "New • p"}), None)
+check("save_bio: Pipeline failure -> 502 with error, no Dynamo write",
+      save_fail["statusCode"] == 502 and "Pipeline" in json.loads(save_fail["body"])["error"] and bio_table.puts == [])
+lf.urllib.request.urlopen = _bio_urlopen_ok
+save_ok = lf.lambda_handler(_bio_post({"key": ADMIN_KEY, "person_id": "2", "bio": "New • p"}), None)
+check("save_bio: success -> 200 ok", save_ok["statusCode"] == 200 and json.loads(save_ok["body"])["ok"] is True)
+
+# Bulk POST: sequential, per-entry results; stops per person on Pipeline failure
+def _bio_bulk_post(raw, key=ADMIN_KEY):
+    return {"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+            "queryStringParameters": {"view": "bios", "key": key}, "cookies": [],
+            "body": lf.urllib.parse.urlencode({"bios": raw})}
+
+def _bio_urlopen_mixed(req, timeout=15):
+    bio_calls.append((req.get_method(), req.full_url, json.loads(req.data.decode())))
+    if "/people/5.json" in req.full_url:
+        raise lf.urllib.error.HTTPError(req.full_url, 422, "bad", {}, None)
+    return FakeHTTPResponse(200)
+
+bio_calls.clear()
+lf.urllib.request.urlopen = _bio_urlopen_mixed
+_, bio_table = use_fixture({lf.PEOPLE_KEY: bio_people, lf.INTEREST_KEY: {"buy": {}},
+                            lf.DEALS_KEY: {"deals": [deal_disc_802, deal_own_sell]}})
+bulk_resp = lf.lambda_handler(_bio_bulk_post(json.dumps({"4": "Carol • a", "5": "Dave • b", "2": "Alice • c"})), None)
+check("bulk POST: entries processed sequentially in input order",
+      [c[1].split("/people/")[1].split(".json")[0] for c in bio_calls] == ["4", "5", "2"])
+check("bulk POST: results table has the four columns",
+      all(h in bulk_resp["body"] for h in ["<th>person_id</th>", "<th>Pipeline</th>", "<th>Dynamo</th>", "<th>Error</th>"]))
+check("bulk POST: failed entry shows Pipeline ERR and its error text",
+      "<tr><td>5</td><td>ERR</td><td>—</td><td>Pipeline: HTTP 422" in bulk_resp["body"])
+check("bulk POST: good entries show OK/OK", "<tr><td>4</td><td>OK</td><td>OK</td>" in bulk_resp["body"])
+check("bulk POST: failed entry never reaches Dynamo",
+      not any(i.get("sk") == "bio#5" for i in bio_table.items)
+      and any(i.get("sk") == "bio#4" for i in bio_table.items) and any(i.get("sk") == "bio#2" for i in bio_table.items))
+
+bio_calls.clear()
+bad_bulk = lf.lambda_handler(_bio_bulk_post(json.dumps({"4": "ok", "abc": "bad"})), None)
+check("bulk POST: invalid batch -> 400, nothing written",
+      bad_bulk["statusCode"] == 400 and bio_calls == [] and "not a numeric person_id" in bad_bulk["body"])
+check("bulk POST: wrong key -> 403",
+      lf.lambda_handler(_bio_bulk_post("{}", key="nope"), None)["statusCode"] == 403)
+lf.urllib.request.urlopen = fake_urlopen
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 

@@ -3709,6 +3709,296 @@ def _dynamo_write_buyer_note(tenant_email, buyer_id, note, actor):
         return False, f"{type(e).__name__}: {e}"
 
 
+# ── Public Bio (Person custom_label_3801446) ────────────────────────────────
+# Plain text "<headline> • <point> • <point> ...", tenant-visible. Authoring
+# rules: docs/BIO_RULES.md. Write path: Pipeline PUT first, then Dynamo
+# (tenant="__bios__", sk="bio#<person_id>"); display reads Dynamo first,
+# else the person record's own custom field.
+PUBLIC_BIO_FIELD = "custom_label_3801446"
+BIO_PARTITION = "__bios__"
+BIO_MAX_LEN = 1500
+BIO_BULK_MAX_ENTRIES = 25
+
+
+def _bio_sk(person_id):
+    return f"bio#{person_id}"
+
+
+def parse_public_bio(text):
+    """(headline, points). Splits on "•" only, never on newlines:
+    segment 0 trimmed is the headline, every remaining non-empty trimmed
+    segment is a point. Empty/None -> ("", [])."""
+    segments = str(text or "").split("•")
+    headline = segments[0].strip()
+    points = [s.strip() for s in segments[1:] if s.strip()]
+    return headline, points
+
+
+def _get_bio_item(person_id):
+    try:
+        table = _dynamo_table()
+        with _perf_timer("dynamo"):
+            resp = table.get_item(Key={"tenant": BIO_PARTITION, "sk": _bio_sk(person_id)})
+        return resp.get("Item")
+    except Exception:
+        return None
+
+
+def _person_public_bio(rec):
+    """The Dynamo "__bios__" record wins whenever one exists (even an
+    empty one -- a cleared bio stays cleared); otherwise the person
+    record's own custom_label_3801446, if present. Never reads
+    people.json itself -- rec is the record the caller already has."""
+    person_id = (rec or {}).get("id")
+    item = _get_bio_item(person_id) if person_id is not None else None
+    if item is not None:
+        return str(item.get("bio") or "")
+    val = ((rec or {}).get("custom_fields") or {}).get(PUBLIC_BIO_FIELD)
+    if isinstance(val, list):
+        val = val[0] if val else ""
+    return str(val or "") if isinstance(val, str) else ""
+
+
+def _pipeline_update_person_bio(person_id, bio):
+    """PUT ONLY custom_label_3801446 on the person. Same query-string auth
+    and abort-on-non-2xx contract as _pipeline_update_deal_status."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    body = json.dumps({"person": {"custom_fields": {PUBLIC_BIO_FIELD: bio}}}).encode("utf-8")
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/people/{person_id}.json?{qs}",
+        data=body, method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _dynamo_write_bio(person_id, bio, actor):
+    now = datetime.now(timezone.utc)
+    old_item = _get_bio_item(person_id)
+    try:
+        table = _dynamo_table()
+        table.put_item(Item={
+            "tenant": BIO_PARTITION,
+            "sk": _bio_sk(person_id),
+            "bio": bio,
+            "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        })
+        table.put_item(Item={
+            "tenant": BIO_PARTITION,
+            "sk": f"audit#bio#{person_id}#{int(now.timestamp() * 1000)}",
+            "actor": actor,
+            "old": {"bio": (old_item or {}).get("bio")},
+            "new": {"bio": bio},
+        })
+        return True, None
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def write_public_bio(person_id, bio, actor="admin"):
+    """The one bio write path (inline save and bulk page). Pipeline PUT
+    first; on failure stop -- Dynamo is never touched. Returns
+    {"person_id", "pipeline_ok", "dynamo_ok", "error"} (dynamo_ok is None
+    when Dynamo was never attempted)."""
+    result = {"person_id": str(person_id), "pipeline_ok": False, "dynamo_ok": None, "error": ""}
+    ok, err = _pipeline_update_person_bio(person_id, bio)
+    if not ok:
+        result["error"] = f"Pipeline: {err}"
+        return result
+    result["pipeline_ok"] = True
+    ok, err = _dynamo_write_bio(person_id, bio, actor)
+    result["dynamo_ok"] = ok
+    if not ok:
+        result["error"] = f"Dynamo: {err}"
+    return result
+
+
+def validate_bio_batch(raw):
+    """(entries, error). entries is [(person_id_str, bio), ...] in input
+    order; any failure rejects the whole batch (entries None)."""
+    try:
+        data = json.loads(raw or "")
+    except Exception:
+        return None, "JSON does not parse"
+    if not isinstance(data, dict):
+        return None, 'JSON must be an object: {"<person_id>": "<bio>", ...}'
+    if not data:
+        return None, "No entries"
+    if len(data) > BIO_BULK_MAX_ENTRIES:
+        return None, f"Too many entries ({len(data)}); max {BIO_BULK_MAX_ENTRIES}"
+    entries = []
+    for k, v in data.items():
+        if not (isinstance(k, str) and k.isdigit() and k.isascii()):
+            return None, f"Key {k!r} is not a numeric person_id"
+        if not isinstance(v, str) or not v.strip():
+            return None, f"Value for {k} must be a non-empty string"
+        if len(v) > BIO_MAX_LEN:
+            return None, f"Value for {k} is {len(v)} characters; max {BIO_MAX_LEN}"
+        entries.append((k, v))
+    return entries, None
+
+
+def _bio_headline_html(headline):
+    return f'<div class="buyer-header-line bio-headline">{_esc(headline)}</div>' if headline else ""
+
+
+def _bio_points_card_html(points):
+    if not points:
+        return ""
+    items = "".join(f'<li>{_esc(p)}</li>' for p in points)
+    return (
+        '<div class="card bio-card"><h2 class="buyer-section-heading">Before your call</h2>'
+        f'<ul class="bio-points">{items}</ul></div>'
+    )
+
+
+def _bio_edit_html(person_id, bio_text):
+    """Admin-only (&edit=1) inline editor on the person card. Posts to
+    ?action=save_bio; the server re-checks ADMIN_KEY, so this is never
+    the only gate."""
+    return (
+        '<div class="bio-edit">'
+        f'<textarea class="bio-edit-text" id="bio-edit-text" data-person-id="{_esc(str(person_id))}" '
+        f'maxlength="{BIO_MAX_LEN}" placeholder="Headline • point • point">{_esc(bio_text)}</textarea>'
+        '<button type="button" id="bio-edit-save">Save</button> <span class="ei-msg" id="bio-edit-msg"></span>'
+        '</div>'
+    )
+
+
+def _bio_edit_script_html(key):
+    key_json = json.dumps(key or "")
+    return f"""<script>
+(function() {{
+  var btn = document.getElementById('bio-edit-save');
+  if (!btn) return;
+  btn.addEventListener('click', function() {{
+    var ta = document.getElementById('bio-edit-text');
+    var msg = document.getElementById('bio-edit-msg');
+    msg.className = 'ei-msg saving'; msg.textContent = 'Saving…';
+    fetch('?action=save_bio', {{
+      method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ key: {key_json}, person_id: ta.getAttribute('data-person-id'), bio: ta.value }})
+    }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+      if (d && d.ok) {{ window.location.reload(); }}
+      else {{ msg.className = 'ei-msg error'; msg.textContent = (d && d.error) || 'Save failed'; }}
+    }}).catch(function(e) {{ msg.className = 'ei-msg error'; msg.textContent = 'Save failed: ' + e; }});
+  }});
+}})();
+</script>"""
+
+
+def _handle_save_bio(event):
+    """POST ?action=save_bio -- admin-only (ADMIN_KEY in the body), the
+    inline editor's save. An empty bio is allowed here (clears it)."""
+    body = _parse_json_body(event)
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (admin_key and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+    person_id = str(body.get("person_id") or "").strip()
+    if not (person_id.isdigit() and person_id.isascii()):
+        return _json_response({"error": "person_id must be numeric"}, 400)
+    bio = body.get("bio")
+    if not isinstance(bio, str):
+        return _json_response({"error": "bio must be a string"}, 400)
+    bio = bio.strip()
+    if len(bio) > BIO_MAX_LEN:
+        return _json_response({"error": f"bio over {BIO_MAX_LEN} characters"}, 400)
+    result = write_public_bio(person_id, bio)
+    if not result["pipeline_ok"] or not result["dynamo_ok"]:
+        return _json_response({"error": result["error"], "result": result}, 502)
+    return _json_response({"ok": True, "result": result})
+
+
+def _parse_form_body(event):
+    body = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        try:
+            body = base64.b64decode(body).decode("utf-8", errors="replace")
+        except Exception:
+            return {}
+    return {k: v[0] for k, v in urllib.parse.parse_qs(body, keep_blank_values=True).items()}
+
+
+def _ok_err(v):
+    if v is None:
+        return "—"
+    return "OK" if v else "ERR"
+
+
+def render_bios_page(key, raw="", error="", results=None):
+    """?key=ADMIN_KEY&view=bios -- bulk Public Bio writer. Server-rendered
+    form; POSTs back to the same URL (key in the query string, same gate
+    as every other admin GET route)."""
+    action = f"?key={urllib.parse.quote(key or '', safe='')}&view=bios"
+    error_html = f'<p class="bios-error">{_esc(error)}</p>' if error else ""
+    results_html = ""
+    if results is not None:
+        rows = "".join(
+            f'<tr><td>{_esc(r["person_id"])}</td><td>{_ok_err(r["pipeline_ok"])}</td>'
+            f'<td>{_ok_err(r["dynamo_ok"])}</td><td>{_esc(r["error"])}</td></tr>'
+            for r in results
+        )
+        results_html = (
+            '<table class="bios-results"><thead><tr><th>person_id</th><th>Pipeline</th>'
+            f'<th>Dynamo</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>'
+        )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Syndicate · Gracia Group</title>
+<style>
+  body {{ margin: 0; background: #f4f2ee; color: #16181d; padding: 32px 24px 64px;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
+  .wrap {{ max-width: 900px; margin: 0 auto; }}
+  h1 {{ font-size: 20px; }}
+  textarea {{ width: 100%; min-height: 320px; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+             box-sizing: border-box; padding: 8px; }}
+  button {{ margin-top: 10px; padding: 6px 16px; font-size: 14px; }}
+  .bios-error {{ color: #b23b3b; font-weight: 600; }}
+  .bios-results {{ margin-top: 18px; border-collapse: collapse; width: 100%; font-size: 13px; background: #fff; }}
+  .bios-results th, .bios-results td {{ border: 1px solid #e7e5e0; padding: 6px 8px; text-align: left; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Public Bios — bulk write</h1>
+<p>JSON object {{"&lt;person_id&gt;": "&lt;bio&gt;", ...}}, max {BIO_BULK_MAX_ENTRIES} entries, each at most {BIO_MAX_LEN} characters. Writes Pipeline ({PUBLIC_BIO_FIELD}) first, then Dynamo.</p>
+{error_html}
+<form method="post" action="{_esc(action)}">
+<textarea name="bios">{_esc(raw)}</textarea>
+<button type="submit">Save</button>
+</form>
+{results_html}
+</div>
+</body>
+</html>"""
+
+
+def _handle_bios_view(event, method, key):
+    """Caller has already verified the admin key."""
+    if method == "GET":
+        return _html_response(render_bios_page(key))
+    raw = _parse_form_body(event).get("bios", "")
+    entries, error = validate_bio_batch(raw)
+    if error:
+        return _html_response(render_bios_page(key, raw=raw, error=error), 400)
+    results = [write_public_bio(pid, bio.strip()) for pid, bio in entries]
+    return _html_response(render_bios_page(key, raw=raw, results=results))
+
+
 # ── Feature-request capture ──────────────────────────────────────────────
 # Own Query, deliberately NOT merged into get_intro_details's — that query
 # is called from several places that have nothing to do with feature
@@ -10196,7 +10486,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 </html>"""
 
 
-def _buyer_header_html(rec, closer_kind, key=None, view_as=None):
+def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_headline="", bio_edit_html=""):
     """Turn 24: the buyer page's single header card, merging what used
     to be two separate blocks (IDENTITY + CAPACITY, turn 23) into one —
     a circular photo (item 1: ?photo=<id>, same key/view_as context as
@@ -10266,8 +10556,9 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None):
     return (
         f'<div class="card buyer-header"><div class="buyer-header-top">'
         f'<div class="buyer-header-identity">{photo_html}'
-        f'<div><div class="buyer-page-name">{name}</div>{line1_html}{line2_html}</div></div>'
-        f'{badges_html}</div>{chip_row_html}</div>'
+        f'<div><div class="buyer-page-name">{name}</div>{line1_html}{_bio_headline_html(bio_headline)}'
+        f'{line2_html}</div></div>'
+        f'{badges_html}</div>{chip_row_html}{bio_edit_html}</div>'
     )
 
 
@@ -10701,7 +10992,7 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
 
 
 def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=None, view_as=None, edit_mode=False,
-                       cef_html=""):
+                       cef_html="", bio_edit=False):
     """Item 3 (turn 18): ?buyer=<person_id> — replaces the old inline
     <details> expansion on Active Intros with a real page. DISCLOSURE
     GATE: the full profile (turn 24 layout — one header card, then a
@@ -10751,7 +11042,17 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
             full_access = edit_mode or _tenant_has_disclosed_deal_with(person_id, anon_key_email, buyer_id)
             if full_access:
                 closer_kind = _closer_kind(rec, _build_firm_won_index())
-                header_html = _buyer_header_html(rec, closer_kind, key=key, view_as=view_as)
+                # Public Bio: headline under the location line, points in
+                # the "Before your call" card under the header. bio_edit
+                # (admin + &edit=1 only, see lambda_handler) adds the
+                # inline editor; a tenant never gets it.
+                bio_text = _person_public_bio(rec)
+                bio_headline, bio_points = parse_public_bio(bio_text)
+                bio_edit_on = bool(bio_edit and edit_mode and key)
+                header_html = _buyer_header_html(rec, closer_kind, key=key, view_as=view_as,
+                                                 bio_headline=bio_headline,
+                                                 bio_edit_html=(_bio_edit_html(buyer_id, bio_text)
+                                                                if bio_edit_on else ""))
 
                 # About-the-firm: only ever looked up for an entity buyer
                 # (a natural person has no firm to look up) and only when
@@ -10774,13 +11075,16 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 )
                 private_notes_html = _buyer_private_notes_html(anon_key_email, buyer_id)
                 body_html = (
-                    f'<div class="buyer-top-row">{header_html}{private_notes_html}</div>'
+                    f'<div class="buyer-top-row"><div class="buyer-top-left">{header_html}'
+                    f'{_bio_points_card_html(bio_points)}</div>{private_notes_html}</div>'
                     + deal_team_html
                     + f'<div class="buyer-columns"><div class="buyer-col-left">{left_html}</div>'
                     + f'<div class="buyer-col-right">{right_html}</div></div>'
                 )
                 edit_script_html = _edit_script_html(key if edit_mode else None,
                                                        tenant_email=anon_key_email if edit_mode else None)
+                if bio_edit_on:
+                    edit_script_html += _bio_edit_script_html(key)
             else:
                 body_html = _buyer_page_anonymized_html(rec, anon_key_email, buyer_id)
 
@@ -10894,7 +11198,15 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
      in either of its cards) just collapses to nothing, never a
      visible empty box. */
   .buyer-top-row {{ display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; margin-bottom: 14px; }}
-  .buyer-top-row .buyer-header {{ flex: 1 1 420px; margin-bottom: 0; }}
+  .buyer-top-left {{ flex: 1 1 420px; display: flex; flex-direction: column; gap: 14px; min-width: 0; }}
+  .buyer-top-row .buyer-header {{ margin-bottom: 0; }}
+  .bio-points {{ margin: 0; padding-left: 0; list-style: none; font-size: 14px; line-height: 1.5; }}
+  .bio-points li {{ margin-top: 6px; }}
+  .bio-points li:first-child {{ margin-top: 0; }}
+  .bio-points li::before {{ content: "•"; color: var(--muted); margin-right: 8px; }}
+  .bio-edit {{ margin-top: 12px; }}
+  .bio-edit-text {{ width: 100%; min-height: 90px; box-sizing: border-box; font-family: inherit; font-size: 13px;
+                   border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; resize: vertical; }}
   .buyer-private-notes-card {{ flex: 1 1 280px; max-width: 360px; }}
   .buyer-columns {{ display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }}
   .buyer-col-left, .buyer-col-right {{ display: flex; flex-direction: column; gap: 14px; min-width: 0; }}
@@ -12310,6 +12622,21 @@ def _lambda_handler_impl(event, context):
             return _json_response({"error": "POST only"}, 405)
         return _handle_update_buyer_note(event)
 
+    if query.get("action") == "save_bio":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_save_bio(event)
+
+    # Bulk Public Bio page: GET renders, POST saves (form post back to
+    # the same URL). Same ADMIN_KEY query check as every admin GET route.
+    if query.get("view") == "bios":
+        bios_admin_key = os.environ.get("ADMIN_KEY")
+        if not (bios_admin_key and query.get("key") == bios_admin_key):
+            return _forbidden()
+        if method not in ("GET", "POST"):
+            return _forbidden()
+        return _handle_bios_view(event, method, query.get("key"))
+
     if method != "GET":
         return _forbidden()
 
@@ -12473,7 +12800,8 @@ def _lambda_handler_impl(event, context):
     buyer_param = query.get("buyer")
     if buyer_param:
         body = render_buyer_page(buyer_param, viewer_name, tenant, anon_key_email,
-                                  key=nav_key, view_as=nav_view_as, edit_mode=edit_mode, cef_html=cef_html)
+                                  key=nav_key, view_as=nav_view_as, edit_mode=edit_mode, cef_html=cef_html,
+                                  bio_edit=(is_admin_key and query.get("edit") == "1"))
         return _html_response(body)
 
     # Buyer photo (item 1): not an HTML page -- a 302 to Pipeline's signed
