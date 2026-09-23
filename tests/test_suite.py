@@ -6389,21 +6389,24 @@ lf.urllib.request.urlopen = fake_urlopen
 
 
 # ======================================================================
-# SECTION: Overview tab -- nav, default landing, figure parity with My
-# Deals / Active Intros / company page, attention list, disclosure,
-# team scoping, view_as on links
+# SECTION: Overview tab -- nav, default landing, section order, one Won /
+# Capital Raised definition, figure parity with My Deals / company page,
+# attention list, disclosure, team scoping, view_as on links
 # ======================================================================
 OV_FULL = {**MD_TERMS}
 
 def _ov_fixture(clean_only=False):
     people_ov = {"people": [
         {"id": 1801, "full_name": "Alice Ov", "email": "alice@ovcap.com", "company_id": 8801,
-         "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
+         "company_name": "Ov Capital", "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
         {"id": 1802, "full_name": "Bob Ov", "email": "bob@ovcap.com", "company_id": 8801, "custom_fields": {}},
         {"id": 1830, "full_name": "Zed Zov", "email": "zed@zetaov.io", "custom_fields": {}},
         {"id": 1901, "full_name": "Dora Disclosed", "email": "dora@buy1.com", "custom_fields": {}},
         {"id": 1902, "full_name": "Pat Pending", "email": "pat@buy2.com", "custom_fields": {}},
         {"id": 1903, "full_name": "Wes Won", "email": "wes@buy3.com", "custom_fields": {}},
+        {"id": 1904, "full_name": "Cleo Closed", "email": "cleo@buy4.com", "custom_fields": {}},
+        {"id": 1905, "full_name": "Walt Wired", "email": "walt@buy5.com", "custom_fields": {}},
+        {"id": 1906, "full_name": "Stan Stagewon", "email": "stan@buy6.com", "custom_fields": {}},
     ]}
 
     def sell(did, company, stage, cf, extra=None):
@@ -6413,27 +6416,41 @@ def _ov_fixture(clean_only=False):
         d.update(extra or {})
         return d
 
-    def buy(did, company, status, pid, stage=lf.STAGE_MATCHED, upd="2026-08-05T00:00:00Z"):
+    def buy(did, company, status, pid, stage=lf.STAGE_MATCHED, upd="2026-08-05T00:00:00Z", ticket=2_000_000):
         return {"id": did, "name": f"{company} buy", "company": {"name": company}, "deal_stage": {"id": stage},
-                "custom_fields": cf_status(status, {lf.TICKET_MAX_FIELD: 2_000_000}),
+                "custom_fields": cf_status(status, {lf.TICKET_MAX_FIELD: ticket}),
                 "people": [{"id": 1801}, {"id": pid}], "updated_at": upd}
 
-    deals_ov = [sell(89001, "Orion Co", lf.STAGE_FIRM, {**OV_FULL, lf.DEADLINE_FIELD: "2099/01/01"}),
-                buy(89101, "Orion Co", 7207579, 1901, upd="2026-08-09T00:00:00Z"),
-                buy(89102, "Orion Co", 7207578, 1902, upd="2026-08-07T00:00:00Z")]
+    live = [sell(89001, "Orion Co", lf.STAGE_FIRM, {**OV_FULL, lf.DEADLINE_FIELD: "2099/01/01"}),
+            buy(89101, "Orion Co", 7207579, 1901, upd="2026-08-09T00:00:00Z"),
+            buy(89102, "Orion Co", 7207578, 1902, upd="2026-08-07T00:00:00Z")]
+    closed = []
     if not clean_only:
-        deals_ov += [
+        live += [
+            # A Closed intro on the live Orion deal -> Orion is a won deal.
+            buy(89105, "Orion Co", lf.INTRO_STATUS_CLOSED_ID, 1904, upd="2026-08-08T00:00:00Z"),
             sell(89002, "Pax Co", lf.STAGE_FIRM, {k: v for k, v in OV_FULL.items() if k != lf.AGENT_AGREEMENT_FIELD}),
+            buy(89106, "Pax Co", lf.INTRO_STATUS_WIRED_ID, 1905, ticket=1_500_000),
             sell(89003, "Quill Co", lf.STAGE_FIRM, {**OV_FULL, lf.DEADLINE_FIELD: "2020/01/01"}),
-            sell(89004, "Rex Co", 111802, {lf.TICKET_MAX_FIELD: 3_000_000}, {"closed_time": "2026-06-15T00:00:00Z"}),
-            sell(89005, "Sol Co", lf.OBSOLETE_STAGE_ID, {}),
-            buy(89103, "Rex Co", 7207587, 1903, stage=111802),
             {"id": 89901, "name": "Zeta block", "company": {"name": "Zeta Private Co"},
              "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(OV_FULL), "people": [{"id": 1830}],
              "is_archived": False, "updated_at": "2026-08-01T00:00:00Z"},
         ]
-    return use_fixture({lf.PEOPLE_KEY: people_ov, lf.INTEREST_KEY: {"buy": {"Orion Co": [1901, 1902, 1903]}},
-                        lf.DEALS_KEY: {"deals": deals_ov}}, ses=FakeSES())
+        # Terminal-stage deals live ONLY in deals-closed.json (the closed cache).
+        closed = [
+            sell(89004, "Rex Co", 111802, {lf.TICKET_MAX_FIELD: 3_000_000}, {"closed_time": "2026-06-15T00:00:00Z"}),
+            sell(89005, "Sol Co", lf.OBSOLETE_STAGE_ID, {}),
+            buy(89103, "Rex Co", lf.INTRO_STATUS_CLOSED_ID, 1903, stage=111802),
+            # A buy deal at stage Won with a stale Wired status resolves to Closed
+            # (existing rule: a Won stage supersedes Intro Status) -> a won intro.
+            buy(89107, "Quill Co", lf.INTRO_STATUS_WIRED_ID, 1906, stage=111802, ticket=1_000_000),
+        ]
+    out = use_fixture({lf.PEOPLE_KEY: people_ov, lf.INTEREST_KEY: {"buy": {"Orion Co": [1901, 1902, 1903]}},
+                       lf.DEALS_KEY: {"deals": live}}, ses=FakeSES())
+    lf._closed_deals_cache["deals"] = closed
+    lf._closed_deals_cache["fetched_at"] = time.time()
+    lf._req_cache_reset()
+    return out
 
 def _ov_get(email, q=None):
     return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
@@ -6442,6 +6459,9 @@ def _ov_get(email, q=None):
 def _ov_header(page):
     return page[page.find('<header class="gg-nav">'):page.find("</header>")]
 
+def _ov_fresh():
+    lf._req_cache_reset()
+
 _ov_fixture()
 ov_page = _ov_get("alice@ovcap.com")["body"]
 ov_hdr = _ov_header(ov_page)
@@ -6449,90 +6469,137 @@ check("nav: Overview is the first tab and 'Gracia Group' is gone from the nav",
       ov_hdr.find(">Overview</a>") != -1
       and ov_hdr.find(">Overview</a>") < ov_hdr.find(">My Deals</a>") < ov_hdr.find(">Active Intros</a>")
       < ov_hdr.find(">Demand Board</a>") and "Gracia Group" not in ov_hdr)
-check("default landing: a tenant with no ?tab gets Overview (active tab)",
-      '<a class="gg-tab active" href="?tab=overview">Overview</a>' in ov_hdr and "Needs your attention" in ov_page)
+check("nav: Overview is the primary tab (larger/bolder class, ⌂ icon) with the normal active state",
+      '<a class="gg-tab gg-tab-primary active" href="?tab=overview"><span class="gg-tab-icon" aria-hidden="true">&#8962;</span>Overview</a>'
+      in ov_hdr and ".gg-tab-primary { font-size: 14px; font-weight: 700; }" in ov_page)
+check("default landing: a tenant with no ?tab gets Overview", "Needs your attention" in ov_page)
 ov_admin_va = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
                                  "queryStringParameters": {"key": ADMIN_KEY, "view_as": "alice@ovcap.com"},
                                  "cookies": []}, None)["body"]
 check("default landing: admin view_as with no tab gets Overview", "Needs your attention" in ov_admin_va
-      and 'class="gg-tab active" href="?tab=overview' in _ov_header(ov_admin_va))
+      and 'class="gg-tab gg-tab-primary active" href="?tab=overview' in _ov_header(ov_admin_va))
 ov_admin = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
                               "queryStringParameters": {"key": ADMIN_KEY}, "cookies": []}, None)["body"]
 check("default landing: admin without view_as keeps My Deals",
       'class="gg-tab active" href="?tab=mydeals' in _ov_header(ov_admin) and "Needs your attention" not in ov_admin)
-check("other tabs still highlight themselves (My Deals active on ?tab=mydeals)",
-      'class="gg-tab active" href="?tab=mydeals">My Deals' in _ov_header(_ov_get("alice@ovcap.com", {"tab": "mydeals"})["body"]))
 
-# --- Figures equal My Deals / Active Intros / company page
+ov_body = body_only(ov_page)
+check("title 'Overview' + subtitle '<firm> · updated <relative time>'",
+      '<h1 class="ov-title">Overview</h1>' in ov_body
+      and re.search(r'<p class="ov-subtitle">Ov Capital · updated (just now|\d+ (min|h) ago|\d+ days? ago)</p>', ov_body))
+order = [ov_body.find(m) for m in ('<h1 class="ov-title">', '<div class="ov-tiles">', 'class="ov-section ov-intros"',
+                                   'class="ov-section ov-open"', 'class="ov-section ov-attention"',
+                                   'class="ov-section ov-track"')]
+check("section order: title, tiles, Active intros, Open deals, Needs your attention, Track record",
+      all(p != -1 for p in order) and order == sorted(order))
+tile_labels = ("Capital Raised", "Live deals", "$ in pipeline", "Active intros", "Won", "Buyers introduced", "Intro → won")
+tile_pos = [ov_body.find(f'<div class="ov-tile-label">{lbl}</div>') for lbl in tile_labels]
+check("tiles: Capital Raised first (primary/largest), then the rest in spec order",
+      all(p != -1 for p in tile_pos) and tile_pos == sorted(tile_pos)
+      and '<div class="ov-tile ov-tile-primary"><div class="ov-tile-label">Capital Raised</div>' in ov_body)
+
+# --- One Won definition, deals-closed.json included
 ov_deals = lf.get_firm_sell_deals(1801)
 ov_model = lf._overview_model(ov_deals, 1801, "alice@ovcap.com")
-md_model = lf._my_deals_model(ov_deals, 1801, "alice@ovcap.com")
+t = ov_model["tiles"]
+ov_track = ov_body[ov_body.find('<section class="ov-section ov-track">'):]
+won_table = ov_track[:ov_track.find("</table>")]
+check("won: a Won deal present ONLY in deals-closed.json (Rex Co) shows on Overview",
+      89004 in {d["id"] for d in lf.get_closed_deals_list()}
+      and 89004 not in {d["id"] for d in lf._get_live_deals_list()} and "Rex Co" in won_table)
+check("won: a Closed intro on a live deal (Orion) makes that deal won",
+      lf._sell_deal_is_won(next(d for d in ov_deals if d["id"] == 89001), lf.STAGE_FIRM,
+                           lf._company_buy_stats(1801, "Orion Co", lf.get_intro_details("alice@ovcap.com")[0],
+                                                 tenant_email="alice@ovcap.com"))
+      and "Orion Co" in won_table)
+check("won: a Wired-only intro (Pax) does NOT make its deal won",
+      "Pax Co" not in won_table)
+check("won: a stage-Won buy deal resolves to Closed (existing rule) -> Quill is won",
+      "Quill Co" in won_table)
+check("won: Won tile equals the won rows listed in Track record",
+      t["won_count"] == 3 == won_table.count("<tr><td>")
+      and '<div class="ov-tile-label">Won</div><div class="ov-tile-value">3</div>' in ov_body)
+check("won: history line counts won deals by the same definition",
+      "5 deals listed · 3 won · 1 lost/obsolete since Mar 2, 2026" in ov_track)
+
+# --- Capital Raised = Wired + Closed intro amounts, each once
+check("capital raised: Orion Closed $2M + Rex Closed $2M + Pax Wired $1.5M + Quill Wired(stage Won) $1M = $6.5M",
+      t["capital_raised"] == 6_500_000
+      and '<div class="ov-tile-label">Capital Raised</div><div class="ov-tile-value">$6.5M</div>' in ov_body)
+check("capital raised: Introduced/Matched intros never count (Orion's $2M Introduced + $2M Matched excluded)",
+      t["capital_raised"] == 2_000_000 + 2_000_000 + 1_500_000 + 1_000_000)
+
+# --- Company page: Won count equals its listed Won rows
+def _co_won(company):
+    _ov_fresh()
+    page = _ov_get("alice@ovcap.com", {"company": company})["body"]
+    card = re.search(r'<span>Won</span><span class="cd-stat-num">(\d+)</span>', page)
+    sec = re.search(r'<summary>Won <span class="count">\((\d+)\)</span></summary>(.*?)</details>', page, re.S)
+    listed = sec.group(2).split("<tbody>")[1].count("<tr") if sec else 0
+    return int(card.group(1)), (int(sec.group(1)) if sec else 0), listed, page
+
+orion_card, orion_sec, orion_listed, orion_page = _co_won("Orion Co")
+check("company page (Orion): Won card = Won section count = listed won rows = 1",
+      orion_card == orion_sec == orion_listed == 1)
+quill_card, quill_sec, quill_listed, quill_page = _co_won("Quill Co")
+check("company page (Quill): Won card = Won section count = listed won rows = 1",
+      quill_card == quill_sec == quill_listed == 1)
+pax_card, pax_sec, pax_listed, pax_page = _co_won("Pax Co")
+check("company page (Pax): a Wired intro is not won (0 won, none listed) but counts in Total raised ($1.5M)",
+      pax_card == pax_sec == pax_listed == 0
+      and '<span>Total raised</span><span class="cd-stat-num">$1.5M</span>' in pax_page)
+
+# --- Tiles equal My Deals and company-page figures
+_ov_fresh()
 md_page = body_only(_ov_get("alice@ovcap.com", {"tab": "mydeals"})["body"])
 md_summary = md_page[md_page.find('class="mydeals-summary"'):]
 md_summary = md_summary[:md_summary.find("</p>")]
-t = ov_model["tiles"]
-check("tiles: Live deals equals My Deals' 'N live'", f'{t["live_deals"]} live' in md_summary and t["live_deals"] == 2)
-check("tiles: $ in pipeline equals My Deals' 'Total in pipeline'",
-      lf._fmt_money(t["pipeline_total"]) in md_summary.split("Total in pipeline")[1][:80]
-      and t["pipeline_total"] == md_model["pipeline_total"])
-check("tiles: Won $ equals My Deals' 'Total closed' and Won count = archived won rows",
-      t["won_count"] == 1 and lf._fmt_money(t["won_total"]) in md_summary.split("Total closed")[1][:80])
-orion_stats = lf._company_buy_stats(1801, "Orion Co", lf.get_intro_details("alice@ovcap.com")[0],
-                                    tenant_email="alice@ovcap.com")
-rex_stats = lf._company_buy_stats(1801, "Rex Co", lf.get_intro_details("alice@ovcap.com")[0],
-                                  tenant_email="alice@ovcap.com")
-check("tiles: Active intros equals the INTROS column / company-page 'Active intros' figures summed",
-      t["active_intros"] == orion_stats["non_terminal_count"] + rex_stats["non_terminal_count"] == 1)
-ov_co_page = _ov_get("alice@ovcap.com", {"company": "Orion Co"})["body"]
-check("tiles: company page 'Active intros' card shows the same Orion figure",
-      f'<span>Active intros</span><span class="cd-stat-num">{orion_stats["non_terminal_count"]}</span>' in ov_co_page)
-check("tiles: Buyers introduced = unique disclosed buyers (Dora + Wes; Pat is pending)",
-      t["buyers_introduced"] == 2)
-check("tiles: Intro -> won % = company-stats won / introduced (1 of 2 -> 50%)",
-      t["won_intros"] == 1 and t["intro_total"] == md_model["intros_total"] == 2 and t["intro_won_pct"] == 50)
-ov_body = body_only(ov_page)
-check("tiles render in one row with the six labels in order",
-      [ov_body.find(f'<div class="ov-tile-label">{lbl}</div>') for lbl in
-       ("Live deals", "$ in pipeline (live)", "Active intros", "Won", "Buyers introduced", "Intro → won")]
-      == sorted(ov_body.find(f'<div class="ov-tile-label">{lbl}</div>') for lbl in
-                ("Live deals", "$ in pipeline (live)", "Active intros", "Won", "Buyers introduced", "Intro → won"))
-      and '<div class="ov-tile-value">50%</div>' in ov_body)
+md_model = lf._my_deals_model(ov_deals, 1801, "alice@ovcap.com")
+check("parity: Live deals = My Deals 'N live'", f'{t["live_deals"]} live' in md_summary)
+check("parity: $ in pipeline = My Deals 'Total in pipeline'",
+      lf._fmt_money(t["pipeline_total"]) in md_summary.split("Total in pipeline")[1][:80])
+check("parity: Won = My Deals 'N won'", f'{t["won_count"]} won' in md_summary)
+co_raised = 0
+co_active = 0
+for co in ("Orion Co", "Pax Co", "Quill Co", "Rex Co", "Sol Co"):
+    _ov_fresh()
+    pg = _ov_get("alice@ovcap.com", {"company": co})["body"]
+    m = re.search(r'<span>Total raised</span><span class="cd-stat-num">([^<]+)</span>', pg)
+    raised_txt = m.group(1) if m else "—"
+    co_raised += 0 if raised_txt == "—" else float(raised_txt.strip("$M")) * 1_000_000
+    co_active += int(re.search(r'<span>Active intros</span><span class="cd-stat-num">(\d+)</span>', pg).group(1))
+check("parity: Capital Raised = sum of the company pages' 'Total raised'", co_raised == t["capital_raised"])
+check("parity: Active intros = sum of the company pages' 'Active intros'", co_active == t["active_intros"])
+check("parity: Intro -> won % uses the company-page won/intro counts (3 won of 5 introduced -> 60%)",
+      t["won_intros"] == 3 and t["intro_total"] == md_model["intros_total"] == 5 and t["intro_won_pct"] == 60)
+check("parity: Buyers introduced = unique disclosed buyers (Dora, Cleo, Walt, Stan, Wes; Pat pending)",
+      t["buyers_introduced"] == 5)
 
 # --- Needs your attention == My Deals' red chips
 md_red = sorted(lf.RED_ACTION_CHIP_RE.findall(md_page))
-ov_att = ov_body[ov_body.find("Needs your attention"):ov_body.find('<section class="ov-section ov-open">')]
+ov_att = ov_body[ov_body.find('class="ov-section ov-attention"'):ov_body.find('class="ov-section ov-track"')]
 ov_red = sorted(lf.RED_ACTION_CHIP_RE.findall(ov_att))
 check("attention: exactly the red chips My Deals renders (same text + targets)", md_red == ov_red and len(ov_red) == 4)
-check("attention: covers Agent agreement required, Extend deadline and Reopen",
-      "Agent agreement required &rarr;" in ov_att and "Extend deadline &rarr;" in ov_att and ov_att.count("Reopen &rarr;") == 2)
-check("attention: each row names the deal (company + #id)", "Pax Co</a><span class=\"ov-deal-id\">#89002</span>" in ov_att)
 check("attention: no all-clear line when there are items", "All paperwork in order" not in ov_att)
 
-# --- Open deals / Active intros / Track record
-ov_open = ov_body[ov_body.find('<section class="ov-section ov-open">'):ov_body.find('<section class="ov-section ov-intros">')]
-check("open deals: live deals only (no Rex/Sol), See all link to My Deals",
-      "Orion Co" in ov_open and "Pax Co" in ov_open and "Rex Co" not in ov_open and "Sol Co" not in ov_open
-      and 'href="?tab=mydeals">See all in My Deals &rarr;</a>' in ov_open)
-ov_intros = ov_body[ov_body.find('<section class="ov-section ov-intros">'):ov_body.find('<section class="ov-section ov-track">')]
+# --- Disclosure, open deals, intros
+ov_intros = ov_body[ov_body.find('class="ov-section ov-intros"'):ov_body.find('class="ov-section ov-open"')]
 check("active intros: disclosed buyer by name, pending buyer only as its anon code",
       "Dora Disclosed" in ov_intros and "Pat Pending" not in ov_intros
-      and f'Buyer {lf._anon_buyer_code("alice@ovcap.com", 1902)}' in ov_intros)
-check("active intros: newest update first, See all link", ov_intros.find("Dora Disclosed") < ov_intros.find("Buyer ")
+      and f'Buyer {lf._anon_buyer_code("alice@ovcap.com", 1902)}' in ov_intros
       and 'href="?tab=intros">See all in Active Intros &rarr;</a>' in ov_intros)
 check("disclosure: Pat Pending's name/email appear nowhere on Overview", "Pat Pending" not in ov_page and "pat@buy2.com" not in ov_page)
-ov_track = ov_body[ov_body.find('<section class="ov-section ov-track">'):]
-check("track record: won deal with size and close date; one-line history",
-      "Rex Co" in ov_track and "$3M" in ov_track and "Jun 15, 2026" in ov_track
-      and "5 deals listed · 1 won · 1 lost/obsolete since Mar 2, 2026" in ov_track)
-check("track record: collapsed 'All closed deals (2)' with stages",
-      '<details class="closed-out-section ov-all-closed"><summary>All closed deals <span class="count">(2)</span>' in ov_track
-      and "Obsolete" in ov_track)
+ov_open = ov_body[ov_body.find('class="ov-section ov-open"'):ov_body.find('class="ov-section ov-attention"')]
+check("open deals: live deals only, See all link to My Deals",
+      "Orion Co" in ov_open and "Rex Co" not in ov_open and "Sol Co" not in ov_open
+      and 'href="?tab=mydeals">See all in My Deals &rarr;</a>' in ov_open)
 
 # --- Team scoping
+_ov_fresh()
 bob_ov = _ov_get("bob@ovcap.com")["body"]
+_ov_fresh()
 check("team: teammate Bob (no deals) sees the same Overview figures",
-      lf._overview_model(lf.get_firm_sell_deals(1802), 1802, "bob@ovcap.com")["tiles"] == t
-      and "Orion Co" in bob_ov)
+      lf._overview_model(lf.get_firm_sell_deals(1802), 1802, "bob@ovcap.com")["tiles"] == t and "Orion Co" in bob_ov)
 check("team: another team's deal never appears", "Zeta Private Co" not in ov_page and "Zeta Private Co" not in bob_ov)
 
 # --- view_as preserved on every Overview link

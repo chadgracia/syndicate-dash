@@ -3422,6 +3422,65 @@ def _deal_picker_summary(deal):
     }
 
 
+# ── Won / Capital Raised: ONE definition everywhere ─────────────────────────
+# Won intro   = Intro Status Closed (7207587), override-aware.
+# Won deal    = SELL deal at stage Won (111802/2379321) OR with >= 1 won intro
+#               for its company in the viewer's firm/team scope (deals.json
+#               + deals-closed.json, both via get_deals_list).
+# Capital Raised = sum of intro amounts (_intro_amount) over disclosed intros
+#               at Intro Status Wired (7207583) or Closed, each intro once.
+INTRO_STATUS_WIRED_ID = 7207583
+
+
+def _intro_is_won(resolved):
+    return resolved.get("id") == INTRO_STATUS_CLOSED_ID or resolved.get("name") == "Closed"
+
+
+def _intro_counts_toward_raised(resolved):
+    return _intro_is_won(resolved) or resolved.get("id") == INTRO_STATUS_WIRED_ID or resolved.get("name") == "Wired"
+
+
+def _intro_amount(deal):
+    """An intro's amount: its buy deal's ticket max, else min, else 0 --
+    never the native "value" field (our commission)."""
+    max_v = _deal_cf_number(deal, TICKET_MAX_FIELD)
+    min_v = _deal_cf_number(deal, TICKET_MIN_FIELD)
+    return max_v if max_v is not None else (min_v if min_v is not None else 0)
+
+
+def _company_intro_population(person_id, company_name, intro_details=None, tenant_email=None):
+    """THE intro set for one company in the viewer's firm/team scope, shared
+    by _company_buy_stats (every count/Raised figure) and the company
+    page's own Buyers/Won/Lost lists, so a count always equals its rows:
+    {"intros": [(deal, entry, resolved)], "closed_out": [deal]} -- matched-
+    or-later buy deals (+ Dynamo-linked ones when intro_details is given)
+    plus manual intros (when tenant_email is given, minus any already
+    covered by a real deal), and the stage-based dead exits."""
+    matched = get_firm_matched_buy_deals(person_id, company_name)
+    if intro_details is not None:
+        matched = _augment_with_dynamo_linked_deals(matched, intro_details, company_name)
+    deals = list(matched)
+    manual_failed = False
+    if tenant_email:
+        manual_intros, manual_failed = get_manual_intros(tenant_email, company_name)
+        for (_m_company, buyer_pid), item in manual_intros.items():
+            if _tenant_has_deal_derived_intro(person_id, company_name, buyer_pid):
+                continue
+            deals.append(_manual_intro_as_deal(item))
+    intros = []
+    for d in deals:
+        entry = (intro_details.get(str(d.get("id"))) or {}) if (intro_details is not None and not d.get("_manual")) else None
+        intros.append((d, entry, _resolve_intro_status(d, entry)))
+    return {"intros": intros, "closed_out": get_firm_closed_out_buy_deals(person_id, company_name),
+            "manual_failed": manual_failed}
+
+
+def _sell_deal_is_won(deal, resolved_stage, stats):
+    """Won deal: stage Won, or >= 1 won intro for its company (stats =
+    that company's _company_buy_stats)."""
+    return _is_won_stage(resolved_stage) or (stats or {}).get("won_count", 0) > 0
+
+
 def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email=None):
     """Per-company Buy-side stats (intro_count, stalled, raised) — perf
     fix 3: request-scoped and shared by BOTH render_my_deals_page's own
@@ -3443,6 +3502,14 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     make one of the two surfaces show a different number than it does
     today, which the zero-user-visible-change constraint on this pass
     rules out.
+
+    Won / Capital Raised: every count here comes from ONE population
+    (_company_intro_population, also used by the company page's own
+    lists) and ONE rule set: won_count = disclosed intros with
+    _intro_is_won (Intro Status Closed, override-aware -- a Won-stage buy
+    deal resolves to Closed); raised = Capital Raised, the _intro_amount
+    of every disclosed Wired-or-Closed intro, each once. The paragraphs
+    below predate that and are kept for history where they differ.
 
     intro_count counts every disclosed introduction that ever happened
     for this tenant+company -- live (matched) PLUS closed-out (Lost/
@@ -3503,53 +3570,32 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     # tenant sees -- one shared number for the whole firm, not a
     # personal one. Manual/Dynamo-only intros (tenant_email below) stay
     # person-scoped -- see get_firm_deals's own docstring for why.
-    matched = get_firm_matched_buy_deals(person_id, company_name)
     live_intro_count = 0
     stalled = False
     raised = 0
     won_count = 0
     passed_count = 0
     non_terminal_count = 0
-    for d in matched:
-        entry = (intro_details.get(str(d.get("id"))) or {}) if intro_details is not None else None
-        resolved = _resolve_intro_status(d, entry)
+    manual_intro_count = 0
+    pop = _company_intro_population(person_id, company_name, intro_details, tenant_email)
+    for d, _entry, resolved in pop["intros"]:
         if resolved["disclosed"]:
-            live_intro_count += 1
-            if _deal_intro_status_id(d) == INTRO_STATUS_CLOSED_ID or _deal_stage_id(d) in WON_STAGE_IDS:
+            if d.get("_manual"):
+                manual_intro_count += 1
+            else:
+                live_intro_count += 1
+            if _intro_is_won(resolved):
                 won_count += 1
-                max_v = _deal_cf_number(d, TICKET_MAX_FIELD)
-                min_v = _deal_cf_number(d, TICKET_MIN_FIELD)
-                raised += max_v if max_v is not None else (min_v if min_v is not None else 0)
             elif resolved["name"] in ("Passed", "Withdrawn"):
                 passed_count += 1
             else:
                 non_terminal_count += 1
+            if _intro_counts_toward_raised(resolved):
+                raised += _intro_amount(d)
         if resolved["id"] == INTRO_STATUS_STALLED_ID:
             stalled = True
-    closed_out_deals = get_firm_closed_out_buy_deals(person_id, company_name)
-    closed_out_intro_count = sum(1 for d in closed_out_deals if _closed_out_disclosed(d))
+    closed_out_intro_count = sum(1 for d in pop["closed_out"] if _closed_out_disclosed(d))
     passed_count += closed_out_intro_count
-
-    manual_intro_count = 0
-    if tenant_email:
-        manual_intros, _ = get_manual_intros(tenant_email, company_name)
-        for (m_company, buyer_pid), item in manual_intros.items():
-            if _tenant_has_deal_derived_intro(person_id, company_name, buyer_pid):
-                continue
-            fake_deal = _manual_intro_as_deal(item)
-            resolved = _resolve_intro_status(fake_deal, None)
-            if not resolved["disclosed"]:
-                continue
-            manual_intro_count += 1
-            if resolved["name"] == "Closed":
-                won_count += 1
-                max_v = _deal_cf_number(fake_deal, TICKET_MAX_FIELD)
-                min_v = _deal_cf_number(fake_deal, TICKET_MIN_FIELD)
-                raised += max_v if max_v is not None else (min_v if min_v is not None else 0)
-            elif resolved["name"] in ("Passed", "Withdrawn"):
-                passed_count += 1
-            else:
-                non_terminal_count += 1
 
     stats = {
         "intro_count": live_intro_count + closed_out_intro_count + manual_intro_count,
@@ -7836,6 +7882,8 @@ NAV_CSS = """
     border-radius: 6px;
   }
   .gg-tab:hover { color: var(--ink); }
+  .gg-tab-primary { font-size: 14px; font-weight: 700; }
+  .gg-tab-icon { margin-right: 5px; }
   .gg-tab.active {
     color: var(--accent);
     background: rgba(61,90,115,0.10);
@@ -8384,7 +8432,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
               person_id=None):
     suffix = _tab_qs_suffix(key, view_as)
     overview_href = f"?tab=overview{suffix}"
-    overview_cls = "gg-tab active" if active_tab == "overview" else "gg-tab"
+    overview_cls = "gg-tab gg-tab-primary active" if active_tab == "overview" else "gg-tab gg-tab-primary"
     mydeals_href = f"?tab=mydeals{suffix}"
     intros_href = f"?tab=intros{suffix}"
     demand_href = f"?tab=demand{suffix}"
@@ -8540,7 +8588,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     return f"""<header class="gg-nav">
   <div class="gg-nav-inner">
     <nav class="gg-tabs">
-      <a class="{overview_cls}" href="{overview_href}">Overview</a>
+      <a class="{overview_cls}" href="{overview_href}"><span class="gg-tab-icon" aria-hidden="true">&#8962;</span>Overview</a>
       <div class="gg-mydeals-nav">
         <a class="{mydeals_cls}" href="{mydeals_href}">My Deals</a>
         {mydeals_menu_html}
@@ -9655,6 +9703,37 @@ def _intro_last_update_epoch(deal, entry):
     return max(stamps)
 
 
+def _fmt_relative_time(dt, now=None):
+    if dt is None:
+        return "unknown"
+    now = now or datetime.now(timezone.utc)
+    secs = max(0, int((now - dt).total_seconds()))
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return f"{secs // 60} min ago"
+    if secs < 86400:
+        return f"{secs // 3600} h ago"
+    days = secs // 86400
+    return f"{days} day{'' if days == 1 else 's'} ago"
+
+
+def _overview_subtitle(person_id, tenant_email, viewer_name):
+    """"<Team/firm name> · updated <relative time of the last deals.json
+    refresh>"."""
+    team = _tenant_team(tenant_email) if tenant_email else None
+    if team is not None:
+        name = team["name"]
+    else:
+        rec = get_people_by_ids({person_id}).get(person_id) if person_id is not None else None
+        name = ((rec or {}).get("company_name") or "").strip() or viewer_name
+    try:
+        refreshed = _parse_dt(_cached_object_version(_s3_client(), DEALS_KEY))
+    except Exception:
+        refreshed = None
+    return f"{name} · updated {_fmt_relative_time(refreshed)}"
+
+
 def _overview_company_link(company_name, key, view_as):
     if not company_name:
         return "—"
@@ -9674,20 +9753,20 @@ def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
     firm_person_ids = _firm_person_ids(person_id)
     buyer_ids = _introduced_buyer_ids(person_id, [c for c, _st in stats_by_company.values() if c],
                                       intro_details, anon_key_email, firm_person_ids)
-    closed_rows = md["closed_rows"] if md else []
+    won_rows = md["won_rows"] if md else []
     tiles = {
+        "capital_raised": sum(st["raised"] for _c, st in stats_by_company.values()),
         "live_deals": md["live_count"] if md else 0,
         "pipeline_total": md["pipeline_total"] if md else 0,
         "active_intros": sum(st["non_terminal_count"] for _c, st in stats_by_company.values()),
-        "won_count": len(closed_rows),
-        "won_total": md["closed_total"] if md else 0,
+        "won_count": len(won_rows),
         "buyers_introduced": len(buyer_ids),
         "intro_total": intro_total,
         "won_intros": won_intros,
         "intro_won_pct": (round(100 * won_intros / intro_total) if intro_total else None),
     }
     return {"md": md, "rows": rows, "tiles": tiles, "intro_details": intro_details,
-            "firm_person_ids": firm_person_ids}
+            "firm_person_ids": firm_person_ids, "won_rows": won_rows}
 
 
 def _overview_attention_items(rows, key=None, view_as=None):
@@ -9735,13 +9814,19 @@ def _overview_buyer_html(deal, resolved, person_id, firm_person_ids, anon_key_em
 
 
 OVERVIEW_CSS = """
-  .ov-tiles { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .ov-head { margin-bottom: 14px; }
+  .ov-title { font-size: 22px; font-weight: 700; margin: 0; }
+  .ov-subtitle { font-size: 13px; color: var(--muted); margin: 4px 0 0; }
+  .ov-tiles { display: grid; grid-template-columns: 1.6fr repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .ov-tile-primary { border-color: rgba(31,122,77,0.35); background: rgba(31,122,77,0.06); }
+  .ov-tile-primary .ov-tile-value { font-size: 26px; color: var(--qp); }
   .ov-tile { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
   .ov-tile-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.03em;
                    color: var(--muted); }
   .ov-tile-value { font-size: 20px; font-weight: 700; margin-top: 4px; }
   .ov-tile-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
-  @media (max-width: 760px) { .ov-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+  @media (max-width: 760px) { .ov-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+                              .ov-tile-primary { grid-column: 1 / -1; } }
   .ov-section { margin-bottom: 18px; }
   .ov-section h2 { font-size: 15px; font-weight: 600; margin: 0 0 10px; }
   .ov-section .card { padding: 6px 16px; }
@@ -9804,19 +9889,21 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
         t = ov["tiles"]
         rows = ov["rows"]
 
-        def _tile(label, value, sub=""):
+        def _tile(label, value, sub="", primary=False):
             sub_html = f'<div class="ov-tile-sub">{sub}</div>' if sub else ""
-            return (f'<div class="ov-tile"><div class="ov-tile-label">{_esc(label)}</div>'
+            cls = "ov-tile ov-tile-primary" if primary else "ov-tile"
+            return (f'<div class="{cls}"><div class="ov-tile-label">{_esc(label)}</div>'
                     f'<div class="ov-tile-value">{value}</div>{sub_html}</div>')
 
         pct = f'{t["intro_won_pct"]}%' if t["intro_won_pct"] is not None else "—"
         tiles_html = (
             '<div class="ov-tiles">'
+            + _tile("Capital Raised", _esc(_fmt_money(t["capital_raised"]) if t["capital_raised"] else "$0"),
+                    "Wired + closed intros", primary=True)
             + _tile("Live deals", _esc(str(t["live_deals"])))
-            + _tile("$ in pipeline (live)", _esc(_fmt_money(t["pipeline_total"]) if t["pipeline_total"] else "$0"))
+            + _tile("$ in pipeline", _esc(_fmt_money(t["pipeline_total"]) if t["pipeline_total"] else "$0"))
             + _tile("Active intros", _esc(str(t["active_intros"])))
-            + _tile("Won", _esc(str(t["won_count"])),
-                    _esc(_fmt_money(t["won_total"])) if t["won_total"] else "")
+            + _tile("Won", _esc(str(t["won_count"])))
             + _tile("Buyers introduced", _esc(str(t["buyers_introduced"])))
             + _tile("Intro → won", _esc(pct),
                     _esc(f'{t["won_intros"]} of {t["intro_total"]}') if t["intro_total"] else "")
@@ -9866,7 +9953,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
                        f'<a class="ov-see-all" href="?tab=intros{suffix}">See all in Active Intros &rarr;</a></section>')
 
         # 5) Track record
-        won_rows = [r for r in rows if r["section"] == "closed"]
+        won_rows = ov["won_rows"]
         dead_rows = [r for r in rows if r["section"] == "cancelled"]
         listed = [dt for dt in (_deal_date_field(r["deal"], "created_at") for r in rows) if dt]
         since = f' since {_fmt_dt_short(min(listed))}' if listed else ""
@@ -9877,16 +9964,17 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             f'<td class="num">{_esc(_fmt_money(_deal_pipeline_size(r["deal"])) if _deal_pipeline_size(r["deal"]) else "—")}</td>'
             f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "closed_time")))}</td></tr>'
             for r in won_rows)
+        won_ids = {id(r) for r in won_rows}
         won_table = (('<table class="ov-table"><thead><tr><th>Won deal</th><th class="num">Size</th>'
                       f'<th>Closed</th></tr></thead><tbody>{won_body}</tbody></table>') if won_rows
                      else '<div class="ov-muted" style="padding:10px 0">No won deals yet.</div>')
-        archived_rows = won_rows + dead_rows
+        archived_rows = won_rows + [r for r in dead_rows if id(r) not in won_ids]
         all_closed_html = ""
         if archived_rows:
             closed_body = "".join(
                 f'<tr><td>{_overview_company_link(r["company_name"], key, view_as)}'
                 f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></td>'
-                f'<td>{_esc(_deal_stage_label(r["resolved_stage"]))}</td>'
+                f'<td>{_esc("Won" if id(r) in won_ids else _deal_stage_label(r["resolved_stage"]))}</td>'
                 f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "created_at")))}</td>'
                 f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "closed_time")))}</td></tr>'
                 for r in archived_rows)
@@ -9898,7 +9986,9 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
         track_html = (f'<section class="ov-section ov-track"><h2>Track record</h2><div class="card">{won_table}</div>'
                       f'<p class="ov-history">{_esc(history)}</p>{all_closed_html}</section>')
 
-        body_html = tiles_html + attention_html + open_html + intros_html + track_html
+        header_html = (f'<div class="ov-head"><h1 class="ov-title">Overview</h1>'
+                       f'<p class="ov-subtitle">{_esc(_overview_subtitle(person_id, anon_key_email, viewer_name))}</p></div>')
+        body_html = header_html + tiles_html + intros_html + open_html + attention_html + track_html
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -10122,6 +10212,9 @@ def _my_deals_model(deals, person_id, anon_key_email):
         "intros_total": intros_total, "attention_count": attention_count, "deadlines": deadlines,
         "future_deadlines": future_deadlines, "pipeline_total": pipeline_total, "closed_total": closed_total,
         "active_rows": active_rows, "closed_rows": closed_rows,
+        # Won deals by the ONE definition (_sell_deal_is_won): stage Won,
+        # or >= 1 won intro for the deal's company.
+        "won_rows": [r for r in rows if _sell_deal_is_won(r["deal"], r["resolved_stage"], r["stats"])],
     }
 
 
@@ -10176,6 +10269,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         # total" is the new figure that also counts closed-out intros
         # (Passed/Withdrawn/Closed/stage-exits) -- a passed intro is
         # still an introduction that happened, per instruction.
+        if model["won_rows"]:
+            summary_parts.append(f'{len(model["won_rows"])} won')
         if intros_live_total:
             summary_parts.append(f"{intros_live_total} in motion")
         if intros_total:
@@ -10831,25 +10926,17 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     </div>
   </section>"""
 
-        matched_deals = get_firm_matched_buy_deals(person_id, company) if person_id is not None else []
-        matched_deals = _augment_with_dynamo_linked_deals(matched_deals, intro_details, company)
-
-        # Manual intros (Dynamo-only, no backing Pipeline deal at all --
-        # see _manual_intro_as_deal): merged in as synthetic deal dicts
-        # BEFORE wanted_ids/resolved_by_deal_id are computed, so every
-        # downstream step (people lookup, disclosure, main/pending/
-        # closed-out routing, sorting) treats them exactly like a real
-        # row with zero extra code. Suppressed when a REAL deal-derived
-        # intro already covers the same buyer for this company -- the
-        # deal-derived row wins outright, per instruction.
-        manual_intros, manual_failed = (get_manual_intros(anon_key_email, company) if person_id is not None
-                                         else ({}, False))
-        if manual_intros:
-            manual_deals = [
-                _manual_intro_as_deal(item) for (_m_company, buyer_pid), item in manual_intros.items()
-                if not _tenant_has_deal_derived_intro(person_id, company, buyer_pid)
-            ]
-            matched_deals = matched_deals + manual_deals
+        # ONE intro population, shared with _company_buy_stats (the "This
+        # company" card), so every count equals the rows listed below:
+        # matched-or-later + Dynamo-linked + manual intros, same rules.
+        manual_failed = False
+        if person_id is not None:
+            _pop = _company_intro_population(person_id, company, intro_details, tenant_email=anon_key_email)
+            matched_deals = [d for d, _e, _r in _pop["intros"]]
+            _pop_closed_out = list(_pop["closed_out"])
+            manual_failed = _pop["manual_failed"]
+        else:
+            matched_deals, _pop_closed_out = [], []
 
         wanted_ids = set()
         for d in matched_deals:
@@ -10959,7 +11046,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         # a dead-stage (Lost/Trade Broken/Obsolete) BUY deal for this
         # company, keyed off get_my_closed_out_buy_deals rather than the
         # matched-or-later fetch above.
-        closed_out_deals = get_firm_closed_out_buy_deals(person_id, company) if person_id is not None else []
+        closed_out_deals = _pop_closed_out
         closed_out_disclosed_by_id = {str(d.get("id")): (edit_mode or _closed_out_disclosed(d))
                                        for d in closed_out_deals}
         # Merge in the status-based exits routed here above: disjoint by
@@ -10988,9 +11075,14 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             for d in closed_out_deals:
                 wanted_ids |= _deal_linked_person_ids(d) - {person_id}
             people_by_id = get_people_by_ids(wanted_ids) if wanted_ids else {}
-            won_out_deals = sorted((d for d in closed_out_deals if _deal_exit_outcome_name(d) == "Closed"),
+            # Won = _intro_is_won on the same resolved status the "This
+            # company" card counts (stage-based exits are never won).
+            def _is_won_row(d):
+                r = resolved_by_deal_id.get(str(d.get("id")))
+                return bool(r and _intro_is_won(r))
+            won_out_deals = sorted((d for d in closed_out_deals if _is_won_row(d)),
                                     key=lambda d: (_deal_title(d) or "").lower())
-            passed_out_deals = sorted((d for d in closed_out_deals if _deal_exit_outcome_name(d) != "Closed"),
+            passed_out_deals = sorted((d for d in closed_out_deals if not _is_won_row(d)),
                                        key=lambda d: (_deal_title(d) or "").lower())
 
             def _closed_out_section_html(title, count, rows):
