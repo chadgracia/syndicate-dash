@@ -19,7 +19,7 @@ CAREFUL MODE (only when stated, or when the change touches disclosure/money/writ
 ## Hard conventions
 - All literal { } in f-string CSS/JS are doubled. Run `python3 -m py_compile lambda_function.py` before every commit.
 - No screenshots/Playwright unless the task explicitly asks.
-- Secrets ONLY from env vars: ADMIN_KEY, IDENTITY_SECRET, PIPELINE_API_KEY, PIPELINE_APP_KEY, HMAC_SECRET. Never hardcode values in this repo.
+- Secrets ONLY from env vars: ADMIN_KEY, IDENTITY_SECRET, PIPELINE_API_KEY, PIPELINE_APP_KEY, HMAC_SECRET, FORM_HMAC_SECRET. Never hardcode values in this repo. FORM_HMAC_SECRET signs deal-update-form links ONLY (_deal_update_form_url; no link when unset, never falls back); HMAC_SECRET signs tenant magic links ("tenant-link:<email>") only.
 - Pipeline API writes: query-string auth (?api_key=&app_key=), never Basic/Bearer.
 - This sandbox cannot reach api.pipelinecrm.com or live S3. Never fetch them; never invent ids. If a needed id/shape is not in this file or the code, STOP and ask Chad to paste JSON.
 - Do not read sibling repos to re-verify anything listed here — it is already verified against live data.

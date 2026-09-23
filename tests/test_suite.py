@@ -26,6 +26,7 @@ from datetime import datetime, timezone, timedelta
 os.environ["ADMIN_KEY"] = "test-admin-key"
 os.environ["IDENTITY_SECRET"] = "test-secret"
 os.environ["HMAC_SECRET"] = "test-hmac-secret"
+os.environ["FORM_HMAC_SECRET"] = "test-form-hmac-secret"
 os.environ["PIPELINE_API_KEY"] = "pk"
 os.environ["PIPELINE_APP_KEY"] = "ak"
 
@@ -7412,6 +7413,26 @@ check("batched: desk-wide Raised reads owner intro items via BatchGetItem, not o
       _pf_table.batch_calls == 1)
 check("tenant owner lookup: O(1) map returns the first seller email linked to the deal",
       lf._tenant_email_for_deal(_pf_deals[1]) == "pat@perfcap.com" and lf._tenant_email_for_deal({"people": []}) is None)
+
+
+# ======================================================================
+# SECTION: Update-form key rotation -- form links sign with FORM_HMAC_SECRET
+# ======================================================================
+import hashlib as _hl, hmac as _hm, base64 as _b64
+def _sig(secret, ident):
+    return _b64.urlsafe_b64encode(_hm.new(secret.encode(), str(ident).encode(), _hl.sha256).digest()).decode().rstrip("=")
+_rot_url = lf._deal_update_form_url(54779042)
+check("rotation: update-form link token is HMAC(FORM_HMAC_SECRET, deal_id)",
+      _rot_url == f"{lf.DEAL_UPDATE_FORM_URL}?deal_id=54779042&token={_sig('test-form-hmac-secret', 54779042)}")
+check("rotation: update-form link is NOT signed with HMAC_SECRET",
+      _sig("test-hmac-secret", 54779042) not in _rot_url)
+check("rotation: tenant magic links stay on HMAC_SECRET",
+      lf._make_tenant_link_token("a@b.com") == _sig("test-hmac-secret", "tenant-link:a@b.com"))
+_saved_form_key = os.environ.pop("FORM_HMAC_SECRET")
+check("rotation: no FORM_HMAC_SECRET -> no update-form link at all (never falls back to HMAC_SECRET)",
+      lf._deal_update_form_url(54779042) is None and lf._deal_action_html("54779042", lf.STAGE_FIRM) == ""
+      and lf._deal_action_html("54779042", lf.OBSOLETE_STAGE_ID) == "")
+os.environ["FORM_HMAC_SECRET"] = _saved_form_key
 
 
 # ======================================================================

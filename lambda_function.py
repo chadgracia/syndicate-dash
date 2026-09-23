@@ -474,15 +474,16 @@ FEATURE_REQUEST_EMAIL = "cgracia@rainmakersecurities.com"
 # urlsafe base64, no padding) and query shape (?deal_id=<id>&token=<token>)
 # copied verbatim from that repo's own make_token/verify_token, matching
 # exactly how chadgracia/deal-nudge's form_url() already mints the same
-# link. HMAC_SECRET must be the same secret value configured on
-# deal-update-form's own Lambda — when it's unset here, _deal_update_form_url
-# returns None and callers render without the button rather than a broken
-# link.
+# link. Signed with FORM_HMAC_SECRET -- the dedicated update-form key
+# (same env var/value on deal-update-form's own Lambda); HMAC_SECRET stays
+# for this Lambda's tenant magic links only. When FORM_HMAC_SECRET is unset,
+# _deal_update_form_url returns None and callers render without the button
+# rather than a link signed with the wrong key.
 DEAL_UPDATE_FORM_URL = "https://desk.graciagroup.com/update/"
 
 
 def _deal_update_form_url(deal_id):
-    secret = os.environ.get("HMAC_SECRET")
+    secret = os.environ.get("FORM_HMAC_SECRET")
     if not secret:
         return None
     sig = hmac.new(secret.encode(), f"{deal_id}".encode(), hashlib.sha256).digest()
@@ -597,7 +598,7 @@ def _deal_action_html(deal_id, stage_id, stacked=False):
     deal -> the "Update, Pause or Cancel" button; a closed-down deal
     (_is_closed_down_stage) -> red "Reopen ->"; a Won deal -> nothing.
     All link the same HMAC-signed update form (_deal_update_form_url);
-    "" when HMAC_SECRET isn't configured. stacked=True (every table cell)
+    "" when FORM_HMAC_SECRET isn't configured. stacked=True (every table cell)
     renders the same single link compact, "Update" / "Pause" / "Cancel"
     on three centered lines, so it fits its fixed-width column; cards keep
     the one-line label."""
@@ -1600,9 +1601,9 @@ DASH_SELF_URL = "https://ws4stw4iul75a7yx5dra2wmnq40kipav.lambda-url.us-east-1.o
 def _make_tenant_link_token(email):
     """Permanent per-tenant magic-link token: HMAC-SHA256(HMAC_SECRET,
     "tenant-link:<email>"), urlsafe base64 no padding -- same construction
-    and secret as _deal_update_form_url's per-deal token, domain-separated
-    by the "tenant-link:" prefix so the two token types can never be
-    confused for one another even though they share a secret. Unlike the
+    as the deal-update-form token, but keyed on HMAC_SECRET while those
+    links use the dedicated FORM_HMAC_SECRET (and domain-separated by the
+    "tenant-link:" prefix besides). Unlike the
     SSO handoff above, this token never expires: it's the durable link an
     admin hands a tenant who may never have signed in before. None when
     HMAC_SECRET isn't configured (same fail-soft as _deal_update_form_url)."""
@@ -7089,7 +7090,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         else:
             # The update-form link replaces the mailto for tenants (see
             # _deal_update_form_url) — falls back to the mailto only when
-            # HMAC_SECRET isn't configured, so this chip is never dead.
+            # FORM_HMAC_SECRET isn't configured, so this chip is never dead.
             update_url = _deal_update_form_url(deal_id)
             if update_url:
                 href = update_url
@@ -9125,7 +9126,7 @@ def _company_update_link_html(person_id, company_name):
     update-form URL as My Deals' Update/Cancel button. Most-recently-
     updated Sell deal wins when a tenant somehow has more than one on
     file for the same company (get_my_deals already sorts that way).
-    Omitted outright when HMAC_SECRET isn't configured (see
+    Omitted outright when FORM_HMAC_SECRET isn't configured (see
     _deal_update_form_url, which returns None) or the tenant has no Sell
     deal on file for this company.
 
