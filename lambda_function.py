@@ -118,6 +118,7 @@ _req_cache = {
     "my_deals": {}, "matched_buy_deals": {}, "company_stats": {},
     "firm_person_ids": {}, "firm_sell_by_company": {}, "firm_deals": {},
     "firm_matched_buy_deals": {}, "firm_closed_out_buy_deals": {},
+    "tenant_index": None,
 }
 
 
@@ -137,6 +138,7 @@ def _req_cache_reset():
     _req_cache["firm_deals"] = {}
     _req_cache["firm_matched_buy_deals"] = {}
     _req_cache["firm_closed_out_buy_deals"] = {}
+    _req_cache["tenant_index"] = None
 
 
 def _perf_start(page):
@@ -855,6 +857,48 @@ TENANT_OVERRIDES = {
 }
 TENANT_BLOCKLIST = set()
 
+# ── Domain team tenancy ─────────────────────────────────────────────────────
+# Everyone at a tenant's CORPORATE email domain shares one team view (see
+# _build_tenant_index). Free-mail/personal/academic domains keep individual
+# tenancy.
+FREE_MAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "yahoo.com", "yahoo.co.uk", "ymail.com", "outlook.com", "hotmail.com",
+    "hotmail.co.uk", "live.com", "msn.com", "icloud.com", "me.com", "mac.com", "aol.com", "proton.me",
+    "protonmail.com", "pm.me", "gmx.com", "gmx.de", "gmx.net", "web.de", "mail.com", "zoho.com", "yandex.com",
+    "yandex.ru", "mail.ru", "qq.com", "163.com", "126.com", "naver.com", "hanmail.net", "comcast.net",
+    "verizon.net", "att.net", "sbcglobal.net", "btinternet.com", "orange.fr", "free.fr", "t-online.de",
+    "libero.it", "ukr.net", "i.ua", "fastmail.com", "hey.com", "tutanota.com",
+}
+# Corporate domains whose colleagues must NOT share a team view (e.g. large
+# banks). Anyone at one of these keeps individual tenancy.
+DOMAIN_SHARING_BLOCKLIST = set()
+# RFC 2606 / RFC 6761 reserved documentation/test domains -- never real
+# mailboxes, so never a team (the test suite's many unrelated tenants
+# share @example.com).
+RESERVED_EXAMPLE_DOMAINS = {"example.com", "example.org", "example.net"}
+TEAM_ANON_PREFIX = "team#"
+
+
+def _email_domain(email):
+    email = str(email or "").strip().lower()
+    return email.rpartition("@")[2] if "@" in email else ""
+
+
+def _is_corporate_domain(domain):
+    """False for free-mail, .edu (and .edu.<cc>), .ac.<tld>, reserved
+    example domains and DOMAIN_SHARING_BLOCKLIST; True otherwise."""
+    domain = str(domain or "").strip().lower()
+    if not domain or "." not in domain:
+        return False
+    if domain in FREE_MAIL_DOMAINS or domain in DOMAIN_SHARING_BLOCKLIST or domain in RESERVED_EXAMPLE_DOMAINS:
+        return False
+    labels = domain.split(".")
+    if labels[-1] == "edu" or (len(labels) >= 3 and labels[-2] == "edu"):
+        return False
+    if len(labels) >= 3 and labels[-2] == "ac":
+        return False
+    return True
+
 # Module-level cache: survives warm Lambda invocations, reset on cold start.
 _cache = {"version": None, "table": None}
 
@@ -1293,7 +1337,13 @@ def _anon_buyer_code(key_email, person_id):
     digest bytes mapped onto ANON_ALPHABET. Same viewer + same person always
     produces the same code; a different viewer gets a different one. The
     code is a one-way function of the person id — it never appears in the
-    output on its own."""
+    output on its own. Domain teams: a team member's key_email is swapped
+    for the team's shared key (_anon_key_for), so every member of a team
+    sees identical codes; individual tenants are unchanged."""
+    try:
+        key_email = _anon_key_for(key_email)
+    except Exception:
+        pass
     digest = hmac.new(IDENTITY_SECRET.encode(), f"{key_email}|{person_id}".encode(),
                       hashlib.sha256).digest()
     return "".join(ANON_ALPHABET[b % len(ANON_ALPHABET)] for b in digest[:4])
@@ -2428,6 +2478,14 @@ def _person_all_emails(rec):
     return out
 
 
+class _TenantIndex(dict):
+    """email -> tenant entry (see _build_tenant_index), plus .teams
+    ({domain: {"domain", "name", "member_emails", "person_ids",
+    "scope"}}) and .person_team ({str(person_id): domain})."""
+    teams = {}
+    person_team = {}
+
+
 def _build_tenant_index():
     """email (lowercased) -> {"name", "person_id"} for every auto-
     enrolled tenant: a people.json person linked to >=1 deal tagged Sell
@@ -2463,15 +2521,59 @@ def _build_tenant_index():
             seller_person_ids.update(_deal_linked_person_ids(deal))
     seller_person_ids_str = {str(pid) for pid in seller_person_ids}
 
-    by_email = {}
+    # Domain teams (see FREE_MAIL_DOMAINS/_is_corporate_domain). A tenant
+    # domain is the corporate domain of any seller's (non-blocklisted)
+    # email. A PERSON is on a domain team when any of their non-
+    # blocklisted emails is at a tenant domain (first in sorted order if
+    # several), so every email of that person resolves to the same team
+    # and the same Dynamo partitions. Access: sellers keep an entry for
+    # every email (as before); a non-seller team person gets an entry
+    # only for their emails AT the team domain -- a domain match without
+    # a CRM record never gets an entry at all.
+    people_by_pid = {}
     for rec in people_list:
         pid = rec.get("id")
-        if pid is None or str(pid) not in seller_person_ids_str:
+        if pid is None:
+            continue
+        try:
+            people_by_pid[str(pid)] = (int(pid), rec)
+        except (TypeError, ValueError):
+            continue
+
+    def _usable_emails(rec):
+        return [e for e in _person_all_emails(rec) if e not in TENANT_BLOCKLIST]
+
+    tenant_domains = set()
+    for pid_str in seller_person_ids_str:
+        _pid, rec = people_by_pid.get(pid_str, (None, None))
+        if rec is None:
+            continue
+        for email in _usable_emails(rec):
+            domain = _email_domain(email)
+            if _is_corporate_domain(domain):
+                tenant_domains.add(domain)
+
+    person_team = {}
+    if tenant_domains:
+        for pid_str, (_pid, rec) in people_by_pid.items():
+            doms = sorted({_email_domain(e) for e in _usable_emails(rec)} & tenant_domains)
+            if doms:
+                person_team[pid_str] = doms[0]
+
+    by_email = _TenantIndex()
+    for rec in people_list:
+        pid = rec.get("id")
+        if pid is None:
+            continue
+        is_seller = str(pid) in seller_person_ids_str
+        team_domain = person_team.get(str(pid))
+        if not is_seller and not team_domain:
             continue
         try:
             pid = int(pid)
         except (TypeError, ValueError):
-            pass
+            if not is_seller:
+                continue
         default_name = _person_display_name(rec)
         # Firm-level tenancy: company_id (else company_name, same two-path
         # convention _closer_kind/get_company_record/get_firm_closed_sell_
@@ -2481,12 +2583,47 @@ def _build_tenant_index():
         # people.json lookup.
         company_id = rec.get("company_id")
         company_name = (rec.get("company_name") or "").strip() or None
-        for email in _person_all_emails(rec):
-            if email in TENANT_BLOCKLIST:
+        for email in _usable_emails(rec):
+            if not is_seller and _email_domain(email) != team_domain:
                 continue
             override_name = (TENANT_OVERRIDES.get(email) or {}).get("name")
             by_email[email] = {"name": override_name or default_name or email, "person_id": pid,
-                                "company_id": company_id, "company_name": company_name}
+                                "company_id": company_id, "company_name": company_name,
+                                "team_domain": team_domain, "is_seller": is_seller}
+
+    # Per-team scope: every team person plus each one's firm (company_id,
+    # else exact lowercased company_name -- the same rule
+    # _firm_person_ids uses for an individual tenant).
+    by_company_id, by_company_name = {}, {}
+    for pid_str, (pid_int, rec) in people_by_pid.items():
+        if rec.get("company_id") is not None:
+            by_company_id.setdefault(rec.get("company_id"), set()).add(pid_int)
+        cname = (rec.get("company_name") or "").strip().lower()
+        if cname:
+            by_company_name.setdefault(cname, set()).add(pid_int)
+    teams = {}
+    for pid_str, domain in person_team.items():
+        pid_int, rec = people_by_pid[pid_str]
+        team = teams.setdefault(domain, {"domain": domain, "person_ids": set(), "scope": set()})
+        team["person_ids"].add(pid_int)
+        team["scope"].add(pid_int)
+        if rec.get("company_id") is not None:
+            team["scope"] |= by_company_id.get(rec.get("company_id"), set())
+        else:
+            cname = (rec.get("company_name") or "").strip().lower()
+            if cname:
+                team["scope"] |= by_company_name.get(cname, set())
+    for domain, team in teams.items():
+        members = sorted(e for e, entry in by_email.items() if entry["team_domain"] == domain)
+        seller_firms = [by_email[e]["company_name"] for e in members
+                        if by_email[e]["is_seller"] and by_email[e]["company_name"]]
+        any_firms = [by_email[e]["company_name"] for e in members if by_email[e]["company_name"]]
+        team["member_emails"] = members
+        team["name"] = (seller_firms or any_firms or [domain])[0]
+        team["person_ids"] = frozenset(team["person_ids"])
+        team["scope"] = frozenset(team["scope"])
+    by_email.teams = teams
+    by_email.person_team = person_team
     return by_email
 
 
@@ -2518,7 +2655,59 @@ def _resolve_tenant(email):
     control check below calls instead of the old TENANTS lookup."""
     if not email:
         return None
-    return _tenant_index().get(email.strip().lower())
+    return _tenant_index_req().get(email.strip().lower())
+
+
+def _tenant_index_req():
+    """_tenant_index() memoized for the rest of the request, so the
+    team helpers below (called per row/per buyer) never add an S3
+    version check each."""
+    if _req_cache.get("tenant_index") is None:
+        _req_cache["tenant_index"] = _tenant_index()
+    return _req_cache["tenant_index"]
+
+
+def _tenant_teams():
+    return getattr(_tenant_index_req(), "teams", {}) or {}
+
+
+def _tenant_team(email):
+    """The team dict (see _TenantIndex) this tenant email belongs to, or
+    None for an individual tenant / unknown email."""
+    entry = _tenant_index_req().get(str(email).strip().lower()) if email else None
+    domain = (entry or {}).get("team_domain")
+    return _tenant_teams().get(domain) if domain else None
+
+
+def _team_partitions(email):
+    """Every Dynamo tenant partition a read for this viewer spans: just
+    [email] for an individual tenant; for a team member, their own email
+    first, then every other team member email (all of the team's intro
+    items, manual intros and person notes live in member partitions)."""
+    email = str(email or "").strip().lower()
+    team = _tenant_team(email)
+    if team is None:
+        return [email]
+    return [email] + [m for m in team["member_emails"] if m != email]
+
+
+def _same_team(email_a, email_b):
+    """True when both emails are the same tenant or on the same team."""
+    a = str(email_a or "").strip().lower()
+    b = str(email_b or "").strip().lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    team_a = _tenant_team(a)
+    return team_a is not None and team_a is _tenant_team(b)
+
+
+def _anon_key_for(email):
+    """Anonymized-code key: the team's shared key for a team member (so
+    every member sees identical codes), else the email itself."""
+    team = _tenant_team(email) if email and email != "admin" else None
+    return f"{TEAM_ANON_PREFIX}{team['domain']}" if team else email
 
 
 # ── Firm-level tenancy ──────────────────────────────────────────────────
@@ -2563,6 +2752,15 @@ def _firm_person_ids(person_id):
     cache = _req_cache["firm_person_ids"]
     if person_id in cache:
         return cache[person_id]
+    # Domain team: a team person's scope is the whole team's (every
+    # person at the domain plus each one's firm), precomputed in
+    # _build_tenant_index. Individual tenants fall through unchanged.
+    idx = _tenant_index_req()
+    team_domain = getattr(idx, "person_team", {}).get(str(person_id))
+    if team_domain and team_domain in getattr(idx, "teams", {}):
+        result = frozenset(idx.teams[team_domain]["scope"] | {person_id})
+        cache[person_id] = result
+        return result
     people_list = _people_list()
     pid_str = str(person_id)
     self_rec = next((rec for rec in people_list if str(rec.get("id")) == pid_str), None)
@@ -2685,13 +2883,25 @@ def _eligible_tenants_list():
     (_handle_tenants_list) so neither recomputes its own copy of this
     population."""
     tenant_index = _tenant_index()
+    teams = getattr(tenant_index, "teams", {}) or {}
     people = get_people_by_ids({e["person_id"] for e in tenant_index.values() if e["person_id"] is not None})
     entries = []
     for email, entry in tenant_index.items():
         rec = people.get(entry["person_id"]) or {}
         firm = (rec.get("company_name") or "").strip()
-        entries.append({"email": email, "name": entry["name"], "firm": firm})
-    entries.sort(key=lambda r: (r["firm"].lower(), r["name"].lower()))
+        row = {"email": email, "name": entry["name"], "firm": firm}
+        team = teams.get(entry.get("team_domain")) if entry.get("team_domain") else None
+        if team is not None:
+            # Domain team: grouped under one "<Firm> (<domain>) — N
+            # members" heading in the picker, one row per member email.
+            n = len(team["member_emails"])
+            row["team_domain"] = team["domain"]
+            row["group"] = f"{team['name']} ({team['domain']}) — {n} member{'' if n == 1 else 's'}"
+            row["_sort"] = (team["name"].lower(), team["domain"], email)
+        else:
+            row["_sort"] = (firm.lower(), "", entry["name"].lower())
+        entries.append(row)
+    entries.sort(key=lambda r: r.pop("_sort"))
     return entries
 
 
@@ -2724,7 +2934,10 @@ def _tenant_search_html(key, view_as):
     current_label = ""
     if view_as:
         match = next((e for e in entries if e["email"] == view_as), None)
-        current_label = f'{match["name"]} · {match["firm"] or "—"}' if match else view_as
+        if match and match.get("group"):
+            current_label = f'{match["email"]} · {match["group"]}'
+        else:
+            current_label = f'{match["name"]} · {match["firm"] or "—"}' if match else view_as
     html = f"""<div class="gg-tenant-search" id="gg-tenant-search">
       <input type="text" class="gg-tenant-search-input" id="gg-tenant-search-input"
              placeholder="Search tenant…" value="{_esc(current_label)}" autocomplete="off"
@@ -2755,12 +2968,21 @@ def _tenant_search_html(key, view_as):
     clearA.textContent = 'Clear (no tenant)';
     clearLi.appendChild(clearA);
     results.appendChild(clearLi);
+    var lastGroup = null;
     list.forEach(function(t) {{
+      if (t.group && t.group !== lastGroup) {{
+        var head = document.createElement('li');
+        head.className = 'gg-tenant-search-group';
+        head.textContent = t.group;
+        results.appendChild(head);
+      }}
+      lastGroup = t.group || null;
       var li = document.createElement('li');
+      if (t.group) li.className = 'gg-tenant-search-member';
       var a = document.createElement('a');
       a.href = hrefFor(t.email);
       a.setAttribute('role', 'menuitem');
-      a.textContent = t.name + ' · ' + (t.firm || '—');
+      a.textContent = t.group ? (t.email + ' · ' + t.name) : (t.name + ' · ' + (t.firm || '—'));
       li.appendChild(a);
       results.appendChild(li);
     }});
@@ -2770,7 +2992,8 @@ def _tenant_search_html(key, view_as):
     var q = input.value.trim().toLowerCase();
     if (!q) return TENANTS;
     return TENANTS.filter(function(t) {{
-      return t.name.toLowerCase().indexOf(q) !== -1 || (t.firm || '').toLowerCase().indexOf(q) !== -1;
+      return t.name.toLowerCase().indexOf(q) !== -1 || (t.firm || '').toLowerCase().indexOf(q) !== -1
+        || t.email.indexOf(q) !== -1 || (t.group || '').toLowerCase().indexOf(q) !== -1;
     }});
   }}
 
@@ -3424,7 +3647,43 @@ def _dynamo_table():
     return _dynamo_table_singleton["table"]
 
 
-def get_intro_details(tenant_email):
+def _intro_entry_freshness(entry):
+    """Latest timestamp an intro entry carries -- decides which copy wins
+    when the same deal_id turns up in more than one team partition."""
+    stamps = [entry.get(k) for k in ("notes_updated_at", "override_at", "stage_override_at",
+                                     "deadline_override_at")]
+    stamps += list((entry.get("milestones") or {}).values())
+    best = 0.0
+    for v in stamps:
+        try:
+            best = max(best, float(v))
+        except (TypeError, ValueError):
+            continue
+    return best
+
+
+def get_intro_details(tenant_email, expand_team=True):
+    """Domain teams: for a team member (and expand_team) this spans every
+    team partition (_team_partitions) -- the owning member's partition
+    holds each deal's item, so the union is every team intro; if one
+    deal_id somehow appears twice, the most recently touched copy wins.
+    Individual tenants: exactly one partition, unchanged.
+
+    Returns (entries, dynamo_failed) -- see _get_intro_details_one."""
+    partitions = _team_partitions(tenant_email) if expand_team else [tenant_email]
+    if len(partitions) == 1:
+        return _get_intro_details_one(partitions[0])
+    merged, failed = {}, False
+    for partition in partitions:
+        out, part_failed = _get_intro_details_one(partition)
+        failed = failed or part_failed
+        for deal_id, entry in out.items():
+            if deal_id not in merged or _intro_entry_freshness(entry) > _intro_entry_freshness(merged[deal_id]):
+                merged[deal_id] = entry
+    return merged, failed
+
+
+def _get_intro_details_one(tenant_email):
     """{deal_id_str: {"next_steps", "notes", "follow_up", "status_override",
     "override_at", ..., "milestones"}} for every intro item under this
     tenant, via a single Query on the syndicate-dash table (never one
@@ -3480,6 +3739,24 @@ def _manual_intro_sk(company, person_id):
 
 
 def get_manual_intros(tenant_email, company=None):
+    """Domain teams: union across every team partition (_team_partitions);
+    a (company, person_id) present twice keeps the most recently updated
+    copy. Individual tenants: one partition, unchanged. See
+    _get_manual_intros_one for the item shape."""
+    partitions = _team_partitions(tenant_email)
+    if len(partitions) == 1:
+        return _get_manual_intros_one(partitions[0], company)
+    merged, failed = {}, False
+    for partition in partitions:
+        out, part_failed = _get_manual_intros_one(partition, company)
+        failed = failed or part_failed
+        for k, v in out.items():
+            if k not in merged or str(v.get("updated_at") or "") > str(merged[k].get("updated_at") or ""):
+                merged[k] = v
+    return merged, failed
+
+
+def _get_manual_intros_one(tenant_email, company=None):
     """Every manual-intro Dynamo item under this tenant (sk begins_with
     "manual-intro#"), optionally filtered to one company. The company
     name is parsed back out of the sk itself via rsplit on the trailing
@@ -5691,7 +5968,10 @@ def _tenant_email_for_deal(deal):
     in that case."""
     linked = _deal_linked_person_ids(deal)
     for email, info in _tenant_index().items():
-        if info.get("person_id") in linked:
+        # Sellers only: the index also holds non-seller domain-team
+        # members now, and a deal's owning partition must stay exactly
+        # the seller it always resolved to.
+        if info.get("is_seller", True) and info.get("person_id") in linked:
             return email
     return None
 
@@ -7663,6 +7943,11 @@ NAV_CSS = """
   }
   .gg-tenant-search-results li a:hover { background: rgba(61,90,115,0.08); }
   .gg-tenant-search-clear { color: var(--muted); border-bottom: 1px solid var(--line); }
+  .gg-tenant-search-results li.gg-tenant-search-group {
+    padding: 8px 12px 4px; font-size: 11px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.03em; border-top: 1px solid var(--line);
+  }
+  .gg-tenant-search-results li.gg-tenant-search-member a { padding-left: 24px; }
   /* Shared .ei-msg (Saving…/Saved ✓/error) -- most pages already define
      this themselves, but _nav_html's own "Copy client link" feedback
      needs it on EVERY page the nav renders on, buyer page and Demand
@@ -11065,7 +11350,35 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
     return f'<div class="card buyer-track-card"><h2 class="buyer-section-heading">Track with you</h2>{body}</div>'
 
 
-NOTE_VISIBILITY_TEXT = "Only you and Gracia Group can see these."
+def _note_visibility_text(tenant_email):
+    """Who can read this viewer's notes: their whole domain team (plus
+    Gracia Group) for a team member, else just them."""
+    team = _tenant_team(tenant_email)
+    who = f"your team at {team['domain']}" if team else "you"
+    return f"Visible to {who} and Gracia Group."
+
+
+def _team_owned_buy_deals(person_id, tenant_email):
+    """[(deal, closed_out)] for a DOMAIN-TEAM viewer: every matched-or-
+    later and closed-out buy deal in the team's scope whose owning
+    partition (_tenant_email_for_deal) is one of the team's own -- the
+    deals whose notes the team shares. A deal owned by someone outside
+    the team (e.g. a free-mail firm colleague in firm scope) is excluded:
+    that owner's notes stay private to them."""
+    partitions = set(_team_partitions(tenant_email))
+    out, seen = [], set()
+    for closed_out, deals in ((False, get_firm_matched_buy_deals(person_id)),
+                              (True, get_firm_closed_out_buy_deals(person_id))):
+        for d in deals:
+            deal_id = str(d.get("id"))
+            if deal_id in seen:
+                continue
+            owner = _tenant_email_for_deal(d)
+            if owner is None or owner not in partitions:
+                continue
+            seen.add(deal_id)
+            out.append((d, closed_out))
+    return out
 
 
 def _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode):
@@ -11114,6 +11427,22 @@ def _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode):
             entry = intro_cache[owner_email].get(str(d.get("id")))
             if entry:
                 _add_deal(owner_email, d, entry)
+    elif _tenant_team(anon_key_email) is not None:
+        # Domain team: every member's person note on this buyer, and
+        # every team-owned intro's deal notes (disclosed ones only).
+        person_id = tenant.get("person_id")
+        for partition in _team_partitions(anon_key_email):
+            _add_person(partition)
+        intro_details, _ = get_intro_details(anon_key_email)
+        for d, closed_out in _team_owned_buy_deals(person_id, anon_key_email):
+            if buyer_id not in _deal_linked_person_ids(d):
+                continue
+            entry = intro_details.get(str(d.get("id")))
+            if not entry:
+                continue
+            disclosed = _closed_out_disclosed(d) if closed_out else _resolve_intro_status(d, entry)["disclosed"]
+            if disclosed:
+                _add_deal(_tenant_email_for_deal(d), d, entry)
     else:
         person_id = tenant.get("person_id")
         _add_person(anon_key_email)
@@ -11178,11 +11507,11 @@ def _note_input_card_html(title, subtitle, attrs):
     )
 
 
-def _buyer_person_note_input_html(rec, buyer_id):
+def _buyer_person_note_input_html(rec, buyer_id, tenant_email=None):
     first = _first_name(rec) or "this person"
     return _note_input_card_html(
         f"Your notes on {first}",
-        f"About this person, across all deals. {NOTE_VISIBILITY_TEXT}",
+        f"About this person, across all deals. {_note_visibility_text(tenant_email)}",
         f'data-kind="person" data-buyer-id="{_esc(str(buyer_id))}"')
 
 
@@ -11203,12 +11532,17 @@ def _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode):
             tenant_name = (tenant_index.get(owner_email) or {}).get("name", owner_email)
             cards.append(_note_input_card_html(
                 f"Deal notes: {_deal_company_name(d) or '—'} · {tenant_name}",
-                f"About this intro only. {NOTE_VISIBILITY_TEXT}",
+                f"About this intro only. {_note_visibility_text(owner_email)}",
                 f'data-kind="deal" data-deal-id="{_esc(str(d.get("id")))}"'))
     else:
         person_id = tenant.get("person_id")
         intro_details, _ = get_intro_details(anon_key_email)
-        for d in get_my_matched_buy_deals(person_id):
+        if _tenant_team(anon_key_email) is not None:
+            candidates = [d for d, closed_out in _team_owned_buy_deals(person_id, anon_key_email)
+                          if not closed_out]
+        else:
+            candidates = get_my_matched_buy_deals(person_id)
+        for d in candidates:
             if buyer_id not in _deal_linked_person_ids(d):
                 continue
             entry = intro_details.get(str(d.get("id"))) or {}
@@ -11216,7 +11550,7 @@ def _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode):
                 continue
             cards.append(_note_input_card_html(
                 f"Deal notes: {_deal_company_name(d) or '—'}",
-                f"About this intro only. {NOTE_VISIBILITY_TEXT}",
+                f"About this intro only. {_note_visibility_text(anon_key_email)}",
                 f'data-kind="deal" data-deal-id="{_esc(str(d.get("id")))}"'))
     return "".join(cards)
 
@@ -11392,7 +11726,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 about_html = _buyer_about_firm_html(firm_name, company_rec, edit_mode) + deal_team_html
                 history_html = _buyer_notes_history_html(
                     _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode), edit_mode)
-                inputs_html = (_buyer_person_note_input_html(rec, buyer_id)
+                inputs_html = (_buyer_person_note_input_html(rec, buyer_id, anon_key_email)
                                + _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode))
                 track_html = _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode)
                 body_html = (
@@ -12255,9 +12589,17 @@ def _handle_update_intro(event):
         return _json_response({"error": "deal has no linked tenant"}, 400)
 
     if not is_admin and tenant_email != tenant_identity_email:
-        return _json_response({"error": "forbidden"}, 403)
+        # Domain teams: a teammate may add a DEAL NOTE to another member's
+        # intro (notes are team-shared); every other field -- status,
+        # milestones, flags, next steps, follow-up -- stays owner-only.
+        notes_only = (not has_status_intent and next_steps is None and follow_up is None
+                      and deadline is None and share_loss_reason is None and notes is not None)
+        if not (notes_only and _same_team(tenant_email, tenant_identity_email)):
+            return _json_response({"error": "forbidden"}, 403)
 
-    intro_details, _ = get_intro_details(tenant_email)
+    # The owning partition only (expand_team=False): this is the item the
+    # write below lands on.
+    intro_details, _ = get_intro_details(tenant_email, expand_team=False)
     old_entry = intro_details.get(deal_id) or {}
     old_resolved = _resolve_intro_status(deal, old_entry)
 
@@ -12417,7 +12759,7 @@ def _handle_duplicate_report():
     person_to_tenant = {}
     for email, entry in tenant_index.items():
         pid = entry.get("person_id")
-        if pid is not None:
+        if pid is not None and entry.get("is_seller", True):
             person_to_tenant.setdefault(pid, email)
 
     groups = {}

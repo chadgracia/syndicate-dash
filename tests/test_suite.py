@@ -5101,13 +5101,13 @@ pn_page = lf.render_buyer_page(PN_BUYER_PID, "Tessa Seller", pn_tenant, PN_TENAN
 check("Person note: input card titled with the buyer's first name",
       '<h2 class="buyer-section-heading">Your notes on Barry</h2>' in pn_page)
 check("Person note: subtitle states the verified visibility",
-      "About this person, across all deals. Only you and Gracia Group can see these." in pn_page)
+      "About this person, across all deals. Visible to you and Gracia Group." in pn_page)
 check("Person note: empty input keyed by buyer_id, short placeholder",
       f'<textarea class="nh-input" data-kind="person" data-buyer-id="{PN_BUYER_PID}" placeholder="Add a note…"></textarea>'
       in pn_page)
 check("Deal note: subtitle states the verified visibility",
       ">Deal notes: PN Buy Co</h2>" in pn_page
-      and "About this intro only. Only you and Gracia Group can see these." in pn_page)
+      and "About this intro only. Visible to you and Gracia Group." in pn_page)
 
 pn_anon_page = lf.render_buyer_page(PN_BUYER_PID, "Nora Seller", pn_other_tenant, PN_OTHER_TENANT_EMAIL,
                                      key=None, view_as=None, edit_mode=False)
@@ -5898,6 +5898,219 @@ check("layout: mobile order classes present (header 1, track 2, bio 3, inputs 4,
       and ".bp-o5 {{" not in nh_page_a and ".bp-o5 { order: 5; }" in nh_page_a)
 check("layout: old side-by-side private-notes card is gone", "buyer-top-row" not in nh_page_a)
 lf.urllib.request.urlopen = fake_urlopen
+
+
+# ======================================================================
+# SECTION: Domain team tenancy -- corporate-domain teams, free-mail /
+# academic / blocklisted individuals, TENANT_BLOCKLIST, team notes
+# ======================================================================
+_saved_tenant_blocklist = set(lf.TENANT_BLOCKLIST)
+_saved_domain_blocklist = set(lf.DOMAIN_SHARING_BLOCKLIST)
+lf.DOMAIN_SHARING_BLOCKLIST = {"bigbank.com"}
+lf.TENANT_BLOCKLIST = _saved_tenant_blocklist | {"tom@acmecap.com"}
+
+check("domain class: gmail.com is not corporate", not lf._is_corporate_domain("gmail.com"))
+check("domain class: .edu is not corporate", not lf._is_corporate_domain("mit.edu"))
+check("domain class: .ac.uk / .ac.jp are not corporate",
+      not lf._is_corporate_domain("ox.ac.uk") and not lf._is_corporate_domain("u-tokyo.ac.jp"))
+check("domain class: DOMAIN_SHARING_BLOCKLIST domain is not corporate", not lf._is_corporate_domain("bigbank.com"))
+check("domain class: an ordinary firm domain is corporate", lf._is_corporate_domain("acmecap.com"))
+check("domain class: every listed free-mail domain present",
+      {"yahoo.co.uk", "proton.me", "163.com", "tutanota.com", "i.ua", "t-online.de"} <= lf.FREE_MAIL_DOMAINS
+      and len(lf.FREE_MAIL_DOMAINS) == 45)
+
+TT_BUYER = 850
+tt_people = {"people": [
+    {"id": 801, "full_name": "Alice Acme", "email": "alice@acmecap.com", "company_id": 5001,
+     "company_name": "Acme Capital", "custom_fields": {}},
+    # Colleague: CRM record, no deal linkage, messy case/whitespace, different company_id.
+    {"id": 802, "full_name": "Bob Acme", "email": "  Bob@AcmeCap.COM ", "company_id": 5002,
+     "company_name": "Acme Ventures", "custom_fields": {}},
+    # Bob's company colleague on gmail, with his own sell deal -> team sees it via firm scope.
+    {"id": 803, "full_name": "Dan Gmail", "email": "dan@gmail.com", "company_id": 5002,
+     "company_name": "Acme Ventures", "custom_fields": {}},
+    {"id": 804, "full_name": "Tom Blocked", "email": "tom@acmecap.com", "company_id": 5001, "custom_fields": {}},
+    {"id": 810, "full_name": "Gina Gmail", "email": "gina@gmail.com", "custom_fields": {}},
+    {"id": 811, "full_name": "Gus Gmail", "email": "gus@gmail.com", "custom_fields": {}},
+    {"id": 820, "full_name": "Eve Edu", "email": "eve@mit.edu", "custom_fields": {}},
+    {"id": 821, "full_name": "Ed Edu", "email": "ed@mit.edu", "custom_fields": {}},
+    {"id": 822, "full_name": "Oli Ox", "email": "oli@ox.ac.uk", "custom_fields": {}},
+    {"id": 823, "full_name": "Ola Ox", "email": "ola@ox.ac.uk", "custom_fields": {}},
+    {"id": 824, "full_name": "Bea Bank", "email": "bea@bigbank.com", "custom_fields": {}},
+    {"id": 825, "full_name": "Ben Bank", "email": "ben@bigbank.com", "custom_fields": {}},
+    {"id": 830, "full_name": "Zed Zeta", "email": "zed@zeta.io", "company_id": 6001,
+     "company_name": "Zeta Partners", "custom_fields": {}},
+    {"id": TT_BUYER, "first_name": "Xena", "full_name": "Xena Buyer", "email": "xena@buyerfund.com",
+     "custom_fields": {}},
+]}
+
+def _tt_sell(did, company, pid):
+    return {"id": did, "name": f"{company} sell", "company": {"name": company}, "deal_stage": {"id": lf.STAGE_FIRM},
+            "custom_fields": cf_sell(), "people": [{"id": pid}], "updated_at": "2026-08-01T00:00:00Z"}
+
+def _tt_buy(did, company, pid):
+    return {"id": did, "name": f"{company} buy", "company": {"name": company}, "deal_stage": {"id": lf.STAGE_MATCHED},
+            "custom_fields": cf_status(7207579), "people": [{"id": pid}, {"id": TT_BUYER}],
+            "updated_at": "2026-08-02T00:00:00Z"}
+
+tt_deals = [
+    _tt_sell(980001, "Widget Co", 801), _tt_buy(980101, "Widget Co", 801),
+    _tt_sell(980002, "Gadget Co", 803),
+    _tt_sell(980003, "Gizmo Co", 810), _tt_buy(980103, "Gizmo Co", 810),
+    _tt_sell(980004, "Gear Co", 811),
+    _tt_sell(980005, "Edu Sell Co", 820), _tt_sell(980006, "Ox Sell Co", 822),
+    _tt_sell(980007, "Bank Sell Co", 824),
+    _tt_sell(980008, "Zeta Target", 830), _tt_buy(980108, "Zeta Target", 830),
+    _tt_sell(980009, "Tom Sell Co", 804),
+]
+_, tt_table = use_fixture({lf.PEOPLE_KEY: tt_people, lf.INTEREST_KEY: {"buy": {}},
+                           lf.DEALS_KEY: {"deals": tt_deals}})
+
+tt_idx = lf._tenant_index()
+check("team: Bob (CRM record, no deals) is enrolled on the acmecap.com team",
+      tt_idx.get("bob@acmecap.com", {}).get("team_domain") == "acmecap.com")
+check("team: case/whitespace in the CRM email normalized", "bob@acmecap.com" in tt_idx
+      and lf._resolve_tenant("  BOB@ACMECAP.com ") is not None)
+check("team: a same-domain email with no CRM record is not enrolled", lf._resolve_tenant("carl@acmecap.com") is None)
+check("team: TENANT_BLOCKLIST removes Tom even though he is at the team domain and has a deal",
+      lf._resolve_tenant("tom@acmecap.com") is None)
+check("individual: gmail seller has no team", tt_idx["gina@gmail.com"]["team_domain"] is None)
+check("individual: .edu and .ac.uk sellers have no team",
+      tt_idx["eve@mit.edu"]["team_domain"] is None and tt_idx["oli@ox.ac.uk"]["team_domain"] is None)
+check("individual: .edu / .ac.uk colleagues without deals are not enrolled",
+      lf._resolve_tenant("ed@mit.edu") is None and lf._resolve_tenant("ola@ox.ac.uk") is None)
+check("individual: DOMAIN_SHARING_BLOCKLIST seller falls back to individual tenancy",
+      tt_idx["bea@bigbank.com"]["team_domain"] is None and lf._resolve_tenant("ben@bigbank.com") is None)
+check("team: gmail colleague Dan is NOT a team member (individual)", tt_idx["dan@gmail.com"]["team_domain"] is None)
+check("team: the deal's owning partition is still its seller, never a non-seller teammate",
+      lf._tenant_email_for_deal(tt_deals[1]) == "alice@acmecap.com")
+
+def _tt_get(email, tab="mydeals", extra=None):
+    q = {"tab": tab}
+    q.update(extra or {})
+    return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": q,
+                              "cookies": [tenant_cookie(email)]}, None)
+
+bob_resp = _tt_get("BOB@acmecap.com")
+check("team: Bob (no deals of his own) sees the team's deals (Alice's Widget Co)",
+      bob_resp["statusCode"] == 200 and "Widget Co" in bob_resp["body"])
+check("team: Bob also sees firm-scope deals of his own company (Dan's Gadget Co)", "Gadget Co" in bob_resp["body"])
+check("team: Bob sees nothing of other teams / individuals",
+      not any(c in bob_resp["body"] for c in ("Zeta Target", "Gizmo Co", "Gear Co", "Bank Sell Co")))
+alice_resp = _tt_get("alice@acmecap.com")
+check("team: Alice sees the same team deal set (Widget Co + Gadget Co)",
+      "Widget Co" in alice_resp["body"] and "Gadget Co" in alice_resp["body"])
+check("team: Alice and Bob get the same firm-scope person set",
+      lf._firm_person_ids(801) == lf._firm_person_ids(802))
+carl_resp = _tt_get("carl@acmecap.com")
+check("team: same-domain email without a CRM record is denied (not-a-tenant page)",
+      lf.NOT_ENABLED_MESSAGE in carl_resp["body"] and "Widget Co" not in carl_resp["body"])
+tom_resp = _tt_get("tom@acmecap.com")
+check("team: TENANT_BLOCKLIST member denied", lf.NOT_ENABLED_MESSAGE in tom_resp["body"])
+dan_resp = _tt_get("dan@gmail.com")
+check("individual: Dan (gmail) keeps his own company-firm scope only -- no Widget Co",
+      "Gadget Co" in dan_resp["body"] and "Widget Co" not in dan_resp["body"])
+gina_resp = _tt_get("gina@gmail.com")
+gus_resp = _tt_get("gus@gmail.com")
+check("individual: gmail Gina sees only her own deals",
+      "Gizmo Co" in gina_resp["body"] and "Gear Co" not in gina_resp["body"] and "Widget Co" not in gina_resp["body"])
+check("individual: gmail Gus sees nothing of Gina's", "Gear Co" in gus_resp["body"] and "Gizmo Co" not in gus_resp["body"])
+check("individual: .edu Eve sees only her own", "Edu Sell Co" in _tt_get("eve@mit.edu")["body"]
+      and "Ox Sell Co" not in _tt_get("eve@mit.edu")["body"])
+check("individual: blocklisted-domain Bea sees only her own",
+      "Bank Sell Co" in _tt_get("bea@bigbank.com")["body"] and "Widget Co" not in _tt_get("bea@bigbank.com")["body"])
+check("team: identical anonymized buyer codes for every team member",
+      lf._anon_buyer_code("alice@acmecap.com", 12345) == lf._anon_buyer_code("bob@acmecap.com", 12345))
+check("individual: anonymized codes still differ between individual tenants",
+      lf._anon_buyer_code("gina@gmail.com", 12345) != lf._anon_buyer_code("gus@gmail.com", 12345))
+bob_intros = _tt_get("bob@acmecap.com", tab="intros")
+check("team: Bob's Active Intros shows the team's intro (Widget Co)",
+      bob_intros["statusCode"] == 200 and "Widget Co" in bob_intros["body"])
+
+# --- Admin: grouped picker, view_as any member
+tt_entries = lf._eligible_tenants_list()
+acme_rows = [e for e in tt_entries if e.get("team_domain") == "acmecap.com"]
+check("admin picker: acmecap.com members grouped under '<Firm> (<domain>) — N members'",
+      {e["email"] for e in acme_rows} == {"alice@acmecap.com", "bob@acmecap.com"}
+      and all(e["group"] == "Acme Capital (acmecap.com) — 2 members" for e in acme_rows))
+check("admin picker: team rows are contiguous", [e.get("team_domain") for e in tt_entries].count("acmecap.com") == 2
+      and abs(tt_entries.index(acme_rows[0]) - tt_entries.index(acme_rows[1])) == 1)
+check("admin picker: individual tenants listed as today (no group)",
+      next(e for e in tt_entries if e["email"] == "gina@gmail.com").get("group") is None)
+tt_search_html, tt_search_js = lf._tenant_search_html(ADMIN_KEY, None)
+check("admin picker: script renders team group headers", "gg-tenant-search-group" in tt_search_js
+      and "Acme Capital (acmecap.com) \\u2014 2 members" in tt_search_js)
+tt_admin_bob = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                  "queryStringParameters": {"key": ADMIN_KEY, "view_as": "bob@acmecap.com",
+                                                            "tab": "mydeals"}, "cookies": []}, None)
+check("admin view_as a no-deal team member renders the team view",
+      tt_admin_bob["statusCode"] == 200 and "Widget Co" in tt_admin_bob["body"] and "Gadget Co" in tt_admin_bob["body"])
+
+# --- Notes: shared within a team, isolated across teams, individual stays private
+lf.urllib.request.urlopen = fake_urlopen2
+def _tt_post(action, body, email):
+    return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": action}, "cookies": [tenant_cookie(email)],
+                              "body": json.dumps(body)}, None)
+r_alice_deal = _tt_post("update_intro", {"deal_id": "980101", "notes": "Alice deal note"}, "alice@acmecap.com")
+r_bob_person = _tt_post("update_buyer_note", {"buyer_id": TT_BUYER, "note": "Bob person note"}, "bob@acmecap.com")
+r_bob_deal = _tt_post("update_intro", {"deal_id": "980101", "notes": "Bob deal note on Alice's intro"},
+                      "bob@acmecap.com")
+r_bob_status = _tt_post("update_intro", {"deal_id": "980101", "flag": "stalled"}, "bob@acmecap.com")
+r_zed_person = _tt_post("update_buyer_note", {"buyer_id": TT_BUYER, "note": "Zed private"}, "zed@zeta.io")
+r_zed_deal = _tt_post("update_intro", {"deal_id": "980108", "notes": "Zed deal note"}, "zed@zeta.io")
+r_gina_person = _tt_post("update_buyer_note", {"buyer_id": TT_BUYER, "note": "Gina private"}, "gina@gmail.com")
+r_zed_hijack = _tt_post("update_intro", {"deal_id": "980101", "notes": "Zed hijack"}, "zed@zeta.io")
+check("notes: all legitimate saves -> 200",
+      all(r["statusCode"] == 200 for r in (r_alice_deal, r_bob_person, r_bob_deal, r_zed_person, r_zed_deal,
+                                           r_gina_person)))
+check("notes: a teammate can add a deal note but NOT change status on another member's intro",
+      r_bob_status["statusCode"] == 403)
+check("notes: another team cannot write a note on this team's intro", r_zed_hijack["statusCode"] == 403)
+tt_item = next(i for i in tt_table.items if i["tenant"] == "alice@acmecap.com" and i["sk"] == "intro#980101")
+check("notes: Bob's deal note lands on the owning item with Bob as author",
+      tt_item["notes_history"][-1]["text"] == "Bob deal note on Alice's intro"
+      and tt_item["notes_history"][-1]["author_name"] == "Bob Acme"
+      and tt_item["notes_history"][-1]["author_email"] == "bob@acmecap.com")
+
+def _tt_hist(email, pid):
+    tenant = lf._resolve_tenant(email)
+    return [(e["text"], e["author_name"]) for e, _o in lf._buyer_note_history_entries(TT_BUYER, tenant, email, False)]
+
+h_alice = _tt_hist("alice@acmecap.com", 801)
+h_bob = _tt_hist("bob@acmecap.com", 802)
+check("notes shared in team: Alice sees Bob's person note and both deal notes with author names",
+      ("Bob person note", "Bob Acme") in h_alice and ("Alice deal note", "Alice Acme") in h_alice
+      and ("Bob deal note on Alice's intro", "Bob Acme") in h_alice)
+check("notes shared in team: Bob sees exactly what Alice sees", sorted(h_alice) == sorted(h_bob))
+check("notes isolated across teams: acme sees nothing of Zed's; Zed sees nothing of acme's",
+      not any("Zed" in t for t, _a in h_alice)
+      and not any(t in ("Bob person note", "Alice deal note") for t, _a in _tt_hist("zed@zeta.io", 830)))
+check("individual notes private: Gina's note visible to Gina only",
+      ("Gina private", "Gina Gmail") in _tt_hist("gina@gmail.com", 810)
+      and not any(t == "Gina private" for t, _a in h_alice + _tt_hist("zed@zeta.io", 830)))
+tt_admin_hist = [e["text"] for e, _o in lf._buyer_note_history_entries(
+    TT_BUYER, lf._resolve_tenant("alice@acmecap.com"), "alice@acmecap.com", True)]
+check("notes: admin sees every team's and individual's entries",
+      all(t in tt_admin_hist for t in ("Bob person note", "Alice deal note", "Zed private", "Zed deal note",
+                                        "Gina private")))
+tt_bob_page = lf.render_buyer_page(TT_BUYER, "Bob Acme", lf._resolve_tenant("bob@acmecap.com"), "bob@acmecap.com")
+check("labels: team person-note subtitle names the domain",
+      "About this person, across all deals. Visible to your team at acmecap.com and Gracia Group." in tt_bob_page)
+check("labels: team deal-note input for the teammate's intro, domain subtitle",
+      ">Deal notes: Widget Co</h2>" in tt_bob_page
+      and "About this intro only. Visible to your team at acmecap.com and Gracia Group." in tt_bob_page)
+check("labels: team page history shows teammate authors", '<span class="nh-author">Alice Acme</span>' in tt_bob_page)
+tt_gina_page = lf.render_buyer_page(TT_BUYER, "Gina Gmail", lf._resolve_tenant("gina@gmail.com"), "gina@gmail.com")
+check("labels: individual tenant subtitle says 'you'",
+      "About this person, across all deals. Visible to you and Gracia Group." in tt_gina_page
+      and "Bob person note" not in tt_gina_page)
+
+lf.urllib.request.urlopen = fake_urlopen
+lf.DOMAIN_SHARING_BLOCKLIST = _saved_domain_blocklist
+lf.TENANT_BLOCKLIST = _saved_tenant_blocklist
+reset_caches()
 
 
 # ======================================================================
