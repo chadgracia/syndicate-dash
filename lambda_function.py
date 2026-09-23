@@ -3004,8 +3004,8 @@ def _anon_key_for(email):
 #
 # Write paths (_find_deal_derived_intro, _find_existing_buy_deal_for_
 # person_company, _handle_add_buyer, _pipeline_create_buy_deal,
-# _handle_deal_stage, _handle_update_intro, _tenant_email_for_deal,
-# _company_update_link_html) are deliberately LEFT untouched, still
+# _handle_deal_stage, _handle_update_intro, _tenant_email_for_deal)
+# are deliberately LEFT untouched, still
 # scoped to the single acting person_id: broadening those would let a
 # write intended for one person land on a colleague's deal, or let the
 # Dynamo/audit-trail actor resolution (_tenant_email_for_deal) become
@@ -7401,7 +7401,7 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
         if company_name:
             col1_html = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
                          f'{_esc(company_name)}</a>{via_html}')
-            col1_html += _company_update_link_html(tenant_person_id, company_name)
+            col1_html += _company_update_link_html(tenant_person_id, company_name, anon_key_email)
         else:
             col1_html = "—"
         if disclosed:
@@ -9118,28 +9118,52 @@ def _group_empty_row_html(message, colspan):
     return f'<tr><td colspan="{colspan}" class="group-empty">{_esc(message)}</td></tr>'
 
 
-def _company_update_link_html(person_id, company_name):
-    """Item 6 (turn 16): a small muted "Update deal ->" link under the
-    company name on each Active Intros row, to the tenant's own Sell
-    Order deal for that company (get_my_sell_deals — never the buy-side
-    intro deal this row itself represents) via the same minted deal-
-    update-form URL as My Deals' Update/Cancel button. Most-recently-
-    updated Sell deal wins when a tenant somehow has more than one on
-    file for the same company (get_my_deals already sorts that way).
-    Omitted outright when FORM_HMAC_SECRET isn't configured (see
-    _deal_update_form_url, which returns None) or the tenant has no Sell
-    deal on file for this company.
+def _sell_deals_by_preference(sell_deals, intro_details=None):
+    """THE Sell-deal preference order, shared by the company page's Deal
+    Details card and Active Intros' company chip so the two can never
+    pick different deals. Returns (live, archived): lists of
+    (deal, resolved_stage) -- stage resolved newer-wins against the
+    deal's Dynamo item (_resolve_deal_stage) -- each newest-updated
+    first. Archived = Won or _is_closed_down_stage; everything else
+    (incl. Hold) is live."""
+    intro_details = intro_details or {}
+    live, archived = [], []
+    for d in sorted(sell_deals, key=lambda d: d.get("updated_at") or "", reverse=True):
+        rsid = _resolve_deal_stage(d, intro_details.get(str(d.get("id"))))
+        if _is_won_stage(rsid) or _is_closed_down_stage(rsid):
+            archived.append((d, rsid))
+        else:
+            live.append((d, rsid))
+    return live, archived
 
-    Deliberately still get_my_sell_deals (person-scoped), not the firm-
-    wide get_firm_sell_deals: this mints a signed link straight into
-    Pipeline's own deal-update form, which must only ever point at the
-    VIEWING tenant's own deal record, never a colleague's -- see the
-    write-path exceptions noted above get_my_deals's firm-level
-    neighbors."""
-    sell_deals = get_my_sell_deals(person_id, company_name)
-    if not sell_deals:
+
+def _preferred_sell_deal(person_id, company, intro_details=None):
+    """The one Sell deal a company-level action points at: the newest-
+    updated LIVE firm/team Sell deal for `company`, else the newest
+    archived one. Same scope (get_firm_sell_deals) and order
+    (_sell_deals_by_preference) as the company page's Deal Details card,
+    whose first card is this deal. Returns (deal, resolved_stage) or
+    (None, None)."""
+    if person_id is None:
+        return None, None
+    live, archived = _sell_deals_by_preference(get_firm_sell_deals(person_id, company), intro_details)
+    return (live or archived or [(None, None)])[0]
+
+
+def _company_update_link_html(person_id, company_name, anon_key_email=None):
+    """Active Intros' per-row deal action under the company name
+    (_deal_action_html, stacked). The deal is _preferred_sell_deal --
+    exactly the deal the company page's Deal Details card leads with, so
+    a newer archived deal can never shadow a live one ("Reopen ->" next
+    to a live deal). Firm/team-scoped like that card (Sep 22 firm-level-
+    writes decision). Omitted when there is no Sell deal for this company
+    or _deal_action_html renders nothing (Won, or FORM_HMAC_SECRET
+    unset)."""
+    intro_details = get_intro_details(anon_key_email)[0] if anon_key_email else None
+    deal, stage = _preferred_sell_deal(person_id, company_name, intro_details)
+    if deal is None:
         return ""
-    action = _deal_action_html(str(sell_deals[0].get("id")), _deal_stage_id(sell_deals[0]), stacked=True)
+    action = _deal_action_html(str(deal.get("id")), stage, stacked=True)
     return f'<div class="company-update-link">{action}</div>' if action else ""
 
 
@@ -11579,9 +11603,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             # _is_closed_down_stage My Deals' Archived section uses).
             # Closed cards carry no paperwork (see _deal_card_html).
             live_cards, won_cards, down_cards = [], [], []
-            for d in sell_deals:
+            live_ordered, archived_ordered = _sell_deals_by_preference(sell_deals, intro_details)
+            for d, rsid in live_ordered + archived_ordered:
                 entry = intro_details.get(str(d.get("id")))
-                rsid = _resolve_deal_stage(d, entry)
                 if _is_won_stage(rsid):
                     won_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode))
                 elif _is_closed_down_stage(rsid):

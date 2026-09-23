@@ -7436,6 +7436,62 @@ os.environ["FORM_HMAC_SECRET"] = _saved_form_key
 
 
 # ======================================================================
+# SECTION: Active Intros chip picks the same Sell deal as Deal Details
+# ======================================================================
+# A newer-updated archived Sell deal must never shadow a live one: the
+# chip and the company page's first Deal Details card both go through
+# _preferred_sell_deal / _sell_deals_by_preference.
+PREF_TENANT_PID, PREF_BUYER_PID = 702001, 702002
+_pref_people = {"people": [
+    {"id": PREF_TENANT_PID, "full_name": "Pia Pref", "email": "pia@example.com", "custom_fields": {}},
+    {"id": PREF_BUYER_PID, "full_name": "Buyer P", "email": "bp@example.com", "custom_fields": {}},
+]}
+_pref_live = {"id": 950001, "name": "Pref Co Live", "company": {"name": "Pref Co"},
+              "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+              "people": [{"id": PREF_TENANT_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+_pref_old = {"id": 950002, "name": "Pref Co Old", "company": {"name": "Pref Co"},
+             "deal_stage": {"id": lf.OBSOLETE_STAGE_ID}, "custom_fields": cf_sell(),
+             "people": [{"id": PREF_TENANT_PID}], "updated_at": "2026-09-01T00:00:00Z"}
+_pref_buy = {"id": 950003, "name": "Pref Buy", "company": {"name": "Pref Co"},
+             "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(7207579),
+             "people": [{"id": PREF_TENANT_PID}, {"id": PREF_BUYER_PID}], "updated_at": "2026-08-02T00:00:00Z"}
+
+
+def _pref_scenario(sell_deals):
+    use_fixture({lf.PEOPLE_KEY: _pref_people, lf.INTEREST_KEY: {"buy": {}},
+                 lf.DEALS_KEY: {"deals": sell_deals + [_pref_buy]}})
+    t = lf._resolve_tenant("pia@example.com")
+    chip = lf._company_update_link_html(PREF_TENANT_PID, "Pref Co", "pia@example.com")
+    intros = body_only(lf.render_intros_page("Pia Pref", tenant=t, tenant_email="pia@example.com",
+                                             key=None, view_as=None, edit_mode=False))
+    comp = lf.render_company_page("Pref Co", "Pia Pref", t, "pia@example.com", "intros")
+    dd = comp[comp.find('id="deal-details"'):]
+    card_ids = re.findall(r"deal_id=(\d+)", dd)
+    chip_ids = re.findall(r"deal_id=(\d+)", chip)
+    return chip, intros, card_ids, chip_ids
+
+
+_c, _p, _cards, _chips = _pref_scenario([_pref_live, _pref_old])
+check("deal preference: newer archived deal does not shadow the live one -- chip is Update, not Reopen",
+      'class="update-cancel-btn stacked"' in _c and "Reopen" not in _c and _chips == ["950001"])
+check("deal preference: Active Intros row renders the live deal's Update chip, no Reopen",
+      'class="update-cancel-btn stacked"' in _p and "Reopen &rarr;" not in _p.split("company-update-link", 1)[1][:600])
+check("deal preference: chip and company-page Deal Details lead with the same (live) deal",
+      bool(_cards) and _cards[0] == _chips[0] == "950001")
+
+_c, _p, _cards, _chips = _pref_scenario([_pref_old])
+check("deal preference: only archived Sell deals -> chip still 'Reopen ->'",
+      "Reopen &rarr;" in _c and _chips == ["950002"])
+check("deal preference: archived-only chip and company-page card select the same deal",
+      bool(_cards) and _cards[0] == _chips[0] == "950002")
+_pref_won = dict(_pref_old, id=950004, deal_stage={"id": 111802},
+                 updated_at="2026-07-01T00:00:00Z")
+check("deal preference: helper falls back to the newest-updated archived deal",
+      lf._sell_deals_by_preference([_pref_won, _pref_old])[1][0][0]["id"] == 950002
+      and lf._sell_deals_by_preference([_pref_won, _pref_old])[0] == [])
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 
