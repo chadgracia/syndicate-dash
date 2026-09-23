@@ -283,7 +283,7 @@ def use_fixture(objs, table_items=None, last_modified=None, ses=None):
     return fake_s3, fake_table
 
 
-AGREEMENT_YES = next(iter(lf.AGENT_ENGAGED_OPTS))
+AGREEMENT_YES = lf.AGENT_AGREEMENT_SELL_SIGNED_ID  # 6354277, sell-side signed (paperwork rule)
 AGREEMENT_IN_PROCESS = next(iter(lf.AGENT_IN_PROCESS_OPTS))
 
 
@@ -546,9 +546,10 @@ check("nav badge (Yes) says ID verified", "ID verified" in badge_yes)
 check("nav badge (Yes) has no leftover CEF text", "CEF" not in badge_yes)
 check("nav badge (Pending) says ID pending", "ID pending" in badge_pending)
 check("nav badge (Pending) has no leftover CEF text", "CEF" not in badge_pending)
-check("nav badge (No/missing) says ID required — FINRA compliance", "ID required — FINRA compliance" in badge_no)
+check("nav badge (No/missing) says CEF required — FINRA compliance", "CEF required — FINRA compliance" in badge_no)
 check("nav badge (No/missing) still links the CEF form", lf.CEF_FORM_URL in badge_no)
-check("nav badge (No/missing) has no leftover CEF text", "CEF" not in badge_no)
+check("nav badge (No/missing) uses the paperwork rule's 'CEF required' wording, not 'ID required'",
+      "ID required" not in badge_no)
 
 box_html = lf._feature_box_html("bob@example.com", key=None)
 check("feature box is unaffected by the CEF-badge rename", "feature-input" in box_html)
@@ -573,19 +574,23 @@ check("admin badge stays a fixed high-contrast red (not palette-driven)",
 # nudge > id_required > agreement_unsigned), with a tooltip naming any
 # lower-priority candidates that also applied.
 
-deal_no_id = {"custom_fields": cf_sell()}
-check("state: CEF not Yes -> id_required", lf._my_deal_visibility_state(deal_no_id, lf.CEF_NO_ID, False) == "id_required")
-check("id_required wins even with agreement signed + full terms",
-      lf._my_deal_visibility_state({"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_YES],
-                                                                **full_terms()})}, lf.CEF_PENDING_ID, False)
-      == "id_required")
+deal_no_id = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_YES], **full_terms()})}
+check("state: CEF not Yes/N/A -> paperwork_missing",
+      lf._my_deal_visibility_state(deal_no_id, lf.CEF_NO_ID, False) == "paperwork_missing")
+check("paperwork_missing wins even with agreement signed + full terms (CEF Pending)",
+      lf._my_deal_visibility_state(deal_no_id, lf.CEF_PENDING_ID, False) == "paperwork_missing")
 
 deal_agreement_unsigned = {"custom_fields": cf_sell({**full_terms()})}
-check("state: agreement unset -> agreement_unsigned",
-      lf._my_deal_visibility_state(deal_agreement_unsigned, lf.CEF_YES_ID, False) == "agreement_unsigned")
+check("state: agreement unset -> paperwork_missing",
+      lf._my_deal_visibility_state(deal_agreement_unsigned, lf.CEF_YES_ID, False) == "paperwork_missing")
 deal_in_process = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_IN_PROCESS], **full_terms()})}
-check("state: In-Process agreement counts as unsigned",
-      lf._my_deal_visibility_state(deal_in_process, lf.CEF_YES_ID, False) == "agreement_unsigned")
+check("state: In-Process agreement counts as missing",
+      lf._my_deal_visibility_state(deal_in_process, lf.CEF_YES_ID, False) == "paperwork_missing")
+deal_buyside_only = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [6354274], **full_terms()})}
+check("state: a BUY-side agreement (6354274) does not satisfy the sell-side rule",
+      lf._my_deal_visibility_state(deal_buyside_only, lf.CEF_YES_ID, False) == "paperwork_missing")
+check("state: CEF N/A satisfies the CEF half",
+      lf._my_deal_visibility_state(deal_no_id, lf.CEF_NA_ID, False) == "live")
 
 deal_no_terms = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_YES]})}
 check("state: no size, no fees -> terms_incomplete",
@@ -610,47 +615,56 @@ check("is_won=True -> 'sold' even when is_held=True (never 'held')",
 check("is_won=False, everything unset -> falls through the normal ladder (not 'sold')",
       lf._my_deal_visibility_state({}, None, False, is_won=False) != "sold")
 
-# Badge HTML: state-only text, no links (the actionable links moved to the
-# Next Steps chip below), shortened wording with a middot separator.
 check("live badge exact text", lf._my_deal_visibility_badge_html(deal_full, lf.CEF_YES_ID, False)
       == '<span class="visibility-badge live">Live · shown to buyers</span>')
-check("id_required badge exact text", lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False)
-      == '<span class="visibility-badge id-required">Not live · ID required</span>')
-check("agreement_unsigned badge exact text", lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_YES_ID, False)
-      == '<span class="visibility-badge agreement-unsigned">Not live · unsigned agreement</span>')
+check("CEF-missing badge exact text", lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False)
+      == '<span class="visibility-badge id-required">Not live · CEF required</span>')
+check("agreement-missing badge exact text", lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_YES_ID, False)
+      == '<span class="visibility-badge id-required">Not live · Agent agreement required</span>')
+check("both-missing badge names both",
+      lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_NO_ID, False)
+      == '<span class="visibility-badge id-required">Not live · CEF required · Agent agreement required</span>')
 check("terms_incomplete badge exact text", lf._my_deal_visibility_badge_html(deal_no_terms, lf.CEF_YES_ID, False)
       == '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>')
 check("held badge exact text", lf._my_deal_visibility_badge_html(deal_full, lf.CEF_YES_ID, True)
       == '<span class="visibility-badge held">Held · not shown to buyers</span>')
 check("sold badge exact text", lf._my_deal_visibility_badge_html({}, None, False, is_won=True)
       == '<span class="visibility-badge sold">Sold &#10003;</span>')
-_badge_no_id = lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False)
-check("id_required badge is a span, not a link (no href)", "<span" in _badge_no_id and "<a " not in _badge_no_id)
+check("no 'ID required' wording left in the Visibility badge",
+      "ID required" not in lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False))
 
-# Next Steps chip priority: a) overdue > b) terms_incomplete > c) nudge > d) id_required > e) agreement_unsigned
-chip = lf._my_deal_action_chip_html("1", "Co", True, True, "id_required", key=None, view_as=None)
-check("a) overdue wins over everything else", 'class="action-chip overdue"' in chip)
-check("a) tooltip names the other applicable actions",
-      'title="Also: nudge buyers, id required"' in chip)
+# Next Steps: paperwork chips first (red, one per missing item); once in
+# order, "Extend deadline" is the only red chip; archived -> "Reopen".
+chip = lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, view_as=None)
+check("in order + past deadline -> red 'Extend deadline ->' to the update form",
+      'class="action-chip overdue"' in chip and "Extend deadline &rarr;" in chip
+      and lf.DEAL_UPDATE_FORM_URL in chip)
+check("overdue tooltip names the other applicable actions", 'title="Also: nudge buyers"' in chip)
 
 chip = lf._my_deal_action_chip_html("1", "Co", False, True, "terms_incomplete", key=None, view_as=None)
-check("b) terms_incomplete beats nudge", 'class="action-chip terms"' in chip)
-check("b) chip text", "Provide deal terms" in chip)
+check("terms_incomplete beats nudge", 'class="action-chip terms"' in chip and "Provide deal terms" in chip)
 
 chip = lf._my_deal_action_chip_html("1", "Co", False, True, "live", key=None, view_as=None)
-check("c) nudge shown alone when nothing else applies", 'class="action-chip nudge"' in chip)
-check("c) nudge chip text", "Nudge buyers" in chip)
+check("nudge shown alone when nothing else applies", 'class="action-chip nudge"' in chip and "Nudge buyers" in chip)
 
-chip = lf._my_deal_action_chip_html("1", "Co", False, False, "id_required", key=None, view_as=None)
-check("d) id_required chip shown when nothing higher-priority applies", 'class="action-chip id-required"' in chip)
-check("d) id_required chip links the CEF form", lf.CEF_FORM_URL in chip)
+chip = lf._my_deal_action_chip_html("1", "Co", True, False, "paperwork_missing", key=None, view_as=None,
+                                     paperwork_missing=["CEF required", "Agent agreement required"])
+check("paperwork missing -> one red chip per missing item, linking CEF form / agreement doc",
+      chip.count('class="action-chip paperwork"') == 2 and "CEF required &rarr;" in chip
+      and "Agent agreement required &rarr;" in chip and lf.CEF_FORM_URL in chip and lf.AGENT_AGREEMENT_DOC_URL in chip)
+check("paperwork missing -> no Extend deadline chip yet", "Extend deadline" not in chip)
 
-chip = lf._my_deal_action_chip_html("1", "Co", False, False, "agreement_unsigned", key=None, view_as=None)
-check("e) sign-agreement chip shown when nothing higher-priority applies", 'class="action-chip sign"' in chip)
-check("e) sign-agreement chip links the agreement doc", lf.AGENT_AGREEMENT_DOC_URL in chip)
+chip = lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, view_as=None, archived=True)
+check("archived -> only the red 'Reopen ->' chip, to the update form",
+      chip.count("action-chip") == 1 and 'class="action-chip reopen"' in chip and "Reopen &rarr;" in chip
+      and lf.DEAL_UPDATE_FORM_URL in chip)
 
 chip = lf._my_deal_action_chip_html("1", "Co", False, False, "live", key=None, view_as=None)
 check("nothing applies -> empty chip", chip == "")
+_chip_css_page = lf.render_my_deals_page("Sella", deals=[], key=None, view_as=None)
+check("only overdue/reopen/paperwork chips are red; Provide deal terms is amber",
+      ".action-chip.overdue, .action-chip.reopen, .action-chip.paperwork {" in _chip_css_page
+      and ".action-chip.nudge, .action-chip.terms, .action-chip.terms-nudge {" in _chip_css_page)
 
 check("_my_deal_action_chip_html has no no_interest parameter (removed feature)",
       "no_interest" not in __import__("inspect").signature(lf._my_deal_action_chip_html).parameters)
@@ -701,8 +715,8 @@ page = lf.render_my_deals_page("Sella", deals=deals, key=None, view_as=None,
 
 check("no leftover 'Open Hold' text", "Open Hold" not in page)
 check("no leftover request-chip text", "Cancel requests" not in page)
-check("Active section present (Active Deal)", "Active Deal" in page)
-check("Held Deal row present", "Held Deal" in page)
+check("Active section present (Active Deal)", "Alpha Co" in page)
+check("Held Deal row present", "Beta Co" in page)
 check("Cancelled (Obsolete) Deal row present (via its company name)", "Gamma Co" in page)
 
 # body_only: slice the nav (its My Deals dropdown also lists companies)
@@ -713,9 +727,10 @@ main_table = page_body.split('<details class="closed-out-section mydeals-archive
 archived_section = page_body.split('<details class="closed-out-section mydeals-archived">')[1]
 row_held = row_for(page_body, "102") or ""
 check("Held Deal sits in the main table (Hold is not archived)", "Beta Co" in main_table and "Beta Co" not in archived_section)
-check("Reactivate button present on the held row (tenant)", 'data-target="reactivate"' in main_table)
-check("Hold/Cancel buttons present in the main table", 'data-target="hold"' in main_table
-      and 'data-target="cancel"' in main_table)
+check("single action: every live row (Hold included) has exactly one Update button, no Hold/Cancel/Reactivate",
+      (row_for(page_body, "101") or "").count("update-cancel-btn") == 1
+      and (row_for(page_body, "102") or "").count("update-cancel-btn") == 1
+      and "deal-stage-btn" not in main_table)
 check("Obsolete deal only in the Archived section", "Gamma Co" in archived_section and "Gamma Co" not in main_table)
 check("Archived section carries no stage actions and no Update link",
       "deal-stage-btn" not in archived_section.split("</details>")[0]
@@ -723,7 +738,8 @@ check("Archived section carries no stage actions and no Update link",
 
 page_admin = body_only(lf.render_my_deals_page("Admin", deals=deals, key=ADMIN_KEY, view_as=TENANT_EMAIL,
                                                 person_id=TENANT_PID, anon_key_email=TENANT_EMAIL))
-check("Reactivate button present on the held row (admin)", 'data-target="reactivate"' in page_admin)
+check("single action: admin view also shows one Update button on the held row",
+      (row_for(page_admin, "102") or "").count("update-cancel-btn") == 1)
 
 page_active_only = body_only(lf.render_my_deals_page("Sella", deals=[deal_active], key=None, view_as=None,
                                                       person_id=TENANT_PID, anon_key_email=TENANT_EMAIL))
@@ -852,7 +868,8 @@ check("Archived section: collapsed by default, counts all 5 dead deals (Obsolete
 
 row_won_a = row_for(page, "606") or page[page.find("Won Co A"):]
 check("Closed row: green 'Sold' badge", 'class="visibility-badge sold"' in row_won_a and "Sold" in row_won_a)
-check("Closed row: no Next Steps action chip", "action-chip" not in row_won_a)
+check("Closed (Won, archived) row: only the red 'Reopen ->' chip", "Reopen &rarr;" in row_won_a
+      and row_won_a.count("action-chip") == 1)
 check("Closed row: no Update/Hold/Cancel/Reactivate", 'data-target="hold"' not in row_won_a
       and 'data-target="cancel"' not in row_won_a and 'data-target="reactivate"' not in row_won_a
       and "update-cancel-btn" not in row_won_a)
@@ -2796,18 +2813,21 @@ check("Not-enabled page: below $1M -> both headline and companies-count line sup
 # ======================================================================
 
 people_chip = {"people": [{"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL,
-                            "custom_fields": {}}]}
+                            "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}}]}
 overdue_deal = {"id": 620, "name": "Overdue Deal", "company": {"name": "Overdue Co"},
                  "deal_stage": {"id": lf.STAGE_FIRM},
-                 "custom_fields": cf_sell({lf.DEADLINE_FIELD: "2020/01/01"}),
+                 "custom_fields": cf_sell({lf.DEADLINE_FIELD: "2020/01/01",
+                                           lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_YES], **full_terms()}),
                  "people": [{"id": TENANT_A_PID}], "updated_at": "2026-08-01T00:00:00Z"}
 use_fixture({lf.PEOPLE_KEY: people_chip, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": [overdue_deal]}})
 tenant_chip = lf._resolve_tenant(TENANT_A_EMAIL)
 assert tenant_chip is not None
 page_mydeals_chip = lf.render_my_deals_page("Sella Seller", deals=[overdue_deal], key=None, view_as=None,
                                              edit_mode=False, person_id=TENANT_A_PID, anon_key_email=TENANT_A_EMAIL)
-check("My Deals: overdue-deadline chip now reads 'Update deadline or cancel ->'",
-      "Update deadline or cancel" in page_mydeals_chip)
+check("My Deals: past deadline (paperwork in order) shows the red 'Extend deadline ->' chip to the update form",
+      'class="action-chip overdue"' in page_mydeals_chip and "Extend deadline &rarr;" in page_mydeals_chip
+      and "Update deadline or cancel" not in page_mydeals_chip
+      and lf.DEAL_UPDATE_FORM_URL in (row_for(body_only(page_mydeals_chip), "620") or ""))
 
 
 # ======================================================================
@@ -6169,10 +6189,12 @@ check("ID status: a teammate (Bob, no deals) with CEF Yes satisfies it for Alice
       and lf._deal_id_status(md_deal, "bob@harkcap.com", 1602) == "verified")
 alice_md = body_only(_md_get("alice@harkcap.com", {})["body"])
 alice_row = row_for(alice_md, "54779042") or ""
-check("ID status: My Deals row is not 'ID required' when a teammate has CEF Yes",
-      "Not live · ID required" not in alice_row and 'class="visibility-badge live"' in alice_row)
+check("paperwork: teammate CEF Yes + sell-side agreement on the deal -> in order (row is Live)",
+      lf.deal_paperwork_status(md_deal, "alice@harkcap.com", 1601) == {"in_order": True, "missing": []}
+      and "Not live" not in alice_row and 'class="visibility-badge live"' in alice_row)
 alice_co = _md_get("alice@harkcap.com", {"company": "Hark Labs"})["body"]
-check("ID status: company page Deal Details shows the same 'verified' status", "&#10003; ID verified</span>" in alice_co)
+check("paperwork: company page Deal Details shows the same 'in order' status",
+      "&#10003; Paperwork in order</span>" in alice_co)
 
 _md_fixture(lf.CEF_NA_ID)
 check("ID status: CEF N/A also satisfies the requirement",
@@ -6182,20 +6204,43 @@ _md_fixture(None)
 check("ID status: no qualifying team member -> required",
       lf._deal_id_status(md_deal, "alice@harkcap.com", 1601) == "required")
 alice_md_req = body_only(_md_get("alice@harkcap.com", {})["body"])
-check("ID status: My Deals row shows 'Not live · ID required'",
-      "Not live · ID required" in (row_for(alice_md_req, "54779042") or ""))
+alice_row_req = row_for(alice_md_req, "54779042") or ""
+check("paperwork: agreement but no CEF anywhere on the team -> 'CEF required' (Visibility + Next Steps)",
+      lf.deal_paperwork_status(md_deal, "alice@harkcap.com", 1601) == {"in_order": False, "missing": ["CEF required"]}
+      and "Not live · CEF required</span>" in alice_row_req and "CEF required &rarr;" in alice_row_req)
 alice_co_req = _md_get("alice@harkcap.com", {"company": "Hark Labs"})["body"]
-check("ID status: company page shows the same 'required' status", "&#10007; ID required</a>" in alice_co_req
-      and "&#10003; ID verified</span>" not in alice_co_req)
+check("paperwork: company page shows the same 'CEF required' status", "&#10007; CEF required</a>" in alice_co_req
+      and "Paperwork in order" not in alice_co_req and "Agent agreement required" not in alice_co_req)
 check("ID status: an individual tenant's own CEF Yes still satisfies their own deals",
       lf._deal_id_status({}, "gina.solo@gmail.com", 1610) == "verified")
+
+_md_fixture(lf.CEF_YES_ID)
+check("nav badge: Alice (own CEF No) shows verified because teammate Bob has CEF Yes",
+      "ID verified" in _md_get("alice@harkcap.com", {})["body"]
+      and "CEF required — FINRA compliance" not in _md_get("alice@harkcap.com", {})["body"])
+
+# CEF on the team but NO sell-side agreement on the deal
+_md_fixture(lf.CEF_YES_ID)
+md_noagr = dict(md_deal, custom_fields=cf_sell({k: v for k, v in MD_TERMS.items() if k != lf.AGENT_AGREEMENT_FIELD}))
+check("paperwork: CEF on the team but no agreement -> 'Agent agreement required'",
+      lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602)
+      == {"in_order": False, "missing": ["Agent agreement required"]})
+md_noagr_row = lf._my_deal_row_html(md_noagr, "Hark Labs", None, {"non_terminal_count": 0, "stalled": False},
+                                     0, lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602), "active")
+md_noagr_card = lf._deal_card_html(md_noagr, "Hark Labs",
+                                   paperwork=lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602))
+check("paperwork: table row and detail card agree on 'Agent agreement required'",
+      "Not live · Agent agreement required</span>" in md_noagr_row
+      and "Agent agreement required &rarr;" in md_noagr_row
+      and "&#10007; Agent agreement required</a>" in md_noagr_card and "Paperwork in order" not in md_noagr_card)
 
 # --- Actions on every team row + write auth
 _md_fixture(lf.CEF_YES_ID)
 bob_md = body_only(_md_get("bob@harkcap.com", {})["body"])
 bob_row = row_for(bob_md, "54779042") or ""
-check("actions: a teammate's row shows Update, Hold and Cancel",
-      "update-cancel-btn" in bob_row and 'data-target="hold"' in bob_row and 'data-target="cancel"' in bob_row)
+check("actions: a teammate's row shows the single Update button (update form), no Hold/Cancel",
+      bob_row.count("update-cancel-btn") == 1 and lf.DEAL_UPDATE_FORM_URL + "?deal_id=54779042" in bob_row
+      and "deal-stage-btn" not in bob_row)
 
 def _md_post(action, body, email):
     return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
@@ -6227,6 +6272,8 @@ check("archive: section is collapsed by default and titled 'Archived deals (2)'"
       in arch_page and "mydeals-archived\" open" not in arch_page)
 check("archive: archived rows have no Update/Hold/Cancel", "update-cancel-btn" not in arch_sec
       and "deal-stage-btn" not in arch_sec)
+check("archive: every archived row carries the red 'Reopen ->' chip to the update form",
+      arch_sec.count("Reopen &rarr;") == 2 and lf.DEAL_UPDATE_FORM_URL + "?deal_id=54779050" in arch_sec)
 check("archive: ▸ marker comes from the shared closed-out-section style",
       'details.closed-out-section summary::before { content: "\\25B8 "' in _md_get("alice@harkcap.com", {})["body"])
 arch_summary = arch_page[arch_page.find('class="mydeals-summary"'):]

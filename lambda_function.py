@@ -413,44 +413,43 @@ def _deal_update_form_url(deal_id):
 
 
 def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibility_state,
-                               key=None, view_as=None, terms_missing=None):
-    """Next Steps: ONE specific action chip per row, chosen by priority
-    (highest first): a) deadline passed (red, Update link) > b) terms
-    incomplete (red, Update link) > c) nudge buyers (amber: a stalled
-    intro — turn 22 dropped the overdue-follow-up half of this
-    condition, see _company_stats) > d) ID required (red, CEF form
-    link) > e) sign agreement (amber, agreement template link) > f)
-    complete deal terms (amber, advisory — a "live" deal missing one or
-    more fields from _deal_terms_missing's fuller audit; never affects
-    which deals are live, see that function's own docstring). At most
-    one of {b, d, e} ever applies — they're three of the "not live"
-    visibility_state values and that state machine is first-match-wins
-    (see _my_deal_visibility_state) — while a/c/f are independent
-    conditions that can co-occur with any of them or each other (f only
-    ever co-occurs with a/c, since it requires visibility_state ==
-    "live"). When more than one candidate applies, the top-priority chip
-    carries a title/tooltip naming the rest."""
+                               key=None, view_as=None, terms_missing=None, paperwork_missing=None,
+                               archived=False):
+    """Next Steps column. Archived row -> one red "Reopen ->" chip (update
+    form). Paperwork not in order (deal_paperwork_status) -> one red chip
+    per missing item: "CEF required ->" (CEF form) and/or "Agent
+    agreement required ->" (agreement template). Paperwork in order ->
+    ONE chip by priority: "Extend deadline ->" (red, update form, only
+    when the deadline has passed) > "Provide deal terms ->" (amber) >
+    "Nudge buyers ->" (amber) > "Complete deal terms ->" (amber,
+    advisory). When more than one applies, the chip's tooltip names the
+    rest."""
+    update_url = _deal_update_form_url(deal_id)
+    if archived:
+        # Archived deals: the one red "Reopen ->" chip, to the update form.
+        if not update_url:
+            return ""
+        return (f'<a class="action-chip reopen" href="{update_url}" target="_blank" '
+                'rel="noopener noreferrer">Reopen &rarr;</a>')
+    if visibility_state == "paperwork_missing":
+        # Paperwork not in order: one red chip per missing item.
+        links = {PAPERWORK_CEF_MISSING: CEF_FORM_URL, PAPERWORK_AGREEMENT_MISSING: AGENT_AGREEMENT_DOC_URL}
+        return " ".join(
+            f'<a class="action-chip paperwork" href="{links[m]}" target="_blank" rel="noopener noreferrer">'
+            f'{_esc(m)} &rarr;</a>' for m in (paperwork_missing or []) if m in links)
+    # Paperwork in order: "Extend deadline" is the only red chip; every
+    # other state keeps its non-red (amber) display.
     candidates = []
-    if is_overdue:
-        update_url = _deal_update_form_url(deal_id)
-        if update_url:
-            candidates.append(("update deadline", "overdue", "Update deadline or cancel &rarr;", update_url, True, None))
-    if visibility_state == "terms_incomplete":
-        update_url = _deal_update_form_url(deal_id)
-        if update_url:
-            candidates.append(("provide deal terms", "terms", "Provide deal terms &rarr;", update_url, True, None))
+    if is_overdue and update_url:
+        candidates.append(("extend deadline", "overdue", "Extend deadline &rarr;", update_url, True, None))
+    if visibility_state == "terms_incomplete" and update_url:
+        candidates.append(("provide deal terms", "terms", "Provide deal terms &rarr;", update_url, True, None))
     if stalled:
         href = _company_href(company_name, "mydeals", key, view_as)
         candidates.append(("nudge buyers", "nudge", "Nudge buyers &rarr;", href, False, None))
-    if visibility_state == "id_required":
-        candidates.append(("id required", "id-required", "ID required &rarr;", CEF_FORM_URL, True, None))
-    if visibility_state == "agreement_unsigned":
-        candidates.append(("sign agreement", "sign", "Sign agreement &rarr;", AGENT_AGREEMENT_DOC_URL, True, None))
-    if visibility_state == "live" and terms_missing:
-        update_url = _deal_update_form_url(deal_id)
-        if update_url:
-            candidates.append(("complete deal terms", "terms-nudge", "Complete deal terms &rarr;", update_url, True,
-                                "Missing: " + ", ".join(terms_missing)))
+    if visibility_state == "live" and terms_missing and update_url:
+        candidates.append(("complete deal terms", "terms-nudge", "Complete deal terms &rarr;", update_url, True,
+                            "Missing: " + ", ".join(terms_missing)))
     if not candidates:
         return ""
     phrase, css_class, label, href, new_tab, custom_title = candidates[0]
@@ -3073,23 +3072,64 @@ def _id_status_ok(id_status):
     return id_status == "verified" or id_status in CEF_QUALIFYING_IDS
 
 
-def _deal_id_status_badge_html(id_status):
-    if _id_status_ok(id_status):
-        return '<span class="id-status-badge id-ok">&#10003; ID verified</span>'
-    return (f'<a class="id-status-badge id-missing" href="{CEF_FORM_URL}" target="_blank" '
-            'rel="noopener noreferrer">&#10007; ID required</a>')
+# Paperwork rule: a deal is "in order" only when BOTH (a) CEF is satisfied
+# at team level (_deal_id_status) and (b) THIS deal's Agent Agreement
+# (custom_label_3714334) carries 6354277 -- the SELL-side agreement signed.
+AGENT_AGREEMENT_SELL_SIGNED_ID = 6354277
+PAPERWORK_CEF_MISSING = "CEF required"
+PAPERWORK_AGREEMENT_MISSING = "Agent agreement required"
+
+
+def _deal_paperwork_missing(deal, cef_status):
+    """Missing paperwork items for a deal, given its (team-level) CEF
+    status: [] when in order. Pure helper under deal_paperwork_status."""
+    missing = []
+    if not _id_status_ok(cef_status):
+        missing.append(PAPERWORK_CEF_MISSING)
+    if AGENT_AGREEMENT_SELL_SIGNED_ID not in _deal_cf_option_ids(deal or {}, AGENT_AGREEMENT_FIELD):
+        missing.append(PAPERWORK_AGREEMENT_MISSING)
+    return missing
+
+
+def deal_paperwork_status(deal, tenant_email, person_id):
+    """THE single source of a deal's paperwork status -- the My Deals
+    Visibility column, its Next Steps column and the company page's Deal
+    Details card all call this. {"in_order": bool, "missing": [...]},
+    missing drawn from PAPERWORK_CEF_MISSING / PAPERWORK_AGREEMENT_MISSING
+    in that order."""
+    missing = _deal_paperwork_missing(deal, _deal_id_status(deal, tenant_email, person_id))
+    return {"in_order": not missing, "missing": missing}
+
+
+def _coerce_paperwork(deal, paperwork):
+    """deal_paperwork_status's dict, or (legacy callers/tests) a bare CEF
+    status/option id -- converted through the same rule."""
+    if isinstance(paperwork, dict):
+        return paperwork
+    missing = _deal_paperwork_missing(deal, paperwork)
+    return {"in_order": not missing, "missing": missing}
+
+
+def _paperwork_badge_html(paperwork):
+    """Deal Details card badge -- same status as the My Deals row."""
+    if paperwork["in_order"]:
+        return '<span class="id-status-badge id-ok">&#10003; Paperwork in order</span>'
+    links = {PAPERWORK_CEF_MISSING: CEF_FORM_URL, PAPERWORK_AGREEMENT_MISSING: AGENT_AGREEMENT_DOC_URL}
+    return " ".join(
+        f'<a class="id-status-badge id-missing" href="{links[m]}" target="_blank" rel="noopener noreferrer">'
+        f'&#10007; {_esc(m)}</a>' for m in paperwork["missing"])
 
 
 def _cef_badge_html(cef_option_id, tenant_name):
     """Nav-bar badge for the tenant view (and admin &view_as preview),
     one state per CEF option: Yes -> green "ID verified"; Pending ->
     amber "ID pending"; No or unset (cef_option_id is None or any id
-    outside the verified map) -> red "ID required — FINRA compliance"
+    outside the verified map) -> red "CEF required — FINRA compliance"
     linking straight to the CEF form itself (CEF_FORM_URL, new tab) — no
     longer a mailto, since there's now a direct form to send people to;
-    N/A -> no badge at all. "CEF" is internal-only from here on (field
-    id, option ids, the form URL, Dynamo/variable names) — every
-    client-facing string says "ID" instead. Only ever called when there
+    N/A -> no badge at all. The missing state reads "CEF required" -- the
+    same wording as the paperwork rule (deal_paperwork_status); the call
+    site passes a team-level result, so a teammate's Yes/N/A clears it. Only ever called when there
     IS a tenant to report on (see the call site's tenant is not None
     guard) — there's no separate "no tenant" case to handle here."""
     if cef_option_id == CEF_NA_ID:
@@ -3099,7 +3139,7 @@ def _cef_badge_html(cef_option_id, tenant_name):
     if cef_option_id == CEF_PENDING_ID:
         return '<div class="gg-cef-badge cef-pending">&#8226; ID pending</div>'
     return (f'<a class="gg-cef-badge cef-missing" href="{CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">'
-            '&#10007; ID required — FINRA compliance</a>')
+            '&#10007; CEF required — FINRA compliance</a>')
 
 
 def _person_display_name(rec):
@@ -5161,34 +5201,6 @@ def _deal_stage_script_html():
 </script>"""
 
 
-def _deal_actions_html(deal_id, deal_name, update_btn, section, key=None):
-    """update_btn is the existing minted Update link, unchanged. section is
-    which of My Deals' stacked tables this row belongs to: "active" rows
-    get Hold + Cancel; "hold" rows get Reactivate (writes stage back
-    to Inquiry — same direct-write path, available to tenant and admin
-    alike, exactly like Hold/Cancel: the data-key value is only ever a
-    real ADMIN_KEY for an admin session, empty for a tenant session, and
-    the server derives the tenant identity from the auth cookie either
-    way, never from this attribute); "cancelled" and "closed" (turn 26 —
-    a won deal has nothing left to Hold/Cancel/Reactivate either) rows
-    are both terminal, no stage-change actions, Update link only."""
-    key_attr = _esc(key or "")
-    id_attr = _esc(deal_id)
-    name_attr = _esc(deal_name)
-    if section == "hold":
-        reactivate_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" '
-                           f'data-deal-id="{id_attr}" data-deal-name="{name_attr}" '
-                           f'data-target="reactivate">Reactivate</button>')
-        return f'<div class="actions-stack">{update_btn}{reactivate_btn}</div>'
-    if section in ("cancelled", "closed"):
-        return f'<div class="actions-stack">{update_btn}</div>'
-    hold_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
-                f'data-deal-name="{name_attr}" data-target="hold">Hold</button>')
-    cancel_btn = (f'<button type="button" class="deal-stage-btn" data-key="{key_attr}" data-deal-id="{id_attr}" '
-                  f'data-deal-name="{name_attr}" data-target="cancel">Cancel</button>')
-    return f'<div class="actions-stack">{update_btn}{hold_btn}{cancel_btn}</div>'
-
-
 def _default_intro_status(deal):
     """Derived status when the Intro Status field is empty/absent for a
     deal (including when the deals.json snapshot hasn't picked up the
@@ -6425,13 +6437,11 @@ def _my_deal_visibility_state(deal, cef_state, is_held, is_won=False):
     distinct visibility state; only "sold" gets one."""
     if is_won:
         return "sold"
-    # cef_state: _deal_id_status's "verified"/"required" (or a raw CEF
-    # option id) -- team-level, see _deal_id_status.
-    if not _id_status_ok(cef_state):
-        return "id_required"
-    opts = _deal_cf_option_ids(deal, AGENT_AGREEMENT_FIELD)
-    if not (opts & AGENT_ENGAGED_OPTS):
-        return "agreement_unsigned"
+    # cef_state: deal_paperwork_status's dict (or a legacy bare CEF
+    # status) -- paperwork = team-level CEF + this deal's sell-side agent
+    # agreement; see deal_paperwork_status.
+    if not _coerce_paperwork(deal, cef_state)["in_order"]:
+        return "paperwork_missing"
     if not _deal_terms_complete(deal):
         return "terms_incomplete"
     if is_held:
@@ -6446,10 +6456,9 @@ def _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=False):
     state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
     if state == "sold":
         return '<span class="visibility-badge sold">Sold &#10003;</span>'
-    if state == "id_required":
-        return '<span class="visibility-badge id-required">Not live · ID required</span>'
-    if state == "agreement_unsigned":
-        return '<span class="visibility-badge agreement-unsigned">Not live · unsigned agreement</span>'
+    if state == "paperwork_missing":
+        missing = " · ".join(_coerce_paperwork(deal, cef_state)["missing"])
+        return f'<span class="visibility-badge id-required">Not live · {_esc(missing)}</span>'
     if state == "terms_incomplete":
         return '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>'
     if state == "held":
@@ -6457,7 +6466,7 @@ def _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=False):
     return '<span class="visibility-badge live">Live · shown to buyers</span>'
 
 
-def _deal_card_html(deal, company, override_entry=None, edit_mode=False, id_status=None):
+def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
     render_company_page), used to resolve any deadline_override. edit_mode
@@ -6531,11 +6540,14 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, id_stat
     fees = _fmt_fees(deal)
     fees_html = f'<div class="dc-line">{_esc(fees)}</div>' if fees else ""
 
-    badge_html = _engagement_badge_html(deal, company) + _update_cancel_button_html(deal_id)
-    # ID status: the same _deal_id_status decision the My Deals table uses
-    # (None only when there is no tenant context to decide it for).
-    if id_status is not None:
-        badge_html = f'<div class="dc-line">{_deal_id_status_badge_html(id_status)}</div>' + badge_html
+    # Paperwork: the same deal_paperwork_status the My Deals row uses
+    # (it covers the agent agreement too, so it replaces the older
+    # Engaged badge). None only when there's no tenant context.
+    if paperwork is not None:
+        badge_html = (f'<div class="dc-line">{_paperwork_badge_html(paperwork)}</div>'
+                      + _update_cancel_button_html(deal_id))
+    else:
+        badge_html = _engagement_badge_html(deal, company) + _update_cancel_button_html(deal_id)
 
     return f"""<div class="{card_cls}">
       {overdue_html}
@@ -9427,6 +9439,9 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # Turn 26: a Closed row's badge/state short-circuits to "sold" —
     # see _my_deal_visibility_state.
     is_won = section == "closed"
+    # cef_state is this deal's deal_paperwork_status (or a legacy CEF
+    # status, coerced through the same rule).
+    paperwork = _coerce_paperwork(deal, cef_state)
     badge_html = _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=is_won)
     visibility_state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
     # Item 5: net per-share, Closed rows only -- a subtle line under the
@@ -9493,14 +9508,14 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
 
     # Item 1: no Next Steps chip either on a Closed row — there's
     # nothing left to nudge/update/sign on a deal that's already sold.
-    action_chip_html = ("" if is_won else
-                         _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
-                                                    visibility_state, key=key, view_as=view_as,
-                                                    terms_missing=_deal_terms_missing(deal)))
+    action_chip_html = _my_deal_action_chip_html(deal_id, company_name, is_overdue, stats["stalled"],
+                                                  visibility_state, key=key, view_as=view_as,
+                                                  terms_missing=_deal_terms_missing(deal),
+                                                  paperwork_missing=paperwork["missing"], archived=archived)
 
     update_btn = _update_cancel_button_html(deal_id, label="Update")
     # Bug fix: Hold/Cancel/Reactivate are tenant self-service (see
-    # _deal_actions_html's own docstring), never admin-only, but the
+    # _handle_deal_stage), never admin-only, but the
     # data-key attribute they carry decides whether the resulting write
     # is treated as an admin write server-side -- so it must not carry
     # the real ADMIN_KEY into a Tenant-view preview.
@@ -9510,14 +9525,15 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # Cancel (or Reactivate when held); _handle_deal_stage authorizes by
     # firm/team scope (_tenant_can_act_on_deal). Archived rows (Obsolete/
     # Lost/Won/Trade Broken) get no actions at all.
-    if archived:
-        actions_html = ""
-    else:
-        actions_html = _deal_actions_html(deal_id, _deal_title(deal), update_btn, section,
-                                           key=(key if edit_mode else None))
+    # Single action: ONE "Update" button (the deal update form, which
+    # itself offers Hold and Cancel) on every live row the viewer can
+    # see. Archived rows get none -- their "Reopen ->" chip links to the
+    # same form.
+    actions_html = "" if archived else f'<div class="actions-stack">{update_btn}</div>'
+
 
     return (
-        f'<tr><td class="company">{company_link}{deal_id_sub}{via_html}</td>'
+        f'<tr data-deal-id="{_esc(deal_id)}"><td class="company">{company_link}{deal_id_sub}{via_html}</td>'
         f'<td>{badge_html}{per_share_html}</td>'
         f'<td class="num">{buyer_text}</td>'
         f'<td class="num">{intro_text}{raised_html}</td>'
@@ -9612,7 +9628,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 "resolved_stage": resolved_stage,
                 "section": section,
                 "colleague_name": _colleague_name_for(d),
-                "id_status": _deal_id_status(d, anon_key_email, person_id),
+                "id_status": deal_paperwork_status(d, anon_key_email, person_id),
             })
 
         # Deadline ascending (ISO yyyy-mm-dd sorts correctly as a string),
@@ -9664,7 +9680,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 state = _my_deal_visibility_state(d, r["id_status"], False)
                 if state == "live":
                     live_count += 1
-                elif state == "id_required":
+                elif state == "paperwork_missing":
                     not_engaged_count += 1
                 elif state == "terms_incomplete":
                     terms_incomplete_count += 1
@@ -9724,7 +9740,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         if live_count:
             summary_parts.append(f"{live_count} live")
         if not_engaged_count:
-            summary_parts.append(f"{not_engaged_count} not engaged")
+            summary_parts.append(f"{not_engaged_count} missing paperwork")
         if terms_incomplete_count:
             summary_parts.append(f"{terms_incomplete_count} awaiting terms")
         # "In motion" stays live-only (unchanged meaning); "introduced
@@ -10040,10 +10056,11 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     cursor: pointer;
   }}
   .action-chip:hover {{ text-decoration: underline; }}
-  .action-chip.overdue, .action-chip.terms, .action-chip.id-required {{
+  .action-chip.overdue, .action-chip.reopen, .action-chip.paperwork {{
     background: rgba(178,59,59,0.12); color: #b23b3b;
   }}
-  .action-chip.nudge, .action-chip.sign, .action-chip.terms-nudge {{
+  .action-chip.paperwork + .action-chip.paperwork {{ margin-top: 4px; }}
+  .action-chip.nudge, .action-chip.terms, .action-chip.terms-nudge {{
     background: rgba(201,162,39,0.15); color: var(--accredited);
   }}
   .ei-deadline {{
@@ -10340,7 +10357,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         if sell_deals:
             deals_body = "".join(
                 _deal_card_html(d, company, intro_details.get(str(d.get("id"))), edit_mode=edit_mode,
-                                id_status=_deal_id_status(d, anon_key_email, person_id))
+                                paperwork=deal_paperwork_status(d, anon_key_email, person_id))
                 for d in sell_deals
             )
         else:
@@ -13580,7 +13597,13 @@ def _lambda_handler_impl(event, context):
     # view_as) exactly when there's no tenant context to report on.
     cef_html = ""
     if tenant is not None:
-        cef_html = _cef_badge_html(_tenant_cef_state(tenant.get("person_id")), tenant["name"])
+        # Team-level CEF (same rule as deal_paperwork_status's CEF half):
+        # a teammate's Yes/N/A clears the red badge for everyone on the team.
+        own_cef = _tenant_cef_state(tenant.get("person_id"))
+        if own_cef not in CEF_QUALIFYING_IDS and _deal_id_status(
+                None, anon_key_email, tenant.get("person_id")) == "verified":
+            own_cef = CEF_YES_ID
+        cef_html = _cef_badge_html(own_cef, tenant["name"])
 
     # Company detail page: same auth resolution as the tabs above, just a
     # different route param.
