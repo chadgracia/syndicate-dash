@@ -83,7 +83,7 @@ import urllib.error
 import uuid
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import boto3
 from boto3.dynamodb.conditions import Key
 
@@ -427,8 +427,10 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibi
     rest."""
     update_url = _deal_update_form_url(deal_id)
     if archived:
-        # Archived deals: the one red "Reopen ->" chip, to the update form.
-        if not update_url:
+        # Archived deals: the one red "Reopen ->" chip, to the update form
+        # -- only on Lost / Obsolete / Trade Broken rows, never on a Won
+        # ("sold") row.
+        if not update_url or visibility_state == "sold":
             return ""
         return (f'<a class="action-chip reopen" href="{update_url}" target="_blank" '
                 'rel="noopener noreferrer">Reopen &rarr;</a>')
@@ -2124,13 +2126,11 @@ _raised_cache = {"version": None, "total": None, "closed_count": None,
 def _raised_headline_stats():
     """Desk-wide (item 2), computed across ALL buy deals in deals.json --
     never tenant-scoped, unlike every other aggregate in this file.
-    closed = Intro Status Closed (7207587) OR stage in WON_STAGE_IDS --
-    either signal alone is enough (a deal can be Won-stage without ever
-    having its Intro Status field set to Closed, and vice versa via an
-    admin override). amount = max ticket size (TICKET_MAX_FIELD) else min
-    (TICKET_MIN_FIELD) else 0 -- NEVER the deal's own "value" field,
-    which is our commission, not the purchase amount (on a won deal,
-    ticket min==max==the actual purchase amount per instruction).
+    Now the shared Capital Raised rule (see _intro_counts_toward_raised):
+    Wired or Closed intros (a Won-stage buy deal resolves to Closed),
+    override-aware, plus manual intros, each once; amount = _intro_amount
+    -- NEVER the deal's own "value" field (our commission).
+    closed_count now counts those intros.
     Cached against the same deals.json S3 object version get_deals_list
     already checks, PLUS _closed_deals_cache_token() -- the live
     snapshot's version alone can't detect a closed-deals-only refresh
@@ -2145,21 +2145,53 @@ def _raised_headline_stats():
     version = (_cached_object_version(s3, DEALS_KEY), _closed_deals_cache_token())
     if _raised_cache["version"] == version and _raised_cache["total"] is not None:
         return _raised_cache
+    # Capital Raised, desk-wide, by the SAME helpers every tenant figure
+    # uses (_intro_counts_toward_raised / _intro_amount): Wired or Closed
+    # (override-aware via the owning seller's Dynamo partition), each
+    # intro once -- real buy deals by deal id, manual intros by (company,
+    # buyer), skipping a manual intro a real buy deal already covers.
     total = 0.0
     closed_count = 0
     zero_size_count = 0
     companies = set()
+    intro_cache = {}
+    real_pairs = set()
+    counted = []
     for d in deals:
         if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
             continue
-        is_closed = (_deal_intro_status_id(d) == INTRO_STATUS_CLOSED_ID
-                     or _deal_stage_id(d) in WON_STAGE_IDS)
-        if not is_closed:
+        owner = _tenant_email_for_deal(d)
+        entry = None
+        if owner is not None:
+            if owner not in intro_cache:
+                intro_cache[owner], _ = get_intro_details(owner, expand_team=False)
+            entry = intro_cache[owner].get(str(d.get("id")))
+        company_key = (_deal_company_name(d) or "").strip().lower()
+        for pid in _deal_linked_person_ids(d):
+            real_pairs.add((company_key, pid))
+        resolved = _resolve_intro_status(d, entry)
+        if resolved["disclosed"] and _intro_counts_toward_raised(resolved):
+            counted.append(d)
+    seen_manual = set()
+    for email, info in _tenant_index().items():
+        if not info.get("is_seller", True):
             continue
+        try:
+            manual_intros, _ = _get_manual_intros_one(email)
+        except Exception:
+            manual_intros = {}
+        for (m_company, buyer_pid), item in manual_intros.items():
+            mkey = ((m_company or "").strip().lower(), buyer_pid)
+            if mkey in seen_manual or mkey in real_pairs:
+                continue
+            seen_manual.add(mkey)
+            fake = _manual_intro_as_deal(item)
+            resolved = _resolve_intro_status(fake, None)
+            if resolved["disclosed"] and _intro_counts_toward_raised(resolved):
+                counted.append(fake)
+    for d in counted:
         closed_count += 1
-        max_v = _deal_cf_number(d, TICKET_MAX_FIELD)
-        min_v = _deal_cf_number(d, TICKET_MIN_FIELD)
-        amount = max_v if max_v is not None else (min_v if min_v is not None else 0)
+        amount = _intro_amount(d)
         total += amount
         if amount == 0:
             zero_size_count += 1
@@ -6334,17 +6366,11 @@ def _resolve_deal_deadline(deal, override_entry=None):
 
 
 def _deal_size_text(deal):
-    """Ticket min/max, falling back to the deal's own 'value' field (a
-    built-in Pipeline deal attribute, not a custom_field) when both are
-    empty."""
+    """Ticket max, else ticket min, else "—". NEVER the deal's native
+    "value"/value_in_cents (that is our commission, not a size)."""
     ticket_max = _deal_cf_number(deal, TICKET_MAX_FIELD)
     ticket_min = _deal_cf_number(deal, TICKET_MIN_FIELD)
     size_val = ticket_max if ticket_max is not None else ticket_min
-    if size_val is None:
-        try:
-            size_val = float(deal.get("value"))
-        except (TypeError, ValueError):
-            size_val = None
     return _fmt_money(size_val)
 
 
@@ -6352,11 +6378,9 @@ def _deal_size_range_text(deal):
     """Company-page parity pass, item 2: the Deal Details card's Size
     line as a min-max RANGE ('$500K – $25M') from ticket min
     (TICKET_MIN_FIELD) / max (TICKET_MAX_FIELD) -- a single figure only
-    when min==max or only one of the two is actually set. Falls back to
-    the deal's own "value" field (commission, not size) only when
-    NEITHER ticket field is present, same fallback _deal_size_text
-    itself uses, so this never shows "—" in a case _deal_size_text
-    wouldn't. Row-level Size cells (Active Intros, both Buyers tables)
+    when min==max or only one of the two is actually set; "—" when
+    neither is set (NEVER the deal's native "value" -- our commission).
+    Row-level Size cells (Active Intros, both Buyers tables)
     are unaffected -- they keep _deal_size_text's single largest-value
     figure; only the Deal Details card uses the range."""
     min_v = _deal_cf_number(deal, TICKET_MIN_FIELD)
@@ -6369,10 +6393,7 @@ def _deal_size_range_text(deal):
         return _fmt_money(min_v)
     if max_v is not None:
         return _fmt_money(max_v)
-    try:
-        return _fmt_money(float(deal.get("value")))
-    except (TypeError, ValueError):
-        return _fmt_money(None)
+    return _fmt_money(None)
 
 
 def _engagement_badge_html(deal, company):
@@ -6389,17 +6410,12 @@ def _engagement_badge_html(deal, company):
 
 def _deal_pipeline_size(deal):
     """Numeric size for the summary strip's dollar totals: the larger of
-    min/max ticket size, else the deal's own "value" field. None if
-    neither is present — callers must skip rather than treat as 0."""
+    min/max ticket size. None if neither is present — callers must skip
+    rather than treat as 0. NEVER the deal's native "value" (commission)."""
     min_val = _deal_cf_number(deal, TICKET_MIN_FIELD)
     max_val = _deal_cf_number(deal, TICKET_MAX_FIELD)
     candidates = [v for v in (min_val, max_val) if v is not None]
-    if candidates:
-        return max(candidates)
-    try:
-        return float(deal.get("value"))
-    except (TypeError, ValueError):
-        return None
+    return max(candidates) if candidates else None
 
 
 # Stage-based won predicate: routes a Sell deal into My Deals' own
@@ -9659,11 +9675,50 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
 OVERVIEW_LIST_LIMIT = 10
 
 
-def _deal_date_field(deal, field):
-    """A date carried on the deal record itself (e.g. "closed_time",
-    "created_at") parsed with _parse_dt, or None when the snapshot doesn't
-    carry it -- callers show "—" rather than substituting another date."""
-    return _parse_dt(deal.get(field)) if deal.get(field) else None
+def _parse_pipeline_ts(value):
+    """A Pipeline deal timestamp ("YYYY/MM/DD HH:MM:SS +ZZZZ", confirmed
+    from a live record) as an aware datetime; slashes are normalized
+    before parsing. Falls back to _parse_dt for ISO shapes. None if
+    missing/unparsable."""
+    if not value:
+        return None
+    text = str(value).strip()
+    m = re.match(r"^(\d{4})/(\d{2})/(\d{2})(.*)$", text)
+    if m:
+        text = f"{m.group(1)}-{m.group(2)}-{m.group(3)}{m.group(4)}"
+    for fmt in ("%Y-%m-%d %H:%M:%S %z", "%Y-%m-%d %H:%M:%S%z"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return _parse_dt(text)
+
+
+def _deal_listed_dt(deal):
+    """Date listed = the deal's created_at."""
+    return _parse_pipeline_ts(deal.get("created_at"))
+
+
+def _deal_closed_dt(deal, now=None):
+    """Date closed for an archived deal: closed_time if present, else
+    today minus days_in_stage. None when neither is available."""
+    dt = _parse_pipeline_ts(deal.get("closed_time"))
+    if dt is not None:
+        return dt
+    try:
+        days = int(float(deal.get("days_in_stage")))
+    except (TypeError, ValueError):
+        return None
+    return (now or datetime.now(timezone.utc)) - timedelta(days=days)
+
+
+def _deal_closed_label(deal, resolved_stage):
+    """"Won Sep 3, 2026" for a Won stage, "Closed Sep 3, 2026" for any
+    other archived stage; "—" when no date is available."""
+    dt = _deal_closed_dt(deal)
+    if dt is None:
+        return "—"
+    return f'{"Won" if _is_won_stage(resolved_stage) else "Closed"} {_fmt_dt_short(dt)}'
 
 
 def _fmt_dt_short(dt):
@@ -9778,6 +9833,8 @@ def _overview_attention_items(rows, key=None, view_as=None):
         chip_html = _my_deal_row_chip_html(r["deal"], r["company_name"], r["deadline"], r["stats"], r["id_status"],
                                            r["section"], archived, key=key, view_as=view_as)
         for red in RED_ACTION_CHIP_RE.findall(chip_html):
+            if 'class="action-chip reopen"' in red:
+                continue  # Reopen never belongs in "Needs your attention"
             items.append((r, red))
     return items
 
@@ -9955,14 +10012,14 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
         # 5) Track record
         won_rows = ov["won_rows"]
         dead_rows = [r for r in rows if r["section"] == "cancelled"]
-        listed = [dt for dt in (_deal_date_field(r["deal"], "created_at") for r in rows) if dt]
+        listed = [dt for dt in (_deal_listed_dt(r["deal"]) for r in rows) if dt]
         since = f' since {_fmt_dt_short(min(listed))}' if listed else ""
         history = (f'{len(rows)} deal{"" if len(rows) == 1 else "s"} listed · {len(won_rows)} won · '
                    f'{len(dead_rows)} lost/obsolete{since}')
         won_body = "".join(
             f'<tr><td>{_overview_company_link(r["company_name"], key, view_as)}</td>'
             f'<td class="num">{_esc(_fmt_money(_deal_pipeline_size(r["deal"])) if _deal_pipeline_size(r["deal"]) else "—")}</td>'
-            f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "closed_time")))}</td></tr>'
+            f'<td>{_esc(_deal_closed_label(r["deal"], r["resolved_stage"]) if r["section"] in ("closed", "cancelled") else "—")}</td></tr>'
             for r in won_rows)
         won_ids = {id(r) for r in won_rows}
         won_table = (('<table class="ov-table"><thead><tr><th>Won deal</th><th class="num">Size</th>'
@@ -9975,8 +10032,8 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 f'<tr><td>{_overview_company_link(r["company_name"], key, view_as)}'
                 f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></td>'
                 f'<td>{_esc("Won" if id(r) in won_ids else _deal_stage_label(r["resolved_stage"]))}</td>'
-                f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "created_at")))}</td>'
-                f'<td>{_esc(_fmt_dt_short(_deal_date_field(r["deal"], "closed_time")))}</td></tr>'
+                f'<td>{_esc(_fmt_dt_short(_deal_listed_dt(r["deal"])))}</td>'
+                f'<td>{_esc(_deal_closed_label(r["deal"], r["resolved_stage"]) if r["section"] in ("closed", "cancelled") else "—")}</td></tr>'
                 for r in archived_rows)
             all_closed_html = (
                 '<details class="closed-out-section ov-all-closed">'

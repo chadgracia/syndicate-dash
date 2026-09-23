@@ -872,8 +872,10 @@ check("Archived section: collapsed by default, counts all 5 dead deals (Obsolete
 
 row_won_a = row_for(page, "606") or page[page.find("Won Co A"):]
 check("Closed row: green 'Sold' badge", 'class="visibility-badge sold"' in row_won_a and "Sold" in row_won_a)
-check("Closed (Won, archived) row: only the red 'Reopen ->' chip", "Reopen &rarr;" in row_won_a
-      and row_won_a.count("action-chip") == 1)
+check("Closed (Won, archived) row: no Reopen chip (Reopen is Lost/Obsolete/Trade Broken only)",
+      "Reopen" not in row_won_a and "action-chip" not in row_won_a)
+_row_lost_reopen = row_for(page, "604") or ""
+check("Lost (archived) row still gets the red 'Reopen ->' chip", "Reopen &rarr;" in _row_lost_reopen)
 check("Closed row: no Update/Hold/Cancel/Reactivate", 'data-target="hold"' not in row_won_a
       and 'data-target="cancel"' not in row_won_a and 'data-target="reactivate"' not in row_won_a
       and "update-cancel-btn" not in row_won_a)
@@ -884,8 +886,9 @@ check("Won Co B appears exactly once too", page.count("Won Co B") == 1)
 check("summary strip shows '1 live' (won deals excluded from the live count)", "1 live" in page)
 check("summary strip's pipeline total excludes the won deals' sizes",
       "$9.5M" not in page and "$10.5M" not in page)
-check("summary strip shows 'Total closed' summing both won deals ($3M+$4.5M=$7.5M)",
-      "Total closed" in page and "$7.5M" in page)
+check("summary strip 'Total closed' counts only ticket sizes -- Won Deal B's $4.5M native 'value' "
+      "(our commission) is never a size, so the total is $3M",
+      "Total closed" in page and "$3M" in page.split("Total closed")[1][:80] and "$7.5M" not in page)
 
 row_lost_a = row_for(page, "604") or page[page.find("Lost Co A"):]
 check("Lost Deal (111801) sits in Archived with no actions",
@@ -3033,8 +3036,8 @@ check("_deal_size_range_text: min-only -> single figure",
       lf._deal_size_range_text({"custom_fields": {lf.TICKET_MIN_FIELD: 2_000_000}}) == "$2M")
 check("_deal_size_range_text: max-only -> single figure",
       lf._deal_size_range_text({"custom_fields": {lf.TICKET_MAX_FIELD: 3_000_000}}) == "$3M")
-check("_deal_size_range_text: neither field, falls back to 'value'",
-      lf._deal_size_range_text({"custom_fields": {}, "value": 4_000_000}) == "$4M")
+check("_deal_size_range_text: neither field -> '—' (never the commission 'value')",
+      lf._deal_size_range_text({"custom_fields": {}, "value": 4_000_000}) == "—")
 check("_deal_size_range_text: nothing at all -> '—'", lf._deal_size_range_text({}) == "—")
 
 check("_fmt_fees: seller/mgmt/carry order",
@@ -6576,10 +6579,12 @@ check("parity: Buyers introduced = unique disclosed buyers (Dora, Cleo, Walt, St
       t["buyers_introduced"] == 5)
 
 # --- Needs your attention == My Deals' red chips
-md_red = sorted(lf.RED_ACTION_CHIP_RE.findall(md_page))
+md_red = sorted(c for c in lf.RED_ACTION_CHIP_RE.findall(md_page) if 'class="action-chip reopen"' not in c)
 ov_att = ov_body[ov_body.find('class="ov-section ov-attention"'):ov_body.find('class="ov-section ov-track"')]
 ov_red = sorted(lf.RED_ACTION_CHIP_RE.findall(ov_att))
-check("attention: exactly the red chips My Deals renders (same text + targets)", md_red == ov_red and len(ov_red) == 4)
+check("attention: exactly My Deals' red chips excluding Reopen (same text + targets)",
+      md_red == ov_red and len(ov_red) == 2)
+check("attention: never contains a Reopen chip", "Reopen" not in ov_att)
 check("attention: no all-clear line when there are items", "All paperwork in order" not in ov_att)
 
 # --- Disclosure, open deals, intros
@@ -6614,6 +6619,106 @@ ov_clean = body_only(_ov_get("alice@ovcap.com")["body"])
 check("attention: the green all-clear line when nothing is red",
       '<div class="ov-all-clear">All paperwork in order, no deadlines past.</div>' in ov_clean
       and not lf.RED_ACTION_CHIP_RE.findall(ov_clean))
+
+
+# ======================================================================
+# SECTION: Follow-ups to 7b03616 -- size never shows commission, admin
+# raised = Capital Raised, Pipeline dates, Reopen scope
+# ======================================================================
+# --- Admin raised headline == tenant Capital Raised (Overview fixture)
+_ov_fixture()
+lf._raised_cache["version"] = None
+lf._raised_cache["total"] = None
+_fu_tiles = lf._overview_model(lf.get_firm_sell_deals(1801), 1801, "alice@ovcap.com")["tiles"]
+check("admin raised: desk-wide headline total equals the tenant Capital Raised for the same fixture ($6.5M)",
+      lf._raised_headline_stats()["total"] == _fu_tiles["capital_raised"] == 6_500_000)
+
+# --- A buy deal with no ticket min/max but a native "value" renders "—" everywhere
+_fu_people = {"people": [
+    {"id": 2001, "full_name": "Sid Seller", "email": "sid@fucap.com", "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
+    {"id": 2002, "full_name": "Vic Valueonly", "email": "vic@vbuy.com", "custom_fields": {}},
+]}
+_fu_deals = [
+    {"id": 99001, "name": "Vee block", "company": {"name": "Vee Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+     "custom_fields": cf_sell(MD_TERMS), "people": [{"id": 2001}], "updated_at": "2026-08-01T00:00:00Z"},
+    {"id": 99002, "name": "Vee buy", "company": {"name": "Vee Co"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+     "custom_fields": cf_status(7207579), "value": 987_654, "value_in_cents": 98_765_400,
+     "people": [{"id": 2001}, {"id": 2002}], "updated_at": "2026-08-02T00:00:00Z"},
+]
+use_fixture({lf.PEOPLE_KEY: _fu_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": _fu_deals}})
+
+def _fu_get(q, admin=False):
+    lf._req_cache_reset()
+    if admin:
+        qq = dict(q, key=ADMIN_KEY, view_as="sid@fucap.com", edit="1")
+        return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                  "queryStringParameters": qq, "cookies": []}, None)["body"]
+    return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": q, "cookies": [tenant_cookie("sid@fucap.com")]}, None)["body"]
+
+_fu_pages = {
+    "Active Intros": _fu_get({"tab": "intros"}),
+    "company page": _fu_get({"company": "Vee Co"}),
+    "Overview": _fu_get({}),
+    "person page": _fu_get({"buyer": "2002"}),
+    "admin Active Intros": _fu_get({"tab": "intros"}, admin=True),
+    "admin company page": _fu_get({"company": "Vee Co"}, admin=True),
+    "admin person page": _fu_get({"buyer": "2002"}, admin=True),
+}
+check("size: the commission 'value' ($987.7K / $988K) never renders on any page",
+      all("$987" not in pg and "$988" not in pg and "987,654" not in pg for pg in _fu_pages.values()))
+check("size: Active Intros Size cell renders '—' for the value-only buy deal",
+      '<td class="num">—</td>' in (row_for(_fu_pages["Active Intros"], "99002") or ""))
+check("size: company page Buyers row renders '—'", '<td class="num">—</td>' in (row_for(_fu_pages["company page"], "99002") or "")
+      or '<td class="num">—</td>' in _fu_pages["company page"])
+check("size: _deal_size_text / _deal_pipeline_size never fall back to value",
+      lf._deal_size_text(_fu_deals[1]) == "—" and lf._deal_pipeline_size(_fu_deals[1]) is None
+      and lf._intro_amount(_fu_deals[1]) == 0)
+
+# --- Dates: created_at / closed_time / days_in_stage
+_dt_now = datetime.now(timezone.utc)
+_dt_people = {"people": [{"id": 2101, "full_name": "Dee Dates", "email": "dee@dtcap.com",
+                          "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}}]}
+_dt_live = [{"id": 99101, "name": "Live dt", "company": {"name": "Live Dt Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+             "custom_fields": cf_sell(MD_TERMS), "people": [{"id": 2101}], "updated_at": "2026-08-01T00:00:00Z",
+             "created_at": "2026/05/10 09:00:00 -0700"}]
+_dt_closed = [
+    {"id": 99102, "name": "Won dt", "company": {"name": "Won Dt Co"}, "deal_stage": {"id": 111802},
+     "custom_fields": cf_sell({lf.TICKET_MAX_FIELD: 2_000_000}), "people": [{"id": 2101}],
+     "updated_at": "2026-08-01T00:00:00Z", "created_at": "2026/03/02 14:05:09 -0700", "days_in_stage": 3},
+    {"id": 99103, "name": "Lost dt", "company": {"name": "Lost Dt Co"}, "deal_stage": {"id": lf.OBSOLETE_STAGE_ID},
+     "custom_fields": cf_sell(), "people": [{"id": 2101}], "updated_at": "2026-08-01T00:00:00Z",
+     "created_at": "2026/04/01 08:00:00 +0000", "closed_time": "2026/06/15 10:00:00 +0000", "days_in_stage": 40},
+]
+use_fixture({lf.PEOPLE_KEY: _dt_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": _dt_live}})
+lf._closed_deals_cache["deals"] = _dt_closed
+lf._closed_deals_cache["fetched_at"] = time.time()
+lf._req_cache_reset()
+check("dates: created_at 'YYYY/MM/DD HH:MM:SS +ZZZZ' parses (slashes normalized)",
+      lf._deal_listed_dt(_dt_closed[0]) == datetime(2026, 3, 2, 21, 5, 9, tzinfo=timezone.utc))
+_won_expected = lf._fmt_dt_short(_dt_now - timedelta(days=3))
+check("dates: Won with no closed_time -> today minus days_in_stage, labelled 'Won <date>'",
+      lf._deal_closed_label(_dt_closed[0], 111802) == f"Won {_won_expected}")
+check("dates: closed_time wins over days_in_stage, labelled 'Closed <date>' for a non-won stage",
+      lf._deal_closed_label(_dt_closed[1], lf.OBSOLETE_STAGE_ID) == "Closed Jun 15, 2026")
+_dt_page = body_only(lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                         "queryStringParameters": {}, "cookies": [tenant_cookie("dee@dtcap.com")]},
+                                        None)["body"])
+_dt_track = _dt_page[_dt_page.find('class="ov-section ov-track"'):]
+check("dates: Track record won row shows 'Won <today-3>'", f"Won {_won_expected}" in _dt_track.split("</table>")[0])
+check("dates: All closed deals shows Listed (created_at) and Closed labels",
+      "Mar 2, 2026" in _dt_track and "Closed Jun 15, 2026" in _dt_track and "Apr 1, 2026" in _dt_track)
+check("dates: history line 'since <earliest created_at>'",
+      "3 deals listed · 1 won · 1 lost/obsolete since Mar 2, 2026" in _dt_track)
+
+# --- Reopen scope on My Deals archived rows
+_dt_md = body_only(lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                       "queryStringParameters": {"tab": "mydeals"},
+                                       "cookies": [tenant_cookie("dee@dtcap.com")]}, None)["body"])
+check("reopen: no Reopen chip on the Won archived row", "Reopen" not in (row_for(_dt_md, "99102") or "x Reopen"))
+check("reopen: Reopen chip on the Obsolete archived row", "Reopen &rarr;" in (row_for(_dt_md, "99103") or ""))
+check("reopen: never in Overview's Needs your attention",
+      "Reopen" not in _dt_page[_dt_page.find('class="ov-section ov-attention"'):_dt_page.find('class="ov-section ov-track"')])
 
 
 # ======================================================================
