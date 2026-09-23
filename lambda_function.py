@@ -417,7 +417,7 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibi
                                archived=False):
     """Next Steps column. Archived row -> one red "Reopen ->" chip (update
     form). Paperwork not in order (deal_paperwork_status) -> one red chip
-    per missing item: "CEF required ->" (CEF form) and/or "Agent
+    per missing item: "ID required ->" (CEF form) and/or "Agent
     agreement required ->" (agreement template). Paperwork in order ->
     ONE chip by priority: "Extend deadline ->" (red, update form, only
     when the deadline has passed) > "Provide deal terms ->" (amber) >
@@ -3072,64 +3072,84 @@ def _id_status_ok(id_status):
     return id_status == "verified" or id_status in CEF_QUALIFYING_IDS
 
 
-# Paperwork rule: a deal is "in order" only when BOTH (a) CEF is satisfied
-# at team level (_deal_id_status) and (b) THIS deal's Agent Agreement
-# (custom_label_3714334) carries 6354277 -- the SELL-side agreement signed.
+# Paperwork rule (deal_paperwork_status):
+#   - Agent Agreement (custom_label_3714334) contains 6354274 (BUY-side
+#     agreement) -> in order regardless of CEF, flagged buy_side.
+#   - otherwise in order only when it contains 6354277 (SELL-side signed)
+#     AND CEF is satisfied at team level (_deal_id_status).
+#   - In Process / blank -> "Agent agreement required".
 AGENT_AGREEMENT_SELL_SIGNED_ID = 6354277
-PAPERWORK_CEF_MISSING = "CEF required"
+AGENT_AGREEMENT_BUY_SIGNED_ID = 6354274
+# Tenant-facing wording never says "CEF" (internal field name only).
+PAPERWORK_CEF_MISSING = "ID required"
 PAPERWORK_AGREEMENT_MISSING = "Agent agreement required"
+FINRA_ID_UNMET_TEXT = "FINRA-mandated ID requirements unmet"
+BUY_SIDE_AGREEMENT_TEXT = "Buy-side agreement"
 
 
-def _deal_paperwork_missing(deal, cef_status):
-    """Missing paperwork items for a deal, given its (team-level) CEF
-    status: [] when in order. Pure helper under deal_paperwork_status."""
+def _deal_paperwork(deal, cef_status):
+    """{"in_order", "missing", "buy_side"} for a deal given its team-level
+    CEF status. Pure helper under deal_paperwork_status."""
+    opts = _deal_cf_option_ids(deal or {}, AGENT_AGREEMENT_FIELD)
+    if AGENT_AGREEMENT_BUY_SIGNED_ID in opts:
+        return {"in_order": True, "missing": [], "buy_side": True}
     missing = []
     if not _id_status_ok(cef_status):
         missing.append(PAPERWORK_CEF_MISSING)
-    if AGENT_AGREEMENT_SELL_SIGNED_ID not in _deal_cf_option_ids(deal or {}, AGENT_AGREEMENT_FIELD):
+    if AGENT_AGREEMENT_SELL_SIGNED_ID not in opts:
         missing.append(PAPERWORK_AGREEMENT_MISSING)
-    return missing
+    return {"in_order": not missing, "missing": missing, "buy_side": False}
+
+
+def _deal_paperwork_missing(deal, cef_status):
+    return _deal_paperwork(deal, cef_status)["missing"]
 
 
 def deal_paperwork_status(deal, tenant_email, person_id):
     """THE single source of a deal's paperwork status -- the My Deals
     Visibility column, its Next Steps column and the company page's Deal
-    Details card all call this. {"in_order": bool, "missing": [...]},
-    missing drawn from PAPERWORK_CEF_MISSING / PAPERWORK_AGREEMENT_MISSING
-    in that order."""
-    missing = _deal_paperwork_missing(deal, _deal_id_status(deal, tenant_email, person_id))
-    return {"in_order": not missing, "missing": missing}
+    Details card all call this. {"in_order": bool, "missing": [...],
+    "buy_side": bool}; missing drawn from PAPERWORK_CEF_MISSING /
+    PAPERWORK_AGREEMENT_MISSING in that order."""
+    return _deal_paperwork(deal, _deal_id_status(deal, tenant_email, person_id))
 
 
 def _coerce_paperwork(deal, paperwork):
     """deal_paperwork_status's dict, or (legacy callers/tests) a bare CEF
     status/option id -- converted through the same rule."""
     if isinstance(paperwork, dict):
-        return paperwork
-    missing = _deal_paperwork_missing(deal, paperwork)
-    return {"in_order": not missing, "missing": missing}
+        return {"buy_side": False, **paperwork}
+    return _deal_paperwork(deal, paperwork)
+
+
+def _buy_side_note_html():
+    return f'<span class="paperwork-note buy-side">&#10003; {_esc(BUY_SIDE_AGREEMENT_TEXT)}</span>'
 
 
 def _paperwork_badge_html(paperwork):
-    """Deal Details card badge -- same status as the My Deals row."""
+    """Deal Details card badge -- same status as the My Deals row, with the
+    full FINRA wording for a missing ID."""
+    if paperwork.get("buy_side"):
+        return f'<span class="id-status-badge id-ok">&#10003; {_esc(BUY_SIDE_AGREEMENT_TEXT)}</span>'
     if paperwork["in_order"]:
         return '<span class="id-status-badge id-ok">&#10003; Paperwork in order</span>'
     links = {PAPERWORK_CEF_MISSING: CEF_FORM_URL, PAPERWORK_AGREEMENT_MISSING: AGENT_AGREEMENT_DOC_URL}
+    labels = {PAPERWORK_CEF_MISSING: FINRA_ID_UNMET_TEXT, PAPERWORK_AGREEMENT_MISSING: PAPERWORK_AGREEMENT_MISSING}
     return " ".join(
         f'<a class="id-status-badge id-missing" href="{links[m]}" target="_blank" rel="noopener noreferrer">'
-        f'&#10007; {_esc(m)}</a>' for m in paperwork["missing"])
+        f'&#10007; {_esc(labels[m])}</a>' for m in paperwork["missing"])
 
 
 def _cef_badge_html(cef_option_id, tenant_name):
     """Nav-bar badge for the tenant view (and admin &view_as preview),
     one state per CEF option: Yes -> green "ID verified"; Pending ->
     amber "ID pending"; No or unset (cef_option_id is None or any id
-    outside the verified map) -> red "CEF required — FINRA compliance"
+    outside the verified map) -> red "FINRA-mandated ID requirements unmet"
     linking straight to the CEF form itself (CEF_FORM_URL, new tab) — no
     longer a mailto, since there's now a direct form to send people to;
-    N/A -> no badge at all. The missing state reads "CEF required" -- the
-    same wording as the paperwork rule (deal_paperwork_status); the call
-    site passes a team-level result, so a teammate's Yes/N/A clears it. Only ever called when there
+    N/A -> no badge at all. Tenant-facing text never says "CEF". The call
+    site passes a team-level result, so a teammate's Yes/N/A clears it
+    (same CEF rule as deal_paperwork_status). Only ever called when there
     IS a tenant to report on (see the call site's tenant is not None
     guard) — there's no separate "no tenant" case to handle here."""
     if cef_option_id == CEF_NA_ID:
@@ -3139,7 +3159,7 @@ def _cef_badge_html(cef_option_id, tenant_name):
     if cef_option_id == CEF_PENDING_ID:
         return '<div class="gg-cef-badge cef-pending">&#8226; ID pending</div>'
     return (f'<a class="gg-cef-badge cef-missing" href="{CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">'
-            '&#10007; CEF required — FINRA compliance</a>')
+            f'&#10007; {FINRA_ID_UNMET_TEXT}</a>')
 
 
 def _person_display_name(rec):
@@ -6452,7 +6472,16 @@ def _my_deal_visibility_state(deal, cef_state, is_held, is_won=False):
 def _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=False):
     """State-only — no links (item 1); Next Steps carries the actionable
     links for these same states now (item 2). Turn 26: "sold" is the
-    Closed section's own muted-but-positive green badge."""
+    Closed section's own muted-but-positive green badge. A buy-side
+    agreement deal (paperwork in order regardless of CEF) gets a green
+    "Buy-side agreement" note under its badge."""
+    html = _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won)
+    if not is_won and _coerce_paperwork(deal, cef_state).get("buy_side"):
+        html += f'<div class="paperwork-note-line">{_buy_side_note_html()}</div>'
+    return html
+
+
+def _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won=False):
     state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
     if state == "sold":
         return '<span class="visibility-badge sold">Sold &#10003;</span>'
@@ -9077,17 +9106,13 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                                                        colleague_name=_colleague_name_for(d))
                               for i, (d, _) in enumerate(main_rows)]
                 else:
-                    # A colleague's own row is never editable by the
-                    # viewing tenant -- only the tenant's own rows are
-                    # (tenant_edit_mode), matching what the backend would
-                    # actually authorize (_tenant_email_for_deal resolves
-                    # writes to the deal's OWN linked tenant, not the
-                    # viewer) and avoiding a save button that would just
-                    # 403.
+                    # Firm/team write rights: a colleague's/teammate's row
+                    # is editable too -- _handle_update_intro authorizes by
+                    # firm/team scope (_tenant_can_act_on_deal) and records
+                    # the signed-in email as the audit actor; outsiders 403.
                     parts += [_buy_deal_row_html(d, resolved, people_by_id, person_id, _entry_for(d),
                                                   key=key, view_as=view_as,
-                                                  editable=(tenant_edit_mode
-                                                            and _colleague_name_for(d) is None),
+                                                  editable=tenant_edit_mode,
                                                   surface="intros", firm_won_index=firm_won_index,
                                                   company_repeated=main_repeats[i],
                                                   firm_person_ids=firm_person_ids,
@@ -10027,6 +10052,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                      border-radius: 14px; text-decoration: none; }}
   .id-status-badge.id-ok {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .id-status-badge.id-missing {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
+  .paperwork-note-line {{ margin-top: 4px; }}
+  .paperwork-note.buy-side {{ font-size: 11px; font-weight: 600; color: var(--qp); }}
   .visibility-badge {{
     display: inline-block;
     font-size: 12px;
@@ -10928,6 +10955,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                      border-radius: 14px; text-decoration: none; }}
   .id-status-badge.id-ok {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .id-status-badge.id-missing {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
+  .paperwork-note-line {{ margin-top: 4px; }}
+  .paperwork-note.buy-side {{ font-size: 11px; font-weight: 600; color: var(--qp); }}
   .engagement-badge {{
     display: inline-block;
     font-size: 12px;

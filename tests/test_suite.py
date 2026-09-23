@@ -546,10 +546,10 @@ check("nav badge (Yes) says ID verified", "ID verified" in badge_yes)
 check("nav badge (Yes) has no leftover CEF text", "CEF" not in badge_yes)
 check("nav badge (Pending) says ID pending", "ID pending" in badge_pending)
 check("nav badge (Pending) has no leftover CEF text", "CEF" not in badge_pending)
-check("nav badge (No/missing) says CEF required — FINRA compliance", "CEF required — FINRA compliance" in badge_no)
+check("nav badge (No/missing) says 'FINRA-mandated ID requirements unmet'",
+      "FINRA-mandated ID requirements unmet" in badge_no)
 check("nav badge (No/missing) still links the CEF form", lf.CEF_FORM_URL in badge_no)
-check("nav badge (No/missing) uses the paperwork rule's 'CEF required' wording, not 'ID required'",
-      "ID required" not in badge_no)
+check("nav badge (No/missing) has no leftover CEF text", "CEF" not in badge_no)
 
 box_html = lf._feature_box_html("bob@example.com", key=None)
 check("feature box is unaffected by the CEF-badge rename", "feature-input" in box_html)
@@ -587,8 +587,8 @@ deal_in_process = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMEN
 check("state: In-Process agreement counts as missing",
       lf._my_deal_visibility_state(deal_in_process, lf.CEF_YES_ID, False) == "paperwork_missing")
 deal_buyside_only = {"custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [6354274], **full_terms()})}
-check("state: a BUY-side agreement (6354274) does not satisfy the sell-side rule",
-      lf._my_deal_visibility_state(deal_buyside_only, lf.CEF_YES_ID, False) == "paperwork_missing")
+check("state: a BUY-side agreement (6354274) is in order even with no CEF",
+      lf._my_deal_visibility_state(deal_buyside_only, lf.CEF_NO_ID, False) == "live")
 check("state: CEF N/A satisfies the CEF half",
       lf._my_deal_visibility_state(deal_no_id, lf.CEF_NA_ID, False) == "live")
 
@@ -617,21 +617,25 @@ check("is_won=False, everything unset -> falls through the normal ladder (not 's
 
 check("live badge exact text", lf._my_deal_visibility_badge_html(deal_full, lf.CEF_YES_ID, False)
       == '<span class="visibility-badge live">Live · shown to buyers</span>')
-check("CEF-missing badge exact text", lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False)
-      == '<span class="visibility-badge id-required">Not live · CEF required</span>')
+check("ID-missing badge exact text", lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False)
+      == '<span class="visibility-badge id-required">Not live · ID required</span>')
 check("agreement-missing badge exact text", lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_YES_ID, False)
       == '<span class="visibility-badge id-required">Not live · Agent agreement required</span>')
 check("both-missing badge names both",
       lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_NO_ID, False)
-      == '<span class="visibility-badge id-required">Not live · CEF required · Agent agreement required</span>')
+      == '<span class="visibility-badge id-required">Not live · ID required · Agent agreement required</span>')
 check("terms_incomplete badge exact text", lf._my_deal_visibility_badge_html(deal_no_terms, lf.CEF_YES_ID, False)
       == '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>')
 check("held badge exact text", lf._my_deal_visibility_badge_html(deal_full, lf.CEF_YES_ID, True)
       == '<span class="visibility-badge held">Held · not shown to buyers</span>')
 check("sold badge exact text", lf._my_deal_visibility_badge_html({}, None, False, is_won=True)
       == '<span class="visibility-badge sold">Sold &#10003;</span>')
-check("no 'ID required' wording left in the Visibility badge",
-      "ID required" not in lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False))
+check("no 'CEF' wording in the Visibility badge",
+      "CEF" not in lf._my_deal_visibility_badge_html(deal_no_id, lf.CEF_NO_ID, False))
+_buyside_badge = lf._my_deal_visibility_badge_html(deal_buyside_only, lf.CEF_NO_ID, False)
+check("buy-side agreement: Visibility shows Live plus a green 'Buy-side agreement' note",
+      'class="visibility-badge live"' in _buyside_badge
+      and '<span class="paperwork-note buy-side">&#10003; Buy-side agreement</span>' in _buyside_badge)
 
 # Next Steps: paperwork chips first (red, one per missing item); once in
 # order, "Extend deadline" is the only red chip; archived -> "Reopen".
@@ -648,9 +652,9 @@ chip = lf._my_deal_action_chip_html("1", "Co", False, True, "live", key=None, vi
 check("nudge shown alone when nothing else applies", 'class="action-chip nudge"' in chip and "Nudge buyers" in chip)
 
 chip = lf._my_deal_action_chip_html("1", "Co", True, False, "paperwork_missing", key=None, view_as=None,
-                                     paperwork_missing=["CEF required", "Agent agreement required"])
+                                     paperwork_missing=["ID required", "Agent agreement required"])
 check("paperwork missing -> one red chip per missing item, linking CEF form / agreement doc",
-      chip.count('class="action-chip paperwork"') == 2 and "CEF required &rarr;" in chip
+      chip.count('class="action-chip paperwork"') == 2 and "ID required &rarr;" in chip and "CEF" not in chip
       and "Agent agreement required &rarr;" in chip and lf.CEF_FORM_URL in chip and lf.AGENT_AGREEMENT_DOC_URL in chip)
 check("paperwork missing -> no Extend deadline chip yet", "Extend deadline" not in chip)
 
@@ -6190,7 +6194,8 @@ check("ID status: a teammate (Bob, no deals) with CEF Yes satisfies it for Alice
 alice_md = body_only(_md_get("alice@harkcap.com", {})["body"])
 alice_row = row_for(alice_md, "54779042") or ""
 check("paperwork: teammate CEF Yes + sell-side agreement on the deal -> in order (row is Live)",
-      lf.deal_paperwork_status(md_deal, "alice@harkcap.com", 1601) == {"in_order": True, "missing": []}
+      lf.deal_paperwork_status(md_deal, "alice@harkcap.com", 1601)
+      == {"in_order": True, "missing": [], "buy_side": False}
       and "Not live" not in alice_row and 'class="visibility-badge live"' in alice_row)
 alice_co = _md_get("alice@harkcap.com", {"company": "Hark Labs"})["body"]
 check("paperwork: company page Deal Details shows the same 'in order' status",
@@ -6205,11 +6210,13 @@ check("ID status: no qualifying team member -> required",
       lf._deal_id_status(md_deal, "alice@harkcap.com", 1601) == "required")
 alice_md_req = body_only(_md_get("alice@harkcap.com", {})["body"])
 alice_row_req = row_for(alice_md_req, "54779042") or ""
-check("paperwork: agreement but no CEF anywhere on the team -> 'CEF required' (Visibility + Next Steps)",
-      lf.deal_paperwork_status(md_deal, "alice@harkcap.com", 1601) == {"in_order": False, "missing": ["CEF required"]}
-      and "Not live · CEF required</span>" in alice_row_req and "CEF required &rarr;" in alice_row_req)
+check("paperwork: sell-side agreement but no CEF anywhere on the team -> 'ID required' (Visibility + Next Steps)",
+      lf.deal_paperwork_status(md_deal, "alice@harkcap.com", 1601)
+      == {"in_order": False, "missing": ["ID required"], "buy_side": False}
+      and "Not live · ID required</span>" in alice_row_req and "ID required &rarr;" in alice_row_req)
 alice_co_req = _md_get("alice@harkcap.com", {"company": "Hark Labs"})["body"]
-check("paperwork: company page shows the same 'CEF required' status", "&#10007; CEF required</a>" in alice_co_req
+check("paperwork: company page shows the full FINRA wording for the same status",
+      "&#10007; FINRA-mandated ID requirements unmet</a>" in alice_co_req
       and "Paperwork in order" not in alice_co_req and "Agent agreement required" not in alice_co_req)
 check("ID status: an individual tenant's own CEF Yes still satisfies their own deals",
       lf._deal_id_status({}, "gina.solo@gmail.com", 1610) == "verified")
@@ -6224,7 +6231,7 @@ _md_fixture(lf.CEF_YES_ID)
 md_noagr = dict(md_deal, custom_fields=cf_sell({k: v for k, v in MD_TERMS.items() if k != lf.AGENT_AGREEMENT_FIELD}))
 check("paperwork: CEF on the team but no agreement -> 'Agent agreement required'",
       lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602)
-      == {"in_order": False, "missing": ["Agent agreement required"]})
+      == {"in_order": False, "missing": ["Agent agreement required"], "buy_side": False})
 md_noagr_row = lf._my_deal_row_html(md_noagr, "Hark Labs", None, {"non_terminal_count": 0, "stalled": False},
                                      0, lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602), "active")
 md_noagr_card = lf._deal_card_html(md_noagr, "Hark Labs",
@@ -6282,6 +6289,103 @@ check("archive: 'Total in pipeline' excludes the archived $90M Obsolete deal (li
       "Total in pipeline" in arch_summary and "$5M" in arch_summary and "$95M" not in arch_summary)
 check("archive: 'introduced total' still counts the archived Dead Co intro", "1 introduced total" in arch_summary)
 check("archive: 'in motion' counts live deals only (Dead Co's intro is not in motion)", "in motion" not in arch_summary)
+
+
+# ======================================================================
+# SECTION: Paperwork follow-ups -- buy-side exception, tenant wording
+# (no "CEF"), Active Intros colleague edits
+# ======================================================================
+def _pw_fixture(agreement_ids, bob_cef=None):
+    people_pw = {"people": [
+        {"id": 1701, "full_name": "Ann Pw", "email": "ann@pwcap.com", "custom_fields": {}},
+        {"id": 1702, "full_name": "Ben Pw", "email": "ben@pwcap.com",
+         "custom_fields": ({lf.CEF_FIELD: [bob_cef]} if bob_cef else {})},
+        {"id": 1710, "full_name": "Olly Out", "email": "olly@outsider.io", "custom_fields": {}},
+        {"id": 1750, "full_name": "Byron Buyer", "email": "byron@buyers.com", "custom_fields": {}},
+    ]}
+    deals_pw = [
+        {"id": 88001, "name": "Pw Block", "company": {"name": "Pw Target"}, "deal_stage": {"id": lf.STAGE_FIRM},
+         "custom_fields": cf_sell({**MD_TERMS, lf.AGENT_AGREEMENT_FIELD: agreement_ids}),
+         "people": [{"id": 1701}], "is_archived": False, "updated_at": "2026-08-01T00:00:00Z"},
+        {"id": 88002, "name": "Pw buy", "company": {"name": "Pw Target"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+         "custom_fields": cf_status(7207579), "people": [{"id": 1701}, {"id": 1750}],
+         "updated_at": "2026-08-02T00:00:00Z"},
+        {"id": 88009, "name": "Out Block", "company": {"name": "Out Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+         "custom_fields": cf_sell(), "people": [{"id": 1710}], "is_archived": False,
+         "updated_at": "2026-08-01T00:00:00Z"},
+    ]
+    return use_fixture({lf.PEOPLE_KEY: people_pw, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_pw}},
+                       ses=FakeSES())
+
+def _pw_get(email, extra=None):
+    q = {"tab": "mydeals"}
+    q.update(extra or {})
+    return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": q, "cookies": [tenant_cookie(email)]}, None)
+
+# Buy-side agreement, no CEF anywhere on the team -> in order
+_pw_fixture([lf.AGENT_AGREEMENT_BUY_SIGNED_ID])
+pw_deal = next(d for d in lf.get_deals_list() if d["id"] == 88001)
+check("buy-side: 6354274 with no CEF on the team -> in order, buy_side flagged",
+      lf.deal_paperwork_status(pw_deal, "ann@pwcap.com", 1701) == {"in_order": True, "missing": [], "buy_side": True})
+pw_row = row_for(body_only(_pw_get("ann@pwcap.com")["body"]), "88001") or ""
+check("buy-side: My Deals Visibility shows the green 'Buy-side agreement' note, no red paperwork",
+      '<span class="paperwork-note buy-side">&#10003; Buy-side agreement</span>' in pw_row
+      and "Not live" not in pw_row and "action-chip paperwork" not in pw_row)
+pw_card = _pw_get("ann@pwcap.com", {"company": "Pw Target"})["body"]
+check("buy-side: detail card shows the same green 'Buy-side agreement'",
+      '<span class="id-status-badge id-ok">&#10003; Buy-side agreement</span>' in pw_card)
+
+# Sell-side agreement, no CEF -> "ID required"; nav + card use the full FINRA wording
+_pw_fixture([lf.AGENT_AGREEMENT_SELL_SIGNED_ID])
+pw_mydeals = _pw_get("ann@pwcap.com")["body"]
+pw_row = row_for(body_only(pw_mydeals), "88001") or ""
+check("sell-side without CEF: short chips say 'ID required'",
+      "Not live · ID required</span>" in pw_row and "ID required &rarr;" in pw_row)
+check("nav badge: full 'FINRA-mandated ID requirements unmet' wording",
+      "&#10007; FINRA-mandated ID requirements unmet</a>" in pw_mydeals)
+pw_card = _pw_get("ann@pwcap.com", {"company": "Pw Target"})["body"]
+check("detail card: full 'FINRA-mandated ID requirements unmet' wording",
+      '<a class="id-status-badge id-missing"' in pw_card and "FINRA-mandated ID requirements unmet</a>" in pw_card)
+
+# In Process -> Agent agreement required
+_pw_fixture([6354283], bob_cef=lf.CEF_YES_ID)
+pw_row = row_for(body_only(_pw_get("ann@pwcap.com")["body"]), "88001") or ""
+check("In Process agreement -> 'Agent agreement required' (red)",
+      "Not live · Agent agreement required</span>" in pw_row and "Agent agreement required &rarr;" in pw_row)
+_pw_fixture([])
+check("blank agreement -> 'Agent agreement required'",
+      lf.deal_paperwork_status(next(d for d in lf.get_deals_list() if d["id"] == 88001), "ann@pwcap.com", 1701)
+      ["missing"] == ["ID required", "Agent agreement required"])
+
+# No "CEF" anywhere in tenant-facing pages (tenant session and admin view_as without &edit=1)
+_pw_fixture([lf.AGENT_AGREEMENT_SELL_SIGNED_ID])
+pw_pages = [_pw_get("ann@pwcap.com", q)["body"]
+            for q in ({}, {"tab": "intros"}, {"tab": "demand"}, {"company": "Pw Target"}, {"buyer": "1750"})]
+pw_pages.append(lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                   "queryStringParameters": {"key": ADMIN_KEY, "view_as": "ann@pwcap.com",
+                                                             "tab": "mydeals"}, "cookies": []}, None)["body"])
+check("tenant-facing text never contains 'CEF' (My Deals, Active Intros, Demand, company, person, admin view_as)",
+      all("CEF" not in p for p in pw_pages))
+
+# Active Intros: a teammate's row is editable; outsiders get 403
+_, pw_table = _pw_fixture([lf.AGENT_AGREEMENT_SELL_SIGNED_ID])
+ben_intros = _pw_get("ben@pwcap.com", {"tab": "intros"})["body"]
+ben_row = row_for(ben_intros, "88002") or ""
+check("Active Intros: teammate Ben sees Ann's intro with editable controls (notes textarea, enabled milestones)",
+      '<textarea class="ei-notes" data-deal-id="88002"' in ben_row
+      and re.search(r'<input type="checkbox" class="ei-milestone"(?![^>]*disabled)[^>]*data-deal-id="88002"', ben_row)
+      is not None)
+lf.urllib.request.urlopen = fake_urlopen2
+pw_ok = lf.lambda_handler(post_event({"deal_id": "88002", "milestone_step": "NDA", "milestone_checked": True},
+                                     cookies=[tenant_cookie("ben@pwcap.com")]), None)
+pw_no = lf.lambda_handler(post_event({"deal_id": "88002", "notes": "outsider"},
+                                     cookies=[tenant_cookie("olly@outsider.io")]), None)
+check("Active Intros: teammate's edit -> 200, audited as the teammate in the owner's partition",
+      pw_ok["statusCode"] == 200
+      and any(p and p.get("actor") == "ben@pwcap.com" and p.get("tenant") == "ann@pwcap.com" for p in pw_table.puts))
+check("Active Intros: non-member's edit -> 403", pw_no["statusCode"] == 403)
+lf.urllib.request.urlopen = fake_urlopen
 
 
 # ======================================================================
