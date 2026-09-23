@@ -392,7 +392,7 @@ REF_LABELS = {"overview": "Overview", "mydeals": "My Deals", "intros": "Active I
 
 FEATURE_REQUEST_EMAIL = "cgracia@rainmakersecurities.com"
 
-# Deal-update-form ("Update / Cancel" button): chadgracia/deal-update-form,
+# Deal-update-form ("Update, Pause or Cancel" button, see _deal_action_html): chadgracia/deal-update-form,
 # routed at this CloudFront URL. Token format (HMAC-SHA256 of str(deal_id),
 # urlsafe base64, no padding) and query shape (?deal_id=<id>&token=<token>)
 # copied verbatim from that repo's own make_token/verify_token, matching
@@ -429,8 +429,7 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibi
         # ("sold") row.
         if not update_url or visibility_state == "sold":
             return ""
-        return (f'<a class="action-chip reopen" href="{update_url}" target="_blank" '
-                'rel="noopener noreferrer">Reopen &rarr;</a>')
+        return _reopen_chip_html(update_url)
     # "Extend deadline" is the only red chip; every other state keeps its
     # non-red (amber) display.
     candidates = []
@@ -458,16 +457,36 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibi
     return f'<a class="action-chip {css_class}"{title_attr} href="{href}"{target_attr}>{label}</a>'
 
 
-def _update_cancel_button_html(deal_id, label="Update / Cancel"):
-    """label defaults to "Update / Cancel" everywhere except My Deals,
-    which now has its own separate one-click Hold/Cancel REQUEST controls
-    alongside this link and passes label="Update" so the three don't read
-    as duplicates — same minted link, unchanged."""
+DEAL_ACTION_LABEL = "Update, Pause or Cancel"
+
+
+def _is_closed_down_stage(stage_id):
+    """Closed-down (archived, not won): Obsolete, Lost, Trade Broken. The
+    one shared archived-stage test -- My Deals' Archived section and the
+    company page's "Closed down" section both read it."""
+    return stage_id == OBSOLETE_STAGE_ID or stage_id in LOST_STAGE_IDS or stage_id == STAGE_TRADE_BROKEN
+
+
+def _reopen_chip_html(update_url):
+    return (f'<a class="action-chip reopen" href="{update_url}" target="_blank" '
+            'rel="noopener noreferrer">Reopen &rarr;</a>')
+
+
+def _deal_action_html(deal_id, stage_id):
+    """THE per-deal action, shared by every place a sell deal renders (My
+    Deals, Overview Open deals / Needs your attention / All closed deals,
+    company-page Deal Details cards, Active Intros' company link): a live
+    deal -> the "Update, Pause or Cancel" button; a closed-down deal
+    (_is_closed_down_stage) -> red "Reopen ->"; a Won deal -> nothing.
+    All link the same HMAC-signed update form (_deal_update_form_url);
+    "" when HMAC_SECRET isn't configured."""
     url = _deal_update_form_url(deal_id)
-    if not url:
+    if not url or _is_won_stage(stage_id):
         return ""
+    if _is_closed_down_stage(stage_id):
+        return _reopen_chip_html(url)
     return (f'<a class="update-cancel-btn" href="{url}" target="_blank" rel="noopener noreferrer">'
-            f'{_esc(label)}</a>')
+            f'{_esc(DEAL_ACTION_LABEL)}</a>')
 
 
 # Public buyer-facing deal detail page. Verified verbatim in
@@ -6632,8 +6651,12 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         deadline_html = (f'<div class="dc-line">Deadline: {_esc(deadline)}</div>'
                           if deadline else "")
 
+    # Closed (Won or closed-down, resolved like My Deals): no overdue
+    # warning, no paperwork, a close label instead.
+    resolved_sid = _resolve_deal_stage(deal, override_entry)
+    is_closed = _is_won_stage(resolved_sid) or _is_closed_down_stage(resolved_sid)
     is_overdue = False
-    if deadline:
+    if deadline and not is_closed:
         deadline_dt = _parse_dt(deadline)
         is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
 
@@ -6672,11 +6695,14 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     # Paperwork: the same deal_paperwork_status the My Deals row uses
     # (it covers the agent agreement too, so it replaces the older
     # Engaged badge). None only when there's no tenant context.
-    if paperwork is not None:
-        badge_html = (f'<div class="dc-line">{_paperwork_badge_html(paperwork, deal)}</div>'
-                      + _update_cancel_button_html(deal_id))
+    action_html = _deal_action_html(deal_id, resolved_sid)
+    if is_closed:
+        badge_html = (f'<div class="dc-line dc-closed-label">{_esc(_deal_closed_label(deal, resolved_sid))}</div>'
+                      + action_html)
+    elif paperwork is not None:
+        badge_html = f'<div class="dc-line">{_paperwork_badge_html(paperwork, deal)}</div>' + action_html
     else:
-        badge_html = _engagement_badge_html(deal, company) + _update_cancel_button_html(deal_id)
+        badge_html = _engagement_badge_html(deal, company) + action_html
 
     return f"""<div class="{card_cls}">
       {overdue_html}
@@ -8691,11 +8717,8 @@ def _company_update_link_html(person_id, company_name):
     sell_deals = get_my_sell_deals(person_id, company_name)
     if not sell_deals:
         return ""
-    update_url = _deal_update_form_url(str(sell_deals[0].get("id")))
-    if not update_url:
-        return ""
-    return (f'<div class="company-update-link"><a href="{update_url}" target="_blank" '
-            f'rel="noopener noreferrer">Update deal &rarr;</a></div>')
+    action = _deal_action_html(str(sell_deals[0].get("id")), _deal_stage_id(sell_deals[0]))
+    return f'<div class="company-update-link">{action}</div>' if action else ""
 
 
 def _investor_type_cell_html(buyer_recs):
@@ -9513,8 +9536,11 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
      Update-deal link beneath it, matching My Deals' own deal-id-sub
      spacing fix. */
   .company-update-link {{ margin-top: 7px; }}
-  .company-update-link a {{ font-size: 12px; color: var(--muted); text-decoration: none; }}
-  .company-update-link a:hover {{ color: var(--accent); text-decoration: underline; }}
+  .company-update-link a {{ display: inline-block; font-size: 11px; font-weight: 600; padding: 3px 9px;
+                            border-radius: 6px; text-decoration: none; }}
+  .company-update-link a:hover {{ text-decoration: underline; }}
+  .company-update-link a.update-cancel-btn {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
+  .company-update-link a.reopen {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .closed-dot {{
     display: inline-block;
     width: 7px;
@@ -9538,7 +9564,6 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 {nav}
 <div class="wrap">
   <h1>Active Intros</h1>
-  {feature_box_html}
   {summary_html}
   {subtle_html}
   {body_html}
@@ -9577,7 +9602,8 @@ RED_ACTION_CHIP_RE = re.compile(r'<a class="action-chip (?:overdue|reopen)"[^>]*
 
 
 def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_state, section,
-                       key=None, view_as=None, edit_mode=False, colleague_name=None, archived=False):
+                       key=None, view_as=None, edit_mode=False, colleague_name=None, archived=False,
+                       resolved_stage=None):
     deal_id = str(deal.get("id"))
     if company_name:
         company_link = (f'<a href="{_company_href(company_name, "mydeals", key, view_as)}">'
@@ -9672,7 +9698,6 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     action_chip_html = _my_deal_row_chip_html(deal, company_name, deadline, stats, cef_state, section,
                                                archived, key=key, view_as=view_as)
 
-    update_btn = _update_cancel_button_html(deal_id, label="Update")
     # Bug fix: Hold/Cancel/Reactivate are tenant self-service (see
     # _handle_deal_stage), never admin-only, but the
     # data-key attribute they carry decides whether the resulting write
@@ -9688,7 +9713,8 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # itself offers Hold and Cancel) on every live row the viewer can
     # see. Archived rows get none -- their "Reopen ->" chip links to the
     # same form.
-    actions_html = "" if archived else f'<div class="actions-stack">{update_btn}</div>'
+    actions_html = ("" if archived else
+                    f'<div class="actions-stack">{_deal_action_html(deal_id, resolved_stage)}</div>')
 
 
     return (
@@ -9844,11 +9870,18 @@ def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
     buyer_ids = _introduced_buyer_ids(person_id, [c for c, _st in stats_by_company.values() if c],
                                       intro_details, anon_key_email, firm_person_ids)
     won_rows = md["won_rows"] if md else []
+    # Active intros: ONE definition for the tile and the list -- every row
+    # of Active Intros' own set (_active_intros_model kept_deals: live buy
+    # deals whose resolved Intro Status isn't Passed/Withdrawn/Closed,
+    # pending-disclosure Matched and Stalled included). Tile = uncapped
+    # row count; the section lists the newest OVERVIEW_LIST_LIMIT.
+    recent_intros = (_overview_recent_intros(person_id, anon_key_email, intro_details, firm_person_ids,
+                                             edit_mode=edit_mode) if person_id is not None else [])
     tiles = {
         "capital_raised": sum(st["raised"] for _c, st in stats_by_company.values()),
         "live_deals": md["live_count"] if md else 0,
         "pipeline_total": md["pipeline_total"] if md else 0,
-        "active_intros": sum(st["non_terminal_count"] for _c, st in stats_by_company.values()),
+        "active_intros": len(recent_intros),
         "won_count": len(won_rows),
         "buyers_introduced": len(buyer_ids),
         "intro_total": intro_total,
@@ -9856,7 +9889,23 @@ def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
         "intro_won_pct": (round(100 * won_intros / intro_total) if intro_total else None),
     }
     return {"md": md, "rows": rows, "tiles": tiles, "intro_details": intro_details,
-            "firm_person_ids": firm_person_ids, "won_rows": won_rows}
+            "firm_person_ids": firm_person_ids, "won_rows": won_rows, "recent_intros": recent_intros}
+
+
+def _overview_deadline_html(r, key=None, view_as=None):
+    """Open deals' Deadline cell, as My Deals renders it: a past deadline
+    is red (.deadline-overdue) with the same red "Extend deadline ->"
+    chip (_my_deal_row_chip_html)."""
+    deadline = r["deadline"]
+    if not deadline:
+        return "—"
+    text = _esc(_fmt_short_date(deadline) or deadline)
+    if not _my_deal_is_overdue(deadline, r["section"]):
+        return f'<span>{text}</span>'
+    chip = _my_deal_row_chip_html(r["deal"], r["company_name"], deadline, r["stats"], r["id_status"],
+                                  r["section"], False, key=key, view_as=view_as)
+    extend = "".join(c for c in RED_ACTION_CHIP_RE.findall(chip) if 'class="action-chip overdue"' in c)
+    return f'<span class="deadline-overdue">{text}</span>' + (f'<div>{extend}</div>' if extend else "")
 
 
 def _overview_attention_items(rows, key=None, view_as=None):
@@ -9942,6 +9991,12 @@ OVERVIEW_CSS = """
   .ov-table tr:first-child td { border-top: none; }
   .ov-table td.num, .ov-table th.num { text-align: center; }
   .ov-history { font-size: 13px; color: var(--muted); margin: 10px 0 4px; }
+  .deadline-overdue { color: #b23b3b; font-weight: 600; }
+  .ov-row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .ov-table td.ov-actions { text-align: right; white-space: nowrap; }
+  .update-cancel-btn { display: inline-block; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 6px;
+                       text-decoration: none; background: rgba(31,122,77,0.15); color: var(--qp); }
+  .update-cancel-btn:hover { text-decoration: underline; }
   .buyer-code { font-weight: 600; }
   .visibility-badge { display: inline-block; font-size: 12px; font-weight: 600; line-height: 1.3; padding: 4px 10px;
                       border-radius: 14px; }
@@ -10003,10 +10058,11 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             + _tile("Live deals", _esc(str(t["live_deals"])))
             + _tile("$ in pipeline", _esc(_fmt_money(t["pipeline_total"]) if t["pipeline_total"] else "$0"))
             + _tile("Active intros", _esc(str(t["active_intros"])))
-            + _tile("Won", _esc(str(t["won_count"])))
+            + _tile("Won", _esc(str(t["won_count"])), "deals closed")
             + _tile("Buyers introduced", _esc(str(t["buyers_introduced"])))
             + _tile("Intro → won", _esc(pct),
-                    _esc(f'{t["won_intros"]} of {t["intro_total"]}') if t["intro_total"] else "")
+                    "intros that closed" + (_esc(f' · {t["won_intros"]} of {t["intro_total"]}')
+                                            if t["intro_total"] else ""))
             + '</div>')
 
         # 2) Needs your attention
@@ -10014,7 +10070,9 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
         if items:
             att_rows = "".join(
                 f'<div class="ov-row ov-attention-row"><div>{_overview_company_link(r["company_name"], key, view_as)}'
-                f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></div><div>{chip}</div></div>'
+                f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></div>'
+                f'<div class="ov-row-actions">{chip}{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"])}'
+                '</div></div>'
                 for r, chip in items)
         else:
             att_rows = '<div class="ov-all-clear">All paperwork in order, no deadlines past.</div>'
@@ -10028,18 +10086,19 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></td>'
             f'<td>{_my_deal_visibility_badge_html(r["deal"], r["id_status"], r["section"] == "hold")}</td>'
             f'<td class="num">{r["buyer_count"]}</td><td class="num">{r["stats"]["non_terminal_count"] or "—"}</td>'
-            f'<td>{_esc(_fmt_short_date(r["deadline"]) or r["deadline"]) if r["deadline"] else "—"}</td></tr>'
+            f'<td>{_overview_deadline_html(r, key, view_as)}</td>'
+            f'<td class="ov-actions">{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"])}</td></tr>'
             for r in live_rows[:OVERVIEW_LIST_LIMIT])
         open_table = (('<table class="ov-table"><thead><tr><th>Deal</th><th>Status</th>'
-                       '<th class="num">Interested buyers</th><th class="num">Intros</th><th>Deadline</th></tr></thead>'
+                       '<th class="num">Interested buyers</th><th class="num">Intros</th><th>Deadline</th>'
+                       '<th></th></tr></thead>'
                        f'<tbody>{open_body}</tbody></table>') if live_rows
                       else '<div class="ov-muted" style="padding:10px 0">No open deals.</div>')
         open_html = (f'<section class="ov-section ov-open"><h2>Open deals</h2><div class="card">{open_table}</div>'
                      f'<a class="ov-see-all" href="?tab=mydeals{suffix}">See all in My Deals &rarr;</a></section>')
 
         # 4) Active intros (most recent updates)
-        recent = (_overview_recent_intros(person_id, anon_key_email, ov["intro_details"], ov["firm_person_ids"],
-                                          edit_mode=edit_mode) if person_id is not None else [])
+        recent = ov["recent_intros"]
         intro_body = "".join(
             f'<tr><td>{_overview_buyer_html(d, res, person_id, ov["firm_person_ids"], anon_key_email, edit_mode, key, view_as)}</td>'
             f'<td>{_overview_company_link(_deal_company_name(d), key, view_as)}</td>'
@@ -10080,13 +10139,14 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></td>'
                 f'<td>{_esc("Won" if id(r) in won_ids else _deal_stage_label(r["resolved_stage"]))}</td>'
                 f'<td>{_esc(_fmt_dt_short(_deal_listed_dt(r["deal"])))}</td>'
-                f'<td>{_esc(_deal_closed_label(r["deal"], r["resolved_stage"]) if r["section"] in ("closed", "cancelled") else "—")}</td></tr>'
+                f'<td>{_esc(_deal_closed_label(r["deal"], r["resolved_stage"]) if r["section"] in ("closed", "cancelled") else "—")}</td>'
+                f'<td>{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"])}</td></tr>'
                 for r in archived_rows)
             all_closed_html = (
                 '<details class="closed-out-section ov-all-closed">'
                 f'<summary>All closed deals <span class="count">({len(archived_rows)})</span></summary>'
                 '<div class="card"><table class="ov-table"><thead><tr><th>Deal</th><th>Stage</th><th>Listed</th>'
-                f'<th>Closed</th></tr></thead><tbody>{closed_body}</tbody></table></div></details>')
+                f'<th>Closed</th><th></th></tr></thead><tbody>{closed_body}</tbody></table></div></details>')
         if archived_rows:
             track_html = (f'<section class="ov-section ov-track"><h2>Track record</h2><div class="card">{won_table}</div>'
                           f'<p class="ov-history">{_esc(history)}</p>{all_closed_html}</section>')
@@ -10096,7 +10156,12 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
 
         header_html = (f'<div class="ov-head"><h1 class="ov-title">Overview</h1>'
                        f'<p class="ov-subtitle">{_esc(_overview_subtitle(person_id, anon_key_email, viewer_name))}</p></div>')
-        body_html = header_html + tiles_html + intros_html + open_html + attention_html + track_html
+        # "Help shape this dashboard": Overview and My Deals only. Submits
+        # tagged "my-deals" so they list on My Deals' Feature requests.
+        feature_box_html = _feature_box_html(anon_key_email or "admin", key=(key if edit_mode else None),
+                                             page="my-deals")
+        body_html = (header_html + feature_box_html + tiles_html + intros_html + open_html + attention_html
+                     + track_html)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -10127,6 +10192,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .gg-placeholder {{ max-width: 640px; margin: 96px auto; padding: 0 24px; text-align: center; color: var(--muted);
                     font-size: 15px; }}
 {OVERVIEW_CSS}
+{FEATURE_CSS}
 </style>
 </head>
 <body>
@@ -10190,8 +10256,7 @@ def _my_deals_model(deals, person_id, anon_key_email):
             # section — the trophy shelf — and is excluded from
             # "active" outright, same footing as Hold/Cancelled.
             section = "closed"
-        elif (resolved_stage == OBSOLETE_STAGE_ID or resolved_stage in LOST_STAGE_IDS
-              or resolved_stage == STAGE_TRADE_BROKEN):
+        elif _is_closed_down_stage(resolved_stage):
             # Item 4: Lost (111801/2379322) sits alongside Obsolete
             # in Cancelled -- previously Lost wasn't checked here at
             # all, so a Lost-stage sell deal fell into the "else"
@@ -10366,7 +10431,8 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 _my_deal_row_html(r["deal"], r["company_name"], r["deadline"], r["stats"], r["buyer_count"],
                                    r["id_status"], section, key=key, view_as=view_as, edit_mode=edit_mode,
                                    colleague_name=r["colleague_name"],
-                                   archived=section in ("cancelled", "closed")))
+                                   archived=section in ("cancelled", "closed"),
+                                   resolved_stage=r["resolved_stage"]))
 
         summary_parts = []
         if live_count:
@@ -10964,7 +11030,6 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     # cross-tenant aggregation here, that's render_my_deals_page's
     # tenant_picker branch only (see get_feature_requests).
     feature_items, _ = get_feature_requests(anon_key_email, page="company")
-    feature_box_html = _feature_box_html(anon_key_email, key=(key if edit_mode else None), page="company")
     feature_list_html = _feature_requests_list_html(feature_items["open"], feature_items["done"])
 
     # tenant_edit_mode: the tenant (real session, or admin &view_as preview
@@ -10994,11 +11059,29 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         # not just the viewing tenant's.
         sell_deals = get_firm_sell_deals(person_id, company) if person_id is not None else []
         if sell_deals:
-            deals_body = "".join(
-                _deal_card_html(d, company, intro_details.get(str(d.get("id"))), edit_mode=edit_mode,
-                                paperwork=deal_paperwork_status(d, anon_key_email, person_id))
-                for d in sell_deals
-            )
+            # Order: live cards, then "Won" (expanded), then a collapsed
+            # "Closed down (N)" (Obsolete/Lost/Trade Broken, the same
+            # _is_closed_down_stage My Deals' Archived section uses).
+            # Closed cards carry no paperwork (see _deal_card_html).
+            live_cards, won_cards, down_cards = [], [], []
+            for d in sell_deals:
+                entry = intro_details.get(str(d.get("id")))
+                rsid = _resolve_deal_stage(d, entry)
+                if _is_won_stage(rsid):
+                    won_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode))
+                elif _is_closed_down_stage(rsid):
+                    down_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode))
+                else:
+                    live_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode,
+                                                      paperwork=deal_paperwork_status(d, anon_key_email, person_id)))
+            deals_body = "".join(live_cards)
+            if won_cards:
+                deals_body += ('<div class="cd-won-deals"><h3 class="cd-deals-subhead">Won</h3>'
+                               + "".join(won_cards) + '</div>')
+            if down_cards:
+                deals_body += ('<details class="closed-out-section cd-closed-down">'
+                               f'<summary>Closed down <span class="count">({len(down_cards)})</span></summary>'
+                               + "".join(down_cards) + '</details>')
         else:
             deals_body = '<div class="gg-placeholder small">No deals with this company yet.</div>'
 
@@ -11546,6 +11629,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   }}
   .dc-value {{ font-size: 16px; font-weight: 600; }}
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
+  .cd-deals-subhead {{ font-size: 14px; font-weight: 600; margin: 16px 0 8px; }}
+  details.cd-closed-down {{ margin-top: 16px; }}
+  .action-chip.reopen {{ display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3;
+                         padding: 3px 9px; border-radius: 12px; text-decoration: none;
+                         background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .buyer-contact {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
   .buyer-cell-links {{
     font-size: 12px;
@@ -11712,7 +11800,6 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   <p class="cd-subnav">
     <a href="#deal-details">Deal details</a><span class="sep">·</span><a href="#buyers">Active intros ({active_intros_nav_count})</a><span class="sep">·</span><a href="#demand">Interested buyers ({len(buyers)})</a>
   </p>
-  {feature_box_html}
   {your_deals_html}
   {matched_buyers_html}
   <section class="cd-section" id="demand">
@@ -13026,7 +13113,6 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     </div>
   </div>
   {tenant_picker_html}
-  {feature_box_html}
   <div class="toolbar">
     <input id="search" type="text" placeholder="Search companies...">
   </div>

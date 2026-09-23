@@ -802,13 +802,14 @@ company_table_page = lf.render_page([{"company": "Alpha Co", "total": 1, "qp": 1
                                      anon_key_email=TENANT_EMAIL, tenant_picker=False)
 check("Demand Board uses the light --bg token", "--bg: #f4f2ee;" in company_table_page)
 check("Demand Board has no leftover dark-mode literal", "#14161a" not in company_table_page)
-check("Demand Board renders the feature box", 'id="feature-box"' in company_table_page)
+check("Demand Board has no 'Help shape' feature box (Overview + My Deals only)",
+      'id="feature-box"' not in company_table_page)
 check("Demand Board renders the feature list container", "feature-section-heading" in company_table_page)
 check("old mailto 'Request a feature' button is fully gone", "Request a feature" not in company_table_page)
 
 demand_admin_agg = lf.render_page([], "Admin", key=ADMIN_KEY, view_as=None,
                                    anon_key_email="admin", tenant_picker=True)
-check("Demand Board admin aggregate (no view_as) also renders the feature box", 'id="feature-box"' in demand_admin_agg)
+check("Demand Board admin aggregate (no view_as) has no feature box either", 'id="feature-box"' not in demand_admin_agg)
 
 msg_page = lf._message_page("Not enabled", lf.NOT_ENABLED_MESSAGE)
 check("_message_page uses the light bg", "#f4f2ee" in msg_page)
@@ -1178,8 +1179,9 @@ page_repeat = body_only(page_repeat_full)
 check("Active Intros: no 'grouped-row' class left in the page CSS/markup", "grouped-row" not in page_repeat_full)
 check("Active Intros: both same-company rows render the full company link (2 occurrences)",
       page_repeat.count(">Repeat Co<") == 2)
-check("Active Intros: both same-company rows also render the Update-deal link (2 occurrences)",
-      page_repeat.count('<div class="company-update-link">') == 2 and page_repeat.count("Update deal") == 2)
+check("Active Intros: both same-company rows also render the shared deal action (2 occurrences)",
+      page_repeat.count('<div class="company-update-link">') == 2
+      and page_repeat.count(">Update, Pause or Cancel<") == 2)
 
 admin_page_repeat = body_only(lf.render_intros_page(
     "Rhea Repeat", tenant=repeat_tenant, tenant_email="rhea@example.com",
@@ -6605,7 +6607,10 @@ for co in ("Orion Co", "Pax Co", "Quill Co", "Rex Co", "Sol Co"):
     co_raised += 0 if raised_txt == "—" else float(raised_txt.strip("$M")) * 1_000_000
     co_active += int(re.search(r'<span>Active intros</span><span class="cd-stat-num">(\d+)</span>', pg).group(1))
 check("parity: Capital Raised = sum of the company pages' 'Total raised'", co_raised == t["capital_raised"])
-check("parity: Active intros = sum of the company pages' 'Active intros'", co_active == t["active_intros"])
+_aim_ov = lf._active_intros_model(1801, "alice@ovcap.com", lf.get_intro_details("alice@ovcap.com")[0])
+check("active intros: tile = Active Intros' uncapped row set (incl. pending Matched Pat, which the "
+      "disclosed-only company-page figure excludes)",
+      t["active_intros"] == len(_aim_ov["kept_deals"]) == len(ov_model["recent_intros"]) == co_active + 1)
 check("parity: Intro -> won % uses the company-page won/intro counts (3 won of 5 introduced -> 60%)",
       t["won_intros"] == 3 and t["intro_total"] == md_model["intros_total"] == 5 and t["intro_won_pct"] == 60)
 check("parity: Buyers introduced = unique disclosed buyers (Dora, Cleo, Walt, Stan, Wes; Pat pending)",
@@ -6815,6 +6820,141 @@ check("reopen: no Reopen chip on the Won archived row", "Reopen" not in (row_for
 check("reopen: Reopen chip on the Obsolete archived row", "Reopen &rarr;" in (row_for(_dt_md, "99103") or ""))
 check("reopen: never in Overview's Needs your attention",
       "Reopen" not in _dt_page[_dt_page.find('class="ov-section ov-attention"'):_dt_page.find('class="ov-section ov-track"')])
+
+
+# ======================================================================
+# Shared deal action ("Update, Pause or Cancel" / Reopen / none),
+# company-page Closed down section, Overview consistency
+# ======================================================================
+_ac_now = datetime.now(timezone.utc)
+_ac_past = (_ac_now - timedelta(days=37)).strftime("%Y/%m/%d")
+_ac_people = {"people": [{"id": 2301, "full_name": "Ada Action", "email": "ada@actcap.com",
+                          "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}}]
+              + [{"id": 2400 + i, "full_name": f"Buyer {i}", "email": f"b{i}@buy{i}.com", "custom_fields": {}}
+                 for i in range(12)]}
+
+
+def _ac_sell(did, name, stage, cf=None, extra=None):
+    d = {"id": did, "name": name, "company": {"name": "Act Co"}, "deal_stage": {"id": stage},
+         "custom_fields": cf_sell(cf), "people": [{"id": 2301}], "updated_at": "2026-08-01T00:00:00Z",
+         "created_at": "2026/03/02 09:00:00 +0000"}
+    d.update(extra or {})
+    return d
+
+
+# 12 live intros: 4 Introduced, 4 pending (Matched), 4 Stalled -> the tile must be 12, the list capped at 10.
+_ac_statuses = [7207579] * 4 + [7207578] * 4 + [lf.INTRO_STATUS_STALLED_ID] * 4
+_ac_buys = [{"id": 99300 + i, "name": "Act Co buy", "company": {"name": "Act Co"},
+             "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(st, {lf.TICKET_MAX_FIELD: 1_000_000}),
+             "people": [{"id": 2301}, {"id": 2400 + i}], "updated_at": f"2026-08-{10 + i:02d}T00:00:00Z"}
+            for i, st in enumerate(_ac_statuses)]
+_ac_live = [_ac_sell(99201, "Act live block", lf.STAGE_FIRM, {**MD_TERMS, lf.DEADLINE_FIELD: _ac_past})] + _ac_buys
+_ac_closed = [
+    _ac_sell(99202, "Act won block", 111802, {lf.TICKET_MAX_FIELD: 2_000_000}, {"closed_time": "2026/09/03 10:00:00 +0000"}),
+    _ac_sell(99203, "Act obsolete block", lf.OBSOLETE_STAGE_ID, {}, {"closed_time": "2026/07/01 10:00:00 +0000"}),
+    _ac_sell(99204, "Act lost block", 111801, {}, {"closed_time": "2026/07/02 10:00:00 +0000"}),
+]
+use_fixture({lf.PEOPLE_KEY: _ac_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": _ac_live}})
+lf._closed_deals_cache["deals"] = _ac_closed
+lf._closed_deals_cache["fetched_at"] = time.time()
+lf._req_cache_reset()
+
+
+def _ac_get(q):
+    lf._req_cache_reset()
+    return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": q, "cookies": [tenant_cookie("ada@actcap.com")]}, None)["body"]
+
+
+_AC_BTN = ">Update, Pause or Cancel<"
+# --- The shared helper
+check("action helper: live stage -> the 'Update, Pause or Cancel' button to the signed update form",
+      _AC_BTN in lf._deal_action_html("99201", lf.STAGE_FIRM)
+      and lf._deal_update_form_url("99201") in lf._deal_action_html("99201", lf.STAGE_FIRM))
+check("action helper: Hold is live -> the button", _AC_BTN in lf._deal_action_html("99201", lf.HOLD_STAGE_ID))
+check("action helper: Obsolete / Lost / Trade Broken -> Reopen, no button",
+      all("Reopen &rarr;" in lf._deal_action_html("1", sid) and _AC_BTN not in lf._deal_action_html("1", sid)
+          for sid in (lf.OBSOLETE_STAGE_ID, 111801, 2379322, lf.STAGE_TRADE_BROKEN)))
+check("action helper: Won -> no action at all",
+      lf._deal_action_html("1", 111802) == "" and lf._deal_action_html("1", 2379321) == "")
+
+# --- My Deals
+_ac_md = body_only(_ac_get({"tab": "mydeals"}))
+check("my deals: live row has the shared button", _AC_BTN in (row_for(_ac_md, "99201") or ""))
+check("my deals: Obsolete/Lost rows have Reopen and no button",
+      all("Reopen &rarr;" in (row_for(_ac_md, i) or "") and _AC_BTN not in (row_for(_ac_md, i) or "x")
+          for i in ("99203", "99204")))
+check("my deals: Won row has no action",
+      _AC_BTN not in (row_for(_ac_md, "99202") or _AC_BTN) and "Reopen" not in (row_for(_ac_md, "99202") or "Reopen"))
+check("feedback box: on My Deals", 'id="feature-box"' in _ac_md)
+
+# --- Overview
+_ac_ov = body_only(_ac_get({"tab": "overview"}))
+_ac_open = _ac_ov[_ac_ov.find('class="ov-section ov-open"'):]
+_ac_open = _ac_open[:_ac_open.find("</section>")]
+_ac_att = _ac_ov[_ac_ov.find('class="ov-section ov-attention"'):]
+_ac_att = _ac_att[:_ac_att.find("</section>")]
+_ac_track = _ac_ov[_ac_ov.find('class="ov-section ov-track"'):]
+_ac_track = _ac_track[:_ac_track.find("</section>")]
+_ac_intros = _ac_ov[_ac_ov.find('class="ov-section ov-intros"'):]
+_ac_intros = _ac_intros[:_ac_intros.find("</section>")]
+check("overview: Open deals row has the shared button", _AC_BTN in _ac_open)
+check("overview: a past deadline in Open deals renders red with the 'Extend deadline' chip",
+      '<span class="deadline-overdue">' in _ac_open and 'class="action-chip overdue"' in _ac_open
+      and "Extend deadline &rarr;" in _ac_open)
+check("overview: Needs your attention row (Extend) also carries the shared button",
+      "Extend deadline &rarr;" in _ac_att and _AC_BTN in _ac_att and "Reopen" not in _ac_att)
+_ac_all_closed = _ac_track[_ac_track.find("ov-all-closed"):]
+check("overview: All closed deals -> Reopen on Obsolete and Lost, nothing on Won",
+      _ac_all_closed.count("Reopen &rarr;") == 2 and _AC_BTN not in _ac_track)
+_ac_model = lf._overview_model(lf.get_firm_sell_deals(2301), 2301, "ada@actcap.com")
+_ac_aim = lf._active_intros_model(2301, "ada@actcap.com", lf.get_intro_details("ada@actcap.com")[0])
+check("overview: Active intros tile = uncapped Active Intros row count (12: Introduced + pending + Stalled)",
+      _ac_model["tiles"]["active_intros"] == len(_ac_aim["kept_deals"]) == 12
+      and '<div class="ov-tile-label">Active intros</div><div class="ov-tile-value">12</div>' in _ac_ov)
+check("overview: the Active intros section lists 10 (capped) of those 12",
+      _ac_intros.split("<tbody>")[1].count("<tr>") == lf.OVERVIEW_LIST_LIMIT == 10)
+check("overview: Won tile caption 'deals closed'",
+      '<div class="ov-tile-label">Won</div><div class="ov-tile-value">1</div><div class="ov-tile-sub">deals closed</div>'
+      in _ac_ov)
+check("overview: Intro -> won caption 'intros that closed'",
+      re.search(r'Intro → won</div><div class="ov-tile-value">[^<]*</div><div class="ov-tile-sub">intros that closed',
+                _ac_ov) is not None)
+check("feedback box: on Overview", 'id="feature-box"' in _ac_ov)
+
+# --- Company page
+_ac_co = body_only(_ac_get({"company": "Act Co"}))
+_ac_dd = _ac_co[_ac_co.find('id="deal-details"'):]
+_ac_dd = _ac_dd[:_ac_dd.find('<div class="cd-stats-col">')]
+_ac_i_live, _ac_i_won, _ac_i_down = (_ac_dd.find("Act live block"), _ac_dd.find('<h3 class="cd-deals-subhead">Won</h3>'),
+                                     _ac_dd.find('<details class="closed-out-section cd-closed-down">'))
+check("company page: order is live, then Won, then Closed down",
+      -1 < _ac_i_live < _ac_i_won < _ac_i_down)
+_ac_won_sec = _ac_dd[_ac_i_won:_ac_i_down]
+_ac_down_sec = _ac_dd[_ac_i_down:]
+check("company page: Won card sits in the expanded Won section (not in any <details>)",
+      "Act won block" in _ac_won_sec and "<details" not in _ac_won_sec)
+check("company page: Closed down is collapsed by default with its count",
+      '<details class="closed-out-section cd-closed-down"><summary>Closed down <span class="count">(2)</span></summary>'
+      in _ac_dd)
+check("company page: Obsolete and Lost appear ONLY inside Closed down",
+      "Act obsolete block" in _ac_down_sec and "Act lost block" in _ac_down_sec
+      and "Act obsolete block" not in _ac_dd[:_ac_i_down] and "Act lost block" not in _ac_dd[:_ac_i_down])
+check("company page: live card has the shared button",
+      _AC_BTN in _ac_dd[_ac_i_live:_ac_i_won])
+check("company page: closed-down cards have Reopen, Won card has no action",
+      _ac_down_sec.count("Reopen &rarr;") == 2 and _AC_BTN not in _ac_down_sec
+      and _AC_BTN not in _ac_won_sec and "Reopen" not in _ac_won_sec)
+check("company page: closed cards show close labels and no paperwork",
+      "Won Sep 3, 2026" in _ac_won_sec and "Closed Jul 1, 2026" in _ac_down_sec and "Closed Jul 2, 2026" in _ac_down_sec
+      and "id-status-badge" not in _ac_won_sec + _ac_down_sec
+      and "engagement-badge" not in _ac_won_sec + _ac_down_sec
+      and "Deadline passed" not in _ac_won_sec + _ac_down_sec)
+check("company page: no 'Help shape this dashboard' box", 'id="feature-box"' not in _ac_co
+      and "Help shape this dashboard" not in _ac_co)
+_ac_ai = body_only(_ac_get({"tab": "intros"}))
+check("feedback box: not on Active Intros", 'id="feature-box"' not in _ac_ai)
+check("active intros: the company link is the shared button", _AC_BTN in _ac_ai)
 
 
 # ======================================================================
