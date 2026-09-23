@@ -556,8 +556,8 @@ check("feature box is unaffected by the CEF-badge rename", "feature-input" in bo
 
 check("nav background is transparent (no fill)", "background: transparent;" in lf.NAV_CSS)
 check("nav has a single thin bottom border in the page line color", "border-bottom: 1px solid var(--line);" in lf.NAV_CSS)
-check("brand text uses the blue accent",
-      re.search(r"\.gg-brand \{[^}]*color: var\(--accent\);", lf.NAV_CSS) is not None)
+check("old 'Gracia Group' nav brand is gone (Overview tab replaced it)",
+      ".gg-brand" not in lf.NAV_CSS and "gg-brand" not in lf._nav_html("overview", "X"))
 check("active tab text uses the blue accent",
       re.search(r"\.gg-tab\.active \{[^}]*color: var\(--accent\);", lf.NAV_CSS) is not None)
 check("admin badge stays a fixed high-contrast red (not palette-driven)",
