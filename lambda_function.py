@@ -3215,6 +3215,31 @@ def _paperwork_lines_html(deal, paperwork):
         for l, h, t in _paperwork_needed_items(deal, pw))
 
 
+# Pending intros: why a Matched buyer hasn't been introduced yet, from the
+# deal's own deal_paperwork_status (agreement first, then ID), else
+# PENDING_AWAITING_TEXT. Links are the same fixes as the paperwork lines.
+PENDING_AWAITING_TEXT = "Awaiting introduction by Gracia Group"
+PENDING_AGREEMENT_TEXT = "Agent agreement needed"
+PENDING_ID_TEXT = "ID needed"
+
+
+def _pending_block_items(sell_deal, paperwork):
+    """[(short label, href, new_tab)] -- one per missing paperwork item on
+    the seller's deal, agreement first; [] when in order (or no deal)."""
+    if sell_deal is None or paperwork is None:
+        return []
+    short = {PAPERWORK_AGREEMENT_NEEDED_TEXT: PENDING_AGREEMENT_TEXT, PAPERWORK_ID_NEEDED_TEXT: PENDING_ID_TEXT}
+    items = [(short[l], h, t) for l, h, t in _paperwork_needed_items(sell_deal, paperwork)]
+    return sorted(items, key=lambda it: 0 if it[0] == PENDING_AGREEMENT_TEXT else 1)
+
+
+def _pending_block_html(items):
+    """Blocked-by cell: one amber chip per item, else the muted awaiting line."""
+    if not items:
+        return f'<span class="pending-awaiting">{_esc(PENDING_AWAITING_TEXT)}</span>'
+    return " ".join(_paperwork_needed_link_html(l, h, t, "action-chip paperwork-needed") for l, h, t in items)
+
+
 def _paperwork_badge_html(paperwork, deal=None):
     """Deal Details card badge -- same paperwork status as the My Deals
     row: a missing ID keeps the red FINRA wording; a missing agreement is
@@ -3534,6 +3559,24 @@ def _intro_counts_toward_raised(resolved):
     return _intro_is_won(resolved) or resolved.get("id") == INTRO_STATUS_WIRED_ID or resolved.get("name") == "Wired"
 
 
+INTRO_TERMINAL_NAMES = ("Closed", "Passed", "Withdrawn")
+
+
+def _intro_is_active(resolved):
+    """ACTIVE intro: introduced and still in play -- disclosed (Introduced
+    or later, incl. Stalled with evidence of an introduction) and not
+    Closed/Passed/Withdrawn (a Won-stage buy deal resolves to Closed)."""
+    return bool(resolved["disclosed"]) and resolved["name"] not in INTRO_TERMINAL_NAMES
+
+
+def _intro_is_pending(resolved):
+    """PENDING intro: not yet introduced -- Matched, or a Stalled status
+    with no evidence of an introduction (_resolve_intro_status leaves it
+    undisclosed, i.e. its underlying status is pre-introduction). Stays
+    anonymous. Closed/Passed/Withdrawn are neither Active nor Pending."""
+    return not resolved["disclosed"] and resolved["name"] not in INTRO_TERMINAL_NAMES
+
+
 def _intro_amount(deal):
     """An intro's amount: its buy deal's ticket max, else min, else 0 --
     never the native "value" field (our commission)."""
@@ -3653,7 +3696,7 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     construction, never non-terminal)."""
     if person_id is None or not company_name:
         return {"intro_count": 0, "live_intro_count": 0, "non_terminal_count": 0, "stalled": False, "raised": 0,
-                "won_count": 0, "passed_count": 0}
+                "won_count": 0, "passed_count": 0, "pending_count": 0}
     cache_key = (person_id, company_name.strip().lower(), intro_details is not None, tenant_email is not None)
     cached = _req_cache["company_stats"].get(cache_key)
     if cached is not None:
@@ -3671,8 +3714,11 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
     passed_count = 0
     non_terminal_count = 0
     manual_intro_count = 0
+    pending_count = 0
     pop = _company_intro_population(person_id, company_name, intro_details, tenant_email)
     for d, _entry, resolved in pop["intros"]:
+        if _intro_is_pending(resolved):
+            pending_count += 1
         if resolved["disclosed"]:
             if d.get("_manual"):
                 manual_intro_count += 1
@@ -3699,6 +3745,9 @@ def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email
         "raised": raised,
         "won_count": won_count,
         "passed_count": passed_count,
+        # non_terminal_count IS the Active-intros count (_intro_is_active);
+        # pending_count the Pending one (_intro_is_pending).
+        "pending_count": pending_count,
     }
     _req_cache["company_stats"][cache_key] = stats
     return stats
@@ -7085,7 +7134,7 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
 
 def _pending_buy_deal_row_html(deal, people_by_id, tenant_person_id, anon_key_email, key=None, view_as=None,
                                 surface="intros", company_repeated=False, firm_person_ids=None,
-                                colleague_name=None):
+                                colleague_name=None, block_html=""):
     """Shared PENDING-row builder (parity refactor): never gets inputs --
     only Introduced-or-later rows are editable, disclosed or not -- and
     always shows the anonymized buyer cell. Same col1/col2 surface split
@@ -7104,7 +7153,7 @@ def _pending_buy_deal_row_html(deal, people_by_id, tenant_person_id, anon_key_em
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
         f'<td>{_status_pill_html("Matched")}</td>'
-        f'<td class="notes-cell"></td></tr>'
+        f'<td class="notes-cell pending-block">{block_html}</td></tr>'
     )
 
 
@@ -9019,6 +9068,40 @@ def _active_intros_model(person_id, tenant_email, intro_details, edit_mode=False
             "manual_failed": manual_failed}
 
 
+def _intro_buckets(person_id, tenant_email, intro_details, edit_mode=False):
+    """THE Active / Pending split (Overview tiles + sections, Active Intros
+    tab sections and counts), over Active Intros' own row set:
+    {"active": [(deal, resolved)], "pending": [(deal, resolved, sell_deal,
+    block_items)], "aim": _active_intros_model(...)}. A pending intro's
+    sell_deal is the viewer's firm/team sell deal for that company (a live
+    one first) and block_items its _pending_block_items."""
+    aim = _active_intros_model(person_id, tenant_email, intro_details, edit_mode=edit_mode)
+    active, pending = [], []
+    sell_by_company = {}
+
+    def _sell_for(company):
+        k = (company or "").strip().lower()
+        if k not in sell_by_company:
+            sells = get_firm_sell_deals(person_id, company) if (person_id is not None and company) else []
+            live = [d for d in sells
+                    if not (_is_won_stage(_resolve_deal_stage(d, intro_details.get(str(d.get("id")))))
+                            or _is_closed_down_stage(_resolve_deal_stage(d, intro_details.get(str(d.get("id"))))))]
+            sell = (live or sells or [None])[0]
+            items = (_pending_block_items(sell, deal_paperwork_status(sell, tenant_email, person_id))
+                     if sell is not None else [])
+            sell_by_company[k] = (sell, items)
+        return sell_by_company[k]
+
+    for d in aim["kept_deals"]:
+        resolved = aim["resolved_by_deal_id"][str(d.get("id"))]
+        if _intro_is_active(resolved):
+            active.append((d, resolved))
+        elif _intro_is_pending(resolved):
+            sell, items = _sell_for(_deal_company_name(d))
+            pending.append((d, resolved, sell, items))
+    return {"active": active, "pending": pending, "aim": aim}
+
+
 def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None, edit_mode=False,
                         cef_html=""):
     """tenant is None only for admin-without-view_as — the same
@@ -9065,7 +9148,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         # feature not part of this instruction.
         firm_person_ids = _firm_person_ids(person_id)
         intro_details, dynamo_failed = get_intro_details(tenant_email)
-        _aim = _active_intros_model(person_id, tenant_email, intro_details, edit_mode=edit_mode)
+        _buckets = _intro_buckets(person_id, tenant_email, intro_details, edit_mode=edit_mode)
+        _aim = _buckets["aim"]
         kept_deals = _aim["kept_deals"]
         resolved_by_deal_id = _aim["resolved_by_deal_id"]
         closed_out_deals = _aim["closed_out_deals"]
@@ -9098,10 +9182,10 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         note_html = ('<p class="gg-note">Status overrides unavailable — showing Pipeline values.</p>'
                      if (dynamo_failed or manual_failed) else "")
 
-        main_rows, pending_rows = [], []
-        for d in kept_deals:
-            resolved = resolved_by_deal_id[str(d.get("id"))]
-            (main_rows if resolved["disclosed"] else pending_rows).append((d, resolved))
+        # Active / Pending: the shared _intro_buckets split.
+        main_rows = list(_buckets["active"])
+        pending_rows = [(d, resolved) for d, resolved, _sell, _items in _buckets["pending"]]
+        pending_block_by_id = {str(d.get("id")): items for d, _r, _sell, items in _buckets["pending"]}
 
         def _entry_for(d):
             return intro_details.get(str(d.get("id"))) or {}
@@ -9229,37 +9313,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                 f'</div>{closed_out_html}'
             )
         else:
-            # "Introduced" always renders — even with zero rows — per
-            # instruction; "Pending introductions" only when there's
-            # something pending.
-            parts = [_group_header_row_html("Introduced", 6)]
-            if main_rows:
-                if edit_mode:
-                    parts += [_buy_deal_row_edit_html(d, people_by_id, person_id, intro_details,
-                                                       key=key, view_as=view_as, surface="intros",
-                                                       firm_won_index=firm_won_index,
-                                                       company_repeated=main_repeats[i],
-                                                       firm_person_ids=firm_person_ids,
-                                                       colleague_name=_colleague_name_for(d))
-                              for i, (d, _) in enumerate(main_rows)]
-                else:
-                    # Firm/team write rights: a colleague's/teammate's row
-                    # is editable too -- _handle_update_intro authorizes by
-                    # firm/team scope (_tenant_can_act_on_deal) and records
-                    # the signed-in email as the audit actor; outsiders 403.
-                    parts += [_buy_deal_row_html(d, resolved, people_by_id, person_id, _entry_for(d),
-                                                  key=key, view_as=view_as,
-                                                  editable=tenant_edit_mode,
-                                                  surface="intros", firm_won_index=firm_won_index,
-                                                  company_repeated=main_repeats[i],
-                                                  firm_person_ids=firm_person_ids,
-                                                  colleague_name=_colleague_name_for(d))
-                              for i, (d, resolved) in enumerate(main_rows)]
-            else:
-                parts.append(_group_empty_row_html("No introductions yet on this deal.", 6))
-
+            parts = []
             if pending_rows:
-                parts.append(_group_header_row_html("Pending introductions", 6))
+                parts.append(_group_header_row_html(f"Pending ({len(pending_rows)})", 6))
                 parts.append(
                     f'<tr><td colspan="6" class="group-note">'
                     f"We're preparing these introductions — buyer identities appear here "
@@ -9283,8 +9339,38 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                                                           key=key, view_as=view_as, surface="intros",
                                                           company_repeated=pending_repeats[i],
                                                           firm_person_ids=firm_person_ids,
-                                                          colleague_name=_colleague_name_for(d))
+                                                          colleague_name=_colleague_name_for(d),
+                                                          block_html=_pending_block_html(
+                                                              pending_block_by_id.get(str(d.get("id")), [])))
                               for i, (d, resolved) in enumerate(pending_rows)]
+
+            # "Pending" (top) only when there's something pending; "Active"
+            # always renders, even with zero rows. Counts = _intro_buckets.
+            parts.append(_group_header_row_html(f"Active ({len(main_rows)})", 6))
+            if main_rows:
+                if edit_mode:
+                    parts += [_buy_deal_row_edit_html(d, people_by_id, person_id, intro_details,
+                                                       key=key, view_as=view_as, surface="intros",
+                                                       firm_won_index=firm_won_index,
+                                                       company_repeated=main_repeats[i],
+                                                       firm_person_ids=firm_person_ids,
+                                                       colleague_name=_colleague_name_for(d))
+                              for i, (d, _) in enumerate(main_rows)]
+                else:
+                    # Firm/team write rights: a colleague's/teammate's row
+                    # is editable too -- _handle_update_intro authorizes by
+                    # firm/team scope (_tenant_can_act_on_deal) and records
+                    # the signed-in email as the audit actor; outsiders 403.
+                    parts += [_buy_deal_row_html(d, resolved, people_by_id, person_id, _entry_for(d),
+                                                  key=key, view_as=view_as,
+                                                  editable=tenant_edit_mode,
+                                                  surface="intros", firm_won_index=firm_won_index,
+                                                  company_repeated=main_repeats[i],
+                                                  firm_person_ids=firm_person_ids,
+                                                  colleague_name=_colleague_name_for(d))
+                              for i, (d, resolved) in enumerate(main_rows)]
+            else:
+                parts.append(_group_empty_row_html("No active introductions yet.", 6))
 
             rows_html = "".join(parts)
             table_html = f"""<div class="card">
@@ -9445,6 +9531,10 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   .iqf-flag {{ font-size: 10px; color: var(--muted); background: transparent; margin-left: 4px; }}
   .tier-badge-line {{ margin-top: 4px; }}
   tr.pending-row {{ opacity: 0.85; }}
+  .pending-block .action-chip {{ display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3;
+                                 padding: 3px 9px; border-radius: 12px; text-decoration: none; margin: 0 4px 4px 0;
+                                 background: rgba(201,162,39,0.15); color: var(--accredited, #8a6d1f); }}
+  .pending-awaiting {{ font-size: 12px; color: var(--muted); }}
   tr.closed-out-row {{ opacity: 0.7; }}
   .via-colleague-chip {{ display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }}
   /* Nav pass, item 2: a soft amber left-border accent on Stalled rows so
@@ -9664,6 +9754,8 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
         intro_text = f'<a class="mydeals-count-link" href="{intro_href}">{stats["non_terminal_count"]}</a>'
     else:
         intro_text = "—"
+    if stats.get("pending_count"):
+        intro_text += f'<div class="mydeals-pending">+{stats["pending_count"]} pending</div>'
     # Company-level Raised: the same figure for every row that shares
     # this company (multiple sell deals for one company all read the
     # same _company_buy_stats cache entry) -- labeled explicitly via the
@@ -9870,18 +9962,21 @@ def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
     buyer_ids = _introduced_buyer_ids(person_id, [c for c, _st in stats_by_company.values() if c],
                                       intro_details, anon_key_email, firm_person_ids)
     won_rows = md["won_rows"] if md else []
-    # Active intros: ONE definition for the tile and the list -- every row
-    # of Active Intros' own set (_active_intros_model kept_deals: live buy
-    # deals whose resolved Intro Status isn't Passed/Withdrawn/Closed,
-    # pending-disclosure Matched and Stalled included). Tile = uncapped
-    # row count; the section lists the newest OVERVIEW_LIST_LIMIT.
-    recent_intros = (_overview_recent_intros(person_id, anon_key_email, intro_details, firm_person_ids,
-                                             edit_mode=edit_mode) if person_id is not None else [])
+    # Active / Pending intros: the shared _intro_buckets split (the same
+    # one the Active Intros tab's sections use). Tiles = uncapped counts;
+    # the Active section lists the newest OVERVIEW_LIST_LIMIT.
+    buckets = (_intro_buckets(person_id, anon_key_email, intro_details, edit_mode=edit_mode)
+               if person_id is not None else {"active": [], "pending": []})
+    recent_intros = sorted(((d, res, _intro_last_update_epoch(d, intro_details.get(str(d.get("id")))))
+                            for d, res in buckets["active"]), key=lambda t: -t[2])
+    pending_intros = buckets["pending"]
     tiles = {
         "capital_raised": sum(st["raised"] for _c, st in stats_by_company.values()),
         "live_deals": md["live_count"] if md else 0,
         "pipeline_total": md["pipeline_total"] if md else 0,
-        "active_intros": len(recent_intros),
+        "active_intros": len(buckets["active"]),
+        "pending_intros": len(pending_intros),
+        "pending_blocked": sum(1 for _d, _r, _s, items in pending_intros if items),
         "won_count": len(won_rows),
         "buyers_introduced": len(buyer_ids),
         "intro_total": intro_total,
@@ -9889,7 +9984,8 @@ def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
         "intro_won_pct": (round(100 * won_intros / intro_total) if intro_total else None),
     }
     return {"md": md, "rows": rows, "tiles": tiles, "intro_details": intro_details,
-            "firm_person_ids": firm_person_ids, "won_rows": won_rows, "recent_intros": recent_intros}
+            "firm_person_ids": firm_person_ids, "won_rows": won_rows, "recent_intros": recent_intros,
+            "pending_intros": pending_intros}
 
 
 def _overview_deadline_html(r, key=None, view_as=None):
@@ -9908,13 +10004,29 @@ def _overview_deadline_html(r, key=None, view_as=None):
     return f'<span class="deadline-overdue">{text}</span>' + (f'<div>{extend}</div>' if extend else "")
 
 
-def _overview_attention_items(rows, key=None, view_as=None):
+def _overview_waiting_html(n, block_items):
+    """"<N> buyers waiting — Agent agreement needed" with each reason
+    linking to its fix (same links as the paperwork chips)."""
+    reasons = " · ".join(_paperwork_needed_link_html(l, h, t, "action-chip paperwork-needed") for l, h, t in block_items)
+    return (f'<span class="ov-waiting">{n} buyer{"" if n == 1 else "s"} waiting — </span>{reasons}')
+
+
+def _overview_attention_items(rows, key=None, view_as=None, pending_intros=None):
     """[(row, chip_html)] -- the red chips My Deals renders in Next Steps
     (same helper, same targets; Reopen excluded), plus one amber item per
     missing paperwork item on a live-table row (same links as the lines
-    under its Status pill)."""
+    under its Status pill), plus one "<N> buyers waiting — <reason>" line
+    per deal whose pending intros are blocked by its paperwork."""
     items = []
+    waiting = {}
+    for _d, _res, sell, block_items in (pending_intros or []):
+        if sell is not None and block_items:
+            n, _items = waiting.get(str(sell.get("id")), (0, block_items))
+            waiting[str(sell.get("id"))] = (n + 1, block_items)
     for r in rows:
+        w = waiting.get(str(r["deal"].get("id")))
+        if w:
+            items.append((r, _overview_waiting_html(*w)))
         archived = r["section"] in ("cancelled", "closed")
         chip_html = _my_deal_row_chip_html(r["deal"], r["company_name"], r["deadline"], r["stats"], r["id_status"],
                                            r["section"], archived, key=key, view_as=view_as)
@@ -9926,18 +10038,6 @@ def _overview_attention_items(rows, key=None, view_as=None):
             for label, href, new_tab in _paperwork_needed_items(r["deal"], r["id_status"]):
                 items.append((r, _paperwork_needed_link_html(label, href, new_tab, "action-chip paperwork-needed")))
     return items
-
-
-def _overview_recent_intros(person_id, anon_key_email, intro_details, firm_person_ids, edit_mode=False):
-    """[(deal, resolved, epoch)] newest first, from the SAME row set
-    Active Intros lists (_active_intros_model's kept_deals)."""
-    aim = _active_intros_model(person_id, anon_key_email, intro_details, edit_mode=edit_mode)
-    out = []
-    for d in aim["kept_deals"]:
-        resolved = aim["resolved_by_deal_id"][str(d.get("id"))]
-        out.append((d, resolved, _intro_last_update_epoch(d, intro_details.get(str(d.get("id"))))))
-    out.sort(key=lambda t: -t[2])
-    return out
 
 
 def _overview_buyer_html(deal, resolved, person_id, firm_person_ids, anon_key_email, edit_mode, key, view_as):
@@ -9963,7 +10063,9 @@ OVERVIEW_CSS = """
   .ov-head { margin-bottom: 14px; }
   .ov-title { font-size: 22px; font-weight: 700; margin: 0; }
   .ov-subtitle { font-size: 13px; color: var(--muted); margin: 4px 0 0; }
-  .ov-tiles { display: grid; grid-template-columns: 1.6fr repeat(6, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .ov-tiles { display: grid; grid-template-columns: 1.6fr repeat(7, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
+  .ov-waiting { font-size: 12px; font-weight: 600; color: var(--accredited); }
+  .pending-awaiting { font-size: 12px; color: var(--muted); }
   .ov-tile-primary { border-color: rgba(31,122,77,0.35); background: rgba(31,122,77,0.06); }
   .ov-tile-primary .ov-tile-value { font-size: 26px; color: var(--qp); }
   .ov-tile { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
@@ -10058,6 +10160,8 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             + _tile("Live deals", _esc(str(t["live_deals"])))
             + _tile("$ in pipeline", _esc(_fmt_money(t["pipeline_total"]) if t["pipeline_total"] else "$0"))
             + _tile("Active intros", _esc(str(t["active_intros"])))
+            + _tile("Pending intros", _esc(str(t["pending_intros"])),
+                    "waiting on you" if t["pending_blocked"] else "")
             + _tile("Won", _esc(str(t["won_count"])), "deals closed")
             + _tile("Buyers introduced", _esc(str(t["buyers_introduced"])))
             + _tile("Intro → won", _esc(pct),
@@ -10066,7 +10170,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             + '</div>')
 
         # 2) Needs your attention
-        items = _overview_attention_items(rows, key=key, view_as=view_as)
+        items = _overview_attention_items(rows, key=key, view_as=view_as, pending_intros=ov["pending_intros"])
         if items:
             att_rows = "".join(
                 f'<div class="ov-row ov-attention-row"><div>{_overview_company_link(r["company_name"], key, view_as)}'
@@ -10090,7 +10194,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             f'<td class="ov-actions">{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"])}</td></tr>'
             for r in live_rows[:OVERVIEW_LIST_LIMIT])
         open_table = (('<table class="ov-table"><thead><tr><th>Deal</th><th>Status</th>'
-                       '<th class="num">Interested buyers</th><th class="num">Intros</th><th>Deadline</th>'
+                       '<th class="num">Interested buyers</th><th class="num">Active intros</th><th>Deadline</th>'
                        '<th></th></tr></thead>'
                        f'<tbody>{open_body}</tbody></table>') if live_rows
                       else '<div class="ov-muted" style="padding:10px 0">No open deals.</div>')
@@ -10108,7 +10212,18 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
         intro_table = (('<table class="ov-table"><thead><tr><th>Buyer</th><th>Company</th><th>Status</th>'
                         f'<th>Updated</th></tr></thead><tbody>{intro_body}</tbody></table>') if recent
                        else '<div class="ov-muted" style="padding:10px 0">No active introductions yet.</div>')
-        if recent:
+        pending = ov["pending_intros"]
+        pending_html = ""
+        if pending:
+            pending_body = "".join(
+                f'<tr><td>{_overview_buyer_html(d, res, person_id, ov["firm_person_ids"], anon_key_email, edit_mode, key, view_as)}</td>'
+                f'<td>{_overview_company_link(_deal_company_name(d), key, view_as)}</td>'
+                f'<td>{_pending_block_html(block_items)}</td></tr>'
+                for d, res, _sell, block_items in pending)
+            pending_html = ('<section class="ov-section ov-pending"><h2>Pending intros</h2><div class="card">'
+                            '<table class="ov-table"><thead><tr><th>Buyer</th><th>Company</th><th>Blocked by</th>'
+                            f'</tr></thead><tbody>{pending_body}</tbody></table></div></section>')
+        if recent or pending:
             intros_html = (f'<section class="ov-section ov-intros"><h2>Active intros</h2><div class="card">{intro_table}</div>'
                            f'<a class="ov-see-all" href="?tab=intros{suffix}">See all in Active Intros &rarr;</a></section>')
         else:
@@ -10160,8 +10275,8 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
         # tagged "my-deals" so they list on My Deals' Feature requests.
         feature_box_html = _feature_box_html(anon_key_email or "admin", key=(key if edit_mode else None),
                                              page="my-deals")
-        body_html = (header_html + feature_box_html + tiles_html + intros_html + open_html + attention_html
-                     + track_html)
+        body_html = (header_html + feature_box_html + tiles_html + pending_html + intros_html + open_html
+                     + attention_html + track_html)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -10493,7 +10608,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
           <th>Deal</th>
           <th>Status</th>
           <th class="num">Interested buyers</th>
-          <th class="num" title="Introductions still in progress -- not yet Won or Lost">Intros</th>
+          <th class="num" title="Buyers introduced and still in play -- not yet Won, Passed or Withdrawn">Active intros</th>
           <th>Deadline</th>
           <th>Next Steps</th>
           <th></th>
@@ -10627,6 +10742,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   }}
   .mydeals-per-share {{ margin-top: 4px; font-size: 12px; color: var(--muted); }}
   .mydeals-raised {{ margin-top: 2px; font-size: 11px; color: var(--qp); }}
+  .mydeals-pending {{ margin-top: 2px; font-size: 11px; color: var(--muted); }}
   /* Nav pass, item 1: a count that's a door to the company page still
      reads as a plain number -- no default blue/underline -- with only
      a subtle hover affordance. */
@@ -11101,10 +11217,12 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                                      {"intro_count": 0, "non_terminal_count": 0, "won_count": 0, "passed_count": 0, "raised": 0})
         buyer_total = len(get_company_buyer_details(company))
         raised_text = _fmt_money(company_stats_for_tenant["raised"]) if company_stats_for_tenant["raised"] else "—"
+        _cd_pending = company_stats_for_tenant.get("pending_count", 0)
+        cd_pending_html = f'<span class="cd-stat-pending">+{_cd_pending} pending</span>' if _cd_pending else ""
         company_stats_html = f"""<div class="card cd-stats-card">
       <h3>This company</h3>
       <div class="cd-stat-row"><span>Interested buyers</span><span class="cd-stat-num">{buyer_total}</span></div>
-      <div class="cd-stat-row"><span>Active intros</span><span class="cd-stat-num">{company_stats_for_tenant["non_terminal_count"]}</span></div>
+      <div class="cd-stat-row"><span>Active intros</span><span class="cd-stat-num">{company_stats_for_tenant["non_terminal_count"]}{cd_pending_html}</span></div>
       <div class="cd-stat-row"><span>Won</span><span class="cd-stat-num">{company_stats_for_tenant["won_count"]}</span></div>
       <div class="cd-stat-row"><span>Lost</span><span class="cd-stat-num">{company_stats_for_tenant["passed_count"]}</span></div>
       <div class="cd-stat-row"><span>Total raised</span><span class="cd-stat-num">{_esc(raised_text)}</span></div>
@@ -11460,6 +11578,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   }}
   .cd-stat-row:last-child {{ border-bottom: none; }}
   .cd-stat-num {{ font-weight: 700; }}
+  .cd-stat-pending {{ font-weight: 400; font-size: 12px; color: var(--muted); margin-left: 4px; }}
   .card {{
     background: var(--card);
     border: 1px solid var(--line);
@@ -11723,6 +11842,10 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     margin: 0 0 10px;
   }}
   tr.pending-row {{ opacity: 0.85; }}
+  .pending-block .action-chip {{ display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3;
+                                 padding: 3px 9px; border-radius: 12px; text-decoration: none; margin: 0 4px 4px 0;
+                                 background: rgba(201,162,39,0.15); color: var(--accredited, #8a6d1f); }}
+  .pending-awaiting {{ font-size: 12px; color: var(--muted); }}
   tr.closed-out-row {{ opacity: 0.7; }}
   tr.closed-out-row-won {{ opacity: 1; background: rgba(31,122,77,0.08); }}
   tr.closed-out-row-passed {{ opacity: 0.7; }}

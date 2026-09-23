@@ -818,7 +818,7 @@ check("_message_page has no leftover dark bg", "#14161a" not in msg_page)
 # Item: Deal ID moved under the company name (own sub-line, not a
 # standalone column), Size column removed entirely, header order.
 head = page[page.find("<thead>"):page.find("</thead>")]
-expected_order = ["Deal", "Status", "Interested buyers", "Intros", "Deadline", "Next Steps"]
+expected_order = ["Deal", "Status", "Interested buyers", "Active intros", "Deadline", "Next Steps"]
 positions = [head.find(f">{h}<") for h in expected_order]
 check("header columns present in the exact expected order", positions == sorted(positions) and all(p != -1 for p in positions))
 check("Deal ID column header removed", "<th>Deal ID</th>" not in page)
@@ -839,11 +839,12 @@ check("sticky thead offset (top:0) present", "position: sticky;" in page and "to
 check("actions-stack still renders (Update/Hold/Cancel stacked)", 'class="actions-stack"' in page)
 check("action-chip column header is 'Next Steps'", "<th>Next Steps</th>" in page)
 check("table uses table-layout:fixed", "table-layout: fixed;" in page)
-check("num columns centered (Interested buyers/Intros use the .num class)",
+check("num columns centered (Interested buyers/Active intros use the .num class)",
       '<th class="num">Interested buyers</th>' in page
-      and '<th class="num" title="Introductions still in progress -- not yet Won or Lost">Intros</th>' in page)
-check("headers renamed: DEAL and INTROS (old Company/Active intros headers gone)",
-      "<th>Deal</th>" in page and "<th>Company</th>" not in page and ">Active intros</th>" not in page)
+      and '<th class="num" title="Buyers introduced and still in play -- not yet Won, Passed or Withdrawn">'
+          'Active intros</th>' in page)
+check("headers: DEAL and ACTIVE INTROS (old Company header gone)",
+      "<th>Deal</th>" in page and "<th>Company</th>" not in page and ">Active intros</th>" in page)
 check("deal-id-sub has a clear tap gap (margin-top)", "margin-top: 7px;" in page)
 
 # _fmt_short_date
@@ -1122,8 +1123,7 @@ check("exit-via-status-on-live-stage: the Closed out chip reads 'Lost' (via _dea
       "fallback, display-renamed from Passed)",
       '<span class="status-chip exit">Lost</span>' in page[page.find('<details class="closed-out-section">'):])
 
-intro_section = page[page.find(">Introduced<"):page.find("Pending introductions")
-                      if "Pending introductions" in page else len(page)]
+intro_section = page[page.find(">Active ("):page.find('<details class="closed-out-section">')]
 pos_beta = intro_section.find("Beta Holdings")
 pos_gamma = intro_section.find("Gamma Co")
 check("Stalled (Beta Holdings) sorts ahead of non-stalled rows", 0 <= pos_beta < pos_gamma)
@@ -1135,7 +1135,7 @@ check("both of Gamma Co's rows render the full company link (repeat-suppression 
       intro_section.count(">Gamma Co<") == 2)
 
 check("pending-introductions explanatory note present", "We're preparing these introductions" in page)
-check("Pending introductions header present (801 is Matched-only)", "Pending introductions" in page)
+check("Pending header present (801 is Matched-only)", ">Pending (" in page)
 
 
 # ======================================================================
@@ -1359,7 +1359,7 @@ check("804 (Closed) IS in Closed out (admin edit mode too)",
       "Gamma Co" in closed_out_admin and '<span class="status-chip closed">Won</span>' in closed_out_admin)
 
 check("805 (Matched/pending) has no checkbox markup", 'class="ei-milestone" data-deal-id="805"' not in page_tenant)
-check("805 is listed in the Pending introductions section", "Pending introductions" in page_tenant)
+check("805 is listed in the Pending section", ">Pending (" in page_tenant)
 
 # ---- Write path: checkbox toggle, uncheck-a-middle-step, Closed-lock, flags ----
 pipeline_calls = []
@@ -6605,12 +6605,14 @@ for co in ("Orion Co", "Pax Co", "Quill Co", "Rex Co", "Sol Co"):
     m = re.search(r'<span>Total raised</span><span class="cd-stat-num">([^<]+)</span>', pg)
     raised_txt = m.group(1) if m else "—"
     co_raised += 0 if raised_txt == "—" else float(raised_txt.strip("$M")) * 1_000_000
-    co_active += int(re.search(r'<span>Active intros</span><span class="cd-stat-num">(\d+)</span>', pg).group(1))
+    co_active += int(re.search(r'<span>Active intros</span><span class="cd-stat-num">(\d+)', pg).group(1))
 check("parity: Capital Raised = sum of the company pages' 'Total raised'", co_raised == t["capital_raised"])
 _aim_ov = lf._active_intros_model(1801, "alice@ovcap.com", lf.get_intro_details("alice@ovcap.com")[0])
-check("active intros: tile = Active Intros' uncapped row set (incl. pending Matched Pat, which the "
-      "disclosed-only company-page figure excludes)",
-      t["active_intros"] == len(_aim_ov["kept_deals"]) == len(ov_model["recent_intros"]) == co_active + 1)
+_bk_ov = lf._intro_buckets(1801, "alice@ovcap.com", lf.get_intro_details("alice@ovcap.com")[0])
+check("active intros: tile = Active bucket = sum of the company pages' 'Active intros'; Pat (Matched) is Pending",
+      t["active_intros"] == len(_bk_ov["active"]) == len(ov_model["recent_intros"]) == co_active
+      and t["pending_intros"] == len(_bk_ov["pending"]) == 1
+      and len(_aim_ov["kept_deals"]) == co_active + 1)
 check("parity: Intro -> won % uses the company-page won/intro counts (3 won of 5 introduced -> 60%)",
       t["won_intros"] == 3 and t["intro_total"] == md_model["intros_total"] == 5 and t["intro_won_pct"] == 60)
 check("parity: Buyers introduced = unique disclosed buyers (Dora, Cleo, Walt, Stan, Wes; Pat pending)",
@@ -6633,9 +6635,11 @@ check("attention: no all-clear line when there are items", "All paperwork in ord
 
 # --- Disclosure, open deals, intros
 ov_intros = ov_body[ov_body.find('class="ov-section ov-intros"'):ov_body.find('class="ov-section ov-open"')]
-check("active intros: disclosed buyer by name, pending buyer only as its anon code",
-      "Dora Disclosed" in ov_intros and "Pat Pending" not in ov_intros
-      and f'Buyer {lf._anon_buyer_code("alice@ovcap.com", 1902)}' in ov_intros
+ov_pending = ov_body[ov_body.find('class="ov-section ov-pending"'):ov_body.find('class="ov-section ov-intros"')]
+check("active intros: disclosed buyer by name; pending buyer only in Pending, as its anon code",
+      "Dora Disclosed" in ov_intros and "Pat Pending" not in ov_intros + ov_pending
+      and f'Buyer {lf._anon_buyer_code("alice@ovcap.com", 1902)}' in ov_pending
+      and f'Buyer {lf._anon_buyer_code("alice@ovcap.com", 1902)}' not in ov_intros
       and 'href="?tab=intros">See all in Active Intros &rarr;</a>' in ov_intros)
 check("disclosure: Pat Pending's name/email appear nowhere on Overview", "Pat Pending" not in ov_page and "pat@buy2.com" not in ov_page)
 ov_open = ov_body[ov_body.find('class="ov-section ov-open"'):ov_body.find('class="ov-section ov-attention"')]
@@ -6842,8 +6846,8 @@ def _ac_sell(did, name, stage, cf=None, extra=None):
     return d
 
 
-# 12 live intros: 4 Introduced, 4 pending (Matched), 4 Stalled -> the tile must be 12, the list capped at 10.
-_ac_statuses = [7207579] * 4 + [7207578] * 4 + [lf.INTRO_STATUS_STALLED_ID] * 4
+# 12 active intros (Introduced / VDR / Docs Sent / Wired) -> the tile must be 12, the list capped at 10.
+_ac_statuses = [7207579, 7207581, 7207582, 7207583] * 3
 _ac_buys = [{"id": 99300 + i, "name": "Act Co buy", "company": {"name": "Act Co"},
              "deal_stage": {"id": lf.STAGE_MATCHED}, "custom_fields": cf_status(st, {lf.TICKET_MAX_FIELD: 1_000_000}),
              "people": [{"id": 2301}, {"id": 2400 + i}], "updated_at": f"2026-08-{10 + i:02d}T00:00:00Z"}
@@ -6908,9 +6912,9 @@ _ac_all_closed = _ac_track[_ac_track.find("ov-all-closed"):]
 check("overview: All closed deals -> Reopen on Obsolete and Lost, nothing on Won",
       _ac_all_closed.count("Reopen &rarr;") == 2 and _AC_BTN not in _ac_track)
 _ac_model = lf._overview_model(lf.get_firm_sell_deals(2301), 2301, "ada@actcap.com")
-_ac_aim = lf._active_intros_model(2301, "ada@actcap.com", lf.get_intro_details("ada@actcap.com")[0])
-check("overview: Active intros tile = uncapped Active Intros row count (12: Introduced + pending + Stalled)",
-      _ac_model["tiles"]["active_intros"] == len(_ac_aim["kept_deals"]) == 12
+_ac_bk = lf._intro_buckets(2301, "ada@actcap.com", lf.get_intro_details("ada@actcap.com")[0])
+check("overview: Active intros tile = uncapped Active bucket (12)",
+      _ac_model["tiles"]["active_intros"] == len(_ac_bk["active"]) == 12
       and '<div class="ov-tile-label">Active intros</div><div class="ov-tile-value">12</div>' in _ac_ov)
 check("overview: the Active intros section lists 10 (capped) of those 12",
       _ac_intros.split("<tbody>")[1].count("<tr>") == lf.OVERVIEW_LIST_LIMIT == 10)
@@ -6955,6 +6959,173 @@ check("company page: no 'Help shape this dashboard' box", 'id="feature-box"' not
 _ac_ai = body_only(_ac_get({"tab": "intros"}))
 check("feedback box: not on Active Intros", 'id="feature-box"' not in _ac_ai)
 check("active intros: the company link is the shared button", _AC_BTN in _ac_ai)
+
+
+# ======================================================================
+# Active vs Pending intros (_intro_buckets): one split everywhere
+# ======================================================================
+_pn_terms_no_agreement = {k: v for k, v in MD_TERMS.items() if k != lf.AGENT_AGREEMENT_FIELD}
+_pn_people = {"people": [
+    {"id": 2501, "full_name": "Pia Pen", "email": "pia@pencap.com", "custom_fields": {lf.CEF_FIELD: [lf.CEF_NO_ID]}},
+    {"id": 2502, "full_name": "Quinn Q", "email": "quinn@qcap.com", "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
+] + [{"id": 2600 + i, "full_name": f"Pnbuyer {i}", "email": f"pn{i}@pnbuy{i}.com", "custom_fields": {}}
+     for i in range(20)]}
+
+
+def _pn_sell(did, company, owner, cf):
+    return {"id": did, "name": f"{company} block", "company": {"name": company}, "deal_stage": {"id": lf.STAGE_FIRM},
+            "custom_fields": cf_sell(cf), "people": [{"id": owner}], "updated_at": "2026-08-01T00:00:00Z",
+            "created_at": "2026/03/02 09:00:00 +0000"}
+
+
+def _pn_buy(did, company, owner, status, buyer, stage=lf.STAGE_MATCHED):
+    return {"id": did, "name": f"{company} buy", "company": {"name": company}, "deal_stage": {"id": stage},
+            "custom_fields": cf_status(status, {lf.TICKET_MAX_FIELD: 1_000_000}),
+            "people": [{"id": owner}, {"id": buyer}], "updated_at": f"2026-08-{did % 28 + 1:02d}T00:00:00Z"}
+
+
+_pn_deals = [
+    _pn_sell(99501, "Pen Agree Co", 2501, _pn_terms_no_agreement),   # Pia: CEF No + no agreement -> both
+    _pn_sell(99502, "Pen Id Co", 2501, MD_TERMS),                    # Pia: agreement signed, CEF No -> ID
+    _pn_sell(99503, "Q Ready Co", 2502, MD_TERMS),                   # Quinn: in order -> awaiting
+    _pn_sell(99504, "Q Agree Co", 2502, _pn_terms_no_agreement),     # Quinn: CEF Yes, no agreement -> agreement
+    _pn_buy(99601, "Pen Agree Co", 2501, 7207578, 2600),                       # Matched -> Pending
+    _pn_buy(99602, "Pen Agree Co", 2501, None, 2601),                          # blank (derived Matched) -> Pending
+    _pn_buy(99603, "Pen Agree Co", 2501, 7207579, 2602),                       # Introduced -> Active
+    _pn_buy(99604, "Pen Agree Co", 2501, 7207581, 2603),                       # VDR -> Active
+    _pn_buy(99605, "Pen Agree Co", 2501, 7207582, 2604),                       # Docs Sent -> Active
+    _pn_buy(99606, "Pen Agree Co", 2501, lf.INTRO_STATUS_WIRED_ID, 2605),      # Wired -> Active
+    _pn_buy(99607, "Pen Agree Co", 2501, lf.INTRO_STATUS_STALLED_ID, 2606),    # Stalled + milestone -> Active
+    _pn_buy(99608, "Pen Agree Co", 2501, lf.INTRO_STATUS_STALLED_ID, 2607),    # Stalled, no evidence -> Pending
+    _pn_buy(99609, "Pen Agree Co", 2501, lf.INTRO_STATUS_CLOSED_ID, 2608),     # Closed -> neither
+    _pn_buy(99610, "Pen Agree Co", 2501, 7207585, 2609),                       # Passed -> neither
+    _pn_buy(99611, "Pen Agree Co", 2501, 7207586, 2610),                       # Withdrawn -> neither
+    _pn_buy(99612, "Pen Id Co", 2501, 7207578, 2611),                          # Matched -> Pending (ID)
+    _pn_buy(99613, "Q Ready Co", 2502, 7207578, 2612),                         # Matched -> Pending (awaiting)
+    _pn_buy(99614, "Q Agree Co", 2502, 7207578, 2613),                         # Matched -> Pending (agreement)
+]
+_pn_items = [{"tenant": "pia@pencap.com", "sk": "intro#99607", "milestones": {"NDA": 1}},
+             {"tenant": "pia@pencap.com", "sk": "intro#99610", "milestones": {"NDA": 1}},
+             {"tenant": "pia@pencap.com", "sk": "intro#99611", "milestones": {"NDA": 1}}]
+use_fixture({lf.PEOPLE_KEY: _pn_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": _pn_deals}},
+            table_items=_pn_items)
+lf._closed_deals_cache["deals"] = []
+lf._closed_deals_cache["fetched_at"] = time.time()
+lf._req_cache_reset()
+
+
+def _pn_get(email, q):
+    lf._req_cache_reset()
+    return body_only(lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                        "queryStringParameters": q, "cookies": [tenant_cookie(email)]}, None)["body"])
+
+
+_pn_by_id = {d["id"]: d for d in _pn_deals}
+_pn_details = lf.get_intro_details("pia@pencap.com")[0]
+
+
+def _pn_res(did):
+    return lf._resolve_intro_status(_pn_by_id[did], _pn_details.get(str(did)))
+
+
+check("pending: Matched (explicit or blank) -> Pending, not Active, anonymous (undisclosed)",
+      all(lf._intro_is_pending(_pn_res(i)) and not lf._intro_is_active(_pn_res(i)) and not _pn_res(i)["disclosed"]
+          for i in (99601, 99602, 99612)))
+check("active: Introduced / VDR / Docs Sent / Wired -> Active (disclosed)",
+      all(lf._intro_is_active(_pn_res(i)) and not lf._intro_is_pending(_pn_res(i)) and _pn_res(i)["disclosed"]
+          for i in (99603, 99604, 99605, 99606)))
+check("stalled: with a recorded introduction -> Active; with none (pre-introduction underneath) -> Pending",
+      lf._intro_is_active(_pn_res(99607)) and lf._intro_is_pending(_pn_res(99608))
+      and not _pn_res(99608)["disclosed"])
+check("neither: Closed / Passed / Withdrawn are neither Active nor Pending",
+      all(not lf._intro_is_active(_pn_res(i)) and not lf._intro_is_pending(_pn_res(i)) for i in (99609, 99610, 99611)))
+_pn_bk = lf._intro_buckets(2501, "pia@pencap.com", _pn_details)
+_pn_active_ids = sorted(d["id"] for d, _r in _pn_bk["active"])
+_pn_pending_ids = sorted(d["id"] for d, _r, _s, _i in _pn_bk["pending"])
+check("buckets (Pia): Active = 99603-99607 (5), Pending = 99601, 99602, 99608, 99612 (4); stalled split 1 / 1",
+      _pn_active_ids == [99603, 99604, 99605, 99606, 99607] and _pn_pending_ids == [99601, 99602, 99608, 99612])
+_pn_blocks = {d["id"]: [l for l, _h, _t in items] for d, _r, _s, items in _pn_bk["pending"]}
+check("blocked by: agreement missing + ID missing -> both (agreement first)",
+      _pn_blocks[99601] == ["Agent agreement needed", "ID needed"] == _pn_blocks[99608])
+check("blocked by: agreement signed, ID missing -> 'ID needed' only", _pn_blocks[99612] == ["ID needed"])
+_qn_details = lf.get_intro_details("quinn@qcap.com")[0]
+_qn_bk = lf._intro_buckets(2502, "quinn@qcap.com", _qn_details)
+_qn_blocks = {d["id"]: [l for l, _h, _t in items] for d, _r, _s, items in _qn_bk["pending"]}
+check("blocked by: ID in order, no agreement -> 'Agent agreement needed' only", _qn_blocks[99614] == ["Agent agreement needed"])
+check("blocked by: paperwork in order -> none (awaiting Gracia Group)", _qn_blocks[99613] == [])
+check("blocked by: awaiting cell text", lf.PENDING_AWAITING_TEXT in lf._pending_block_html([])
+      and lf.PENDING_AWAITING_TEXT == "Awaiting introduction by Gracia Group")
+_pn_items_01 = next(items for d, _r, _s, items in _pn_bk["pending"] if d["id"] == 99601)
+check("blocked by: links are the same fixes as the paperwork chips (agreement mailto, ID form)",
+      _pn_items_01[0][1] == lf._agent_agreement_mailto("Pen Agree Co", 99501) and _pn_items_01[1][1] == lf.CEF_FORM_URL)
+
+# --- Overview
+_pn_ov = _pn_get("pia@pencap.com", {"tab": "overview"})
+_pn_model = lf._overview_model(lf.get_firm_sell_deals(2501), 2501, "pia@pencap.com")
+check("overview: Active intros tile 5, Pending intros tile 4 with 'waiting on you'",
+      _pn_model["tiles"]["active_intros"] == 5 and _pn_model["tiles"]["pending_intros"] == 4
+      and '<div class="ov-tile-label">Active intros</div><div class="ov-tile-value">5</div>' in _pn_ov
+      and '<div class="ov-tile-label">Pending intros</div><div class="ov-tile-value">4</div>'
+          '<div class="ov-tile-sub">waiting on you</div>' in _pn_ov)
+_pn_i_pend, _pn_i_act, _pn_i_open, _pn_i_att, _pn_i_track = (
+    _pn_ov.find('class="ov-section ov-pending"'), _pn_ov.find('class="ov-section ov-intros"'),
+    _pn_ov.find('class="ov-section ov-open"'), _pn_ov.find('class="ov-section ov-attention"'),
+    _pn_ov.find('class="ov-section ov-track"'))
+check("overview: section order Pending, Active intros, Open deals, Needs your attention",
+      -1 < _pn_i_pend < _pn_i_act < _pn_i_open < _pn_i_att)
+_pn_pend_sec = _pn_ov[_pn_i_pend:_pn_i_act]
+check("overview: Pending rows are anonymous Buyer codes with company and blocked-by chips",
+      _pn_pend_sec.count("<tr><td>") == 4
+      and all(f'Buyer {lf._anon_buyer_code("pia@pencap.com", 2600 + i)}' in _pn_pend_sec for i in (0, 1, 7, 11))
+      and "Pnbuyer" not in _pn_pend_sec and "pnbuy" not in _pn_pend_sec
+      and "Pen Agree Co" in _pn_pend_sec and 'class="action-chip paperwork-needed"' in _pn_pend_sec
+      and ">Agent agreement needed<" in _pn_pend_sec and ">ID needed<" in _pn_pend_sec)
+check("overview: pending buyers' names never render anywhere on Overview",
+      not any(f"Pnbuyer {i}<" in _pn_ov for i in (0, 1, 7, 11)))
+_pn_act_sec = _pn_ov[_pn_i_act:_pn_i_open]
+check("overview: Active intros section lists the 5 active buyers by name, none pending",
+      _pn_act_sec.split("<tbody>")[1].count("<tr>") == 5 and "Pnbuyer 2<" in _pn_act_sec
+      and "Buyer " + lf._anon_buyer_code("pia@pencap.com", 2600) not in _pn_act_sec)
+_pn_att = _pn_ov[_pn_i_att:_pn_i_track]
+check("needs your attention: '3 buyers waiting — Agent agreement needed' line for Pen Agree Co",
+      '<span class="ov-waiting">3 buyers waiting — </span>' in _pn_att
+      and f'href="{lf._esc(lf._agent_agreement_mailto("Pen Agree Co", 99501))}">Agent agreement needed</a>' in _pn_att)
+check("needs your attention: '1 buyer waiting — ID needed' line for Pen Id Co",
+      '<span class="ov-waiting">1 buyer waiting — </span>' in _pn_att
+      and f'href="{lf.CEF_FORM_URL}" target="_blank" rel="noopener noreferrer">ID needed</a>' in _pn_att)
+_qn_ov = _pn_get("quinn@qcap.com", {"tab": "overview"})
+check("overview (Quinn): awaiting row shows 'Awaiting introduction by Gracia Group'; only the blocked deal "
+      "gets a waiting line",
+      "Awaiting introduction by Gracia Group" in _qn_ov and _qn_ov.count('class="ov-waiting"') == 1)
+
+# --- Active Intros tab
+_pn_ai = _pn_get("pia@pencap.com", {"tab": "intros"})
+_pn_ai_p, _pn_ai_a = _pn_ai.find(">Pending (4)<"), _pn_ai.find(">Active (5)<")
+check("Active Intros tab: 'Pending (4)' section on top, then 'Active (5)' -- same counts as the Overview tiles",
+      -1 < _pn_ai_p < _pn_ai_a)
+_pn_ai_pend = _pn_ai[_pn_ai_p:_pn_ai_a]
+check("Active Intros tab: pending rows anonymous, with blocked-by chips",
+      "Pnbuyer" not in _pn_ai_pend and _pn_ai_pend.count('class="pending-row') == 4
+      and ">Agent agreement needed<" in _pn_ai_pend and ">ID needed<" in _pn_ai_pend)
+check("Active Intros tab: pending buyers' names appear nowhere on the page",
+      not any(f"Pnbuyer {i}<" in _pn_ai for i in (0, 1, 7, 11)))
+_qn_ai = _pn_get("quinn@qcap.com", {"tab": "intros"})
+check("Active Intros tab: no Active rows still renders 'Active (0)' after Pending",
+      -1 < _qn_ai.find(">Pending (2)<") < _qn_ai.find(">Active (0)<"))
+
+# --- My Deals + company page use the same Active count
+_pn_md = _pn_get("pia@pencap.com", {"tab": "mydeals"})
+_pn_row = row_for(_pn_md, "99501") or ""
+check("My Deals: Active intros column = 5 with muted '+3 pending'",
+      ">5</a>" in _pn_row and '<div class="mydeals-pending">+3 pending</div>' in _pn_row)
+_pn_md_active = sum(int(m) for m in re.findall(r'#buyers">(\d+)</a>', _pn_md))
+check("My Deals: Active intros column sums to the Overview Active tile", _pn_md_active == 5)
+_pn_co = _pn_get("pia@pencap.com", {"company": "Pen Agree Co"})
+check("company page: 'Active intros' stat = 5 with '+3 pending'; sub-nav count = 5",
+      '<span>Active intros</span><span class="cd-stat-num">5<span class="cd-stat-pending">+3 pending</span></span>'
+      in _pn_co and ">Active intros (5)</a>" in _pn_co)
+_pn_open = _pn_ov[_pn_i_open:_pn_i_att]
+check("overview: Open deals column header is 'Active intros'", '<th class="num">Active intros</th>' in _pn_open)
 
 
 # ======================================================================
