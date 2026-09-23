@@ -32,6 +32,8 @@ os.environ["PIPELINE_APP_KEY"] = "ak"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import lambda_function as lf
 
+lf.S3_VERSION_TTL_SECONDS = 0  # see reset_caches
+
 ADMIN_KEY = "test-admin-key"
 
 
@@ -81,6 +83,14 @@ def reset_caches():
     lf._req_cache_reset()
     lf._s3_client_singleton["client"] = None
     lf._dynamo_table_singleton["table"] = None
+    lf._dynamo_resource_singleton["r"] = None
+    # Cross-request data caches (keyed on S3 version) and the HEAD reuse
+    # window: tests mutate fixtures in place between requests, so every
+    # request re-checks versions (TTL 0) unless a test opts in.
+    lf._s3_version_cache.clear()
+    lf._data_cache.clear()
+    lf._people_cache.update({"version": None, "people": None, "by_id": None})
+    lf._feature_agg_cache["value"] = None
 
 
 class FakeBody:
@@ -246,6 +256,13 @@ class FakeDynamoResource:
 
     def Table(self, name):
         return self._table
+
+    def batch_get_item(self, RequestItems):
+        (name, req), = RequestItems.items()
+        self._table.batch_calls = getattr(self._table, "batch_calls", 0) + 1
+        want = {(k["tenant"], k["sk"]) for k in req["Keys"]}
+        return {"Responses": {name: [i for i in self._table.items if (i.get("tenant"), i.get("sk")) in want]},
+                "UnprocessedKeys": {}}
 
 
 class FakeBoto3:
@@ -3375,8 +3392,9 @@ check("TIMING: page label matches the requested tab", "page=mydeals" in line1)
 check("TIMING: first request in a fresh container is cold=True", "cold=True" in line1)
 check("TIMING: reports s3_people/s3_deals/s3_interest fetch+parse timings",
       "s3_people=" in line1 and "s3_deals=" in line1 and "s3_interest=" in line1)
-check("TIMING: reports dynamo/pipeline_api/render/total",
-      "dynamo=" in line1 and "pipeline_api=0.00s" in line1 and "render=" in line1 and "total=" in line1)
+check("TIMING: reports every phase (s3/tenancy/model/dynamo/pipeline_api/render) and total",
+      all(f" {ph}=" in line1 for ph in ("s3", "tenancy", "model", "dynamo", "render"))
+      and "pipeline_api=0.000s" in line1 and "total=" in line1)
 check("TIMING: reports call counts for the named expensive functions",
       "calls_get_firm_deals=" in line1 and "calls_get_deals_list=" in line1
       and "calls_get_firm_matched_buy_deals=" in line1 and "calls_build_tenant_index=" in line1)
@@ -7252,6 +7270,148 @@ check("stacked: Overview Open deals and Needs your attention use only the stacke
 _ns_mia_co = _ns_get("mia@mangusta.com", {"company": "Mang Co"})
 check("company-page cards keep the one-line label",
       '<a class="update-cancel-btn" href=' in _ns_mia_co and ">Update, Pause or Cancel</a>" in _ns_mia_co)
+
+
+# ======================================================================
+# Performance: cross-request caches, per-request model memo, timing table
+# ======================================================================
+_pf_people = {"people": [
+    {"id": 3001, "full_name": "Pat Perf", "email": "pat@perfcap.com", "summary": "INTERNAL long text",
+     "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID], "custom_label_9999999": "unused"}},
+    {"id": 3101, "full_name": "Bea Buyer", "email": "bea@buyer1.com", "custom_fields": {}},
+]}
+_pf_deals = [
+    {"id": 99901, "name": "Perf block", "company": {"name": "Perf Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+     "custom_fields": cf_sell(MD_TERMS), "people": [{"id": 3001}], "updated_at": "2026-08-01T00:00:00Z",
+     "created_at": "2026/03/02 09:00:00 +0000"},
+    {"id": 99911, "name": "Perf buy", "company": {"name": "Perf Co"}, "deal_stage": {"id": lf.STAGE_MATCHED},
+     "custom_fields": cf_status(7207579), "people": [{"id": 3001}, {"id": 3101}], "updated_at": "2026-08-02T00:00:00Z"},
+]
+_pf_lm = {k: datetime(2026, 9, 1, tzinfo=timezone.utc)
+          for k in (lf.PEOPLE_KEY, lf.DEALS_KEY, lf.INTEREST_KEY, lf.COMPANIES_KEY)}
+_pf_s3, _pf_table = use_fixture({lf.PEOPLE_KEY: _pf_people, lf.INTEREST_KEY: {"buy": {"Perf Co": [3101]}},
+                                 lf.DEALS_KEY: {"deals": _pf_deals}}, last_modified=_pf_lm)
+lf._closed_deals_cache["deals"] = []
+lf._closed_deals_cache["fetched_at"] = time.time()
+_pf_gets, _pf_heads = [], []
+_pf_orig_get, _pf_orig_head = _pf_s3.get_object, _pf_s3.head_object
+
+
+def _pf_get_object(Bucket, Key):
+    _pf_gets.append(Key)
+    return _pf_orig_get(Bucket, Key)
+
+
+def _pf_head_object(Bucket, Key):
+    _pf_heads.append(Key)
+    return _pf_orig_head(Bucket, Key)
+
+
+_pf_s3.get_object, _pf_s3.head_object = _pf_get_object, _pf_head_object
+
+
+def _pf_req(q, cookie=True):
+    ev = {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/", "queryStringParameters": q}
+    if cookie:
+        ev["cookies"] = [tenant_cookie("pat@perfcap.com")]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        resp = lf.lambda_handler(ev, None)
+    line = next((ln for ln in buf.getvalue().splitlines() if ln.startswith("TIMING ")), "")
+    return resp, line
+
+
+# --- Caches: a repeat request with unchanged versions re-parses nothing
+_pf_r1, _pf_l1 = _pf_req({"tab": "overview"})
+check("perf: first request parses people.json (full export, slimmed) and deals.json",
+      _pf_r1["statusCode"] == 200 and "calls_people_full_parse=1" in _pf_l1 and lf.PEOPLE_KEY in _pf_gets
+      and lf.DEALS_KEY in _pf_gets)
+check("perf: the slim people index is written back to S3, tagged with the source version",
+      lf.PEOPLE_SLIM_KEY in _pf_s3.objs
+      and _pf_s3.objs[lf.PEOPLE_SLIM_KEY]["source_version"] == _pf_lm[lf.PEOPLE_KEY].isoformat())
+_pf_slim_rec = next(r for r in _pf_s3.objs[lf.PEOPLE_SLIM_KEY]["people"] if r["id"] == 3001)
+check("perf: slim records keep only used fields (no internal summary, no unreferenced custom fields)",
+      "summary" not in _pf_slim_rec and _pf_slim_rec["full_name"] == "Pat Perf"
+      and lf.CEF_FIELD in _pf_slim_rec["custom_fields"] and "custom_label_9999999" not in _pf_slim_rec["custom_fields"])
+_pf_gets.clear()
+_pf_r2, _pf_l2 = _pf_req({"tab": "mydeals"})
+check("perf: a repeat request with unchanged versions re-parses nothing (no S3 GET at all)",
+      _pf_r2["statusCode"] == 200 and _pf_gets == [] and "parse_" not in _pf_l2 and "people_full_parse" not in _pf_l2)
+lf.S3_VERSION_TTL_SECONDS = 60
+_pf_heads.clear()
+_pf_req({"tab": "intros"})
+_pf_req({"tab": "intros"})
+_pf_heads_after_two = list(_pf_heads)
+_pf_heads.clear()
+_pf_req({"tab": "overview"})
+check("perf: within the 60s window a request re-uses the checked versions (no HEAD on the next click)",
+      _pf_heads == [])
+lf.S3_VERSION_TTL_SECONDS = 0
+_pf_lm[lf.PEOPLE_KEY] = datetime(2026, 9, 2, tzinfo=timezone.utc)
+_pf_gets.clear()
+_pf_r3, _pf_l3 = _pf_req({"tab": "mydeals"})
+check("perf: a new people.json version is re-parsed once, and the slim file rebuilt for it",
+      "calls_people_full_parse=1" in _pf_l3 and lf.DEALS_KEY not in _pf_gets
+      and _pf_s3.objs[lf.PEOPLE_SLIM_KEY]["source_version"] == _pf_lm[lf.PEOPLE_KEY].isoformat())
+# A cold container (module caches empty) reads the slim file, not the full export.
+lf._data_cache.clear()
+lf._people_cache.update({"version": None, "people": None, "by_id": None})
+lf._tenant_cache.update({"version": None, "by_email": None})
+_pf_gets.clear()
+_pf_r4, _pf_l4 = _pf_req({"tab": "overview"})
+check("perf: a cold container with a current slim file reads it instead of the full people.json",
+      _pf_r4["statusCode"] == 200 and "calls_people_slim_hit=1" in _pf_l4 and lf.PEOPLE_KEY not in _pf_gets
+      and "Bea Buyer" in _pf_r4["body"])
+check("perf: every custom_label the code references is kept by the slim index",
+      set(re.findall(r"custom_label_\d+", open(lf.__file__).read())) <= lf.PEOPLE_SLIM_CUSTOM_FIELDS)
+_pf_src = open(lf.__file__).read()
+_pf_person_keys = set(re.findall(r'\b(?:rec|primary)\.get\("([a-z_]+)"\)', _pf_src))
+check("perf: every person field the code reads is kept by the slim index",
+      _pf_person_keys - {"description", "city", "country", "founded_year", "name_override"} <= set(lf.PEOPLE_SLIM_FIELDS)
+      or print("missing:", _pf_person_keys - set(lf.PEOPLE_SLIM_FIELDS)))
+
+# --- One computation of each shared model per request
+for _pf_q in ({"tab": "overview"}, {"tab": "mydeals"}, {"tab": "intros"}):
+    _pf_resp, _pf_line = _pf_req(_pf_q)
+    _pf_counts = dict(p.split("=", 1) for p in _pf_line.split()[1:] if p.startswith("calls_compute_"))
+    check(f"perf: {_pf_q['tab']}: each shared model computed at most once per request "
+          f"({', '.join(f'{k}={v}' for k, v in sorted(_pf_counts.items()))})",
+          _pf_resp["statusCode"] == 200 and _pf_counts and all(v == "1" for v in _pf_counts.values()))
+_pf_ov_counts = dict(p.split("=", 1) for p in _pf_req({"tab": "overview"})[1].split()[1:] if p.startswith("calls_"))
+check("perf: Overview reuses the Active Intros model instead of rebuilding it (buckets + my-deals model once)",
+      _pf_ov_counts.get("calls_compute_active_intros_model") == "1"
+      and _pf_ov_counts.get("calls_compute_intro_buckets") == "1"
+      and _pf_ov_counts.get("calls_compute_my_deals_model") == "1")
+check("perf: each Dynamo partition is read once per request (intro items, manual intros)",
+      _pf_ov_counts.get("calls_get_intro_details", "1") == "1" and _pf_ov_counts.get("calls_get_manual_intros", "1") == "1")
+
+# --- &timing=1: admin only
+_pf_admin, _ = _pf_req({"key": ADMIN_KEY, "view_as": "pat@perfcap.com", "tab": "overview", "timing": "1"}, cookie=False)
+check("timing table: admin key + &timing=1 appends the per-phase table",
+      'id="gg-timing"' in _pf_admin["body"] and all(f"<td>{ph}</td>" in _pf_admin["body"] for ph in lf.PERF_PHASES)
+      and "<td>tenancy</td>" in _pf_admin["body"] and "<td>total</td>" in _pf_admin["body"])
+_pf_tenant, _ = _pf_req({"tab": "overview", "timing": "1"})
+check("timing table: &timing=1 is ignored without the admin key", 'id="gg-timing"' not in _pf_tenant["body"])
+_pf_badkey, _ = _pf_req({"tab": "overview", "timing": "1", "key": "wrong"})
+check("timing table: a wrong key never shows it either", 'id="gg-timing"' not in _pf_badkey["body"])
+_pf_nt, _ = _pf_req({"key": ADMIN_KEY, "view_as": "pat@perfcap.com", "tab": "overview"}, cookie=False)
+check("timing table: admin without &timing=1 gets no table", 'id="gg-timing"' not in _pf_nt["body"])
+
+# --- Batched reads
+_pf_table.items += [{"tenant": "pat@perfcap.com", "sk": lf._buyer_note_sk(3101), "note": "Call Tue",
+                     "updated_at": "2026-08-03T00:00:00Z"}]
+_pf_table.batch_calls = 0
+_pf_bn = lf._buyer_note_history_entries(3101, None, "admin", True)
+check("batched: admin notes history reads every tenant's person note in one BatchGetItem",
+      _pf_table.batch_calls == 1 and any(e.get("text") == "Call Tue" for e, _o in _pf_bn))
+lf._raised_cache["version"] = None
+_pf_table.batch_calls = 0
+lf._req_cache_reset()
+lf._raised_headline_stats()
+check("batched: desk-wide Raised reads owner intro items via BatchGetItem, not one Query per owner",
+      _pf_table.batch_calls == 1)
+check("tenant owner lookup: O(1) map returns the first seller email linked to the deal",
+      lf._tenant_email_for_deal(_pf_deals[1]) == "pat@perfcap.com" and lf._tenant_email_for_deal({"people": []}) is None)
 
 
 # ======================================================================

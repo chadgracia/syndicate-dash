@@ -73,6 +73,9 @@ writes, no other CRM writes, no email.
 """
 
 import base64
+import concurrent.futures
+import functools
+import threading
 import hashlib
 import hmac
 import json
@@ -99,7 +102,7 @@ from boto3.dynamodb.conditions import Key
 # separate, never-reset-mid-container flag: cold=True exactly once per
 # container, on whichever request happens to arrive first.
 _cold_start_seen = {"done": False}
-_perf = {"page": "?", "cold": True, "start": 0.0, "times": {}, "counts": {}}
+_perf = {"page": "?", "cold": True, "start": 0.0, "times": {}, "counts": {}, "stack": []}
 
 # ── Request-scoped data cache (perf fixes 1-4). Reset alongside _perf on
 # every invocation (see _perf_start below) -- this is NOT a warm-
@@ -120,6 +123,7 @@ _req_cache = {
     "firm_person_ids": {}, "firm_sell_by_company": {}, "firm_deals": {},
     "firm_matched_buy_deals": {}, "firm_closed_out_buy_deals": {},
     "tenant_index": None, "id_status": {},
+    "intro_details": {}, "manual_intros": {}, "models": {}, "memo_dynamo": False,
 }
 
 
@@ -141,6 +145,10 @@ def _req_cache_reset():
     _req_cache["firm_closed_out_buy_deals"] = {}
     _req_cache["tenant_index"] = None
     _req_cache["id_status"] = {}
+    _req_cache["intro_details"] = {}
+    _req_cache["manual_intros"] = {}
+    _req_cache["models"] = {}
+    _req_cache["memo_dynamo"] = False
 
 
 def _perf_start(page):
@@ -151,6 +159,7 @@ def _perf_start(page):
     _perf["start"] = time.perf_counter()
     _perf["times"] = {}
     _perf["counts"] = {}
+    _perf["stack"] = []
     _req_cache_reset()
 
 
@@ -166,37 +175,105 @@ class _perf_timer:
     """with _perf_timer("s3_people"): ... -- accumulates wall time under
     that category across every use within the current request (a second
     people.json fetch in the same request adds to the same s3_people
-    bucket rather than overwriting it)."""
+    bucket rather than overwriting it). Nesting-aware: a timer's time is
+    EXCLUSIVE of any timer opened inside it (a Dynamo read inside the
+    model phase counts as dynamo, not model), so the phases always sum to
+    at most the request total and render = the untimed remainder."""
     def __init__(self, category):
         self.category = category
 
     def __enter__(self):
+        # Worker threads (_dynamo_parallel_map) never touch the shared
+        # stack; the main thread times the whole fan-out instead.
+        self._main = threading.current_thread() is threading.main_thread()
+        if not self._main:
+            return self
         self._t0 = time.perf_counter()
+        self._child = 0.0
+        _perf["stack"].append(self)
         return self
 
     def __exit__(self, *exc):
+        if not self._main:
+            return False
         elapsed = time.perf_counter() - self._t0
-        _perf["times"][self.category] = _perf["times"].get(self.category, 0.0) + elapsed
+        stack = _perf["stack"]
+        if stack and stack[-1] is self:
+            stack.pop()
+        if stack:
+            stack[-1]._child += elapsed
+        _perf["times"][self.category] = _perf["times"].get(self.category, 0.0) + (elapsed - self._child)
         return False
+
+
+def _perf_phase(category):
+    """Decorator form of _perf_timer (tenancy / model phases)."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            with _perf_timer(category):
+                return fn(*args, **kwargs)
+        return wrapper
+    return deco
+
+
+def _request_memo(name, keyfn):
+    """Memoize a shared model for the rest of the current request
+    (_req_cache["models"]), so no page recomputes it; every real
+    computation is counted as calls_compute_<name> in the TIMING line."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = (name,) + keyfn(*args, **kwargs)
+            memo = _req_cache["models"]
+            if key in memo:
+                return memo[key]
+            _perf_count(f"compute_{name}")
+            result = fn(*args, **kwargs)
+            memo[key] = result
+            return result
+        return wrapper
+    return deco
+
+
+def _deals_fingerprint(deals):
+    return tuple(str(d.get("id")) for d in (deals or []))
+
+
+def _details_fingerprint(intro_details):
+    return tuple(sorted((intro_details or {}).keys()))
+
+
+PERF_PHASES = ("s3", "tenancy", "model", "dynamo", "pipeline_api", "render")
+
+
+def _perf_breakdown():
+    """{phase: seconds} for the current request: s3 (every s3_* fetch +
+    parse + HEAD), tenancy (tenant/team index build), model (shared
+    deal/intro/paperwork models), dynamo, pipeline_api, render (the
+    untimed remainder), plus total."""
+    times = _perf["times"]
+    total = time.perf_counter() - _perf["start"]
+    out = {"s3": sum(v for k, v in times.items() if k.startswith("s3_")),
+           "tenancy": times.get("tenancy", 0.0), "model": times.get("model", 0.0),
+           "dynamo": times.get("dynamo", 0.0), "pipeline_api": times.get("pipeline_api", 0.0)}
+    out["render"] = max(0.0, total - sum(out.values()))
+    out["total"] = total
+    return out
 
 
 def _perf_log():
     times = _perf["times"]
-    total = time.perf_counter() - _perf["start"]
-    s3_total = sum(v for k, v in times.items() if k.startswith("s3_"))
-    dynamo = times.get("dynamo", 0.0)
-    pipeline_api = times.get("pipeline_api", 0.0)
-    render = max(0.0, total - s3_total - dynamo - pipeline_api)
+    bd = _perf_breakdown()
+    total = bd["total"]
     parts = [f"page={_perf['page']}"]
-    for key in ("s3_people", "s3_deals", "s3_interest", "s3_companies"):
-        if key in times:
-            parts.append(f"{key}={times[key]:.2f}s")
-    parts.append(f"dynamo={dynamo:.2f}s")
-    parts.append(f"pipeline_api={pipeline_api:.2f}s")
-    parts.append(f"render={render:.2f}s")
+    for key in sorted(k for k in times if k.startswith("s3_")):
+        parts.append(f"{key}={times[key]:.3f}s")
+    for phase in PERF_PHASES:
+        parts.append(f"{phase}={bd[phase]:.3f}s")
     for name, n in sorted(_perf["counts"].items()):
         parts.append(f"calls_{name}={n}")
-    parts.append(f"total={total:.2f}s")
+    parts.append(f"total={total:.3f}s")
     parts.append(f"cold={_perf['cold']}")
     # Perf report item 6: this sandbox has no live S3 access to report
     # real snapshot byte sizes directly (see CLAUDE.md), so the sizes
@@ -1297,6 +1374,7 @@ def _person_has_won(rec):
         return False
 
 
+@_perf_phase("model")
 def _build_firm_won_index():
     """Turn 23: one fresh people.json pass, returns
     {"by_company_id": {...won company_ids...}, "by_company_name":
@@ -1572,9 +1650,51 @@ def _s3_client():
     return _s3_client_singleton["client"]
 
 
+# ── Cross-request S3 data caching (container lifetime) ────────────────
+# Every S3 snapshot is parsed at most once per container per data
+# refresh: the parsed object lives in a module-level cache keyed on the
+# object's version (ETag, else LastModified). A request only pays a
+# cheap HEAD to learn the version -- and not even that when this
+# container checked the same key within S3_VERSION_TTL_SECONDS (the
+# snapshots refresh hourly, so a <=60s-stale version is harmless).
+S3_VERSION_TTL_SECONDS = 60
+_s3_version_cache = {}   # key -> (version, time.monotonic() of the HEAD)
+
+
 def _object_version(s3, key):
-    head = s3.head_object(Bucket=BUCKET, Key=key)
-    return head["LastModified"].isoformat()
+    now = time.monotonic()
+    hit = _s3_version_cache.get(key)
+    if hit is not None and now - hit[1] < S3_VERSION_TTL_SECONDS:
+        return hit[0]
+    _perf_count("s3_head")
+    with _perf_timer("s3_head"):
+        head = s3.head_object(Bucket=BUCKET, Key=key)
+    etag = head.get("ETag")
+    version = str(etag) if etag else head["LastModified"].isoformat()
+    _s3_version_cache[key] = (version, now)
+    return version
+
+
+_data_cache = {}   # key -> {"version": ..., "value": parsed-and-derived data}
+
+
+def _versioned_s3_json(key, perf_category, build=None):
+    """Parsed JSON for an S3 key, re-fetched and re-parsed ONLY when the
+    object's version changes (module-level _data_cache). build(parsed)
+    optionally derives the cached value (e.g. a list plus an index)."""
+    s3 = _s3_client()
+    version = _cached_object_version(s3, key)
+    hit = _data_cache.get(key)
+    if hit is not None and hit["version"] == version:
+        return hit["value"]
+    _perf_count(f"parse_{perf_category}")
+    with _perf_timer(perf_category):
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        _req_cache["object_size"][key] = obj.get("ContentLength")
+        parsed = json.loads(obj["Body"].read())
+    value = build(parsed) if build else parsed
+    _data_cache[key] = {"version": version, "value": value}
+    return value
 
 
 def _cached_object_version(s3, key):
@@ -1593,59 +1713,108 @@ def _cached_object_version(s3, key):
     return version
 
 
-def _people_list():
-    """The full parsed people.json list, fetched at most once per
-    request and shared by every function that needs the complete list
-    -- perf fix 4. Previously _build_tenant_index, get_people_by_ids,
-    get_company_buyer_details, _build_firm_won_index, and _build_table
-    each did their own independent S3 get_object+json.loads, so a
-    single request touching several of them (routine: auth resolution
-    needs _build_tenant_index, then the render itself needs
-    get_people_by_ids for linked buyers) paid for the same multi-MB
-    fetch+parse repeatedly."""
+# Slim people index: only the person fields this Lambda reads, written
+# back to S3 (PEOPLE_SLIM_KEY) tagged with the people.json version it was
+# built from, so a cold container reads the small file instead of
+# parsing the full export. Rebuilt whenever people.json's version moves.
+PEOPLE_SLIM_KEY = "syndicate-dash/people-slim.json"
+PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name", "full_name", "company_id",
+                      "company_name", "title", "position", "phone", "phones", "mobile", "website", "linked_in_url",
+                      "work_country", "home_country", "work_city", "home_city", "updated_at", "created_at",
+                      "won_deals_total", "custom_fields")
+# Every custom_label_N this file references (a test keeps this in sync).
+PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
+    1958, 3052210, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3759163,
+    3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
+    3998063, 4006089, 4006402, 4008329))
+
+
+def _slim_person(rec):
+    out = {k: rec[k] for k in PEOPLE_SLIM_FIELDS if k in rec and k != "custom_fields"}
+    cf = rec.get("custom_fields")
+    if isinstance(cf, dict):
+        out["custom_fields"] = {k: v for k, v in cf.items() if k in PEOPLE_SLIM_CUSTOM_FIELDS}
+    return out
+
+
+def _load_people_list(s3, version):
+    """The slim people list for this people.json version: the slim S3
+    file when it was built from exactly this version, else the full
+    export (fetched, parsed, slimmed, and the slim file written back --
+    best effort, a write failure only costs the next cold start)."""
+    try:
+        with _perf_timer("s3_people"):
+            obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_SLIM_KEY)
+            slim = json.loads(obj["Body"].read())
+        if (isinstance(slim, dict) and slim.get("source_version") == version
+                and isinstance(slim.get("people"), list)):
+            _perf_count("people_slim_hit")
+            _req_cache["object_size"][PEOPLE_KEY] = obj.get("ContentLength")
+            return slim["people"]
+    except Exception:
+        pass
+    _perf_count("people_full_parse")
+    with _perf_timer("s3_people"):
+        obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+        _req_cache["object_size"][PEOPLE_KEY] = obj.get("ContentLength")
+        data = json.loads(obj["Body"].read())
+    raw = data.get("people", []) if isinstance(data, dict) else (data or [])
+    people = [_slim_person(r) for r in raw if isinstance(r, dict)]
+    try:
+        with _perf_timer("s3_people_slim_write"):
+            s3.put_object(Bucket=BUCKET, Key=PEOPLE_SLIM_KEY, ContentType="application/json",
+                          Body=json.dumps({"source_version": version, "built_at": _iso_utc(),
+                                           "people": people}, separators=(",", ":")).encode("utf-8"))
+    except Exception as e:
+        print(f"people-slim write failed: {e}")
+    return people
+
+
+_people_cache = {"version": None, "people": None, "by_id": None}
+
+
+def _people_data():
+    """{"people": [...], "by_id": {str(id): rec}} -- parsed at most once
+    per container per people.json version (_people_cache), resolved at
+    most once per request."""
     if _req_cache["people"] is not None:
         return _req_cache["people"]
     s3 = _s3_client()
-    with _perf_timer("s3_people"):
-        people_obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
-        _req_cache["object_size"][PEOPLE_KEY] = people_obj.get("ContentLength")
-        people_data = json.loads(people_obj["Body"].read())
-    people_list = people_data.get("people", []) if isinstance(people_data, dict) else (people_data or [])
-    _req_cache["people"] = people_list
-    return people_list
+    version = _cached_object_version(s3, PEOPLE_KEY)
+    if _people_cache["version"] != version or _people_cache["people"] is None:
+        people = _load_people_list(s3, version)
+        _people_cache["people"] = people
+        _people_cache["by_id"] = {str(r.get("id")): r for r in people if r.get("id") is not None}
+        _people_cache["version"] = version
+    data = {"people": _people_cache["people"], "by_id": _people_cache["by_id"], "version": version}
+    _req_cache["people"] = data
+    return data
+
+
+def _people_list():
+    """The (slim) people list -- see _people_data."""
+    return _people_data()["people"]
 
 
 def _interest_buy_map():
     """interest_people.json's "buy" mapping (company name -> [person_id,
-    ...]), fetched at most once per request and shared by _build_table
-    and get_company_buyer_details (perf fix 4)."""
+    ...]), parsed once per container per version (_versioned_s3_json)."""
     if _req_cache["interest"] is not None:
         return _req_cache["interest"]
-    s3 = _s3_client()
-    with _perf_timer("s3_interest"):
-        interest_obj = s3.get_object(Bucket=BUCKET, Key=INTEREST_KEY)
-        _req_cache["object_size"][INTEREST_KEY] = interest_obj.get("ContentLength")
-        interest_data = json.loads(interest_obj["Body"].read())
-    buy = interest_data.get("buy") or {}
+    buy = _versioned_s3_json(INTEREST_KEY, "s3_interest", lambda d: (d or {}).get("buy") or {})
     _req_cache["interest"] = buy
     return buy
 
 
 def _companies_list():
-    """The full parsed companies.json list, fetched at most once per
-    request (perf fix 4). Raises on any failure -- callers (currently
-    only get_company_record) keep their own try/except around this,
-    exactly as they already wrapped the raw fetch, so a missing file or
-    unexpected shape still fails soft rather than erroring the page."""
+    """The full parsed companies.json list, parsed once per container per
+    version. Raises on any failure -- callers (get_company_record) keep
+    their own try/except, so a missing file still fails soft."""
     if _req_cache["companies"] is not None:
         return _req_cache["companies"]
-    s3 = _s3_client()
-    with _perf_timer("s3_companies"):
-        companies_obj = s3.get_object(Bucket=BUCKET, Key=COMPANIES_KEY)
-        _req_cache["object_size"][COMPANIES_KEY] = companies_obj.get("ContentLength")
-        companies_data = json.loads(companies_obj["Body"].read())
-    companies_list = (companies_data.get("companies", [])
-                       if isinstance(companies_data, dict) else (companies_data or []))
+    companies_list = _versioned_s3_json(
+        COMPANIES_KEY, "s3_companies",
+        lambda d: d.get("companies", []) if isinstance(d, dict) else (d or []))
     _req_cache["companies"] = companies_list
     return companies_list
 
@@ -2215,15 +2384,28 @@ def _raised_headline_stats():
     intro_cache = {}
     real_pairs = set()
     counted = []
-    for d in deals:
-        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
-            continue
-        owner = _tenant_email_for_deal(d)
+    # Owner-partition intro items for every buy deal, fetched in BATCHES
+    # (BatchGetItem, 100 keys per call) instead of one Query per owner;
+    # on any batch failure, the owners' partitions are read in parallel.
+    buy_deals = [(d, _tenant_email_for_deal(d)) for d in deals
+                 if DEAL_SIDE_BUY_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD)]
+    batch_entries = None
+    try:
+        items = _dynamo_batch_get([{"tenant": owner, "sk": f"intro#{d.get('id')}"}
+                                   for d, owner in buy_deals if owner is not None])
+        batch_entries = {key: _intro_entry_from_item(item) for key, item in items.items()}
+    except Exception as e:
+        print(f"raised headline: batch read failed, falling back to per-partition queries: {e}")
+        owners = sorted({owner for _d, owner in buy_deals if owner is not None})
+        for owner, (out, _f) in zip(owners, _memo_partition_reads("intro_details", _get_intro_details_one, owners)):
+            intro_cache[owner] = out
+    for d, owner in buy_deals:
         entry = None
         if owner is not None:
-            if owner not in intro_cache:
-                intro_cache[owner], _ = get_intro_details(owner, expand_team=False)
-            entry = intro_cache[owner].get(str(d.get("id")))
+            if batch_entries is not None:
+                entry = batch_entries.get((owner, f"intro#{d.get('id')}"))
+            else:
+                entry = intro_cache[owner].get(str(d.get("id")))
         company_key = (_deal_company_name(d) or "").strip().lower()
         for pid in _deal_linked_person_ids(d):
             real_pairs.add((company_key, pid))
@@ -2231,13 +2413,10 @@ def _raised_headline_stats():
         if resolved["disclosed"] and _intro_counts_toward_raised(resolved):
             counted.append(d)
     seen_manual = set()
-    for email, info in _tenant_index().items():
-        if not info.get("is_seller", True):
-            continue
-        try:
-            manual_intros, _ = _get_manual_intros_one(email)
-        except Exception:
-            manual_intros = {}
+    sellers = [email for email, info in _tenant_index().items() if info.get("is_seller", True)]
+    # One Query per seller partition (manual intros can't be batch-read by
+    # key), run concurrently rather than one after another.
+    for manual_intros, _failed in _memo_partition_reads("manual_intros", _get_manual_intros_one, sellers):
         for (m_company, buyer_pid), item in manual_intros.items():
             mkey = ((m_company or "").strip().lower(), buyer_pid)
             if mkey in seen_manual or mkey in real_pairs:
@@ -2356,6 +2535,7 @@ def get_my_deals(person_id):
     return mine
 
 
+@_perf_phase("model")
 def get_firm_deals(person_id):
     """Firm-level tenancy's core read-scope fetch: every deal that
     belongs to person_id's FIRM's book, newest-updated first. SELL deals
@@ -2522,13 +2702,12 @@ def get_people_by_ids(person_ids):
     wanted = {str(pid) for pid in person_ids if pid is not None}
     if not wanted:
         return {}
-    people_list = _people_list()
+    by_id = _people_data()["by_id"]
     out = {}
-    for rec in people_list:
-        pid = rec.get("id")
-        if pid is None or str(pid) not in wanted:
-            continue
-        out[pid] = rec
+    for key in wanted:
+        rec = by_id.get(key)
+        if rec is not None:
+            out[rec.get("id")] = rec
     return out
 
 
@@ -2577,6 +2756,7 @@ class _TenantIndex(dict):
     person_team = {}
 
 
+@_perf_phase("tenancy")
 def _build_tenant_index():
     """email (lowercased) -> {"name", "person_id"} for every auto-
     enrolled tenant: a people.json person linked to >=1 deal tagged Sell
@@ -2704,8 +2884,12 @@ def _build_tenant_index():
             cname = (rec.get("company_name") or "").strip().lower()
             if cname:
                 team["scope"] |= by_company_name.get(cname, set())
+    emails_by_domain = {}
+    for e, entry in by_email.items():
+        if entry["team_domain"]:
+            emails_by_domain.setdefault(entry["team_domain"], []).append(e)
     for domain, team in teams.items():
-        members = sorted(e for e, entry in by_email.items() if entry["team_domain"] == domain)
+        members = sorted(emails_by_domain.get(domain, []))
         seller_firms = [by_email[e]["company_name"] for e in members
                         if by_email[e]["is_seller"] and by_email[e]["company_name"]]
         any_firms = [by_email[e]["company_name"] for e in members if by_email[e]["company_name"]]
@@ -3196,6 +3380,7 @@ def _deal_paperwork_missing(deal, cef_status):
     return _deal_paperwork(deal, cef_status)["missing"]
 
 
+@_perf_phase("model")
 def deal_paperwork_status(deal, tenant_email, person_id):
     """THE single source of a deal's paperwork status -- the My Deals
     Visibility column, its Next Steps column and the company page's Deal
@@ -3666,6 +3851,7 @@ def _sell_deal_is_won(deal, resolved_stage, stats):
     return _is_won_stage(resolved_stage) or (stats or {}).get("won_count", 0) > 0
 
 
+@_perf_phase("model")
 def _company_buy_stats(person_id, company_name, intro_details=None, tenant_email=None):
     """Per-company Buy-side stats (intro_count, stalled, raised) — perf
     fix 3: request-scoped and shared by BOTH render_my_deals_page's own
@@ -3992,6 +4178,82 @@ def _dynamo_table():
     return _dynamo_table_singleton["table"]
 
 
+# ── Parallel / batched DynamoDB reads ───────────────────────────────────
+# Many-partition reads (a team's partitions, the desk-wide Raised
+# headline, the admin feature aggregate) fan out over a thread pool
+# instead of running one ~10ms round trip after another. boto3 resources
+# are not thread-safe but clients are, so worker threads query through
+# the Table's own low-level client (table.meta.client -- the resource's
+# client, which still accepts Key() conditions and returns plain Python
+# values); the fakes the test suite binds as `boto3` are shared as-is.
+DYNAMO_PARALLELISM = 32
+_dynamo_executor = {"pool": None}
+
+
+class _ThreadSafeTable:
+    def __init__(self, client):
+        self._client = client
+
+    def query(self, **kwargs):
+        return self._client.query(TableName=INTRO_TABLE, **kwargs)
+
+    def get_item(self, **kwargs):
+        return self._client.get_item(TableName=INTRO_TABLE, **kwargs)
+
+
+def _thread_dynamo_table():
+    table = _dynamo_table()
+    if threading.current_thread() is threading.main_thread():
+        return table
+    client = getattr(getattr(table, "meta", None), "client", None)
+    return _ThreadSafeTable(client) if client is not None else table
+
+
+def _dynamo_parallel_map(fn, args):
+    """[fn(a) for a in args], run concurrently when there is more than one.
+    fn must use _thread_dynamo_table() (never the shared singleton)."""
+    args = list(args)
+    if len(args) <= 1:
+        return [fn(a) for a in args]
+    _dynamo_table()  # bind the shared Table (and its client) on the main thread first
+    if _dynamo_executor["pool"] is None:
+        _dynamo_executor["pool"] = concurrent.futures.ThreadPoolExecutor(max_workers=DYNAMO_PARALLELISM)
+    with _perf_timer("dynamo"):
+        return list(_dynamo_executor["pool"].map(fn, args))
+
+
+def _dynamo_batch_get(keys):
+    """BatchGetItem for [{"tenant", "sk"}, ...] (<=100 keys per call,
+    UnprocessedKeys retried). Returns {(tenant, sk): item} for the items
+    that exist. Raises on failure -- callers keep their fail-soft."""
+    out = {}
+    keys = [dict(k) for k in {(k["tenant"], k["sk"]): k for k in keys}.values()]
+    if not keys:
+        return out
+    # The Table's own client (thread-safe, high-level types) when there is
+    # one; else (test fakes) the resource-level batch_get_item.
+    resource = getattr(getattr(_dynamo_table(), "meta", None), "client", None)
+    if resource is None:
+        if _dynamo_resource_singleton["r"] is None:
+            _dynamo_resource_singleton["r"] = boto3.resource("dynamodb", region_name=INTRO_REGION)
+        resource = _dynamo_resource_singleton["r"]
+    for i in range(0, len(keys), 100):
+        request = {INTRO_TABLE: {"Keys": keys[i:i + 100]}}
+        for _attempt in range(5):
+            _perf_count("dynamo_batch_get")
+            with _perf_timer("dynamo"):
+                resp = resource.batch_get_item(RequestItems=request)
+            for item in (resp.get("Responses") or {}).get(INTRO_TABLE, []):
+                out[(item.get("tenant"), item.get("sk"))] = item
+            request = resp.get("UnprocessedKeys") or {}
+            if not request:
+                break
+    return out
+
+
+_dynamo_resource_singleton = {"r": None}
+
+
 def _intro_entry_freshness(entry):
     """Latest timestamp an intro entry carries -- decides which copy wins
     when the same deal_id turns up in more than one team partition."""
@@ -4007,6 +4269,18 @@ def _intro_entry_freshness(entry):
     return best
 
 
+def _memo_partition_reads(kind, fn, partitions):
+    """[fn(partition) for partition in partitions] -- each partition read
+    at most once per GET request (_req_cache[kind]; POST writes never
+    memoize, so a write is always followed by a fresh read), the
+    missing ones fetched concurrently (_dynamo_parallel_map)."""
+    memo = _req_cache[kind] if _req_cache.get("memo_dynamo") else {}
+    missing = [p for p in dict.fromkeys(partitions) if p not in memo]
+    for p, result in zip(missing, _dynamo_parallel_map(fn, missing)):
+        memo[p] = result
+    return [memo[p] for p in partitions]
+
+
 def get_intro_details(tenant_email, expand_team=True):
     """Domain teams: for a team member (and expand_team) this spans every
     team partition (_team_partitions) -- the owning member's partition
@@ -4016,11 +4290,12 @@ def get_intro_details(tenant_email, expand_team=True):
 
     Returns (entries, dynamo_failed) -- see _get_intro_details_one."""
     partitions = _team_partitions(tenant_email) if expand_team else [tenant_email]
+    results = _memo_partition_reads("intro_details", _get_intro_details_one, partitions)
     if len(partitions) == 1:
-        return _get_intro_details_one(partitions[0])
+        out, failed = results[0]
+        return dict(out), failed
     merged, failed = {}, False
-    for partition in partitions:
-        out, part_failed = _get_intro_details_one(partition)
+    for out, part_failed in results:
         failed = failed or part_failed
         for deal_id, entry in out.items():
             if deal_id not in merged or _intro_entry_freshness(entry) > _intro_entry_freshness(merged[deal_id]):
@@ -4039,7 +4314,7 @@ def _get_intro_details_one(tenant_email):
     dynamo_failed)."""
     _perf_count("get_intro_details")
     try:
-        table = _dynamo_table()
+        table = _thread_dynamo_table()
         with _perf_timer("dynamo"):
             resp = table.query(
                 KeyConditionExpression=Key("tenant").eq(tenant_email) & Key("sk").begins_with("intro#"),
@@ -4052,25 +4327,30 @@ def _get_intro_details_one(tenant_email):
             deal_id = sk[len("intro#"):]
             if not deal_id:
                 continue
-            out[deal_id] = {
-                "next_steps": item.get("next_steps"),
-                "notes": item.get("notes"),
-                "notes_updated_at": item.get("notes_updated_at"),
-                **({NOTES_HISTORY_ATTR: list(item.get(NOTES_HISTORY_ATTR) or [])}
-                   if NOTES_HISTORY_ATTR in item else {}),
-                "follow_up": item.get("follow_up"),
-                "status_override": item.get("status_override"),
-                "override_at": item.get("override_at"),
-                "deadline_override": item.get("deadline_override"),
-                "deadline_override_at": item.get("deadline_override_at"),
-                "stage_override": item.get("stage_override"),
-                "stage_override_at": item.get("stage_override_at"),
-                "milestones": item.get("milestones") or {},
-                "loss_reason_shared": bool(item.get("loss_reason_shared")),
-            }
+            out[deal_id] = _intro_entry_from_item(item)
         return out, False
     except Exception:
         return {}, True
+
+
+def _intro_entry_from_item(item):
+    """The get_intro_details entry shape for one intro# Dynamo item."""
+    return {
+        "next_steps": item.get("next_steps"),
+        "notes": item.get("notes"),
+        "notes_updated_at": item.get("notes_updated_at"),
+        **({NOTES_HISTORY_ATTR: list(item.get(NOTES_HISTORY_ATTR) or [])}
+           if NOTES_HISTORY_ATTR in item else {}),
+        "follow_up": item.get("follow_up"),
+        "status_override": item.get("status_override"),
+        "override_at": item.get("override_at"),
+        "deadline_override": item.get("deadline_override"),
+        "deadline_override_at": item.get("deadline_override_at"),
+        "stage_override": item.get("stage_override"),
+        "stage_override_at": item.get("stage_override_at"),
+        "milestones": item.get("milestones") or {},
+        "loss_reason_shared": bool(item.get("loss_reason_shared")),
+    }
 
 
 # ── Manual intros (Dynamo-only, no backing Pipeline deal at all) ────────────
@@ -4089,11 +4369,15 @@ def get_manual_intros(tenant_email, company=None):
     copy. Individual tenants: one partition, unchanged. See
     _get_manual_intros_one for the item shape."""
     partitions = _team_partitions(tenant_email)
+    results = _memo_partition_reads("manual_intros", _get_manual_intros_one, partitions)
+    if company is not None:
+        target = company.strip().lower()
+        results = [({k: v for k, v in out.items() if k[0].strip().lower() == target}, f) for out, f in results]
     if len(partitions) == 1:
-        return _get_manual_intros_one(partitions[0], company)
+        out, failed = results[0]
+        return dict(out), failed
     merged, failed = {}, False
-    for partition in partitions:
-        out, part_failed = _get_manual_intros_one(partition, company)
+    for out, part_failed in results:
         failed = failed or part_failed
         for k, v in out.items():
             if k not in merged or str(v.get("updated_at") or "") > str(merged[k].get("updated_at") or ""):
@@ -4114,7 +4398,7 @@ def _get_manual_intros_one(tenant_email, company=None):
     broken page. Returns ({(company, person_id): {...}}, dynamo_failed)."""
     _perf_count("get_manual_intros")
     try:
-        table = _dynamo_table()
+        table = _thread_dynamo_table()
         with _perf_timer("dynamo"):
             resp = table.query(
                 KeyConditionExpression=Key("tenant").eq(tenant_email) & Key("sk").begins_with("manual-intro#"),
@@ -4853,7 +5137,7 @@ def get_feature_requests(tenant_partition, page=None):
     ({"open": [], "done": []}, True)."""
     _perf_count("get_feature_requests")
     try:
-        table = _dynamo_table()
+        table = _thread_dynamo_table()
         with _perf_timer("dynamo"):
             resp = table.query(
                 KeyConditionExpression=Key("tenant").eq(tenant_partition) & Key("sk").begins_with("feature#"),
@@ -4884,7 +5168,26 @@ def get_feature_requests(tenant_partition, page=None):
         return {"open": [], "done": []}, True
 
 
+# Admin feature aggregate (every tenant partition): cached per container
+# for FEATURE_AGG_TTL_SECONDS and dropped on any feature write here.
+FEATURE_AGG_TTL_SECONDS = 600
+_feature_agg_cache = {"at": None, "partitions": None, "value": None}
+
+
+def _feature_agg_items(partitions):
+    """[(partition, items), ...] for every partition -- the admin aggregate."""
+    now = time.monotonic()
+    c = _feature_agg_cache
+    if (c["value"] is not None and c["partitions"] == tuple(partitions)
+            and now - c["at"] < FEATURE_AGG_TTL_SECONDS):
+        return c["value"]
+    value = [(p, items) for p, (items, _f) in zip(partitions, _dynamo_parallel_map(get_feature_requests, partitions))]
+    c.update({"at": now, "partitions": tuple(partitions), "value": value})
+    return value
+
+
 def _dynamo_write_feature_request(tenant_partition, text, actor, page):
+    _feature_agg_cache["value"] = None
     try:
         table = _dynamo_table()
         table.put_item(Item={
@@ -4913,6 +5216,7 @@ def _dynamo_toggle_feature_request(tenant_partition, feature_sk, done, actor):
     have it silently create garbage in their OWN partition instead of
     failing. With the condition, that case raises (caught below) and
     nothing is written."""
+    _feature_agg_cache["value"] = None
     now = time.time()
     try:
         table = _dynamo_table()
@@ -5187,8 +5491,10 @@ def _feature_section_html(tenant_picker, anon_key_email, key=None, page="my-deal
         tenant_index = _tenant_index()
         tenant_names = {"admin": "Admin"}
         agg_open, agg_done = [], []
-        for partition in list(tenant_index.keys()) + ["admin"]:
-            items, _ = get_feature_requests(partition)
+        partitions = list(tenant_index.keys()) + ["admin"]
+        # Every partition's feature items, queried concurrently and cached
+        # for a few minutes (_feature_agg_items).
+        for partition, items in _feature_agg_items(partitions):
             agg_open += items["open"]
             agg_done += items["done"]
             tenant_names[partition] = tenant_index[partition]["name"] if partition in tenant_index else "Admin"
@@ -6306,13 +6612,31 @@ def _tenant_email_for_deal(deal):
     deal, or None if no tenant maps to it — writes are rejected outright
     in that case."""
     linked = _deal_linked_person_ids(deal)
-    for email, info in _tenant_index().items():
-        # Sellers only: the index also holds non-seller domain-team
-        # members now, and a deal's owning partition must stay exactly
-        # the seller it always resolved to.
-        if info.get("is_seller", True) and info.get("person_id") in linked:
-            return email
-    return None
+    if not linked:
+        return None
+    # Sellers only: the index also holds non-seller domain-team members,
+    # and a deal's owning partition must stay exactly the seller it
+    # always resolved to -- the FIRST seller email (index order) linked.
+    # O(1) per deal via a person_id -> (order, email) map built once per
+    # tenant-index version (it used to scan the whole index per deal).
+    order = _seller_email_order(_tenant_index_req())
+    best = min((order[pid] for pid in linked if pid in order), default=None)
+    return best[1] if best else None
+
+
+def _seller_email_order(index):
+    cached = getattr(index, "seller_email_order", None)
+    if cached is None:
+        cached = {}
+        for i, (email, info) in enumerate(index.items()):
+            pid = info.get("person_id")
+            if info.get("is_seller", True) and pid is not None and pid not in cached:
+                cached[pid] = (i, email)
+        try:
+            index.seller_email_order = cached
+        except AttributeError:
+            pass
+    return cached
 
 
 def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
@@ -9041,6 +9365,9 @@ def _manual_intro_box_html(key, tenant_email, company):
 </script>"""
 
 
+@_request_memo("active_intros_model", lambda person_id, tenant_email, intro_details, edit_mode=False: (
+    person_id, tenant_email, bool(edit_mode), _details_fingerprint(intro_details)))
+@_perf_phase("model")
 def _active_intros_model(person_id, tenant_email, intro_details, edit_mode=False):
     """Active Intros' row selection, shared with the Overview tab so both
     list the same intros with the same disclosure: kept_deals (live,
@@ -9116,6 +9443,9 @@ def _active_intros_model(person_id, tenant_email, intro_details, edit_mode=False
             "manual_failed": manual_failed}
 
 
+@_request_memo("intro_buckets", lambda person_id, tenant_email, intro_details, edit_mode=False: (
+    person_id, tenant_email, bool(edit_mode), _details_fingerprint(intro_details)))
+@_perf_phase("model")
 def _intro_buckets(person_id, tenant_email, intro_details, edit_mode=False):
     """THE Active / Pending split (Overview tiles + sections, Active Intros
     tab sections and counts), over Active Intros' own row set:
@@ -10001,6 +10331,9 @@ def _overview_company_link(company_name, key, view_as):
     return f'<a href="{_company_href(company_name, "overview", key, view_as)}">{_esc(company_name)}</a>'
 
 
+@_request_memo("overview_model", lambda deals, person_id, anon_key_email, edit_mode=False: (
+    person_id, anon_key_email, bool(edit_mode), _deals_fingerprint(deals)))
+@_perf_phase("model")
 def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
     """All Overview figures/rows (see render_overview_page)."""
     md = _my_deals_model(deals, person_id, anon_key_email) if deals else None
@@ -10379,6 +10712,9 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
 </html>"""
 
 
+@_request_memo("my_deals_model", lambda deals, person_id, anon_key_email: (
+    person_id, anon_key_email, _deals_fingerprint(deals)))
+@_perf_phase("model")
 def _my_deals_model(deals, person_id, anon_key_email):
     """Every per-row fact and summary figure My Deals renders, computed
     once and shared with the Overview tab so their numbers can never
@@ -12426,8 +12762,9 @@ def _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode):
     the migration uses (_migrated_note_history)."""
     out = []
 
-    def _add_person(owner_email):
-        item = _get_buyer_note_item(owner_email, buyer_id)
+    def _add_person(owner_email, item=False):
+        if item is False:
+            item = _get_buyer_note_item(owner_email, buyer_id)
         if item is None:
             return
         history, _ = _migrated_note_history(item, "person", _buyer_note_sk(buyer_id))
@@ -12440,8 +12777,17 @@ def _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode):
         out.extend((e, owner_email, i) for i, e in enumerate(history))
 
     if edit_mode:
-        for owner_email in sorted(_tenant_index()):
-            _add_person(owner_email)
+        # Every tenant's person note on this buyer: BatchGetItem (100 keys
+        # per call), not one GetItem per tenant.
+        owners = sorted(_tenant_index())
+        sk = _buyer_note_sk(buyer_id)
+        try:
+            notes = _dynamo_batch_get([{"tenant": o, "sk": sk} for o in owners])
+        except Exception as e:
+            print(f"buyer notes: batch read failed, falling back to GetItem: {e}")
+            notes = None
+        for owner_email in owners:
+            _add_person(owner_email, False if notes is None else notes.get((owner_email, sk)))
         intro_cache = {}
         for d in get_deals_list():
             if not (_is_matched_or_later_buy_deal(d) or _is_closed_out_buy_deal(d)):
@@ -14297,10 +14643,34 @@ def lambda_handler(event, context):
     hit -- including an exception, which still logs before propagating."""
     query = event.get("queryStringParameters") or {}
     _perf_start(_perf_infer_page(query))
+    method = (event.get("requestContext", {}).get("http", {}).get("method") or event.get("httpMethod") or "GET")
+    _req_cache["memo_dynamo"] = method == "GET"
     try:
-        return _lambda_handler_impl(event, context)
+        resp = _lambda_handler_impl(event, context)
+        return _maybe_append_timing_table(resp, query)
     finally:
         _perf_log()
+
+
+def _maybe_append_timing_table(resp, query):
+    """Admin-only diagnostics: with the valid admin key AND &timing=1, an
+    HTML page gets a small per-phase timing table appended before
+    </body>. Never for tenants (no key, or a wrong key): the flag is
+    ignored and the page is byte-for-byte unchanged."""
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (admin_key and query.get("key") == admin_key and query.get("timing") == "1"):
+        return resp
+    if not isinstance(resp, dict) or not isinstance(resp.get("body"), str) or "</body>" not in resp["body"]:
+        return resp
+    bd = _perf_breakdown()
+    rows = "".join(f"<tr><td>{_esc(k)}</td><td>{bd[k] * 1000:.0f} ms</td></tr>" for k in PERF_PHASES + ("total",))
+    counts = " · ".join(f"{_esc(k)}={n}" for k, n in sorted(_perf["counts"].items()))
+    table = ('<div id="gg-timing" style="max-width:420px;margin:24px auto;font:12px monospace;color:#6b7280">'
+             f'<table style="width:100%;border-collapse:collapse"><caption>timing ({_esc(_perf["page"])}, '
+             f'cold={_perf["cold"]})</caption>{rows}</table><div>{counts}</div></div>')
+    body = resp["body"]
+    i = body.rfind("</body>")
+    return {**resp, "body": body[:i] + table + body[i:]}
 
 
 def _lambda_handler_impl(event, context):
