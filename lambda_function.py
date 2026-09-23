@@ -5704,7 +5704,7 @@ def _send_deal_stage_email(deal, deal_id, tenant_name, target):
     the Pipeline write or the Dynamo overlay (see _handle_deal_stage),
     only get flagged in the audit item. Returns True/False, never
     raises."""
-    action_label = {"hold": "Hold", "cancel": "Cancel", "reactivate": "Reactivate"}[target]
+    action_label = {"hold": "Hold", "cancel": "Cancel", "reactivate": "Reactivate", "reopen": "Re-Open"}[target]
     deal_name = _deal_title(deal)
     company = _deal_company_name(deal) or "—"
     subject = f"[Dashboard] {action_label}: {deal_name} — {tenant_name}"
@@ -5795,9 +5795,10 @@ def _handle_deal_stage(event):
         return _json_response({"error": "deal_id is required"}, 400)
 
     target = body.get("target")
-    if target not in ("hold", "cancel", "reactivate"):
+    if target not in ("hold", "cancel", "reactivate", "reopen"):
         return _json_response({"error": "invalid target"}, 400)
-    target_stage_id = {"hold": HOLD_STAGE_ID, "cancel": OBSOLETE_STAGE_ID, "reactivate": STAGE_INQUIRY}[target]
+    target_stage_id = {"hold": HOLD_STAGE_ID, "cancel": OBSOLETE_STAGE_ID, "reactivate": STAGE_INQUIRY,
+                       "reopen": STAGE_INQUIRY}[target]
 
     deals = get_deals_list()
     deal = next((d for d in deals if str(d.get("id")) == deal_id), None)
@@ -5820,6 +5821,17 @@ def _handle_deal_stage(event):
         actor = tenant_identity_email
 
     old_stage_id = _deal_stage_id(deal)
+
+    # "Re-Open Deal": a closed-down (Obsolete/Lost/Trade Broken) SELL deal
+    # only -- resolved newer-wins against the owner's Dynamo item; a Won
+    # deal (transacted) or a live one is refused before any write.
+    if target == "reopen":
+        if DEAL_SIDE_SELL_ID not in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
+            return _json_response({"error": "only a Sell deal can be re-opened"}, 400)
+        owner_entry = get_intro_details(tenant_email, expand_team=False)[0].get(deal_id)
+        old_stage_id = _resolve_deal_stage(deal, owner_entry)
+        if not _is_closed_down_stage(old_stage_id):
+            return _json_response({"error": "deal is not closed down"}, 409)
 
     ok, err = _pipeline_update_deal_stage(deal_id, target_stage_id)
     if not ok:
@@ -7144,7 +7156,7 @@ def _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won=False):
     return '<span class="visibility-badge live">Live · shown to buyers</span>'
 
 
-def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None):
+def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None, reopen_html=""):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
     render_company_page), used to resolve any deadline_override. edit_mode
@@ -7228,7 +7240,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     action_html = _deal_action_html(deal_id, resolved_sid)
     if is_closed:
         badge_html = (f'<div class="dc-line dc-closed-label">{_esc(_deal_closed_label(deal, resolved_sid))}</div>'
-                      + action_html)
+                      + action_html + reopen_html)
     elif paperwork is not None:
         badge_html = f'<div class="dc-line">{_paperwork_badge_html(paperwork, deal)}</div>' + action_html
     else:
@@ -7764,8 +7776,10 @@ def _loss_reason_notes_cell_html(deal, entry, edit_mode):
 
 def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_key_email, key=None, view_as=None,
                           surface="intros", firm_won_index=None, company_repeated=False, entry=None,
-                          edit_mode=False, firm_person_ids=None, colleague_name=None):
-    """Shared "Closed out" row builder (parity refactor): Status always
+                          edit_mode=False, firm_person_ids=None, colleague_name=None, status_html=None):
+    """Shared "Closed out" row builder (parity refactor): status_html, when
+    given, replaces the outcome chip (a paused intro -- see
+    _paused_intro_status_html). Status always
     shows the derived, muted outcome chip -- never milestone checkboxes
     or a flag select, nothing left to edit on a dead deal. Notes now
     carries the deal's loss notes (deal_loss_reason_notes) when there is
@@ -7803,7 +7817,7 @@ def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_k
         f'<td>{col2}</td>'
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
-        f'<td>{_closed_out_status_chip_html(deal, solid_won=is_company)}</td>'
+        f'<td>{status_html if status_html is not None else _closed_out_status_chip_html(deal, solid_won=is_company)}</td>'
         f'<td class="notes-cell">{_loss_reason_notes_cell_html(deal, entry, edit_mode)}</td></tr>'
     )
 
@@ -9258,6 +9272,75 @@ def _preferred_sell_deal(person_id, company, intro_details=None):
     return (live or archived or [(None, None)])[0]
 
 
+def _company_intros_paused(person_id, company, intro_details=None):
+    """(paused, deal, stage): intros for `company` are PAUSED when the firm
+    has Sell deals for it but none live -- _preferred_sell_deal (live
+    first) lands on an archived one (Won or _is_closed_down_stage). Such
+    intros are neither Active nor Pending (_intro_buckets "paused"): no
+    introductions are coming on a closed deal. No Sell deal at all ->
+    not paused (unchanged)."""
+    deal, stage = _preferred_sell_deal(person_id, company, intro_details)
+    paused = deal is not None and (_is_won_stage(stage) or _is_closed_down_stage(stage))
+    return paused, deal, stage
+
+
+REOPEN_DEAL_LABEL = "Re-Open Deal"
+PAUSED_INTRO_TEXT = "Paused — deal closed"
+
+
+def _reopen_deal_button_html(deal, stage, key=None):
+    """"Re-Open Deal" button (POST ?action=deal_stage target=reopen ->
+    Inquiry) for a closed-down (Obsolete/Lost/Trade Broken) Sell deal;
+    "" for Won (transacted) or anything live. key is the admin key only
+    under edit_mode (never leaked into a view_as preview)."""
+    if deal is None or not _is_closed_down_stage(stage):
+        return ""
+    key_attr = f' data-key="{_esc(key)}"' if key else ""
+    return (f'<button type="button" class="reopen-deal-btn" data-deal-id="{_esc(str(deal.get("id")))}" '
+            f'data-deal-name="{_esc(_deal_title(deal))}"{key_attr}>{REOPEN_DEAL_LABEL}</button>')
+
+
+def _paused_intro_status_html(deal, stage, key=None):
+    """Status cell for an intro row paused by its company's closed Sell
+    deal (Active Intros' Closed out section)."""
+    return (f'<span class="status-chip paused">{_esc(PAUSED_INTRO_TEXT)}</span>'
+            f'{_reopen_deal_button_html(deal, stage, key=key)}')
+
+
+def _reopen_deal_script_html():
+    return """<style>
+  .reopen-deal-btn { display: inline-block; margin: 6px 0 0; padding: 4px 10px; border: none; border-radius: 6px;
+                     background: rgba(31,122,77,0.15); color: #1f7a4d; font: inherit; font-size: 12px;
+                     font-weight: 600; cursor: pointer; }
+  .reopen-deal-btn:hover { text-decoration: underline; }
+  .reopen-deal-btn[disabled] { opacity: 0.6; cursor: default; }
+  .status-chip.paused { background: rgba(22,24,29,0.06); color: #6b7280; }
+  .status-chip.paused + .reopen-deal-btn { display: block; }
+</style>
+<script>
+(function() {
+  document.querySelectorAll('.reopen-deal-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var name = btn.getAttribute('data-deal-name');
+      if (!window.confirm('Re-open ' + name + '? This sets the deal back to Inquiry and returns it to your active pipeline.')) return;
+      btn.disabled = true;
+      fetch('?action=deal_stage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key: btn.getAttribute('data-key'), deal_id: btn.getAttribute('data-deal-id'),
+                               target: 'reopen' })
+      }).then(function(r) {
+        return r.json().then(function(data) { return { ok: r.ok, data: data }; });
+      }).then(function(res) {
+        if (res.ok) { window.location.reload(); }
+        else { btn.disabled = false; alert((res.data && res.data.error) || 'Error'); }
+      }).catch(function(err) { btn.disabled = false; alert('Error: ' + err); });
+    });
+  });
+})();
+</script>"""
+
+
 def _company_update_link_html(person_id, company_name, anon_key_email=None):
     """Active Intros' per-row deal action under the company name
     (_deal_action_html, stacked). The deal is _preferred_sell_deal --
@@ -9583,34 +9666,39 @@ def _intro_buckets(person_id, tenant_email, intro_details, edit_mode=False):
     """THE Active / Pending split (Overview tiles + sections, Active Intros
     tab sections and counts), over Active Intros' own row set:
     {"active": [(deal, resolved)], "pending": [(deal, resolved, sell_deal,
-    block_items)], "aim": _active_intros_model(...)}. A pending intro's
-    sell_deal is the viewer's firm/team sell deal for that company (a live
-    one first) and block_items its _pending_block_items."""
+    block_items)], "paused": [(deal, resolved, sell_deal, sell_stage)],
+    "aim": _active_intros_model(...)}. A pending intro's sell_deal is
+    _preferred_sell_deal (the viewer's firm/team sell deal for that
+    company, a live one first) and block_items its _pending_block_items.
+    PAUSED (_company_intros_paused): the company's firm Sell deals are all
+    archived -- the intro is neither Active nor Pending, whatever its own
+    status; sell_deal/sell_stage are the preferred (newest archived) one."""
     aim = _active_intros_model(person_id, tenant_email, intro_details, edit_mode=edit_mode)
-    active, pending = [], []
+    active, pending, paused = [], [], []
     sell_by_company = {}
 
     def _sell_for(company):
         k = (company or "").strip().lower()
         if k not in sell_by_company:
-            sells = get_firm_sell_deals(person_id, company) if (person_id is not None and company) else []
-            live = [d for d in sells
-                    if not (_is_won_stage(_resolve_deal_stage(d, intro_details.get(str(d.get("id")))))
-                            or _is_closed_down_stage(_resolve_deal_stage(d, intro_details.get(str(d.get("id"))))))]
-            sell = (live or sells or [None])[0]
+            if person_id is not None and company:
+                is_paused, sell, stage = _company_intros_paused(person_id, company, intro_details)
+            else:
+                is_paused, sell, stage = False, None, None
             items = (_pending_block_items(sell, deal_paperwork_status(sell, tenant_email, person_id))
-                     if sell is not None else [])
-            sell_by_company[k] = (sell, items)
+                     if (sell is not None and not is_paused) else [])
+            sell_by_company[k] = (is_paused, sell, stage, items)
         return sell_by_company[k]
 
     for d in aim["kept_deals"]:
         resolved = aim["resolved_by_deal_id"][str(d.get("id"))]
-        if _intro_is_active(resolved):
+        is_paused, sell, stage, items = _sell_for(_deal_company_name(d))
+        if is_paused:
+            paused.append((d, resolved, sell, stage))
+        elif _intro_is_active(resolved):
             active.append((d, resolved))
         elif _intro_is_pending(resolved):
-            sell, items = _sell_for(_deal_company_name(d))
             pending.append((d, resolved, sell, items))
-    return {"active": active, "pending": pending, "aim": aim}
+    return {"active": active, "pending": pending, "paused": paused, "aim": aim}
 
 
 def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None, edit_mode=False,
@@ -9697,6 +9785,14 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         main_rows = list(_buckets["active"])
         pending_rows = [(d, resolved) for d, resolved, _sell, _items in _buckets["pending"]]
         pending_block_by_id = {str(d.get("id")): items for d, _r, _sell, items in _buckets["pending"]}
+        # Paused (company's Sell deals all closed): shown in Closed out,
+        # counted in neither header.
+        paused_status_by_id = {str(d.get("id")): _paused_intro_status_html(sell, stage,
+                                                                           key=(key if edit_mode else None))
+                               for d, _r, sell, stage in _buckets["paused"]}
+        closed_out_disclosed_by_id = dict(closed_out_disclosed_by_id)
+        for d, resolved, _sell, _stage in _buckets["paused"]:
+            closed_out_disclosed_by_id[str(d.get("id"))] = edit_mode or resolved["disclosed"]
 
         def _entry_for(d):
             return intro_details.get(str(d.get("id"))) or {}
@@ -9728,7 +9824,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 
         # Closed out: company A-Z, same as Pending — there's no "how far
         # did it get" ranking that means anything for a dead deal.
-        closed_out_rows = sorted(closed_out_deals, key=lambda d: (_deal_company_name(d) or "").lower())
+        closed_out_rows = sorted(list(closed_out_deals) + [d for d, _r, _s, _st in _buckets["paused"]],
+                                 key=lambda d: (_deal_company_name(d) or "").lower())
         closed_out_repeats = _mark_repeats([(d, None) for d in closed_out_rows])
 
         # tenant_edit_mode: the tenant (real session, or admin &view_as
@@ -9784,7 +9881,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                     key=key, view_as=view_as, surface="intros", firm_won_index=firm_won_index,
                     company_repeated=closed_out_repeats[i],
                     entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode,
-                    firm_person_ids=firm_person_ids, colleague_name=_colleague_name_for(d)))
+                    firm_person_ids=firm_person_ids, colleague_name=_colleague_name_for(d),
+                    status_html=paused_status_by_id.get(str(d.get("id")))))
             co_rows_html = "".join(co_parts)
             closed_out_html = f"""<details class="closed-out-section">
       <summary>Closed out <span class="count">({len(closed_out_rows)})</span></summary>
@@ -9807,8 +9905,10 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         </table>
       </div>
     </details>"""
+            if paused_status_by_id:
+                closed_out_html += _reopen_deal_script_html()
 
-        if not kept_deals:
+        if not (main_rows or pending_rows):
             # Item 9: no intros anywhere for this tenant — a friendlier,
             # page-level empty state instead of a near-empty table.
             my_deals_href = f"?tab=mydeals{_tab_qs_suffix(key, view_as)}"
@@ -11712,12 +11812,21 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             # Closed cards carry no paperwork (see _deal_card_html).
             live_cards, won_cards, down_cards = [], [], []
             live_ordered, archived_ordered = _sell_deals_by_preference(sell_deals, intro_details)
+            # "Re-Open Deal": only with no live Sell deal, on the newest-
+            # updated archived one (= _preferred_sell_deal) when it is
+            # closed down (never Won).
+            reopen_deal_id = (str(archived_ordered[0][0].get("id"))
+                              if (not live_ordered and archived_ordered
+                                  and _is_closed_down_stage(archived_ordered[0][1])) else None)
             for d, rsid in live_ordered + archived_ordered:
                 entry = intro_details.get(str(d.get("id")))
                 if _is_won_stage(rsid):
                     won_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode))
                 elif _is_closed_down_stage(rsid):
-                    down_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode))
+                    reopen_html = (_reopen_deal_button_html(d, rsid, key=(key if edit_mode else None))
+                                   if str(d.get("id")) == reopen_deal_id else "")
+                    down_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode,
+                                                      reopen_html=reopen_html))
                 else:
                     live_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode,
                                                       paperwork=deal_paperwork_status(d, anon_key_email, person_id)))
@@ -11748,7 +11857,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                                      {"intro_count": 0, "non_terminal_count": 0, "won_count": 0, "passed_count": 0, "raised": 0})
         buyer_total = len(get_company_buyer_details(company))
         raised_text = _fmt_money(company_stats_for_tenant["raised"]) if company_stats_for_tenant["raised"] else "—"
-        _cd_pending = company_stats_for_tenant.get("pending_count", 0)
+        # Paused (no live firm Sell deal for this company): its pending
+        # intros are not coming, so the card shows no "+N pending".
+        company_intros_paused = (person_id is not None
+                                 and _company_intros_paused(person_id, company, intro_details)[0])
+        _cd_pending = 0 if company_intros_paused else company_stats_for_tenant.get("pending_count", 0)
         cd_pending_html = f'<span class="cd-stat-pending">+{_cd_pending} pending</span>' if _cd_pending else ""
         company_stats_html = f"""<div class="card cd-stats-card">
       <h3>This company</h3>
@@ -11847,6 +11960,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         else:
             rows_parts.append(_group_empty_row_html("No introductions yet on this deal.", 6))
 
+        # Paused: the would-be Pending rows move to a collapsed "Paused --
+        # deal closed" block below the table (still anonymous).
+        paused_deals = pending_deals if company_intros_paused else []
+        if company_intros_paused:
+            pending_deals = []
         if pending_deals:
             rows_parts.append(_group_header_row_html("Pending introductions", 6))
             if edit_mode:
@@ -11968,8 +12086,42 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                 + _closed_out_section_html("Lost", company_stats_for_tenant["passed_count"], passed_out_deals)
             )
 
+        if paused_deals:
+            _p_deal, _p_stage = _preferred_sell_deal(person_id, company, intro_details)
+            _p_status = _paused_intro_status_html(_p_deal, _p_stage, key=(key if edit_mode else None))
+            _p_rows = "".join(
+                _closed_out_row_html(d, edit_mode, people_by_id, person_id, anon_key_email, key=key,
+                                      view_as=view_as, surface="company",
+                                      entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode,
+                                      firm_person_ids=firm_person_ids, status_html=_p_status)
+                for d in paused_deals)
+            closed_out_html += f"""<details class="closed-out-section cd-paused-intros">
+      <summary>{_esc(PAUSED_INTRO_TEXT)} <span class="count">({len(paused_deals)})</span></summary>
+      <div class="card closed-out-card">
+        <div class="table-scroll">
+        <table>
+          <colgroup>
+            <col style="width:22%">
+            <col style="width:15%">
+            <col style="width:11%">
+            <col style="width:7%">
+            <col style="width:18%">
+            <col style="width:27%">
+          </colgroup>
+          <thead>
+            <tr>
+              {head_row}
+            </tr>
+          </thead>
+          <tbody>{_p_rows}</tbody>
+        </table>
+        </div>
+      </div>
+    </details>"""
+
         edit_script = _edit_script_html(key if edit_mode else None) if (edit_mode or tenant_edit_mode) else ""
         manual_edit_script = _manual_intro_edit_script_html(key, anon_key_email) if edit_mode else ""
+        manual_edit_script += _reopen_deal_script_html()
         add_buyer_trigger_html = ('<button type="button" class="ab-trigger-btn" id="ab-trigger-btn">'
                                    '+ Add buyer</button>') if edit_mode else ""
         add_buyer_panel_html = (_add_buyer_panel_html(key, anon_key_email, default_company=company)

@@ -7578,6 +7578,176 @@ check("deal preference: helper falls back to the newest-updated archived deal",
 
 
 # ======================================================================
+# SECTION: Intros pause when the firm's Sell deal is closed; Re-Open Deal
+# ======================================================================
+RO_PID, RO_BUYER, RO_OTHER = 703001, 703002, 703003
+RO_EMAIL, RO_OTHER_EMAIL = "rita@example.com", "oscar@example.org"
+_ro_people = {"people": [
+    {"id": RO_PID, "full_name": "Rita Reopen", "email": RO_EMAIL, "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
+    {"id": RO_BUYER, "full_name": "Bob Hiddenbuyer", "email": "bob@buyerfirm.com", "custom_fields": {}},
+    {"id": RO_OTHER, "full_name": "Oscar Other", "email": RO_OTHER_EMAIL, "custom_fields": {}},
+]}
+
+
+def _ro_sell(did, company, stage):
+    return {"id": did, "name": f"{company} block", "company": {"name": company}, "deal_stage": {"id": stage},
+            "custom_fields": cf_sell({lf.AGENT_AGREEMENT_FIELD: [AGREEMENT_YES]}),
+            "people": [{"id": RO_PID}], "updated_at": "2026-08-01T00:00:00Z"}
+
+
+def _ro_buy(did, company, status):
+    return {"id": did, "name": f"{company} buy", "company": {"name": company}, "deal_stage": {"id": lf.STAGE_MATCHED},
+            "custom_fields": cf_status(status), "people": [{"id": RO_PID}, {"id": RO_BUYER}],
+            "updated_at": "2026-08-02T00:00:00Z"}
+
+
+_ro_deals = [
+    _ro_sell(960001, "Paused Co", lf.OBSOLETE_STAGE_ID), _ro_buy(960002, "Paused Co", 7207578),
+    _ro_sell(960011, "Liveish Co", lf.STAGE_FIRM), _ro_buy(960012, "Liveish Co", 7207578),
+    _ro_sell(960021, "Wononly Co", 111802), _ro_buy(960022, "Wononly Co", 7207579),
+    {"id": 960031, "name": "Other firm block", "company": {"name": "Elsewhere Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+     "custom_fields": cf_sell(), "people": [{"id": RO_OTHER}], "updated_at": "2026-08-01T00:00:00Z"},
+]
+
+
+def _ro_fixture():
+    return use_fixture({lf.PEOPLE_KEY: _ro_people, lf.INTEREST_KEY: {"buy": {"Paused Co": [RO_BUYER]}},
+                        lf.DEALS_KEY: {"deals": _ro_deals}}, ses=FakeSES())
+
+
+def _ro_pages():
+    lf._req_cache_reset()
+    t = lf._resolve_tenant(RO_EMAIL)
+    intros = body_only(lf.render_intros_page("Rita", tenant=t, tenant_email=RO_EMAIL, key=None, view_as=None,
+                                             edit_mode=False))
+    comps = {c: lf.render_company_page(c, "Rita", t, RO_EMAIL, "intros")
+             for c in ("Paused Co", "Liveish Co", "Wononly Co")}
+    return intros, comps
+
+
+def _ro_split(intros):
+    i = intros.find('<details class="closed-out-section">')
+    return (intros, "") if i == -1 else (intros[:i], intros[i:])
+
+
+def _ro_card(comp):
+    i = comp.find('class="card cd-stats-card"')
+    return comp[i:comp.find('Total raised', i)]
+
+
+def _ro_deal_details(comp):
+    return comp[comp.find('id="deal-details"'):comp.find('id="buyers"')]
+
+
+def _ro_buyers(comp):
+    return comp[comp.find('id="buyers"'):comp.find('id="demand"')]
+
+
+_ro_s3, _ro_table = _ro_fixture()
+_ro_intros, _ro_comps = _ro_pages()
+_ro_main, _ro_closed = _ro_split(_ro_intros)
+_ro_summary = _ro_intros[_ro_intros.find('class="mydeals-summary"'):][:200]
+check("paused: Matched intro with an Obsolete sell deal renders in Closed out on Active Intros, not Pending",
+      "Paused Co" in _ro_closed and "Paused Co" not in _ro_main)
+check("paused: Won-only company's intro also moves to Closed out (no live sell deal)",
+      "Wononly Co" in _ro_closed and "Wononly Co" not in _ro_main)
+_ro_paused_row = _ro_closed[_ro_closed.find("?company=Paused%20Co"):]
+_ro_paused_row = _ro_paused_row[:_ro_paused_row.find("</tr>")]
+check("paused: a paused pending row keeps the buyer anonymous; a paused disclosed row stays named",
+      _ro_paused_row and "Hiddenbuyer" not in _ro_paused_row and "Buyer " in _ro_paused_row
+      and "Bob Hiddenbuyer" in _ro_closed[_ro_closed.find("?company=Wononly%20Co"):])
+check("paused: Active Intros header excludes paused rows (1 pending = Liveish Co only, nothing in motion)",
+      "1 pending introduction" in _ro_summary and "2 pending" not in _ro_summary and "in motion" not in _ro_summary
+      and "Pending (1)" in _ro_main and "Active (0)" in _ro_main)
+check("paused: paused rows carry the 'Paused — deal closed' chip",
+      _ro_closed.count(lf.PAUSED_INTRO_TEXT) == 2)
+check("paused: Re-Open Deal button on the Obsolete company's paused row, targeting its sell deal",
+      'class="reopen-deal-btn" data-deal-id="960001"' in _ro_closed and "Re-Open Deal" in _ro_closed)
+check("paused: Won-only company gets no Re-Open Deal button anywhere",
+      'data-deal-id="960021"' not in _ro_closed and "reopen-deal-btn" not in _ro_comps["Wononly Co"].split("<script")[0]
+      and 'data-deal-id="960021"' not in _ro_comps["Wononly Co"])
+_ro_bk = lf._intro_buckets(RO_PID, RO_EMAIL, lf.get_intro_details(RO_EMAIL)[0])
+check("paused: _intro_buckets -- 1 pending, 0 active, 2 paused (Overview tiles follow the same split)",
+      len(_ro_bk["pending"]) == 1 and len(_ro_bk["active"]) == 0 and len(_ro_bk["paused"]) == 2)
+
+_ro_pc = _ro_comps["Paused Co"]
+check("paused company page: no 'Pending introductions' section; rows in a collapsed 'Paused — deal closed' block",
+      "Pending introductions" not in _ro_buyers(_ro_pc) and 'class="closed-out-section cd-paused-intros"' in _ro_pc
+      and "Hiddenbuyer" not in _ro_pc)
+check("paused company page: THIS COMPANY 'Active intros' shows 0 with no '+N pending'",
+      '<span>Active intros</span><span class="cd-stat-num">0</span>' in _ro_pc and "cd-stat-pending" not in _ro_card(_ro_pc))
+check("paused company page: Interested buyers count unchanged (demand is real)",
+      '<span>Interested buyers</span><span class="cd-stat-num">1</span>' in _ro_pc)
+check("paused company page: Deal Details 'Closed down' card carries the Re-Open Deal button",
+      'class="reopen-deal-btn" data-deal-id="960001"' in _ro_deal_details(_ro_pc)
+      and "cd-closed-down" in _ro_deal_details(_ro_pc))
+_ro_lc = _ro_comps["Liveish Co"]
+check("live sell deal: company page fully unaffected (Pending section, +1 pending, no pause, no Re-Open)",
+      "Pending introductions" in _ro_buyers(_ro_lc) and "+1 pending" in _ro_card(_ro_lc)
+      and "cd-paused-intros" not in _ro_lc and 'class="reopen-deal-btn"' not in _ro_lc)
+check("live sell deal: its intro stays in Pending on Active Intros", "Liveish Co" in _ro_main
+      and "Liveish Co" not in _ro_closed)
+
+# Re-Open write path: Pipeline first, then the Dynamo override + audit item.
+_ro_saved_pipe, _ro_saved_ident = lf._pipeline_update_deal_stage, lf._read_identity_email
+_ro_pipe_calls = []
+
+
+def _ro_pipe_ok(deal_id, stage_id):
+    _ro_pipe_calls.append((deal_id, stage_id, len(_ro_table.updates), len(_ro_table.puts)))
+    return True, None
+
+
+lf._pipeline_update_deal_stage = _ro_pipe_ok
+lf._read_identity_email = lambda event: RO_EMAIL
+_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen"})})
+_ro_audit = [it for it in _ro_table.puts if str(it.get("sk", "")).startswith("audit#960001#")]
+check("reopen: tenant POST -> 200, Pipeline PUT to Inquiry (2109142) before any Dynamo write",
+      _ro_resp["statusCode"] == 200 and _ro_pipe_calls == [("960001", lf.STAGE_INQUIRY, 0, 0)])
+check("reopen: Dynamo stage override (Inquiry) in the owner's partition + audit item with actor = authenticated email",
+      any(u["Key"] == {"tenant": RO_EMAIL, "sk": "intro#960001"}
+          and u["ExpressionAttributeValues"][":s"] == lf.STAGE_INQUIRY for u in _ro_table.updates)
+      and len(_ro_audit) == 1 and _ro_audit[0]["actor"] == RO_EMAIL
+      and _ro_audit[0]["old"] == {"stage": lf.OBSOLETE_STAGE_ID} and _ro_audit[0]["new"] == {"stage": lf.STAGE_INQUIRY})
+_ro_intros2, _ro_comps2 = _ro_pages()
+_ro_main2, _ro_closed2 = _ro_split(_ro_intros2)
+check("reopen: after refresh the deal is live and its intro is back in Pending (Active Intros)",
+      "Paused Co" in _ro_main2 and "Paused Co" not in _ro_closed2
+      and "2 pending introductions" in _ro_intros2[_ro_intros2.find('class="mydeals-summary"'):][:200])
+check("reopen: after refresh the company page shows Pending introductions again, no Re-Open button",
+      "Pending introductions" in _ro_buyers(_ro_comps2["Paused Co"]) and "cd-paused-intros" not in _ro_comps2["Paused Co"]
+      and 'class="reopen-deal-btn"' not in _ro_comps2["Paused Co"] and "+1 pending" in _ro_card(_ro_comps2["Paused Co"]))
+
+_ro_s3, _ro_table = _ro_fixture()
+_ro_pipe_calls.clear()
+lf._read_identity_email = lambda event: RO_OTHER_EMAIL
+_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen"})})
+check("reopen: a different-firm tenant gets 403 and nothing is written",
+      _ro_resp["statusCode"] == 403 and _ro_pipe_calls == [] and not _ro_table.updates and not _ro_table.puts)
+lf._read_identity_email = lambda event: RO_EMAIL
+_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960021", "target": "reopen"})})
+check("reopen: a Won deal is refused (409), no Pipeline call", _ro_resp["statusCode"] == 409 and _ro_pipe_calls == [])
+_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960011", "target": "reopen"})})
+check("reopen: a live deal is refused (409), no Pipeline call", _ro_resp["statusCode"] == 409 and _ro_pipe_calls == [])
+lf._pipeline_update_deal_stage = lambda deal_id, stage_id: (False, "HTTP 500")
+_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen"})})
+check("reopen: Pipeline failure aborts everything (502, no Dynamo write, no audit)",
+      _ro_resp["statusCode"] == 502 and not _ro_table.updates and not _ro_table.puts)
+lf._pipeline_update_deal_stage = _ro_pipe_ok
+lf._read_identity_email = lambda event: None
+_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen", "key": ADMIN_KEY})})
+_ro_audit = [it for it in _ro_table.puts if str(it.get("sk", "")).startswith("audit#960001#")]
+check("reopen: admin key path -> 200, Pipeline first, audit actor 'admin'",
+      _ro_resp["statusCode"] == 200 and _ro_pipe_calls == [("960001", lf.STAGE_INQUIRY, 0, 0)]
+      and len(_ro_audit) == 1 and _ro_audit[0]["actor"] == "admin")
+_ro_admin_comp = lf.render_company_page("Wononly Co", "Admin", lf._resolve_tenant(RO_EMAIL), RO_EMAIL, "intros",
+                                        key=ADMIN_KEY, view_as=RO_EMAIL, edit_mode=True)
+check("reopen: admin edit view of a Won-only company has no Re-Open button either",
+      'class="reopen-deal-btn"' not in _ro_admin_comp)
+lf._pipeline_update_deal_stage, lf._read_identity_email = _ro_saved_pipe, _ro_saved_ident
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 
