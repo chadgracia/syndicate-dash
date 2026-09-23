@@ -172,6 +172,11 @@ class BenchTable:
         t = self._tenant(kw.get("KeyConditionExpression"))
         return {"Items": [i for i in self.items if t is None or i.get("tenant") == t]}
 
+    def scan(self, **kw):
+        time.sleep(DDB_CALL)
+        self.calls += 1
+        return {"Items": list(self.items) if kw.get("Segment", 0) == 0 else []}
+
     def get_item(self, **kw):
         time.sleep(DDB_CALL)
         self.calls += 1

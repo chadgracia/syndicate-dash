@@ -88,7 +88,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
 import boto3
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
 
 # ── Diagnostic timing instrumentation (perf report task -- diagnostic
 # only, nothing here is user-visible). One "TIMING ..." line to
@@ -124,6 +124,7 @@ _req_cache = {
     "firm_matched_buy_deals": {}, "firm_closed_out_buy_deals": {},
     "tenant_index": None, "id_status": {},
     "intro_details": {}, "manual_intros": {}, "models": {}, "memo_dynamo": False,
+    "feature_requests": {},
 }
 
 
@@ -149,6 +150,7 @@ def _req_cache_reset():
     _req_cache["manual_intros"] = {}
     _req_cache["models"] = {}
     _req_cache["memo_dynamo"] = False
+    _req_cache["feature_requests"] = {}
 
 
 def _perf_start(page):
@@ -4201,6 +4203,9 @@ class _ThreadSafeTable:
     def get_item(self, **kwargs):
         return self._client.get_item(TableName=INTRO_TABLE, **kwargs)
 
+    def scan(self, **kwargs):
+        return self._client.scan(TableName=INTRO_TABLE, **kwargs)
+
 
 def _thread_dynamo_table():
     table = _dynamo_table()
@@ -5127,6 +5132,34 @@ FEATURE_PAGE_LABELS = {"my-deals": "My Deals", "intros": "Active Intros", "deman
                         "company": "Company"}
 
 
+def _feature_request_items(tenant_partition, raw_items, page=None):
+    """Raw Dynamo items of one partition -> {"open": [...], "done": [...]}
+    (see get_feature_requests). Shared by the per-partition Query and the
+    admin aggregate's Scan so both produce identical rows."""
+    items = []
+    for item in raw_items:
+        sk = item.get("sk") or ""
+        if not sk.startswith("feature#"):
+            continue
+        item_page = item.get("page") or "my-deals"
+        if page is not None and item_page != page:
+            continue
+        items.append({
+            "sk": sk,
+            "tenant": tenant_partition,
+            "text": item.get("text") or "",
+            "submitted_by": item.get("submitted_by"),
+            "created_at": item.get("created_at"),
+            "done": bool(item.get("done")),
+            "done_by": item.get("done_by"),
+            "done_at": item.get("done_at"),
+            "page": item_page,
+        })
+    items.sort(key=lambda it: it["sk"], reverse=True)
+    return {"open": [it for it in items if not it["done"]],
+            "done": [it for it in items if it["done"]]}
+
+
 def get_feature_requests(tenant_partition, page=None):
     """{"open": [...], "done": [...]} feature-request items for one Dynamo
     partition (sk begins_with "feature#"), each item newest-first within
@@ -5135,7 +5168,15 @@ def get_feature_requests(tenant_partition, page=None):
     view only); any other value filters to items whose stored "page"
     matches it, with a missing "page" attribute treated as "my-deals"
     (see FEATURE_PAGES above). Never raises: any failure returns
-    ({"open": [], "done": []}, True)."""
+    ({"open": [], "done": []}, True).
+
+    Memoized per GET request by (partition, page) (_req_cache
+    ["feature_requests"]; POSTs never memoize, like _memo_partition_reads);
+    calls_get_feature_requests counts real Dynamo Queries only."""
+    memo = _req_cache["feature_requests"] if _req_cache.get("memo_dynamo") else {}
+    memo_key = (tenant_partition, page)
+    if memo_key in memo:
+        return memo[memo_key]
     _perf_count("get_feature_requests")
     try:
         table = _thread_dynamo_table()
@@ -5143,30 +5184,43 @@ def get_feature_requests(tenant_partition, page=None):
             resp = table.query(
                 KeyConditionExpression=Key("tenant").eq(tenant_partition) & Key("sk").begins_with("feature#"),
             )
-        items = []
-        for item in resp.get("Items", []):
-            sk = item.get("sk") or ""
-            if not sk.startswith("feature#"):
-                continue
-            item_page = item.get("page") or "my-deals"
-            if page is not None and item_page != page:
-                continue
-            items.append({
-                "sk": sk,
-                "tenant": tenant_partition,
-                "text": item.get("text") or "",
-                "submitted_by": item.get("submitted_by"),
-                "created_at": item.get("created_at"),
-                "done": bool(item.get("done")),
-                "done_by": item.get("done_by"),
-                "done_at": item.get("done_at"),
-                "page": item_page,
-            })
-        items.sort(key=lambda it: it["sk"], reverse=True)
-        return {"open": [it for it in items if not it["done"]],
-                "done": [it for it in items if it["done"]]}, False
+        result = (_feature_request_items(tenant_partition, resp.get("Items", []), page), False)
     except Exception:
         return {"open": [], "done": []}, True
+    memo[memo_key] = result
+    return result
+
+
+# Admin aggregate read: one Scan (FEATURE_SCAN_SEGMENTS parallel segments,
+# each paginated) filtered to sk begins_with "feature#", instead of one
+# Query per tenant partition (~1.4k on the live desk).
+FEATURE_SCAN_SEGMENTS = 4
+
+
+def _scan_feature_segment(segment):
+    table = _thread_dynamo_table()
+    kwargs = {"FilterExpression": Attr("sk").begins_with("feature#"),
+              "Segment": segment, "TotalSegments": FEATURE_SCAN_SEGMENTS}
+    out = []
+    while True:
+        _perf_count("feature_requests_scan")
+        with _perf_timer("dynamo"):
+            resp = table.scan(**kwargs)
+        out += resp.get("Items", [])
+        last = resp.get("LastEvaluatedKey")
+        if not last:
+            return out
+        kwargs["ExclusiveStartKey"] = last
+
+
+def _scan_feature_items_by_partition():
+    """{partition: [raw feature items]} across the whole table. Raises on
+    failure -- the caller falls back to per-partition Queries."""
+    by_partition = {}
+    for seg_items in _dynamo_parallel_map(_scan_feature_segment, range(FEATURE_SCAN_SEGMENTS)):
+        for item in seg_items:
+            by_partition.setdefault(item.get("tenant"), []).append(item)
+    return by_partition
 
 
 # Admin feature aggregate (every tenant partition): cached per container
@@ -5182,7 +5236,12 @@ def _feature_agg_items(partitions):
     if (c["value"] is not None and c["partitions"] == tuple(partitions)
             and now - c["at"] < FEATURE_AGG_TTL_SECONDS):
         return c["value"]
-    value = [(p, items) for p, (items, _f) in zip(partitions, _dynamo_parallel_map(get_feature_requests, partitions))]
+    try:
+        by_partition = _scan_feature_items_by_partition()
+        value = [(p, _feature_request_items(p, by_partition.get(p, []))) for p in partitions]
+    except Exception as e:
+        print(f"feature aggregate scan failed, falling back to per-partition queries: {type(e).__name__}: {e}")
+        value = [(p, items) for p, (items, _f) in zip(partitions, _dynamo_parallel_map(get_feature_requests, partitions))]
     c.update({"at": now, "partitions": tuple(partitions), "value": value})
     return value
 

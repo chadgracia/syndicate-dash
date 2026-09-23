@@ -199,6 +199,12 @@ class FakeDynamoTable:
             items = [it for it in items if it.get("tenant") == tenant_val]
         return {"Items": items}
 
+    def scan(self, **kwargs):
+        """Whole-table Scan: segment 0 returns every item (the code
+        re-filters by sk prefix), other segments nothing."""
+        self.scan_calls = getattr(self, "scan_calls", 0) + 1
+        return {"Items": list(self.items) if kwargs.get("Segment", 0) == 0 else []}
+
     def get_item(self, **kwargs):
         key = kwargs["Key"]
         item = next((i for i in self.items
@@ -7385,6 +7391,49 @@ check("perf: Overview reuses the Active Intros model instead of rebuilding it (b
       and _pf_ov_counts.get("calls_compute_my_deals_model") == "1")
 check("perf: each Dynamo partition is read once per request (intro items, manual intros)",
       _pf_ov_counts.get("calls_get_intro_details", "1") == "1" and _pf_ov_counts.get("calls_get_manual_intros", "1") == "1")
+
+# --- Feature requests: the admin Demand Board aggregate is one Scan, not one Query per tenant
+_pf_table.items += [{"tenant": "pat@perfcap.com", "sk": "feature#1700000000000", "text": "Perf wish",
+                     "page": "demand", "done": False}]
+lf._feature_agg_cache["value"] = None
+_pf_table.scan_calls = 0
+_pf_dq = {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+          "queryStringParameters": {"key": ADMIN_KEY, "tab": "demand"}}
+_pf_dbuf = io.StringIO()
+with contextlib.redirect_stdout(_pf_dbuf):
+    _pf_dresp = lf.lambda_handler(_pf_dq, None)
+_pf_dline = next((ln for ln in _pf_dbuf.getvalue().splitlines() if ln.startswith("TIMING ")), "")
+_pf_dcounts = dict(p.split("=", 1) for p in _pf_dline.split()[1:] if p.startswith("calls_"))
+check("perf: admin Demand Board reads feature requests with FEATURE_SCAN_SEGMENTS Scan calls, "
+      f"zero per-partition Queries ({_pf_dcounts.get('calls_feature_requests_scan')} scans, "
+      f"{_pf_dcounts.get('calls_get_feature_requests', '0')} queries)",
+      _pf_dresp["statusCode"] == 200 and _pf_table.scan_calls == lf.FEATURE_SCAN_SEGMENTS == 4
+      and _pf_dcounts.get("calls_feature_requests_scan") == str(lf.FEATURE_SCAN_SEGMENTS)
+      and "calls_get_feature_requests" not in _pf_dcounts)
+check("perf: the scanned aggregate still lists a tenant's feature request on the admin Demand Board",
+      "Perf wish" in _pf_dresp["body"])
+lf._feature_agg_cache["value"] = None
+_pf_table.scan_calls = 0
+with contextlib.redirect_stdout(io.StringIO()):
+    _pf_agg_scan = lf._feature_agg_items(["pat@perfcap.com", "admin"])
+_pf_orig_scan = _pf_table.scan
+_pf_table.scan = lambda **kw: (_ for _ in ()).throw(RuntimeError("AccessDenied"))
+lf._feature_agg_cache["value"] = None
+with contextlib.redirect_stdout(io.StringIO()):
+    _pf_agg_query = lf._feature_agg_items(["pat@perfcap.com", "admin"])
+_pf_table.scan = _pf_orig_scan
+check("perf: Scan aggregate equals the per-partition Query aggregate (and Query is the fallback on Scan failure)",
+      _pf_agg_scan == _pf_agg_query and _pf_agg_scan[0][1]["open"][0]["text"] == "Perf wish")
+lf._req_cache_reset()
+lf._req_cache["memo_dynamo"] = True
+_pf_f1 = lf.get_feature_requests("pat@perfcap.com", page="demand")
+_pf_f2 = lf.get_feature_requests("pat@perfcap.com", page="demand")
+_pf_f3 = lf.get_feature_requests("pat@perfcap.com", page="my-deals")
+check("perf: get_feature_requests is memoized per GET request by (partition, page)",
+      _pf_f1 is _pf_f2 and _pf_f3 is not _pf_f1)
+lf._req_cache_reset()
+check("perf: POSTs never memoize feature requests (memo_dynamo off)",
+      lf.get_feature_requests("pat@perfcap.com", page="demand") is not lf.get_feature_requests("pat@perfcap.com", page="demand"))
 
 # --- &timing=1: admin only
 _pf_admin, _ = _pf_req({"key": ADMIN_KEY, "view_as": "pat@perfcap.com", "tab": "overview", "timing": "1"}, cookie=False)
