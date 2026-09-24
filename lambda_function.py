@@ -593,7 +593,7 @@ def _reopen_chip_html(update_url):
             'rel="noopener noreferrer">Reopen &rarr;</a>')
 
 
-def _deal_action_html(deal_id, stage_id, stacked=False):
+def _deal_action_html(deal_id, stage_id, stacked=False, public=False):
     """THE per-deal action, shared by every place a sell deal renders (My
     Deals, Overview Open deals / Needs your attention / All closed deals,
     company-page Deal Details cards, Active Intros' company link): a live
@@ -603,7 +603,9 @@ def _deal_action_html(deal_id, stage_id, stacked=False):
     "" when FORM_HMAC_SECRET isn't configured. stacked=True (every table cell)
     renders the same single link compact, "Update" / "Pause" / "Cancel"
     on three centered lines, so it fits its fixed-width column; cards keep
-    the one-line label."""
+    the one-line label. public=True (_deal_is_public) -> an em dash, no action."""
+    if public:
+        return "—"
     url = _deal_update_form_url(deal_id)
     if not url or _is_won_stage(stage_id):
         return ""
@@ -1282,6 +1284,21 @@ def _fmt_money(v):
         n = v / 1_000
         return f"${n:.0f}K" if n == int(n) else f"${n:.1f}K"
     return f"${v:,.0f}"
+
+
+def _is_public_company(name):
+    """Public company = its name, stripped, ends with "$" (e.g. "SpaceX$").
+    The only public-company signal."""
+    return str(name or "").strip().endswith("$")
+
+
+def _deal_is_public(deal):
+    return _is_public_company(_deal_company_name(deal or {}))
+
+
+PUBLIC_COMPANY_BADGE_HTML = ('<span class="visibility-badge public-company" '
+                             'style="background:rgba(22,24,29,0.06);color:#6b7280">Public company</span>')
+PUBLIC_COMPANY_REFUSAL = "Public company — this deal can't be reopened or updated."
 
 
 def _fmt_short_date(date_str):
@@ -6042,6 +6059,9 @@ def _handle_deal_stage(event):
             return _json_response({"error": "forbidden"}, 403)
         actor = tenant_identity_email
 
+    if _deal_is_public(deal):
+        return _json_response({"error": PUBLIC_COMPANY_REFUSAL}, 409)
+
     old_stage_id = _deal_stage_id(deal)
 
     # "Re-Open Deal": a closed-down (Obsolete/Lost/Trade Broken) SELL deal
@@ -7362,7 +7382,7 @@ def _my_deal_visibility_badge_html(deal, cef_state, is_held, is_won=False, show_
     Turn 26: "sold" is the Closed section's own green badge; won and
     archived rows (show_paperwork=False) get no paperwork lines."""
     html = _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won)
-    if not is_won and show_paperwork:
+    if not is_won and show_paperwork and not _deal_is_public(deal):
         html += _paperwork_lines_html(deal, cef_state)
     return html
 
@@ -7371,6 +7391,8 @@ def _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won=False):
     state = _my_deal_visibility_state(deal, cef_state, is_held, is_won=is_won)
     if state == "sold":
         return '<span class="visibility-badge sold">Sold &#10003;</span>'
+    if _deal_is_public(deal):
+        return PUBLIC_COMPANY_BADGE_HTML
     if state == "terms_incomplete":
         return '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>'
     if state == "held":
@@ -7459,8 +7481,13 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     # Paperwork: the same deal_paperwork_status the My Deals row uses
     # (it covers the agent agreement too, so it replaces the older
     # Engaged badge). None only when there's no tenant context.
-    action_html = _deal_action_html(deal_id, resolved_sid)
-    if is_closed:
+    is_public = _deal_is_public(deal)
+    action_html = _deal_action_html(deal_id, resolved_sid, public=is_public)
+    if is_public:
+        reopen_html = ""
+    if is_public and not _is_won_stage(resolved_sid):
+        badge_html = f'<div class="dc-line">{PUBLIC_COMPANY_BADGE_HTML}</div>' + action_html
+    elif is_closed:
         badge_html = (f'<div class="dc-line dc-closed-label">{_esc(_deal_closed_label(deal, resolved_sid))}</div>'
                       + action_html + reopen_html)
     elif paperwork is not None:
@@ -9519,7 +9546,7 @@ def _reopen_deal_button_html(deal, stage, key=None):
     Inquiry) for a closed-down (Obsolete/Lost/Trade Broken) Sell deal;
     "" for Won (transacted) or anything live. key is the admin key only
     under edit_mode (never leaked into a view_as preview)."""
-    if deal is None or not _is_closed_down_stage(stage):
+    if deal is None or not _is_closed_down_stage(stage) or _deal_is_public(deal):
         return ""
     key_attr = f' data-key="{_esc(key)}"' if key else ""
     return (f'<button type="button" class="reopen-deal-btn" data-deal-id="{_esc(str(deal.get("id")))}" '
@@ -9580,7 +9607,7 @@ def _company_update_link_html(person_id, company_name, anon_key_email=None):
     deal, stage = _preferred_sell_deal(person_id, company_name, intro_details)
     if deal is None:
         return ""
-    action = _deal_action_html(str(deal.get("id")), stage, stacked=True)
+    action = _deal_action_html(str(deal.get("id")), stage, stacked=True, public=_deal_is_public(deal))
     return f'<div class="company-update-link">{action}</div>' if action else ""
 
 
@@ -10523,7 +10550,9 @@ def _my_deal_row_chip_html(deal, company_name, deadline, stats, paperwork, secti
                            view_as=None, seller_name="You"):
     """The exact Next Steps cell a My Deals row renders -- shared with the
     Overview tab's "Needs your attention" list so both show the same red
-    chips with the same targets."""
+    chips with the same targets. Public company -> an em dash only."""
+    if _deal_is_public(deal):
+        return "—"
     is_held = section == "hold"
     is_won = section == "closed"
     visibility_state = _my_deal_visibility_state(deal, paperwork, is_held, is_won=is_won)
@@ -10637,6 +10666,10 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
 
     action_chip_html = _my_deal_row_chip_html(deal, company_name, deadline, stats, cef_state, section,
                                                archived, key=key, view_as=view_as, seller_name=seller_name)
+    # created_at is "YYYY/MM/DD HH:MM:SS +ZZZZ" -- parsed by _deal_listed_dt first.
+    created_dt = _deal_listed_dt(deal)
+    created_text = _fmt_short_date(created_dt.isoformat()) if created_dt else None
+    created_html = f'<span class="mydeals-created">{_esc(created_text)}</span>' if created_text else "—"
 
     # Bug fix: Hold/Cancel/Reactivate are tenant self-service (see
     # _handle_deal_stage), never admin-only, but the
@@ -10654,12 +10687,13 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # see. Archived rows get none -- their "Reopen ->" chip links to the
     # same form.
     actions_html = ("" if archived else
-                    f'<div class="actions-stack">{_deal_action_html(deal_id, resolved_stage, stacked=True)}</div>')
+                    f'<div class="actions-stack">{_deal_action_html(deal_id, resolved_stage, stacked=True, public=_deal_is_public(deal))}</div>')
 
 
     return (
         f'<tr data-deal-id="{_esc(deal_id)}"><td class="company">{company_link}{deal_id_sub}{via_html}</td>'
         f'<td>{badge_html}{per_share_html}</td>'
+        f'<td>{created_html}</td>'
         f'<td class="num">{buyer_text}</td>'
         f'<td class="num">{intro_text}{raised_html}</td>'
         f'<td>{deadline_html}</td>'
@@ -10876,6 +10910,8 @@ def _overview_attention_items(rows, key=None, view_as=None, pending_intros=None,
             n, _items = waiting.get(str(sell.get("id")), (0, block_items))
             waiting[str(sell.get("id"))] = (n + 1, block_items)
     for r in rows:
+        if _deal_is_public(r["deal"]):
+            continue  # public company: nothing actionable
         w = waiting.get(str(r["deal"].get("id")))
         if w:
             items.append((r, _next_step_html("waiting", _overview_waiting_html(*w), seller_name)))
@@ -11032,7 +11068,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             att_rows = "".join(
                 f'<div class="ov-row ov-attention-row"><div>{_overview_company_link(r["company_name"], key, view_as)}'
                 f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></div>'
-                f'<div class="ov-row-actions">{chip}{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], stacked=True)}'
+                f'<div class="ov-row-actions">{chip}{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], stacked=True, public=_deal_is_public(r["deal"]))}'
                 '</div></div>'
                 for r, chip in items)
         else:
@@ -11048,7 +11084,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             f'<td>{_my_deal_visibility_badge_html(r["deal"], r["id_status"], r["section"] == "hold")}</td>'
             f'<td class="num">{r["buyer_count"]}</td><td class="num">{r["stats"]["non_terminal_count"] or "—"}</td>'
             f'<td>{_overview_deadline_html(r, key, view_as)}</td>'
-            f'<td class="ov-actions">{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], stacked=True)}</td></tr>'
+            f'<td class="ov-actions">{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], stacked=True, public=_deal_is_public(r["deal"]))}</td></tr>'
             for r in live_rows[:OVERVIEW_LIST_LIMIT])
         open_table = (('<table class="ov-table"><thead><tr><th>Deal</th><th>Status</th>'
                        '<th class="num">Interested buyers</th><th class="num">Active intros</th><th>Deadline</th>'
@@ -11112,7 +11148,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 f'<td>{_esc("Won" if id(r) in won_ids else _deal_stage_label(r["resolved_stage"]))}</td>'
                 f'<td>{_esc(_fmt_dt_short(_deal_listed_dt(r["deal"])))}</td>'
                 f'<td>{_esc(_deal_closed_label(r["deal"], r["resolved_stage"]) if r["section"] in ("closed", "cancelled") else "—")}</td>'
-                f'<td>{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"])}</td></tr>'
+                f'<td>{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], public=_deal_is_public(r["deal"]))}</td></tr>'
                 for r in archived_rows)
             all_closed_html = (
                 '<details class="closed-out-section ov-all-closed">'
@@ -11302,12 +11338,14 @@ def _my_deals_model(deals, person_id, anon_key_email):
             # is_held=False: this loop is already gated to the active
             # section, which by construction never holds a Held deal.
             state = _my_deal_visibility_state(d, r["id_status"], False)
-            if state == "live" and not d.get("is_archived"):
+            if _deal_is_public(d):
+                pass  # public company: never live / missing paperwork / awaiting terms
+            elif state == "live" and not d.get("is_archived"):
                 live_rows.append(r)
             elif state == "terms_incomplete":
                 terms_incomplete_count += 1
             # Paperwork is independent of liveness ("N missing paperwork").
-            if not _coerce_paperwork(d, r["id_status"])["in_order"]:
+            if not _deal_is_public(d) and not _coerce_paperwork(d, r["id_status"])["in_order"]:
                 not_engaged_count += 1
 
 
@@ -11459,6 +11497,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
       <colgroup>
         <col>
         <col style="width:20%">
+        <col style="width:9%">
         <col style="width:8%">
         <col style="width:8%">
         <col style="width:11%">
@@ -11469,6 +11508,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
         <tr>
           <th>Deal</th>
           <th>Status</th>
+          <th title="Date the deal was created">Created</th>
           <th class="num">Interested buyers</th>
           <th class="num" title="Buyers introduced and still in play -- not yet Won, Passed or Withdrawn">Active intros</th>
           <th>Deadline</th>

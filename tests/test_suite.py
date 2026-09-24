@@ -7849,6 +7849,51 @@ lf._pipeline_update_deal_stage, lf._read_identity_email = _ro_saved_pipe, _ro_sa
 
 
 # ======================================================================
+# SECTION: Public companies (name ends with "$") + My Deals Created column
+# ======================================================================
+check("_is_public_company('SpaceX$') -> True", lf._is_public_company("SpaceX$") is True)
+check("_is_public_company('SpaceX') -> False", lf._is_public_company("SpaceX") is False)
+check("_is_public_company('  SpaceX$ ') -> True", lf._is_public_company("  SpaceX$ ") is True)
+
+_pub_stats = {"non_terminal_count": 0, "stalled": False}
+_pub_arch = dict(_ro_sell(960051, "SpaceX$", lf.OBSOLETE_STAGE_ID), created_at="2026/03/05 10:00:00 -0500")
+_pub_arch_row = lf._my_deal_row_html(_pub_arch, "SpaceX$", None, _pub_stats, 0, None, "cancelled",
+                                     archived=True, resolved_stage=lf.OBSOLETE_STAGE_ID)
+check("public archived deal: 'Public company' badge, no Reopen / Re-Open Deal / Live badge",
+      "Public company" in _pub_arch_row and "Reopen" not in _pub_arch_row
+      and "Re-Open Deal" not in _pub_arch_row and "Live · shown to buyers" not in _pub_arch_row)
+check("public archived deal: no Re-Open Deal button helper output",
+      lf._reopen_deal_button_html(_pub_arch, lf.OBSOLETE_STAGE_ID) == "")
+_pub_live = _ro_sell(960052, "SpaceX$", lf.STAGE_FIRM)
+_pub_live_row = lf._my_deal_row_html(_pub_live, "SpaceX$", None, _pub_stats, 0, None, "active",
+                                     resolved_stage=lf.STAGE_FIRM)
+check("public live deal: no Update/Pause/Cancel button, no owner line, 'Public company' badge",
+      "update-cancel-btn" not in _pub_live_row and lf.DEAL_ACTION_LABEL not in _pub_live_row
+      and "to do" not in _pub_live_row and "Public company" in _pub_live_row
+      and "Live · shown to buyers" not in _pub_live_row)
+_np_arch = _ro_sell(960053, "Rocket Co", lf.OBSOLETE_STAGE_ID)
+_np_arch_row = lf._my_deal_row_html(_np_arch, "Rocket Co", None, _pub_stats, 0, None, "cancelled",
+                                    archived=True, resolved_stage=lf.OBSOLETE_STAGE_ID)
+check("non-public archived deal: Reopen chip still renders exactly as before",
+      lf._reopen_chip_html(lf._deal_update_form_url("960053")) in _np_arch_row
+      and "Public company" not in _np_arch_row)
+check("My Deals row: Created column shows created_at via _fmt_short_date",
+      "<td><span class=\"mydeals-created\">Mar 5, '26</span></td>" in _pub_arch_row)
+check("My Deals row: Created column is an em dash when created_at is missing",
+      "<td>—</td>" in _np_arch_row)
+
+_ro_fixture(_ro_deals + [_pub_arch])
+_pub_calls = []
+lf._pipeline_update_deal_stage = lambda deal_id, stage_id: (_pub_calls.append(deal_id) or (True, None))
+lf._read_identity_email = lambda event: RO_EMAIL
+_pub_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960051", "target": "reopen"})})
+check("reopen handler refuses a public-company deal (409, public-company message, no Pipeline call)",
+      _pub_resp["statusCode"] == 409 and json.loads(_pub_resp["body"])["error"] == lf.PUBLIC_COMPANY_REFUSAL
+      and _pub_calls == [])
+lf._pipeline_update_deal_stage, lf._read_identity_email = _ro_saved_pipe, _ro_saved_ident
+
+
+# ======================================================================
 # Summary
 # ======================================================================
 
