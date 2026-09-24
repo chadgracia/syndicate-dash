@@ -780,6 +780,13 @@ STAGE_BLOCKED = 2447751
 # set): Inquiry (2109142), Hold (2094373), Trade Broken (2486672), Obsolete
 # (2348038), Lost (111801/2379322).
 #
+# Intro Status override: a BUY deal whose raw Intro Status is Introduced
+# or later (INTRO_EVIDENCE_STATUS_IDS) also counts when its stage is
+# Inquiry/Firm/Hold (PRE_MATCH_STAGE_IDS). Intro Status is explicit intro
+# evidence; Firm-stage Buy deals created manually in Pipeline were being
+# hidden (e.g. deal 55573054). Blank/Matched status at those stages still
+# does not count, and Passed/Withdrawn never qualify through this branch.
+#
 # Deal-stage shape: deals.json's own documented shape (module docstring,
 # above — "deal_stage": {...} — verified against chadgracia/daily-brief,
 # which reads this exact structure) carries deal_stage as a NESTED OBJECT,
@@ -804,6 +811,10 @@ MATCHED_OR_LATER_STAGE_IDS = {
     STAGE_MATCHED, STAGE_LOI_SIGNED, STAGE_TRANSFER_NOTICE, STAGE_SPA_SIGNED,
     STAGE_CONFIRM, STAGE_INVOICED, STAGE_ROFR, STAGE_BLOCKED,
 } | WON_STAGE_IDS
+
+# See "Intro Status override" above.
+PRE_MATCH_STAGE_IDS = {STAGE_INQUIRY, STAGE_FIRM, STAGE_HOLD}
+INTRO_EVIDENCE_STATUS_IDS = {7207579, 7207580, 7207581, 7207582, 7207583, 7207584}
 
 # Disclosure carve-out (CAREFUL MODE fix): a BUY deal is only ever
 # CREATED at Matched (see _pipeline_create_buy_deal's hardcoded
@@ -3777,8 +3788,17 @@ def _is_matched_or_later_buy_deal(deal):
     stage that's ALSO one of Lost/Trade Broken/Obsolete never matters
     here -- see _is_closed_out_buy_deal's matching exclusion, which
     keeps a Closed-status deal from ever being claimed by both
-    predicates at once."""
-    if _deal_intro_status_id(deal) == INTRO_STATUS_CLOSED_ID:
+    predicates at once.
+
+    Also true when the raw Intro Status is Introduced or later
+    (INTRO_EVIDENCE_STATUS_IDS) and the stage is Inquiry/Firm/Hold:
+    Intro Status is explicit intro evidence, and Firm-stage Buy deals
+    created manually in Pipeline were being hidden (e.g. deal 55573054).
+    Blank or Matched status at those stages still returns False."""
+    status_id = _deal_intro_status_id(deal)
+    if status_id == INTRO_STATUS_CLOSED_ID:
+        return DEAL_SIDE_BUY_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+    if status_id in INTRO_EVIDENCE_STATUS_IDS and _deal_stage_id(deal) in PRE_MATCH_STAGE_IDS:
         return DEAL_SIDE_BUY_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
     if _deal_stage_id(deal) not in MATCHED_OR_LATER_STAGE_IDS:
         return False

@@ -1985,7 +1985,9 @@ STAGE_DEALS = {
 deals_list = [deal_900a]
 for label, (deal_id, stage_id, _) in STAGE_DEALS.items():
     deals_list.append({"id": deal_id, "name": label, "company": {"name": f"Co {deal_id}"},
-                        "deal_stage": {"id": stage_id, "name": "whatever"}, "custom_fields": cf_status(7207579),
+                        "deal_stage": {"id": stage_id, "name": "whatever"},
+                        # Pre-match stages carry Matched: Introduced+ there now qualifies by design.
+                        "custom_fields": cf_status(7207578 if stage_id in lf.PRE_MATCH_STAGE_IDS else 7207579),
                         "people": [{"id": TENANT_A_PID}, {"id": 2}], "updated_at": "2026-08-01T00:00:00Z"})
 people = {"people": [{"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
                       {"id": 2, "name": "Alice Buyer", "email": "alice@example.com", "custom_fields": {}}]}
@@ -2040,6 +2042,23 @@ check("_is_matched_or_later_buy_deal: Closed status but Sell-tagged -> False (si
                                                                 lf.INTRO_STATUS_FIELD: [lf.INTRO_STATUS_CLOSED_ID]}}))
 check("_is_matched_or_later_buy_deal: no Closed status, unmapped stage -> False (unchanged)",
       not lf._is_matched_or_later_buy_deal({"deal_stage": {"id": 9999999}, "custom_fields": cf_status(7207579)}))
+
+def _pm_deal(stage, status, side=None):
+    cf = {lf.DEAL_SIDE_FIELD: [side or lf.DEAL_SIDE_BUY_ID]}
+    if status is not None:
+        cf[lf.INTRO_STATUS_FIELD] = [status]
+    return {"deal_stage": {"id": stage}, "custom_fields": cf}
+
+check("_is_matched_or_later_buy_deal: Firm-stage Buy deal with Introduced -> True",
+      lf._is_matched_or_later_buy_deal(_pm_deal(lf.STAGE_FIRM, 7207579)))
+check("_is_matched_or_later_buy_deal: Firm-stage Buy deal with blank status -> False",
+      not lf._is_matched_or_later_buy_deal(_pm_deal(lf.STAGE_FIRM, None)))
+check("_is_matched_or_later_buy_deal: Inquiry-stage Buy deal with Matched status -> False",
+      not lf._is_matched_or_later_buy_deal(_pm_deal(lf.STAGE_INQUIRY, 7207578)))
+check("_is_matched_or_later_buy_deal: Hold-stage Buy deal with NDA -> True",
+      lf._is_matched_or_later_buy_deal(_pm_deal(lf.STAGE_HOLD, 7207580)))
+check("_is_matched_or_later_buy_deal: Firm-stage Sell deal with Introduced -> False",
+      not lf._is_matched_or_later_buy_deal(_pm_deal(lf.STAGE_FIRM, 7207579, lf.DEAL_SIDE_SELL_ID)))
 
 
 # ======================================================================
