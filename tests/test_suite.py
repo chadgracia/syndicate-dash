@@ -1108,8 +1108,8 @@ head = page[page.find("<thead>"):page.find("</thead>")]
 # Intro Status Passed) now correctly renders in the "Closed out" section
 # below (see the status-based-exit bug fix), which carries its own
 # second <colgroup> -- counting the whole page would see 12, not 6.
-main_table_section = (page[:page.find('<details class="closed-out-section">')]
-                       if '<details class="closed-out-section">' in page else page)
+main_table_section = (page[:page.find('<details class="closed-out-section intros-completed">')]
+                       if '<details class="closed-out-section intros-completed">' in page else page)
 check("colgroup has exactly 6 columns (no Follow-up column)", main_table_section.count("<col ") == 6)
 check("no Deal column header", ">Deal<" not in head)
 check("Company/Buyer/Investor Type/Size/Status/Notes header order",
@@ -1146,20 +1146,20 @@ check("a Passed (dead/exit) row has no editable data-deal-id markup", 'data-deal
 # render in "Closed out" (same as a stage-based Lost/Obsolete exit),
 # never nowhere and never still in Introduced with live controls.
 check("exit-via-status-on-live-stage: Delta Corp (806, Matched+Passed) is NOT in Introduced/Pending",
-      "Delta Corp" not in page[:page.find('<details class="closed-out-section">')]
-      if '<details class="closed-out-section">' in page else False)
+      "Delta Corp" not in page[:page.find('<details class="closed-out-section intros-completed">')]
+      if '<details class="closed-out-section intros-completed">' in page else False)
 check("exit-via-status-on-live-stage: Delta Corp (806) DOES render, in Closed out",
-      "Delta Corp" in page and '<details class="closed-out-section">' in page
-      and "Delta Corp" in page[page.find('<details class="closed-out-section">'):])
+      "Delta Corp" in page and '<details class="closed-out-section intros-completed">' in page
+      and "Delta Corp" in page[page.find('<details class="closed-out-section intros-completed">'):])
 check("exit-via-status-on-live-stage: 806 has no milestone evidence, but the deal itself (Buy-tagged, "
       "linking the tenant, at a live matched-or-later stage) is evidence an introduction happened -> "
       "discloses ('Alice Buyer' named, not an anonymized code)",
-      "Alice Buyer" in page[page.find('<details class="closed-out-section">'):])
+      "Alice Buyer" in page[page.find('<details class="closed-out-section intros-completed">'):])
 check("exit-via-status-on-live-stage: the Closed out chip reads 'Lost' (via _deal_exit_outcome_name's status "
       "fallback, display-renamed from Passed)",
-      '<span class="status-chip exit">Lost</span>' in page[page.find('<details class="closed-out-section">'):])
+      '<span class="status-chip exit">Lost</span>' in page[page.find('<details class="closed-out-section intros-completed">'):])
 
-intro_section = page[page.find(">Active ("):page.find('<details class="closed-out-section">')]
+intro_section = page[page.find(">Active ("):page.find('<details class="closed-out-section intros-completed">')]
 pos_beta = intro_section.find("Beta Holdings")
 pos_gamma = intro_section.find("Gamma Co")
 check("Stalled (Beta Holdings) sorts ahead of non-stalled rows", 0 <= pos_beta < pos_gamma)
@@ -1385,8 +1385,8 @@ check("804 no longer has milestone checkbox markup in the normal table (tenant)"
       'class="ei-milestone" data-deal-id="804"' not in page_tenant)
 check("804 no longer has milestone checkbox markup in the normal table (admin)",
       'class="ei-milestone" data-deal-id="804"' not in page_admin)
-closed_out_tenant = page_tenant[page_tenant.find('<details class="closed-out-section">'):]
-closed_out_admin = page_admin[page_admin.find('<details class="closed-out-section">'):]
+closed_out_tenant = page_tenant[page_tenant.find('<details class="closed-out-section intros-completed">'):]
+closed_out_admin = page_admin[page_admin.find('<details class="closed-out-section intros-completed">'):]
 check("804 (Closed) IS in Closed out (tenant), named since Closed is always disclosed",
       "Gamma Co" in closed_out_tenant and "Alice Buyer" in closed_out_tenant)
 check("804's Closed out chip is the positive green 'Won' one, not the red Lost styling",
@@ -2211,8 +2211,8 @@ check("get_my_closed_out_buy_deals excludes the Closed-status deal (807, not a d
 
 page_intros = lf.render_intros_page("Sella Seller", tenant=tenant_a, tenant_email=TENANT_A_EMAIL,
                                      key=None, view_as=None, edit_mode=False)
-check("Active Intros: collapsed 'Closed out' section present with count (6: 3 stage-based + 2 status-based exits + 1 status-based Closed)",
-      '<summary>Closed out <span class="count">(6)</span></summary>' in page_intros)
+check("Active Intros: collapsed 'Completed' section present with count (6: 3 stage-based + 2 status-based exits + 1 status-based Closed)",
+      '<summary>Completed <span class="count">(6)</span></summary>' in page_intros)
 check("Active Intros: the live Matched deal still shows under Introduced", ">Live Buy Co<" in page_intros)
 check("Active Intros: a disclosed closed-out row names the real buyer (Bob Buyer)", "Bob Buyer" in page_intros)
 check("Active Intros: a disclosed closed-out row shows the loss-reason suffix",
@@ -2232,8 +2232,8 @@ check("Active Intros: the Lost Co (stage=Lost) row shows the Lost outcome (displ
 
 # --- Bug fix regression: exit-via-status-on-live-stage (804/805), and
 # the negative case, Stalled-stays-in-Introduced (806) ---
-closed_out_section = page_intros[page_intros.find('<details class="closed-out-section">'):]
-intros_section_only = page_intros[:page_intros.find('<details class="closed-out-section">')]
+closed_out_section = page_intros[page_intros.find('<details class="closed-out-section intros-completed">'):]
+intros_section_only = page_intros[:page_intros.find('<details class="closed-out-section intros-completed">')]
 check("exit-via-status-on-live-stage: Status Passed Co (804, Matched+Passed, has milestone) IS in Closed out",
       "Status Passed Co" in closed_out_section and "Status Passed Co" not in intros_section_only)
 check("exit-via-status-on-live-stage: disclosed (milestone evidence) -> names the real buyer (Bob Buyer)",
@@ -2548,7 +2548,7 @@ check("Ticket 55422151: styled positively (solid-green .status-chip.won 'Won'), 
 
 page_elana_intros = lf.render_intros_page("Elana Investor", tenant=elana_tenant, tenant_email=ELANA_EMAIL,
                                            key=None, view_as=None, edit_mode=False)
-elana_closed_out = page_elana_intros[page_elana_intros.find('<details class="closed-out-section">'):]
+elana_closed_out = page_elana_intros[page_elana_intros.find('<details class="closed-out-section intros-completed">'):]
 check("Ticket 55422151: Active Intros' Closed out section shows it, named, styled green 'Won'",
       "Panthalassa Buyer" in elana_closed_out
       and '<span class="status-chip closed">Won</span>' in elana_closed_out)
@@ -5019,7 +5019,7 @@ check("55461737: renders in Senra's Buyers Lost group",
 
 cd_intros_page = lf.render_intros_page("Elana Investor", tenant=cd_tenant, tenant_email=CD_TENANT_EMAIL,
                                         key=None, view_as=None, edit_mode=False)
-cd_closed_out = cd_intros_page[cd_intros_page.find('<details class="closed-out-section">'):]
+cd_closed_out = cd_intros_page[cd_intros_page.find('<details class="closed-out-section intros-completed">'):]
 check("55422151: Active Intros Closed out section shows Panthalassa Buyer, green Won chip",
       "Panthalassa Buyer" in cd_closed_out and '<span class="status-chip closed">Won</span>' in cd_closed_out)
 check("55461737: Active Intros Closed out section shows Senra Buyer, red Lost chip",
@@ -5127,13 +5127,13 @@ check("LR admin, AFTER sharing: checkbox now renders checked",
 # --- Active Intros surfaces the same behavior (shared _closed_out_row_html).
 page_intros_admin = lf.render_intros_page("Admin", tenant=lr_tenant, tenant_email=LR_TENANT_EMAIL,
                                            key=ADMIN_KEY, view_as=LR_TENANT_EMAIL, edit_mode=True)
-intros_closed_out_admin = page_intros_admin[page_intros_admin.find('<details class="closed-out-section">'):]
+intros_closed_out_admin = page_intros_admin[page_intros_admin.find('<details class="closed-out-section intros-completed">'):]
 check("Active Intros admin: loss notes shown, share checkbox present",
       LR_NOTES_TEXT in intros_closed_out_admin and 'class="ei-loss-shared"' in intros_closed_out_admin)
 
 page_intros_tenant = lf.render_intros_page("LR Tenant", tenant=lr_tenant, tenant_email=LR_TENANT_EMAIL,
                                             key=None, view_as=None, edit_mode=False)
-intros_closed_out_tenant = page_intros_tenant[page_intros_tenant.find('<details class="closed-out-section">'):]
+intros_closed_out_tenant = page_intros_tenant[page_intros_tenant.find('<details class="closed-out-section intros-completed">'):]
 check("Active Intros tenant (now shared): loss notes shown, no checkbox",
       LR_NOTES_TEXT in intros_closed_out_tenant and 'class="ei-loss-shared"' not in intros_closed_out_tenant)
 
@@ -7623,6 +7623,7 @@ _ro_people = {"people": [
     {"id": RO_PID, "full_name": "Rita Reopen", "email": RO_EMAIL, "custom_fields": {lf.CEF_FIELD: [lf.CEF_YES_ID]}},
     {"id": RO_BUYER, "full_name": "Bob Hiddenbuyer", "email": "bob@buyerfirm.com", "custom_fields": {}},
     {"id": RO_OTHER, "full_name": "Oscar Other", "email": RO_OTHER_EMAIL, "custom_fields": {}},
+    {"id": 703004, "full_name": "Lena Lostbuyer", "email": "lena@buyerfirm2.com", "custom_fields": {}},
 ]}
 
 
@@ -7644,12 +7645,22 @@ _ro_deals = [
     _ro_sell(960021, "Wononly Co", 111802), _ro_buy(960022, "Wononly Co", 7207579),
     {"id": 960031, "name": "Other firm block", "company": {"name": "Elsewhere Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
      "custom_fields": cf_sell(), "people": [{"id": RO_OTHER}], "updated_at": "2026-08-01T00:00:00Z"},
+    # Completed: a Won intro (Intro Status Closed) at a live-deal company
+    # that sorts LAST A-Z, and a Passed (renders Lost) intro at Liveish Co.
+    _ro_sell(960041, "Zzz Won Co", lf.STAGE_FIRM), _ro_buy(960042, "Zzz Won Co", 7207587),
+    dict(_ro_buy(960013, "Liveish Co", 7207585), people=[{"id": RO_PID}, {"id": 703004}]),
 ]
 
 
-def _ro_fixture():
+def _ro_fixture(deals=None):
     return use_fixture({lf.PEOPLE_KEY: _ro_people, lf.INTEREST_KEY: {"buy": {"Paused Co": [RO_BUYER]}},
-                        lf.DEALS_KEY: {"deals": _ro_deals}}, ses=FakeSES())
+                        lf.DEALS_KEY: {"deals": _ro_deals if deals is None else deals}}, ses=FakeSES())
+
+
+def _ro_intros_full():
+    lf._req_cache_reset()
+    return lf.render_intros_page("Rita", tenant=lf._resolve_tenant(RO_EMAIL), tenant_email=RO_EMAIL, key=None,
+                                 view_as=None, edit_mode=False)
 
 
 def _ro_pages():
@@ -7663,8 +7674,17 @@ def _ro_pages():
 
 
 def _ro_split(intros):
-    i = intros.find('<details class="closed-out-section">')
-    return (intros, "") if i == -1 else (intros[:i], intros[i:])
+    """(live part, Paused section) -- Paused renders first, then Completed."""
+    i = intros.find('<details class="closed-out-section intros-paused">')
+    if i == -1:
+        return intros, ""
+    j = intros.find('<details class="closed-out-section intros-completed">', i)
+    return intros[:i], (intros[i:] if j == -1 else intros[i:j])
+
+
+def _ro_completed(intros):
+    i = intros.find('<details class="closed-out-section intros-completed">')
+    return "" if i == -1 else intros[i:]
 
 
 def _ro_card(comp):
@@ -7684,9 +7704,9 @@ _ro_s3, _ro_table = _ro_fixture()
 _ro_intros, _ro_comps = _ro_pages()
 _ro_main, _ro_closed = _ro_split(_ro_intros)
 _ro_summary = _ro_intros[_ro_intros.find('class="mydeals-summary"'):][:200]
-check("paused: Matched intro with an Obsolete sell deal renders in Closed out on Active Intros, not Pending",
+check("paused: Matched intro with an Obsolete sell deal renders under Paused on Active Intros, not Pending",
       "Paused Co" in _ro_closed and "Paused Co" not in _ro_main)
-check("paused: Won-only company's intro also moves to Closed out (no live sell deal)",
+check("paused: Won-only company's intro also moves to Paused (no live sell deal)",
       "Wononly Co" in _ro_closed and "Wononly Co" not in _ro_main)
 _ro_paused_row = _ro_closed[_ro_closed.find("?company=Paused%20Co"):]
 _ro_paused_row = _ro_paused_row[:_ro_paused_row.find("</tr>")]
@@ -7700,6 +7720,32 @@ check("paused: paused rows carry the 'Paused — deal closed' chip",
       _ro_closed.count(lf.PAUSED_INTRO_TEXT) == 2)
 check("paused: Re-Open Deal button on the Obsolete company's paused row, targeting its sell deal",
       'class="reopen-deal-btn" data-deal-id="960001"' in _ro_closed and "Re-Open Deal" in _ro_closed)
+_ro_done = _ro_completed(_ro_intros)
+check("Paused section: '<summary>Paused (2)', holding exactly the paused rows (no Won/Lost rows)",
+      '<summary>Paused <span class="count">(2)</span></summary>' in _ro_closed
+      and "Zzz Won Co" not in _ro_closed and "status-chip exit" not in _ro_closed)
+check("Paused rows: no old 'Reopen ->' update-form chip, the Re-Open Deal button is the one reopen affordance",
+      "Reopen &rarr;" not in _ro_closed and "company-update-link" not in _ro_closed)
+check("Reopen chip stays everywhere else: company-page Deal Details Closed-down card keeps 'Reopen ->'",
+      "Reopen &rarr;" in _ro_deal_details(_ro_comps["Paused Co"]))
+check("Completed section: '<summary>Completed (2)' with the Won row above the Lost row (status chips unchanged)",
+      '<summary>Completed <span class="count">(2)</span></summary>' in _ro_done
+      and 0 <= _ro_done.find("Zzz Won Co") < _ro_done.find("?company=Liveish%20Co")
+      and '<span class="status-chip closed">Won</span>' in _ro_done
+      and '<span class="status-chip exit">Lost</span>' in _ro_done
+      and _ro_done.find("status-chip closed") < _ro_done.find("status-chip exit")
+      and lf.PAUSED_INTRO_TEXT not in _ro_done)
+check("Active Intros page no longer says 'Closed out' anywhere", "Closed out" not in _ro_intros_full())
+_ro_fixture([d for d in _ro_deals if d["id"] in (960001, 960002)])
+check("empty state: only Paused non-empty -> 'see Paused below'",
+      "No live introductions right now — see Paused below for past ones." in _ro_intros_full())
+_ro_fixture([d for d in _ro_deals if d["id"] in (960041, 960042)])
+check("empty state: only Completed non-empty -> 'see Completed below'",
+      "No live introductions right now — see Completed below for past ones." in _ro_intros_full())
+_ro_fixture([d for d in _ro_deals if d["id"] in (960001, 960002, 960041, 960042)])
+check("empty state: both non-empty -> 'see Paused and Completed below'",
+      "No live introductions right now — see Paused and Completed below for past ones." in _ro_intros_full())
+_ro_s3, _ro_table = _ro_fixture()
 check("paused: Won-only company gets no Re-Open Deal button anywhere",
       'data-deal-id="960021"' not in _ro_closed and "reopen-deal-btn" not in _ro_comps["Wononly Co"].split("<script")[0]
       and 'data-deal-id="960021"' not in _ro_comps["Wononly Co"])

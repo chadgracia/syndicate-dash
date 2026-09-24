@@ -7558,8 +7558,10 @@ def _intro_buyer_cell_html(primary, secondary, more_count, firm_won_index, key=N
 
 def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_person_id, surface, key=None,
                              view_as=None, anon_key_email=None, firm_won_index=None, company_repeated=False,
-                             firm_person_ids=None, colleague_name=None):
-    """Parity refactor: the ONE shared piece of column 1/2 logic for a buy
+                             firm_person_ids=None, colleague_name=None, company_action=True):
+    """company_action=False drops the per-company deal action under the
+    company name (Active Intros' Paused rows: the Re-Open Deal button is
+    their only reopen affordance). Parity refactor: the ONE shared piece of column 1/2 logic for a buy
     deal's row, used by every row-builder below (_buy_deal_row_html,
     _buy_deal_row_edit_html, _pending_buy_deal_row_html,
     _closed_out_row_html) on BOTH surfaces. Everything past column 2
@@ -7609,7 +7611,8 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
         if company_name:
             col1_html = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
                          f'{_esc(company_name)}</a>{via_html}')
-            col1_html += _company_update_link_html(tenant_person_id, company_name, anon_key_email)
+            if company_action:
+                col1_html += _company_update_link_html(tenant_person_id, company_name, anon_key_email)
         else:
             col1_html = "—"
         if disclosed:
@@ -7864,7 +7867,8 @@ def _loss_reason_notes_cell_html(deal, entry, edit_mode):
 
 def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_key_email, key=None, view_as=None,
                           surface="intros", firm_won_index=None, company_repeated=False, entry=None,
-                          edit_mode=False, firm_person_ids=None, colleague_name=None, status_html=None):
+                          edit_mode=False, firm_person_ids=None, colleague_name=None, status_html=None,
+                          company_action=True):
     """Shared "Closed out" row builder (parity refactor): status_html, when
     given, replaces the outcome chip (a paused intro -- see
     _paused_intro_status_html). Status always
@@ -7892,7 +7896,7 @@ def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_k
     col1_open, col1, col2, extra_cls, _buyer_recs, investor_type_cell = _buy_deal_row_cols_html(
         deal, disclosed, people_by_id, tenant_person_id, surface, key=key, view_as=view_as,
         anon_key_email=anon_key_email, firm_won_index=firm_won_index, company_repeated=company_repeated,
-        firm_person_ids=firm_person_ids, colleague_name=colleague_name)
+        firm_person_ids=firm_person_ids, colleague_name=colleague_name, company_action=company_action)
     is_company = surface == "company"
     outcome_cls = ""
     if is_company:
@@ -9873,7 +9877,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         main_rows = list(_buckets["active"])
         pending_rows = [(d, resolved) for d, resolved, _sell, _items in _buckets["pending"]]
         pending_block_by_id = {str(d.get("id")): items for d, _r, _sell, items in _buckets["pending"]}
-        # Paused (company's Sell deals all closed): shown in Closed out,
+        # Paused (company's Sell deals all closed): the "Paused" section,
         # counted in neither header.
         paused_status_by_id = {str(d.get("id")): _paused_intro_status_html(sell, stage,
                                                                            key=(key if edit_mode else None))
@@ -9910,11 +9914,13 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         main_repeats = _mark_repeats(main_rows)
         pending_repeats = _mark_repeats(pending_rows)
 
-        # Closed out: company A-Z, same as Pending — there's no "how far
-        # did it get" ranking that means anything for a dead deal.
-        closed_out_rows = sorted(list(closed_out_deals) + [d for d, _r, _s, _st in _buckets["paused"]],
-                                 key=lambda d: (_deal_company_name(d) or "").lower())
-        closed_out_repeats = _mark_repeats([(d, None) for d in closed_out_rows])
+        # Paused (company A-Z) and Completed (Won above Lost, each company
+        # A-Z) -- the two collapsibles below the live sections.
+        paused_rows = sorted((d for d, _r, _s, _st in _buckets["paused"]),
+                             key=lambda d: (_deal_company_name(d) or "").lower())
+        completed_rows = sorted(closed_out_deals,
+                                key=lambda d: (0 if _deal_exit_outcome_name(d) == "Closed" else 1,
+                                               (_deal_company_name(d) or "").lower()))
 
         # tenant_edit_mode: the tenant (real session, or admin &view_as
         # preview without &edit=1) can auto-save Notes on every
@@ -9956,24 +9962,23 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             '<th>Notes</th>'
         )
 
-        # Item 2: "Closed out" — a collapsed, expandable section below
-        # Pending, built regardless of whether kept_deals is empty (a
-        # tenant can have zero live intros and still have a dead one on
-        # record).
-        closed_out_html = ""
-        if closed_out_rows:
-            co_parts = []
-            for i, d in enumerate(closed_out_rows):
-                co_parts.append(_closed_out_row_html(
-                    d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id, tenant_email,
-                    key=key, view_as=view_as, surface="intros", firm_won_index=firm_won_index,
-                    company_repeated=closed_out_repeats[i],
-                    entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode,
-                    firm_person_ids=firm_person_ids, colleague_name=_colleague_name_for(d),
-                    status_html=paused_status_by_id.get(str(d.get("id")))))
-            co_rows_html = "".join(co_parts)
-            closed_out_html = f"""<details class="closed-out-section">
-      <summary>Closed out <span class="count">({len(closed_out_rows)})</span></summary>
+        # "Paused (N)" then "Completed (N)" -- collapsed sections below
+        # the live table, built regardless of whether any live rows exist.
+        def _collapsed_intro_section_html(title, rows, cls):
+            if not rows:
+                return ""
+            repeats = _mark_repeats([(d, None) for d in rows])
+            rows_html = "".join(_closed_out_row_html(
+                d, closed_out_disclosed_by_id[str(d.get("id"))], people_by_id, person_id, tenant_email,
+                key=key, view_as=view_as, surface="intros", firm_won_index=firm_won_index,
+                company_repeated=repeats[i],
+                entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode,
+                firm_person_ids=firm_person_ids, colleague_name=_colleague_name_for(d),
+                status_html=paused_status_by_id.get(str(d.get("id"))),
+                company_action=str(d.get("id")) not in paused_status_by_id)
+                for i, d in enumerate(rows))
+            return f"""<details class="closed-out-section {cls}">
+      <summary>{_esc(title)} <span class="count">({len(rows)})</span></summary>
       <div class="card closed-out-card">
         <table>
           <colgroup>
@@ -9989,19 +9994,24 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
               {head_row}
             </tr>
           </thead>
-          <tbody>{co_rows_html}</tbody>
+          <tbody>{rows_html}</tbody>
         </table>
       </div>
     </details>"""
-            if paused_status_by_id:
-                closed_out_html += _reopen_deal_script_html()
+
+        closed_out_html = (_collapsed_intro_section_html("Paused", paused_rows, "intros-paused")
+                           + _collapsed_intro_section_html("Completed", completed_rows, "intros-completed"))
+        if paused_rows:
+            closed_out_html += _reopen_deal_script_html()
 
         if not (main_rows or pending_rows):
             # Item 9: no intros anywhere for this tenant — a friendlier,
             # page-level empty state instead of a near-empty table.
             my_deals_href = f"?tab=mydeals{_tab_qs_suffix(key, view_as)}"
-            if closed_out_rows:
-                empty_note = '<p>No live introductions right now — see Closed out below for past ones.</p>'
+            past_sections = [n for n, rows in (("Paused", paused_rows), ("Completed", completed_rows)) if rows]
+            if past_sections:
+                empty_note = (f'<p>No live introductions right now — see {" and ".join(past_sections)} '
+                              'below for past ones.</p>')
             else:
                 empty_note = ('<p>No introductions yet. Your live deals are being shown to buyers — '
                                'introductions appear here as matches firm up.</p>')
