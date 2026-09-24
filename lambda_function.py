@@ -141,8 +141,6 @@ def _req_cache_reset():
     _req_cache["company_stats"] = {}
     _req_cache["firm_person_ids"] = {}
     _req_cache["firm_sell_by_company"] = {}
-    _req_cache["firm_deals"] = {}
-    _req_cache["firm_matched_buy_deals"] = {}
     _req_cache["firm_closed_out_buy_deals"] = {}
     _req_cache["tenant_index"] = None
     _req_cache["id_status"] = {}
@@ -479,8 +477,8 @@ FEATURE_REQUEST_EMAIL = "cgracia@rainmakersecurities.com"
 # copied verbatim from that repo's own make_token/verify_token, matching
 # exactly how chadgracia/deal-nudge's form_url() already mints the same
 # link. Signed with FORM_HMAC_SECRET -- the dedicated update-form key
-# (same env var/value on deal-update-form's own Lambda); HMAC_SECRET stays
-# for this Lambda's tenant magic links only. When FORM_HMAC_SECRET is unset,
+# (same env var/value on deal-update-form's own Lambda); tenant magic links
+# use their own TENANT_LINK_SECRET. When FORM_HMAC_SECRET is unset,
 # _deal_update_form_url returns None and callers render without the button
 # rather than a link signed with the wrong key.
 DEAL_UPDATE_FORM_URL = "https://desk.graciagroup.com/update/"
@@ -1603,16 +1601,17 @@ DASH_SELF_URL = "https://ws4stw4iul75a7yx5dra2wmnq40kipav.lambda-url.us-east-1.o
 
 
 def _make_tenant_link_token(email):
-    """Permanent per-tenant magic-link token: HMAC-SHA256(HMAC_SECRET,
-    "tenant-link:<email>"), urlsafe base64 no padding -- same construction
-    as the deal-update-form token, but keyed on HMAC_SECRET while those
-    links use the dedicated FORM_HMAC_SECRET (and domain-separated by the
-    "tenant-link:" prefix besides). Unlike the
-    SSO handoff above, this token never expires: it's the durable link an
-    admin hands a tenant who may never have signed in before. None when
-    HMAC_SECRET isn't configured (same fail-soft as _deal_update_form_url)."""
-    secret = os.environ.get("HMAC_SECRET")
-    if not (secret and email):
+    """Permanent per-tenant magic-link token: HMAC-SHA256(TENANT_LINK_SECRET,
+    "tenant-link:<email>"), urlsafe base64 no padding. TENANT_LINK_SECRET is
+    this purpose's own key (never HMAC_SECRET or any other/old key -- links
+    signed with those no longer verify). Fails closed: when the env var is
+    missing, no token is minted (and none accepted, see
+    _verify_tenant_link_token) and an error is logged."""
+    secret = os.environ.get("TENANT_LINK_SECRET")
+    if not secret:
+        print("ERROR tenant links disabled: TENANT_LINK_SECRET is not set")
+        return None
+    if not email:
         return None
     sig = hmac.new(secret.encode(), f"tenant-link:{email}".encode(), hashlib.sha256).digest()
     return base64.urlsafe_b64encode(sig).decode().rstrip("=")
@@ -1626,7 +1625,7 @@ def _verify_tenant_link_token(email, token):
 def _tenant_link_url(email):
     """Full permanent magic link for this tenant: opens signed in as them
     (via the same durable gg_id cookie the SSO handoff sets), no admin key,
-    no view_as, no expiry. None when HMAC_SECRET isn't configured."""
+    no view_as, no expiry. None when TENANT_LINK_SECRET isn't configured."""
     token = _make_tenant_link_token(email)
     if not token:
         return None
@@ -1718,10 +1717,12 @@ def _cached_object_version(s3, key):
     return version
 
 
-# Slim people index: only the person fields this Lambda reads, written
-# back to S3 (PEOPLE_SLIM_KEY) tagged with the people.json version it was
-# built from, so a cold container reads the small file instead of
-# parsing the full export. Rebuilt whenever people.json's version moves.
+# Slim people index: only the person fields this Lambda reads, in
+# PEOPLE_SLIM_KEY, tagged with the people.json version it was built from.
+# The request path reads ONLY this file (stale is fine -- a visitor never
+# waits on a rebuild); the full export is parsed on a request only when
+# the slim file doesn't exist at all (first run ever). Rebuilds happen out
+# of band: event {"task": "rebuild_slim"} (see _task_rebuild_slim).
 PEOPLE_SLIM_KEY = "syndicate-dash/people-slim.json"
 PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name", "full_name", "company_id",
                       "company_name", "title", "position", "phone", "phones", "mobile", "website", "linked_in_url",
@@ -1742,22 +1743,11 @@ def _slim_person(rec):
     return out
 
 
-def _load_people_list(s3, version):
-    """The slim people list for this people.json version: the slim S3
-    file when it was built from exactly this version, else the full
-    export (fetched, parsed, slimmed, and the slim file written back --
-    best effort, a write failure only costs the next cold start)."""
-    try:
-        with _perf_timer("s3_people"):
-            obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_SLIM_KEY)
-            slim = json.loads(obj["Body"].read())
-        if (isinstance(slim, dict) and slim.get("source_version") == version
-                and isinstance(slim.get("people"), list)):
-            _perf_count("people_slim_hit")
-            _req_cache["object_size"][PEOPLE_KEY] = obj.get("ContentLength")
-            return slim["people"]
-    except Exception:
-        pass
+def _build_people_slim(s3):
+    """Parse the full people.json export, slim it and write PEOPLE_SLIM_KEY
+    (best effort -- a write failure only costs the next cold start).
+    Returns (people, source_version)."""
+    source_version = _object_version(s3, PEOPLE_KEY)
     _perf_count("people_full_parse")
     with _perf_timer("s3_people"):
         obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)
@@ -1768,10 +1758,43 @@ def _load_people_list(s3, version):
     try:
         with _perf_timer("s3_people_slim_write"):
             s3.put_object(Bucket=BUCKET, Key=PEOPLE_SLIM_KEY, ContentType="application/json",
-                          Body=json.dumps({"source_version": version, "built_at": _iso_utc(),
+                          Body=json.dumps({"source_version": source_version, "built_at": _iso_utc(),
                                            "people": people}, separators=(",", ":")).encode("utf-8"))
+        _s3_version_cache.pop(PEOPLE_SLIM_KEY, None)
     except Exception as e:
         print(f"people-slim write failed: {e}")
+    return people, source_version
+
+
+def _people_version(s3, cached=True):
+    """Version key of the people data requests serve: the slim file's own
+    S3 version ("slim:<etag>"), or "full" when the slim file doesn't exist
+    (first run ever -- _people_data then parses the full export once)."""
+    try:
+        fn = _cached_object_version if cached else _object_version
+        return "slim:" + fn(s3, PEOPLE_SLIM_KEY)
+    except Exception:
+        return "full"
+
+
+def _load_people_list(s3, version):
+    """The slim people list for a request: PEOPLE_SLIM_KEY as-is, even when
+    it lags people.json. Only when it doesn't exist (version "full", or a
+    failed read) is the full export parsed -- logged, and the slim file
+    written so later requests never do it again."""
+    if version != "full":
+        try:
+            with _perf_timer("s3_people"):
+                obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_SLIM_KEY)
+                slim = json.loads(obj["Body"].read())
+            if isinstance(slim, dict) and isinstance(slim.get("people"), list):
+                _perf_count("people_slim_hit")
+                _req_cache["object_size"][PEOPLE_KEY] = obj.get("ContentLength")
+                return slim["people"]
+        except Exception as e:
+            print(f"people-slim read failed: {e}")
+    print("people-slim.json missing: parsing full people.json on a request (first run)")
+    people, _ = _build_people_slim(s3)
     return people
 
 
@@ -1785,9 +1808,11 @@ def _people_data():
     if _req_cache["people"] is not None:
         return _req_cache["people"]
     s3 = _s3_client()
-    version = _cached_object_version(s3, PEOPLE_KEY)
+    version = _people_version(s3)
     if _people_cache["version"] != version or _people_cache["people"] is None:
         people = _load_people_list(s3, version)
+        if version == "full":  # first run ever: key the cache on the slim file just written
+            version = _people_version(s3, cached=False)
         _people_cache["people"] = people
         _people_cache["by_id"] = {str(r.get("id")): r for r in people if r.get("id") is not None}
         _people_cache["version"] = version
@@ -1905,7 +1930,7 @@ def _build_table():
 def get_company_table():
     s3 = _s3_client()
     version = (
-        _cached_object_version(s3, PEOPLE_KEY),
+        _people_version(s3),
         _cached_object_version(s3, INTEREST_KEY),
         _cached_object_version(s3, DEALS_KEY),
     )
@@ -2548,6 +2573,7 @@ def get_my_deals(person_id):
 
 
 @_perf_phase("model")
+@_request_memo("get_firm_deals", lambda person_id: (person_id,))
 def get_firm_deals(person_id):
     """Firm-level tenancy's core read-scope fetch: every deal that
     belongs to person_id's FIRM's book, newest-updated first. SELL deals
@@ -2566,11 +2592,8 @@ def get_firm_deals(person_id):
     of which must stay scoped to the one acting person_id, not the whole
     firm, or a write could get misdirected onto a colleague's deal.
 
-    Request-scoped memoized by person_id, same convention as
-    get_my_deals."""
-    _perf_count("get_firm_deals")
-    if person_id in _req_cache["firm_deals"]:
-        return _req_cache["firm_deals"][person_id]
+    Request-scoped memoized by person_id via _request_memo (counted as
+    calls_compute_get_firm_deals)."""
     firm_person_ids = _firm_person_ids(person_id)
     sellers_by_company = _firm_sell_person_ids_by_company(firm_person_ids)
     out = []
@@ -2581,9 +2604,7 @@ def get_firm_deals(person_id):
         elif _is_firm_intro_buy_deal(d, person_id, firm_person_ids, sellers_by_company):
             out.append(d)
     out.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
-    out = _dedupe_buy_deals_by_company_and_buyer(out, person_id, firm_person_ids)
-    _req_cache["firm_deals"][person_id] = out
-    return out
+    return _dedupe_buy_deals_by_company_and_buyer(out, person_id, firm_person_ids)
 
 
 def get_firm_sell_deals(person_id, company=None):
@@ -2601,22 +2622,19 @@ def get_firm_sell_deals(person_id, company=None):
     return out
 
 
+@_request_memo("get_firm_matched_buy_deals",
+               lambda person_id, company=None: (person_id, company.strip().lower() if company else None))
 def get_firm_matched_buy_deals(person_id, company=None):
     """The firm's BUY deals at Matched-or-later stage -- firm-wide mirror
     of get_my_matched_buy_deals. Request-scoped memoized by
-    (person_id, company), same convention."""
-    _perf_count("get_firm_matched_buy_deals")
+    (person_id, company) via _request_memo."""
     target = company.strip().lower() if company else None
-    cache_key = (person_id, target)
-    if cache_key in _req_cache["firm_matched_buy_deals"]:
-        return _req_cache["firm_matched_buy_deals"][cache_key]
     out = []
     for d in get_firm_deals(person_id):
         if target is not None and (_deal_company_name(d) or "").strip().lower() != target:
             continue
         if _is_matched_or_later_buy_deal(d):
             out.append(d)
-    _req_cache["firm_matched_buy_deals"][cache_key] = out
     return out
 
 
@@ -2926,10 +2944,12 @@ def _tenant_index():
     # calls this at most once per real request anyway, so there is no
     # redundant-HEAD win being left on the table here in practice.
     s3 = _s3_client()
-    version = _object_version(s3, PEOPLE_KEY)
+    version = _people_version(s3, cached=False)
     if _tenant_cache["version"] == version and _tenant_cache["by_email"] is not None:
         return _tenant_cache["by_email"]
     by_email = _build_tenant_index()
+    if version == "full":  # the build above wrote the slim file (first run ever)
+        version = _people_version(s3, cached=False)
     _tenant_cache["version"] = version
     _tenant_cache["by_email"] = by_email
     return by_email
@@ -5123,6 +5143,74 @@ def render_bios_page(key, raw="", error="", results=None):
 </div>
 </body>
 </html>"""
+
+
+def render_client_links_page():
+    """?key=ADMIN_KEY&view=client_links -- one row per eligible tenant
+    email (grouped by domain team, else firm) with a fresh permanent login
+    link (_tenant_link_url, TENANT_LINK_SECRET) and a copy button. When
+    TENANT_LINK_SECRET is unset no links are minted and the page says so."""
+    entries = _eligible_tenants_list()
+    groups = []
+    for e in entries:
+        label = e.get("group") or e.get("firm") or "—"
+        if not groups or groups[-1][0] != label:
+            groups.append((label, []))
+        groups[-1][1].append(e)
+    any_link = False
+    sections = []
+    for label, rows in groups:
+        trs = []
+        for e in rows:
+            link = _tenant_link_url(e["email"])
+            if link:
+                any_link = True
+                cell = (f'<input type="text" readonly class="cl-url" value="{_esc(link)}">'
+                        f'<button type="button" class="cl-copy" data-link="{_esc(link)}">Copy client link</button>')
+            else:
+                cell = '<span class="cl-none">—</span>'
+            trs.append(f'<tr><td>{_esc(e["name"])}</td><td>{_esc(e["email"])}</td><td class="cl-link">{cell}</td></tr>')
+        sections.append(f'<h2>{_esc(label)}</h2><table><thead><tr><th>Name</th><th>Email</th>'
+                        f'<th>Client link</th></tr></thead><tbody>{"".join(trs)}</tbody></table>')
+    warn = "" if any_link or not entries else (
+        '<p class="cl-warn">TENANT_LINK_SECRET is not set: login links are disabled.</p>')
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Client links · Gracia Group</title>
+<style>
+  body {{ margin: 0; background: #f4f2ee; color: #16181d; padding: 32px 16px 64px;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
+  .wrap {{ max-width: 1000px; margin: 0 auto; }}
+  h1 {{ font-size: 20px; }}
+  h2 {{ font-size: 14px; margin: 24px 0 6px; color: #374151; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }}
+  th, td {{ text-align: left; padding: 6px 8px; border-bottom: 1px solid #e5e7eb; vertical-align: middle; }}
+  td.cl-link {{ display: flex; gap: 6px; }}
+  .cl-url {{ flex: 1; min-width: 0; font-size: 12px; }}
+  .cl-warn {{ color: #b91c1c; }}
+  .cl-none {{ color: #9ca3af; }}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Client links</h1>
+{warn}
+{"".join(sections) or '<p>No eligible tenants found.</p>'}
+</div>
+<script>
+document.querySelectorAll('.cl-copy').forEach(function(btn) {{
+  btn.addEventListener('click', function() {{
+    var link = btn.getAttribute('data-link');
+    function done() {{ btn.textContent = 'Copied'; setTimeout(function() {{ btn.textContent = 'Copy client link'; }}, 1500); }}
+    if (navigator.clipboard && navigator.clipboard.writeText) {{
+      navigator.clipboard.writeText(link).then(done, function() {{ btn.previousElementSibling.select(); }});
+    }} else {{ btn.previousElementSibling.select(); document.execCommand('copy'); done(); }}
+  }});
+}});
+</script>
+</body></html>"""
 
 
 def _handle_bios_view(event, method, key):
@@ -9138,7 +9226,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
         # server-built permanent magic link (_tenant_link_url, verified in
         # _lambda_handler_impl next to the SSO handoff) embedded as a data
         # attribute; the button just copies that fixed string. None when
-        # HMAC_SECRET isn't configured -- render without the button rather
+        # TENANT_LINK_SECRET isn't configured -- render without the button rather
         # than a broken link, same fail-soft as _deal_update_form_url.
         if view_as:
             _client_link = _tenant_link_url(view_as.strip().lower())
@@ -14919,6 +15007,46 @@ def _perf_infer_page(query):
     return tab if tab in ("overview", "mydeals", "intros", "demand") else "mydeals"
 
 
+def _task_rebuild_slim():
+    """Out-of-band {"task": "rebuild_slim"}: HEAD people.json; when its
+    version differs from the source_version recorded in the slim file (or
+    the slim file is missing/unreadable), rebuild and write the slim file.
+    Never renders a page."""
+    s3 = _s3_client()
+    _s3_version_cache.pop(PEOPLE_KEY, None)
+    source_version = _object_version(s3, PEOPLE_KEY)
+    recorded = None
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_SLIM_KEY)
+        recorded = (json.loads(obj["Body"].read()) or {}).get("source_version")
+    except Exception:
+        pass
+    if recorded == source_version:
+        return {"task": "rebuild_slim", "rebuilt": False, "source_version": source_version}
+    _, built_from = _build_people_slim(s3)
+    print(f"people-slim rebuilt: {recorded} -> {built_from}")
+    return {"task": "rebuild_slim", "rebuilt": True, "source_version": built_from}
+
+
+def _task_warm():
+    """Out-of-band {"task": "warm"}: load the slim people list, tenant
+    index, deals and the other snapshot caches into this container's
+    memory. Never renders a page."""
+    loaded = {}
+    for name, fn in (("people", _people_data), ("tenants", _tenant_index), ("deals", get_deals_list),
+                     ("interest", _interest_buy_map), ("companies", _companies_list)):
+        try:
+            fn()
+            loaded[name] = True
+        except Exception as e:
+            print(f"warm {name} failed: {e}")
+            loaded[name] = False
+    return {"task": "warm", "loaded": loaded}
+
+
+OUT_OF_BAND_TASKS = {"rebuild_slim": _task_rebuild_slim, "warm": _task_warm}
+
+
 def lambda_handler(event, context):
     """Thin timing wrapper around _lambda_handler_impl (diagnostic only --
     see the perf instrumentation block near the top of this file). Wraps
@@ -14926,6 +15054,13 @@ def lambda_handler(event, context):
     exactly one "TIMING ..." line reaches CloudWatch per invocation
     regardless of which of _lambda_handler_impl's many return points was
     hit -- including an exception, which still logs before propagating."""
+    task = OUT_OF_BAND_TASKS.get(event.get("task")) if isinstance(event, dict) else None
+    if task is not None:
+        _perf_start(f"task_{event['task']}")
+        try:
+            return task()
+        finally:
+            _perf_log()
     query = event.get("queryStringParameters") or {}
     _perf_start(_perf_infer_page(query))
     method = (event.get("requestContext", {}).get("http", {}).get("method") or event.get("httpMethod") or "GET")
@@ -15043,6 +15178,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_lookup_company_buyers(lookup_company_buyers_param)
+
+    if query.get("view") == "client_links":
+        if not is_admin_key:
+            return _forbidden()
+        return _html_response(render_client_links_page())
 
     if query.get("tenants") == "list":
         if not is_admin_key:

@@ -26,6 +26,7 @@ from datetime import datetime, timezone, timedelta
 os.environ["ADMIN_KEY"] = "test-admin-key"
 os.environ["IDENTITY_SECRET"] = "test-secret"
 os.environ["HMAC_SECRET"] = "test-hmac-secret"
+os.environ["TENANT_LINK_SECRET"] = "test-tenant-link-secret"
 os.environ["FORM_HMAC_SECRET"] = "test-form-hmac-secret"
 os.environ["PIPELINE_API_KEY"] = "pk"
 os.environ["PIPELINE_APP_KEY"] = "ak"
@@ -123,6 +124,8 @@ class FakeS3:
                 "LastModified": self.last_modified.get(Key, datetime.now(timezone.utc))}
 
     def head_object(self, Bucket, Key):
+        if Key not in self.objs:
+            raise KeyError(f"NoSuchKey: {Key}")  # real S3: 404 on a missing key
         return {"LastModified": self.last_modified.get(Key, datetime.now(timezone.utc))}
 
     def put_object(self, Bucket, Key, Body, ContentType=None):
@@ -132,6 +135,8 @@ class FakeS3:
         # real S3's read-after-write behavior for a single-writer key.
         parsed = json.loads(Body.decode("utf-8") if isinstance(Body, bytes) else Body)
         self.objs[Key] = parsed
+        if Key in self.last_modified:  # a pinned version moves on write, like a real ETag
+            self.last_modified[Key] = datetime.now(timezone.utc)
         self.put_calls.append({"Key": Key, "ContentType": ContentType})
 
     # ── Multipart upload (see _write_closed_deals_cache_to_s3) ──────────
@@ -439,7 +444,8 @@ deals_list = [
      "custom_fields": cf_sell(), "person_ids": [1307955474], "is_archived": False},
 ]
 deals_data = {"deals": deals_list}
-lm = {"people.json": datetime(2026, 1, 1, tzinfo=timezone.utc)}
+lm = {"people.json": datetime(2026, 1, 1, tzinfo=timezone.utc),
+      lf.PEOPLE_SLIM_KEY: datetime(2026, 1, 1, tzinfo=timezone.utc)}
 fake_s3, _ = use_fixture({"people.json": people, "interest_people.json": interest, "deals.json": deals_data},
                           last_modified=lm)
 lf.TENANT_BLOCKLIST = {"grace@example.com"}
@@ -463,28 +469,31 @@ check("_resolve_tenant returns None for an unknown email", lf._resolve_tenant("n
 check("_resolve_tenant returns None for an empty string", lf._resolve_tenant("") is None)
 check("_resolve_tenant returns None for None", lf._resolve_tenant(None) is None)
 
-# Cache keyed by people.json's LastModified only
-call_count = {"n": 0}
+# Cache keyed by the slim people index's version only (requests never
+# read people.json once people-slim.json exists)
+call_count = {"n": 0, "slim": 0}
 orig_get_object = fake_s3.get_object
 def counting_get_object(Bucket, Key):
     if Key == "people.json":
         call_count["n"] += 1
+    if Key == lf.PEOPLE_SLIM_KEY:
+        call_count["slim"] += 1
     return orig_get_object(Bucket, Key)
 fake_s3.get_object = counting_get_object
 lf._tenant_index()
 lf._tenant_index()
-check("tenant index stays cached across calls (same people.json version)", call_count["n"] == 0)
+check("tenant index stays cached across calls (same people version)", call_count["n"] == 0)
 lm["people.json"] = datetime(2026, 1, 2, tzinfo=timezone.utc)
-# Perf fixes 1-4 added a request-scoped cache (_req_cache) sitting
-# UNDER _tenant_cache, reset once per real request via _perf_start (the
-# lambda_handler wrapper) -- simulate that same request boundary here,
-# since this test calls _tenant_index() directly rather than through
-# lambda_handler, and otherwise the already-cached parsed people list
-# from the earlier calls above would mask the very re-fetch this check
-# exists to verify.
 lf._req_cache_reset()
 lf._tenant_index()
-check("tenant index recomputed once people.json's version changes", call_count["n"] == 1)
+check("a newer people.json alone never triggers a full parse on the request path (stale slim served)",
+      call_count["n"] == 0)
+lm[lf.PEOPLE_SLIM_KEY] = datetime(2026, 1, 3, tzinfo=timezone.utc)
+lf._req_cache_reset()
+_slim_before = call_count["slim"]
+lf._tenant_index()
+check("tenant index recomputed once the slim people index's version changes",
+      call_count["n"] == 0 and call_count["slim"] == _slim_before + 1)
 fake_s3.get_object = orig_get_object
 
 # lambda_handler-level: admin &view_as works for ANY qualifying email, not a fixed list
@@ -3403,8 +3412,8 @@ check("TIMING: reports every phase (s3/tenancy/model/dynamo/pipeline_api/render)
       all(f" {ph}=" in line1 for ph in ("s3", "tenancy", "model", "dynamo", "render"))
       and "pipeline_api=0.000s" in line1 and "total=" in line1)
 check("TIMING: reports call counts for the named expensive functions",
-      "calls_get_firm_deals=" in line1 and "calls_get_deals_list=" in line1
-      and "calls_get_firm_matched_buy_deals=" in line1 and "calls_build_tenant_index=" in line1)
+      "calls_compute_get_firm_deals=" in line1 and "calls_get_deals_list=" in line1
+      and "calls_compute_get_firm_matched_buy_deals=" in line1 and "calls_build_tenant_index=" in line1)
 check("TIMING: no Pipeline API call happens on a normal page render",
       "calls_pipeline_api_call=" not in line1)
 
@@ -3482,15 +3491,11 @@ check("Perf fix 2: get_deals_list's own call count collapses 26 -> 5 "
       "firm-level tenancy's _firm_sell_person_ids_by_company, which scans deals.json once more per request "
       "to group the firm's own Sell deals by company)",
       "calls_get_deals_list=5" in line_p12)
-check("Perf fix 1: get_firm_deals's call count is 26 (firm-level tenancy's mirror of get_my_deals -- "
-      "get_firm_matched_buy_deals' OWN second set of 12 per-company calls hit ITS cache before ever "
-      "reaching get_firm_deals, same as the old get_my_deals shape; every one of those asks is still "
-      "an O(1) cache lookup, not an O(deals) rescan, per the real S3 fetch count checked below)",
-      "calls_get_firm_deals=26" in line_p12)
-check("get_firm_matched_buy_deals is still asked for once per company by both the dropdown "
-      "and the page body (24, unchanged) -- two genuine callers, not a bug -- but each of "
-      "those 24 asks is now an O(1) cache lookup instead of an O(deals) rescan (see below)",
-      "calls_get_firm_matched_buy_deals=24" in line_p12)
+check("Perf fix 1: get_firm_deals is computed once per request (_request_memo; every other ask is a memo hit)",
+      "calls_compute_get_firm_deals=1" in line_p12)
+check("get_firm_matched_buy_deals is computed once per distinct key (12 companies = 12, down from 24 "
+      "calls); the dropdown's and page body's repeat asks are memo hits",
+      "calls_compute_get_firm_matched_buy_deals=12" in line_p12)
 
 # The real win get_deals_list's call count alone doesn't show: only the
 # FIRST of its 3 logical entries this request ever reaches the actual
@@ -4334,6 +4339,7 @@ MI_BUYER4_PID = 804  # a LIVE (non-closed-out) manual intro, for the disabled-co
 mi_people["people"].append({"id": MI_BUYER4_PID, "first_name": "Four", "last_name": "Buyer",
                              "full_name": "Four Buyer", "email": "four@example.com",
                              "company_name": "Fourth Capital", "custom_fields": {}})
+lf._task_rebuild_slim()  # requests read the slim index; rebuild it out of band, as production does
 lf.lambda_handler(mi_event({
     "key": ADMIN_KEY, "company": MI_COMPANY, "person_id": MI_BUYER4_PID, "status": lf.INTRO_STATUS_INTRODUCED_ID,
     "tenant_email": MI_TENANT_EMAIL,
@@ -7295,7 +7301,7 @@ _pf_deals = [
      "custom_fields": cf_status(7207579), "people": [{"id": 3001}, {"id": 3101}], "updated_at": "2026-08-02T00:00:00Z"},
 ]
 _pf_lm = {k: datetime(2026, 9, 1, tzinfo=timezone.utc)
-          for k in (lf.PEOPLE_KEY, lf.DEALS_KEY, lf.INTEREST_KEY, lf.COMPANIES_KEY)}
+          for k in (lf.PEOPLE_KEY, lf.PEOPLE_SLIM_KEY, lf.DEALS_KEY, lf.INTEREST_KEY, lf.COMPANIES_KEY)}
 _pf_s3, _pf_table = use_fixture({lf.PEOPLE_KEY: _pf_people, lf.INTEREST_KEY: {"buy": {"Perf Co": [3101]}},
                                  lf.DEALS_KEY: {"deals": _pf_deals}}, last_modified=_pf_lm)
 lf._closed_deals_cache["deals"] = []
@@ -7357,9 +7363,37 @@ lf.S3_VERSION_TTL_SECONDS = 0
 _pf_lm[lf.PEOPLE_KEY] = datetime(2026, 9, 2, tzinfo=timezone.utc)
 _pf_gets.clear()
 _pf_r3, _pf_l3 = _pf_req({"tab": "mydeals"})
-check("perf: a new people.json version is re-parsed once, and the slim file rebuilt for it",
-      "calls_people_full_parse=1" in _pf_l3 and lf.DEALS_KEY not in _pf_gets
-      and _pf_s3.objs[lf.PEOPLE_SLIM_KEY]["source_version"] == _pf_lm[lf.PEOPLE_KEY].isoformat())
+check("cold load: a newer people.json never triggers a full parse on a request (stale slim served)",
+      _pf_r3["statusCode"] == 200 and "people_full_parse" not in _pf_l3 and lf.PEOPLE_KEY not in _pf_gets)
+_pf_gets.clear()
+_pf_buf = io.StringIO()
+with contextlib.redirect_stdout(_pf_buf):
+    _pf_rb = lf.lambda_handler({"task": "rebuild_slim"}, None)
+check("cold load: rebuild_slim rebuilds when people.json's version differs from the slim source_version, "
+      "and returns without rendering",
+      _pf_rb == {"task": "rebuild_slim", "rebuilt": True, "source_version": _pf_lm[lf.PEOPLE_KEY].isoformat()}
+      and _pf_s3.objs[lf.PEOPLE_SLIM_KEY]["source_version"] == _pf_lm[lf.PEOPLE_KEY].isoformat()
+      and "TIMING page=task_rebuild_slim" in _pf_buf.getvalue())
+with contextlib.redirect_stdout(io.StringIO()):
+    _pf_rb2 = lf.lambda_handler({"task": "rebuild_slim"}, None)
+check("cold load: rebuild_slim is a no-op when the slim file is current",
+      _pf_rb2["rebuilt"] is False and "statusCode" not in _pf_rb2)
+_pf_gets.clear()
+_pf_r3b, _pf_l3b = _pf_req({"tab": "mydeals"})
+check("cold load: the next request picks up the rebuilt slim file (slim read, no full parse)",
+      "calls_people_slim_hit=1" in _pf_l3b and lf.PEOPLE_KEY not in _pf_gets)
+lf._data_cache.clear()
+lf._deals_cache.update({"version": None, "deals": None})
+lf._people_cache.update({"version": None, "people": None, "by_id": None})
+lf._tenant_cache.update({"version": None, "by_email": None})
+with contextlib.redirect_stdout(io.StringIO()):
+    _pf_warm = lf.lambda_handler({"task": "warm"}, None)
+check("cold load: warm loads people/tenants/deals caches and returns without rendering",
+      "statusCode" not in _pf_warm and "body" not in _pf_warm and all(_pf_warm["loaded"][k] for k in ("people", "tenants", "deals", "interest"))
+      and lf._people_cache["people"] and lf._tenant_cache["by_email"] and lf._deals_cache["deals"] is not None)
+_pf_gets.clear()
+_pf_r3c, _pf_l3c = _pf_req({"tab": "overview"})
+check("cold load: after warm, a request re-parses nothing", _pf_r3c["statusCode"] == 200 and _pf_gets == [])
 # A cold container (module caches empty) reads the slim file, not the full export.
 lf._data_cache.clear()
 lf._people_cache.update({"version": None, "people": None, "by_id": None})
@@ -7383,7 +7417,10 @@ for _pf_q in ({"tab": "overview"}, {"tab": "mydeals"}, {"tab": "intros"}):
     _pf_counts = dict(p.split("=", 1) for p in _pf_line.split()[1:] if p.startswith("calls_compute_"))
     check(f"perf: {_pf_q['tab']}: each shared model computed at most once per request "
           f"({', '.join(f'{k}={v}' for k, v in sorted(_pf_counts.items()))})",
-          _pf_resp["statusCode"] == 200 and _pf_counts and all(v == "1" for v in _pf_counts.values()))
+          _pf_resp["statusCode"] == 200 and _pf_counts
+          and all(v == "1" for k, v in _pf_counts.items() if k != "calls_compute_get_firm_matched_buy_deals")
+          # keyed per company: one computation per distinct key (all companies + "Perf Co")
+          and int(_pf_counts.get("calls_compute_get_firm_matched_buy_deals", "0")) <= 2)
 _pf_ov_counts = dict(p.split("=", 1) for p in _pf_req({"tab": "overview"})[1].split()[1:] if p.startswith("calls_"))
 check("perf: Overview reuses the Active Intros model instead of rebuilding it (buckets + my-deals model once)",
       _pf_ov_counts.get("calls_compute_active_intros_model") == "1"
@@ -7512,8 +7549,8 @@ check("rotation: update-form link token is HMAC(FORM_HMAC_SECRET, deal_id)",
       _rot_url == f"{lf.DEAL_UPDATE_FORM_URL}?deal_id=54779042&token={_sig('test-form-hmac-secret', 54779042)}")
 check("rotation: update-form link is NOT signed with HMAC_SECRET",
       _sig("test-hmac-secret", 54779042) not in _rot_url)
-check("rotation: tenant magic links stay on HMAC_SECRET",
-      lf._make_tenant_link_token("a@b.com") == _sig("test-hmac-secret", "tenant-link:a@b.com"))
+check("rotation: tenant magic links sign with TENANT_LINK_SECRET only",
+      lf._make_tenant_link_token("a@b.com") == _sig("test-tenant-link-secret", "tenant-link:a@b.com"))
 _saved_form_key = os.environ.pop("FORM_HMAC_SECRET")
 check("rotation: no FORM_HMAC_SECRET -> no update-form link at all (never falls back to HMAC_SECRET)",
       lf._deal_update_form_url(54779042) is None and lf._deal_action_html("54779042", lf.STAGE_FIRM) == ""
@@ -7750,6 +7787,69 @@ lf._pipeline_update_deal_stage, lf._read_identity_email = _ro_saved_pipe, _ro_sa
 # ======================================================================
 # Summary
 # ======================================================================
+
+# ======================================================================
+# SECTION: Tenant login links -- TENANT_LINK_SECRET only, fail closed
+# ======================================================================
+_tl_email = "tina@linkco.com"
+use_fixture({"people.json": {"people": [{"id": 5501, "full_name": "Tina Link", "email": _tl_email,
+                                         "company_name": "LinkCo", "custom_fields": {}}]},
+             "interest_people.json": {"buy": {}},
+             "deals.json": {"deals": [{"id": 55010, "name": "LinkCo sell", "company": {"name": "LinkCo"},
+                                       "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                                       "people": [{"id": 5501}], "updated_at": "2026-08-01T00:00:00Z"}]}})
+
+
+def _tl_get(q, cookies=None):
+    ev = {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/", "queryStringParameters": q}
+    if cookies:
+        ev["cookies"] = cookies
+    with contextlib.redirect_stdout(io.StringIO()):
+        return lf.lambda_handler(ev, None)
+
+
+_tl_new = _sig("test-tenant-link-secret", f"tenant-link:{_tl_email}")
+_tl_old = _sig("test-hmac-secret", f"tenant-link:{_tl_email}")
+_tl_ok = _tl_get({"tenant": _tl_email, "token": _tl_new})
+check("tenant link: a TENANT_LINK_SECRET token is accepted (302 + identity cookie)",
+      _tl_ok["statusCode"] == 302 and _tl_ok.get("cookies"))
+_tl_bad = _tl_get({"tenant": _tl_email, "token": _tl_old})
+check("tenant link: an old HMAC_SECRET-signed token is rejected (no redirect, no cookie)",
+      _tl_bad.get("statusCode") != 302 and not _tl_bad.get("cookies"))
+check("tenant link: verify rejects the old-key token directly",
+      lf._verify_tenant_link_token(_tl_email, _tl_new) and not lf._verify_tenant_link_token(_tl_email, _tl_old))
+_tl_saved = os.environ.pop("TENANT_LINK_SECRET")
+_tl_buf = io.StringIO()
+with contextlib.redirect_stdout(_tl_buf):
+    _tl_minted = lf._make_tenant_link_token(_tl_email)
+    _tl_url = lf._tenant_link_url(_tl_email)
+    _tl_verified = lf._verify_tenant_link_token(_tl_email, _tl_new)
+check("tenant link: missing TENANT_LINK_SECRET mints nothing, accepts nothing, and logs an error",
+      _tl_minted is None and _tl_url is None and _tl_verified is False
+      and "ERROR tenant links disabled" in _tl_buf.getvalue())
+_tl_nokey = _tl_get({"tenant": _tl_email, "token": _tl_new})
+check("tenant link: missing TENANT_LINK_SECRET -> a formerly valid link no longer signs in",
+      _tl_nokey.get("statusCode") != 302 and not _tl_nokey.get("cookies"))
+check("tenant link: missing key never falls back to HMAC_SECRET",
+      not lf._verify_tenant_link_token(_tl_email, _tl_old))
+os.environ["TENANT_LINK_SECRET"] = _tl_saved
+
+_cl_admin = _tl_get({"key": ADMIN_KEY, "view": "client_links"})
+check("client_links: admin gets the page with a fresh signed link + copy button per tenant",
+      _cl_admin["statusCode"] == 200 and "Copy client link" in _cl_admin["body"]
+      and lf._tenant_link_url(_tl_email) in _cl_admin["body"].replace("&amp;", "&")
+      and _tl_email in _cl_admin["body"])
+check("client_links: no key -> 403", _tl_get({"view": "client_links"})["statusCode"] == 403)
+check("client_links: wrong key -> 403", _tl_get({"key": "nope", "view": "client_links"})["statusCode"] == 403)
+check("client_links: a signed-in tenant without the admin key -> 403",
+      _tl_get({"view": "client_links"}, cookies=[tenant_cookie(_tl_email)])["statusCode"] == 403)
+_tl_saved = os.environ.pop("TENANT_LINK_SECRET")
+with contextlib.redirect_stdout(io.StringIO()):
+    _cl_nokey = _tl_get({"key": ADMIN_KEY, "view": "client_links"})
+check("client_links: without TENANT_LINK_SECRET the page shows no links and says so",
+      "token=" not in _cl_nokey["body"] and "TENANT_LINK_SECRET is not set" in _cl_nokey["body"])
+os.environ["TENANT_LINK_SECRET"] = _tl_saved
+
 
 print(f"\n{passed} passed, {failed} failed")
 if failed:
