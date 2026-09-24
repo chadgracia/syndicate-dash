@@ -7946,6 +7946,55 @@ check("client_links: without TENANT_LINK_SECRET the page shows no links and says
       "/login/" not in _cl_nokey["body"] and "TENANT_LINK_SECRET is not set" in _cl_nokey["body"])
 os.environ["TENANT_LINK_SECRET"] = _tl_saved
 
+# --- Sign-in from trades: the gg_id cookie alone (no ?sso=, no login link)
+_gi_val = lf._make_identity_cookie(_tl_email).split(";", 1)[0]
+_gi_r = _tl_path("/dashboard", None, cookies=[_gi_val])
+check("gg_id cookie alone signs a tenant in at /dashboard (Overview)",
+      _gi_r["statusCode"] == 200 and ">Overview<" in _gi_r["body"] and "LinkCo" in _gi_r["body"])
+_gi_hdr = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/dashboard/",
+                             "headers": {"cookie": "other=1; " + _gi_val}}, None)
+check("gg_id in a plain Cookie header also signs the tenant in", _gi_hdr["statusCode"] == 200
+      and ">Overview<" in _gi_hdr["body"])
+_gi_two = _tl_path("/dashboard", None, cookies=["gg_id=bm90LXZhbGlk", _gi_val])
+check("two gg_id cookies (stale one first): the valid one is used", _gi_two["statusCode"] == 200
+      and ">Overview<" in _gi_two["body"])
+_gi_email_b64, = [_gi_val.split("=", 1)[1]]
+_gi_decoded = _b64.urlsafe_b64decode(_gi_email_b64 + "=" * (-len(_gi_email_b64) % 4)).decode()
+_gi_forged = "gg_id=" + _b64.urlsafe_b64encode(
+    ("x" + _gi_decoded).encode()).decode().rstrip("=")  # email changed, old signature kept
+_gi_bad = _tl_path("/dashboard", None, cookies=[_gi_forged])
+check("tampered gg_id cookie is rejected (sign-in page, 403)",
+      _gi_bad["statusCode"] == 403 and "LinkCo" not in _gi_bad["body"])
+_gi_resigned = "gg_id=" + _b64.urlsafe_b64encode(
+    f"{_tl_email}|{_hm.new(b'wrong-key', _tl_email.encode(), _hl.sha256).hexdigest()}".encode()).decode().rstrip("=")
+check("gg_id signed with the wrong key is rejected",
+      _tl_path("/dashboard", None, cookies=[_gi_resigned])["statusCode"] == 403)
+_gi_nt = _tl_path("/dashboard", None, cookies=[lf._make_identity_cookie("nobody@elsewhere.io").split(";", 1)[0]])
+check("valid gg_id for a non-tenant -> the existing not-a-tenant page",
+      _gi_nt["statusCode"] == 200 and lf.NOT_ENABLED_MESSAGE[:40] in _gi_nt["body"] and "LinkCo" not in _gi_nt["body"])
+_gi_exp = int(time.time()) + 300
+_gi_sso = _b64.urlsafe_b64encode(
+    f"{_tl_email}|{_gi_exp}|{_hm.new(b'test-secret', f'{_tl_email}|{_gi_exp}'.encode(), _hl.sha256).hexdigest()}"
+    .encode()).decode().rstrip("=")
+_gi_s = _tl_path("/dashboard", {"sso": _gi_sso, "tab": "overview"})
+check("?sso= handoff still works: sets gg_id and redirects to the clean dashboard URL",
+      _gi_s["statusCode"] == 302 and _gi_s["headers"]["Location"] == "https://desk.graciagroup.com/dashboard/?tab=overview"
+      and _gi_s["cookies"][0].startswith("gg_id="))
+check("?sso= cookie then signs the tenant in",
+      ">Overview<" in _tl_path("/dashboard/", {"tab": "overview"},
+                               cookies=[_gi_s["cookies"][0].split(";", 1)[0]])["body"])
+
+# --- client_links search box (admin-only page)
+check("client_links: search box present, autofocused, with No matches placeholder and per-row search text",
+      'id="cl-search"' in _cl_admin["body"] and "autofocus" in _cl_admin["body"]
+      and 'id="cl-nomatch"' in _cl_admin["body"] and ">No matches<" in _cl_admin["body"]
+      and f'data-search="tina link {_tl_email} linkco' in _cl_admin["body"]
+      and "input.addEventListener('input', apply)" in _cl_admin["body"])
+for _cl_q in ({"view": "client_links"}, {"key": "nope", "view": "client_links"}):
+    _r = _tl_get(_cl_q, cookies=[_gi_val])
+    check(f"client_links search markup never served without the admin key ({sorted(_cl_q)})",
+          _r["statusCode"] == 403 and 'id="cl-search"' not in _r["body"])
+
 
 print(f"\n{passed} passed, {failed} failed")
 if failed:

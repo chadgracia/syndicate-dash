@@ -1521,6 +1521,25 @@ def _b64u_decode(s):                # unpadded base64url str -> bytes
     return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
 
 
+def _get_cookies(event, name):
+    """Every value of cookie `name` on the request (payload-v2 "cookies"
+    list, then the Cookie header). A browser can send the same name twice,
+    e.g. a host-only gg_id on desk.graciagroup.com plus trades'
+    .graciagroup.com one."""
+    out = []
+    for c in (event.get("cookies") or []):
+        for part in c.split(";"):
+            part = part.strip()
+            if part.startswith(name + "="):
+                out.append(part.split("=", 1)[1])
+    hdr = (event.get("headers") or {}).get("cookie", "")
+    for c in hdr.split(";"):
+        c = c.strip()
+        if c.startswith(name + "="):
+            out.append(c.split("=", 1)[1])
+    return out
+
+
 def _get_cookie(event, name):
     """Read a cookie value from a payload-v2 request, else None."""
     for c in (event.get("cookies") or []):
@@ -1556,22 +1575,22 @@ ADMIN_VIEW_COOKIE = "gg_admin_view"
 
 def _read_identity_email(event):
     """Verified email from the gg_id cookie, or None. Reverses
-    _make_identity_cookie. Never raises."""
+    _make_identity_cookie: gg_id = base64url-nopad("<email>|<hex
+    HMAC-SHA256(IDENTITY_SECRET, email)>"). Checks every gg_id the browser
+    sent (first valid wins). Never raises."""
     if not IDENTITY_SECRET:
         return None
-    raw = _get_cookie(event, "gg_id")
-    if not raw:
-        return None
-    try:
-        decoded = _b64u_decode(raw).decode()
-        email, sig = decoded.rsplit("|", 1)
-        expected = hmac.new(IDENTITY_SECRET.encode(), email.encode(),
-                            hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, sig):
-            return None
-        return email
-    except Exception:
-        return None
+    for raw in _get_cookies(event, "gg_id"):
+        try:
+            decoded = _b64u_decode(raw.strip('"')).decode()
+            email, sig = decoded.rsplit("|", 1)
+            expected = hmac.new(IDENTITY_SECRET.encode(), email.encode(),
+                                hashlib.sha256).hexdigest()
+            if email and hmac.compare_digest(expected, sig):
+                return email
+        except Exception:
+            continue
+    return None
 
 
 def _verify_sso_handoff(token):
@@ -5232,9 +5251,12 @@ def render_client_links_page():
                         f'<button type="button" class="cl-copy" data-link="{_esc(link)}">Copy client link</button>')
             else:
                 cell = '<span class="cl-none">—</span>'
-            trs.append(f'<tr><td>{_esc(e["name"])}</td><td>{_esc(e["email"])}</td><td class="cl-link">{cell}</td></tr>')
-        sections.append(f'<h2>{_esc(label)}</h2><table><thead><tr><th>Name</th><th>Email</th>'
-                        f'<th>Client link</th></tr></thead><tbody>{"".join(trs)}</tbody></table>')
+            hay = " ".join([e.get("name") or "", e["email"], e.get("firm") or "", e.get("group") or "",
+                            e.get("team_domain") or "", e["email"].rsplit("@", 1)[-1]]).lower()
+            trs.append(f'<tr class="cl-row" data-search="{_esc(hay)}"><td>{_esc(e["name"])}</td>'
+                       f'<td>{_esc(e["email"])}</td><td class="cl-link">{cell}</td></tr>')
+        sections.append(f'<section class="cl-group"><h2>{_esc(label)}</h2><table><thead><tr><th>Name</th><th>Email</th>'
+                        f'<th>Client link</th></tr></thead><tbody>{"".join(trs)}</tbody></table></section>')
     warn = "" if any_link or not entries else (
         '<p class="cl-warn">TENANT_LINK_SECRET is not set: login links are disabled.</p>')
     return f"""<!DOCTYPE html>
@@ -5255,13 +5277,42 @@ def render_client_links_page():
   .cl-url {{ flex: 1; min-width: 0; font-size: 12px; }}
   .cl-warn {{ color: #b91c1c; }}
   .cl-none {{ color: #9ca3af; }}
+  .cl-search {{ width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 14px; margin: 4px 0 8px;
+               border: 1px solid #d1d5db; border-radius: 6px; }}
+  [hidden] {{ display: none !important; }}
 </style>
 </head>
 <body><div class="wrap">
 <h1>Client links</h1>
 {warn}
+<input type="search" id="cl-search" class="cl-search" placeholder="Search name, email, firm, team or domain…"
+       autocomplete="off" autofocus>
+<p id="cl-nomatch" class="cl-none" hidden>No matches</p>
 {"".join(sections) or '<p>No eligible tenants found.</p>'}
 </div>
+<script>
+(function() {{
+  var input = document.getElementById('cl-search');
+  var none = document.getElementById('cl-nomatch');
+  function apply() {{
+    var q = input.value.trim().toLowerCase();
+    var any = false;
+    document.querySelectorAll('.cl-group').forEach(function(g) {{
+      var shown = 0;
+      g.querySelectorAll('.cl-row').forEach(function(r) {{
+        var hit = !q || r.getAttribute('data-search').indexOf(q) !== -1;
+        r.hidden = !hit;
+        if (hit) shown++;
+      }});
+      g.hidden = shown === 0;
+      if (shown) any = true;
+    }});
+    none.hidden = any || !document.querySelector('.cl-group');
+  }}
+  input.addEventListener('input', apply);
+  input.focus();
+}})();
+</script>
 <script>
 document.querySelectorAll('.cl-copy').forEach(function(btn) {{
   btn.addEventListener('click', function() {{
