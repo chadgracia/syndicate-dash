@@ -4608,10 +4608,10 @@ check("'Copy client link' renders whenever a tenant is selected, regardless of t
 check("Copy client link button carries the real permanent per-tenant link, "
       "not the admin's own URL with params stripped",
       f'data-link="{lf._esc(lf._tenant_link_url(VT_TENANT_EMAIL))}"' in resp_bare_company["body"])
-check("Copy client link's permanent link verifies server-side back to this exact tenant",
-      lf._verify_tenant_link_token(
-          VT_TENANT_EMAIL,
-          lf._tenant_link_url(VT_TENANT_EMAIL).rsplit("token=", 1)[1]))
+check("Copy client link's permanent link is PUBLIC_BASE_URL/login/<token> and verifies back to this exact tenant",
+      lf._tenant_link_url(VT_TENANT_EMAIL).startswith("https://desk.graciagroup.com/dashboard/login/")
+      and lf._verify_tenant_link_token(lf._tenant_link_url(VT_TENANT_EMAIL).rsplit("/login/", 1)[1])
+      == VT_TENANT_EMAIL.lower())
 check("Copy client link's permanent link carries no admin key, no view_as, no sso param",
       "key=" not in lf._tenant_link_url(VT_TENANT_EMAIL)
       and "view_as=" not in lf._tenant_link_url(VT_TENANT_EMAIL)
@@ -4627,17 +4627,16 @@ check("Copy client link fallback input pre-filled with the same link, hidden unt
 # cookie, no admin key, nothing else -- same as a tenant pasting it cold into
 # a fresh browser.
 _tlink = lf._tenant_link_url(VT_TENANT_EMAIL)
-_tlink_qs = dict(p.split("=", 1) for p in _tlink.split("?", 1)[1].split("&"))
-resp_tenant_link = lf.lambda_handler(vt_get_event(
-    {"tenant": lf.urllib.parse.unquote(_tlink_qs["tenant"]), "token": _tlink_qs["token"]}), None)
+resp_tenant_link = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}},
+                                      "rawPath": "/dashboard/login/" + _tlink.rsplit("/login/", 1)[1],
+                                      "queryStringParameters": None}, None)
 check("Permanent tenant link: fresh GET (no cookie) redirects (signs in), not 403",
       resp_tenant_link["statusCode"] == 302)
 check("Permanent tenant link: sets the same durable gg_id identity cookie the SSO handoff sets",
       any(c.startswith("gg_id=") for c in (resp_tenant_link.get("cookies") or [])))
-resp_tenant_link_bad = lf.lambda_handler(vt_get_event(
-    {"tenant": VT_TENANT_EMAIL, "token": "not-a-real-token"}), None)
-check("Permanent tenant link: tampered token falls through to normal identity "
-      "resolution (403, no cookie) rather than signing anyone in",
+resp_tenant_link_bad = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}},
+                                          "rawPath": "/dashboard/login/not-a-real-token"}, None)
+check("Permanent tenant link: tampered token shows the invalid-link page (403, no cookie, no redirect)",
       resp_tenant_link_bad["statusCode"] == 403
       and not (resp_tenant_link_bad.get("cookies") or []))
 check("toggle script writes the gg_admin_view cookie client-side, Path=/, no HttpOnly (JS must be able to set it)",
@@ -7550,7 +7549,7 @@ check("rotation: update-form link token is HMAC(FORM_HMAC_SECRET, deal_id)",
 check("rotation: update-form link is NOT signed with HMAC_SECRET",
       _sig("test-hmac-secret", 54779042) not in _rot_url)
 check("rotation: tenant magic links sign with TENANT_LINK_SECRET only",
-      lf._make_tenant_link_token("a@b.com") == _sig("test-tenant-link-secret", "tenant-link:a@b.com"))
+      lf._make_tenant_link_token("a@b.com").split(".", 1)[1] == _sig("test-tenant-link-secret", "tenant-link:a@b.com"))
 _saved_form_key = os.environ.pop("FORM_HMAC_SECRET")
 check("rotation: no FORM_HMAC_SECRET -> no update-form link at all (never falls back to HMAC_SECRET)",
       lf._deal_update_form_url(54779042) is None and lf._deal_action_html("54779042", lf.STAGE_FIRM) == ""
@@ -7854,36 +7853,87 @@ def _tl_get(q, cookies=None):
         return lf.lambda_handler(ev, None)
 
 
-_tl_new = _sig("test-tenant-link-secret", f"tenant-link:{_tl_email}")
-_tl_old = _sig("test-hmac-secret", f"tenant-link:{_tl_email}")
-_tl_ok = _tl_get({"tenant": _tl_email, "token": _tl_new})
-check("tenant link: a TENANT_LINK_SECRET token is accepted (302 + identity cookie)",
-      _tl_ok["statusCode"] == 302 and _tl_ok.get("cookies"))
-_tl_bad = _tl_get({"tenant": _tl_email, "token": _tl_old})
-check("tenant link: an old HMAC_SECRET-signed token is rejected (no redirect, no cookie)",
-      _tl_bad.get("statusCode") != 302 and not _tl_bad.get("cookies"))
-check("tenant link: verify rejects the old-key token directly",
-      lf._verify_tenant_link_token(_tl_email, _tl_new) and not lf._verify_tenant_link_token(_tl_email, _tl_old))
+def _tl_path(path, q=None, cookies=None):
+    ev = {"requestContext": {"http": {"method": "GET"}}, "rawPath": path, "queryStringParameters": q}
+    if cookies:
+        ev["cookies"] = cookies
+    with contextlib.redirect_stdout(io.StringIO()):
+        return lf.lambda_handler(ev, None)
+
+
+_tl_b64 = _b64.urlsafe_b64encode(_tl_email.encode()).decode().rstrip("=")
+_tl_new = f'{_tl_b64}.{_sig("test-tenant-link-secret", f"tenant-link:{_tl_email}")}'
+_tl_old = f'{_tl_b64}.{_sig("test-hmac-secret", f"tenant-link:{_tl_email}")}'
+check("login token = b64url(email) + '.' + HMAC(TENANT_LINK_SECRET, 'tenant-link:'+email), unpadded",
+      lf._make_tenant_link_token(_tl_email) == _tl_new and "=" not in _tl_new)
+check("login link URL is PUBLIC_BASE_URL/login/<token>",
+      lf._tenant_link_url(_tl_email) == f"https://desk.graciagroup.com/dashboard/login/{_tl_new}")
+_tl_ok = _tl_path(f"/dashboard/login/{_tl_new}")
+_tl_cookie = (_tl_ok.get("cookies") or [""])[0]
+check("login link: valid token -> 302 to the clean Overview URL (token not kept)",
+      _tl_ok["statusCode"] == 302
+      and _tl_ok["headers"]["Location"] == "https://desk.graciagroup.com/dashboard/?tab=overview")
+check("login link: sets gg_id (shared with trades) for .graciagroup.com, Secure, HttpOnly, SameSite=Lax",
+      _tl_cookie.startswith("gg_id=") and "Domain=.graciagroup.com" in _tl_cookie and "Secure" in _tl_cookie
+      and "HttpOnly" in _tl_cookie and "SameSite=Lax" in _tl_cookie)
+_tl_cookie_val = _tl_cookie.split(";", 1)[0]
+_tl_after = _tl_path("/dashboard/", {"tab": "overview"}, cookies=[_tl_cookie_val])
+check("login link: the cookie it set signs the tenant in (Overview renders)",
+      _tl_after["statusCode"] == 200 and "Overview" in _tl_after["body"] and "LinkCo" in _tl_after["body"])
+_tl_bad = _tl_path(f"/dashboard/login/{_tl_old}")
+check("login link: an old HMAC_SECRET-signed token -> invalid-link page, no cookie, no redirect",
+      _tl_bad["statusCode"] == 403 and not _tl_bad.get("cookies") and "Location" not in _tl_bad["headers"]
+      and "This link is invalid or has expired. Please contact cgracia@rainmakersecurities.com for a new one."
+      in _tl_bad["body"])
+_tl_swapped = _tl_path("/dashboard/login/" + _b64.urlsafe_b64encode(b"x@linkco.com").decode().rstrip("=")
+                       + "." + _tl_new.split(".", 1)[1])
+check("login link: a valid signature for another email is rejected",
+      _tl_swapped["statusCode"] == 403 and not _tl_swapped.get("cookies"))
+for _tl_junk in ("garbage", "", ".", "abc.def", _tl_new + "x"):
+    _r = _tl_path(f"/dashboard/login/{_tl_junk}")
+    check(f"login link: malformed token {_tl_junk[:12]!r} -> invalid-link page",
+          _r["statusCode"] == 403 and not _r.get("cookies") and "invalid or has expired" in _r["body"])
+_tl_oldfmt = _tl_path("/dashboard", {"tenant": _tl_email, "token": _sig("test-tenant-link-secret", f"tenant-link:{_tl_email}")})
+check("old ?tenant=&token= login format is rejected (even with a correctly signed token)",
+      _tl_oldfmt["statusCode"] == 403 and not _tl_oldfmt.get("cookies"))
+_tl_fn = _tl_path(f"/login/{_tl_new}")
+check("login link on the direct Function URL: host-only cookie, relative redirect",
+      _tl_fn["statusCode"] == 302 and _tl_fn["headers"]["Location"] == "/?tab=overview"
+      and "Domain=" not in _tl_fn["cookies"][0])
 _tl_saved = os.environ.pop("TENANT_LINK_SECRET")
 _tl_buf = io.StringIO()
 with contextlib.redirect_stdout(_tl_buf):
     _tl_minted = lf._make_tenant_link_token(_tl_email)
     _tl_url = lf._tenant_link_url(_tl_email)
-    _tl_verified = lf._verify_tenant_link_token(_tl_email, _tl_new)
-check("tenant link: missing TENANT_LINK_SECRET mints nothing, accepts nothing, and logs an error",
-      _tl_minted is None and _tl_url is None and _tl_verified is False
+    _tl_verified = lf._verify_tenant_link_token(_tl_new)
+check("login link: missing TENANT_LINK_SECRET mints nothing, accepts nothing, and logs an error",
+      _tl_minted is None and _tl_url is None and _tl_verified is None
       and "ERROR tenant links disabled" in _tl_buf.getvalue())
-_tl_nokey = _tl_get({"tenant": _tl_email, "token": _tl_new})
-check("tenant link: missing TENANT_LINK_SECRET -> a formerly valid link no longer signs in",
-      _tl_nokey.get("statusCode") != 302 and not _tl_nokey.get("cookies"))
-check("tenant link: missing key never falls back to HMAC_SECRET",
-      not lf._verify_tenant_link_token(_tl_email, _tl_old))
+_tl_nokey = _tl_path(f"/dashboard/login/{_tl_new}")
+check("login link: missing TENANT_LINK_SECRET -> a formerly valid link shows the invalid-link page",
+      _tl_nokey["statusCode"] == 403 and not _tl_nokey.get("cookies"))
 os.environ["TENANT_LINK_SECRET"] = _tl_saved
+
+# /dashboard prefix: same routing as "/"
+_tl_ck = [lf._make_identity_cookie(_tl_email).split(";", 1)[0]]
+for _tl_p in ("/dashboard", "/dashboard/"):
+    _r = _tl_path(_tl_p, None, cookies=_tl_ck)
+    check(f"{_tl_p} renders Overview for a signed-in tenant",
+          _r["statusCode"] == 200 and "<h1" in _r["body"] and ">Overview<" in _r["body"])
+_r_tab = _tl_path("/dashboard/", {"tab": "mydeals"}, cookies=_tl_ck)
+_r_root = _tl_path("/", {"tab": "mydeals"}, cookies=_tl_ck)
+check("/dashboard/?tab=mydeals routes exactly like /?tab=mydeals",
+      _r_tab["statusCode"] == 200 and _r_tab["body"] == _r_root["body"])
+check("tenant pages are never cacheable by CloudFront", "no-store" in _r_tab["headers"].get("Cache-Control", ""))
+_r_admin = _tl_path("/", {"key": ADMIN_KEY, "tab": "mydeals"})
+check("admin ?key= on the Function URL root still works", _r_admin["statusCode"] == 200)
+check("admin ?key=&tenants=list on the Function URL still works",
+      _tl_path("/", {"key": ADMIN_KEY, "tenants": "list"})["statusCode"] == 200)
 
 _cl_admin = _tl_get({"key": ADMIN_KEY, "view": "client_links"})
 check("client_links: admin gets the page with a fresh signed link + copy button per tenant",
       _cl_admin["statusCode"] == 200 and "Copy client link" in _cl_admin["body"]
-      and lf._tenant_link_url(_tl_email) in _cl_admin["body"].replace("&amp;", "&")
+      and f'data-link="https://desk.graciagroup.com/dashboard/login/{_tl_new}"' in _cl_admin["body"]
       and _tl_email in _cl_admin["body"])
 check("client_links: no key -> 403", _tl_get({"view": "client_links"})["statusCode"] == 403)
 check("client_links: wrong key -> 403", _tl_get({"key": "nope", "view": "client_links"})["statusCode"] == 403)
@@ -7893,7 +7943,7 @@ _tl_saved = os.environ.pop("TENANT_LINK_SECRET")
 with contextlib.redirect_stdout(io.StringIO()):
     _cl_nokey = _tl_get({"key": ADMIN_KEY, "view": "client_links"})
 check("client_links: without TENANT_LINK_SECRET the page shows no links and says so",
-      "token=" not in _cl_nokey["body"] and "TENANT_LINK_SECRET is not set" in _cl_nokey["body"])
+      "/login/" not in _cl_nokey["body"] and "TENANT_LINK_SECRET is not set" in _cl_nokey["body"])
 os.environ["TENANT_LINK_SECRET"] = _tl_saved
 
 

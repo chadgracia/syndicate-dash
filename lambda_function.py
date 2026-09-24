@@ -1534,9 +1534,14 @@ def _get_cookie(event, name):
     return None
 
 
-def _make_identity_cookie(email):
+def _make_identity_cookie(email, domain=None):
+    """gg_id cookie. domain=None keeps the host-only cookie the SSO handoff
+    has always set; login links pass PUBLIC_COOKIE_DOMAIN (+ HttpOnly) so
+    one login carries across graciagroup.com."""
     sig = hmac.new(IDENTITY_SECRET.encode(), email.encode(), hashlib.sha256).hexdigest()
     val = _b64u(f"{email}|{sig}".encode())
+    if domain:
+        return f"gg_id={val}; Max-Age=31536000; Domain={domain}; Path=/; Secure; HttpOnly; SameSite=Lax"
     return f"gg_id={val}; Max-Age=31536000; Path=/; Secure; SameSite=Lax"
 
 
@@ -1592,21 +1597,32 @@ def _verify_sso_handoff(token):
         return None
 
 
-# This dash's own canonical URL -- the same Lambda Function URL
-# chadgracia/trades hands out as SYNDICATE_DASH_URL for its nav's "My
-# Dashboard" link and the ?sso= handoff above. Used only to build the
-# permanent tenant link below; every other absolute link to this app in
-# the codebase already points here.
-DASH_SELF_URL = "https://ws4stw4iul75a7yx5dra2wmnq40kipav.lambda-url.us-east-1.on.aws"
+# Public base URL: CloudFront (desk.graciagroup.com, /dashboard* behavior)
+# forwards to this Lambda's Function URL with rawPath still starting
+# "/dashboard" -- _split_public_prefix strips it before routing. Every
+# absolute tenant link (login links, redirects after login) uses this;
+# in-app ?tab= links stay relative. Direct Function URL access (admin
+# ?key= use, rebuild_slim/warm tasks) keeps working unchanged.
+PUBLIC_BASE_URL = "https://desk.graciagroup.com/dashboard"
+PUBLIC_PATH_PREFIX = "/dashboard"
+PUBLIC_COOKIE_DOMAIN = ".graciagroup.com"
+INVALID_LOGIN_LINK_TEXT = ("This link is invalid or has expired. Please contact "
+                           "cgracia@rainmakersecurities.com for a new one.")
 
 
-def _make_tenant_link_token(email):
-    """Permanent per-tenant magic-link token: HMAC-SHA256(TENANT_LINK_SECRET,
-    "tenant-link:<email>"), urlsafe base64 no padding. TENANT_LINK_SECRET is
-    this purpose's own key (never HMAC_SECRET or any other/old key -- links
-    signed with those no longer verify). Fails closed: when the env var is
-    missing, no token is minted (and none accepted, see
-    _verify_tenant_link_token) and an error is logged."""
+def _split_public_prefix(raw_path):
+    """(path, via_public): rawPath with a leading "/dashboard" removed, so
+    /dashboard and /dashboard/ route exactly like "/"."""
+    raw_path = raw_path or "/"
+    if raw_path == PUBLIC_PATH_PREFIX or raw_path.startswith(PUBLIC_PATH_PREFIX + "/"):
+        return raw_path[len(PUBLIC_PATH_PREFIX):] or "/", True
+    return raw_path, False
+
+
+def _tenant_link_sig(email):
+    """HMAC-SHA256(TENANT_LINK_SECRET, "tenant-link:<email>"), urlsafe
+    base64 no padding. TENANT_LINK_SECRET only -- never HMAC_SECRET or any
+    other/old key. Fails closed: missing key -> None + error logged."""
     secret = os.environ.get("TENANT_LINK_SECRET")
     if not secret:
         print("ERROR tenant links disabled: TENANT_LINK_SECRET is not set")
@@ -1614,23 +1630,70 @@ def _make_tenant_link_token(email):
     if not email:
         return None
     sig = hmac.new(secret.encode(), f"tenant-link:{email}".encode(), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
+    return _b64u(sig)
 
 
-def _verify_tenant_link_token(email, token):
-    expected = _make_tenant_link_token(email)
-    return bool(expected) and hmac.compare_digest(expected, token or "")
+def _make_tenant_link_token(email):
+    """Login-link token: urlsafe-base64(email) + "." + _tenant_link_sig(email),
+    padding stripped. None when TENANT_LINK_SECRET is missing."""
+    sig = _tenant_link_sig(email)
+    if not sig:
+        return None
+    return f"{_b64u(email.encode())}.{sig}"
+
+
+def _verify_tenant_link_token(token):
+    """Email the login token names, or None. Constant-time compare; fails
+    closed when TENANT_LINK_SECRET is missing. Never raises."""
+    try:
+        email_part, sig = (token or "").split(".", 1)
+        email = _b64u_decode(email_part).decode("utf-8")
+    except Exception:
+        return None
+    if not email or email != email.strip().lower():
+        return None
+    expected = _tenant_link_sig(email)
+    if not expected or not hmac.compare_digest(expected, sig):
+        return None
+    return email
 
 
 def _tenant_link_url(email):
-    """Full permanent magic link for this tenant: opens signed in as them
-    (via the same durable gg_id cookie the SSO handoff sets), no admin key,
-    no view_as, no expiry. None when TENANT_LINK_SECRET isn't configured."""
-    token = _make_tenant_link_token(email)
+    """Permanent login link for this tenant: PUBLIC_BASE_URL/login/<token>.
+    Opens signed in as them (gg_id cookie), no admin key, no expiry. None
+    when TENANT_LINK_SECRET isn't configured."""
+    token = _make_tenant_link_token((email or "").strip().lower())
     if not token:
         return None
-    return (f"{DASH_SELF_URL}/?tenant={urllib.parse.quote(email, safe='')}"
-            f"&token={token}")
+    return f"{PUBLIC_BASE_URL}/login/{token}"
+
+
+def _invalid_login_link_response():
+    body = ('<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width, initial-scale=1">'
+            '<title>Gracia Group</title></head>'
+            '<body style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,sans-serif;'
+            'max-width:560px;margin:80px auto;padding:0 16px;color:#16181d">'
+            f'<p>{_esc(INVALID_LOGIN_LINK_TEXT)}</p></body></html>')
+    return _html_response(body, 403)
+
+
+def _handle_login_link(token, via_public):
+    """GET /dashboard/login/<token>: valid -> set the gg_id identity cookie
+    (the one shared with trades, IDENTITY_SECRET) and 302 to the clean
+    Overview URL, so the token never stays in the address bar. Invalid ->
+    plain error page (no redirect, no hint which part failed)."""
+    email = _verify_tenant_link_token(token)
+    if not email or not IDENTITY_SECRET:
+        return _invalid_login_link_response()
+    if via_public:
+        cookie = _make_identity_cookie(email, domain=PUBLIC_COOKIE_DOMAIN)
+        location = f"{PUBLIC_BASE_URL}/?tab=overview"
+    else:  # direct Function URL: a .graciagroup.com cookie wouldn't stick there
+        cookie = _make_identity_cookie(email)
+        location = "/?tab=overview"
+    return {"statusCode": 302, "headers": {"Location": location, "Cache-Control": "no-store"},
+            "cookies": [cookie], "body": ""}
 
 
 # Perf fix 5: one boto3 S3 client (and, below, one Dynamo Table binding)
@@ -14134,7 +14197,8 @@ def _forbidden():
 def _html_response(body, status=200):
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "text/html; charset=utf-8"},
+        # Per-viewer pages behind CloudFront: never a shared cache entry.
+        "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "private, no-store"},
         "body": body,
     }
 
@@ -14142,7 +14206,7 @@ def _html_response(body, status=200):
 def _json_response(data, status=200):
     return {
         "statusCode": status,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {"Content-Type": "application/json", "Cache-Control": "private, no-store"},
         "body": json.dumps(data),
     }
 
@@ -15107,6 +15171,12 @@ def _lambda_handler_impl(event, context):
     method = (event.get("requestContext", {}).get("http", {}).get("method")
               or event.get("httpMethod") or "GET")
     query = event.get("queryStringParameters") or {}
+    path, via_public = _split_public_prefix(event.get("rawPath"))
+
+    if path.startswith("/login/"):
+        if method != "GET":
+            return _forbidden()
+        return _handle_login_link(path[len("/login/"):], via_public)
 
     # The one write route: POST only. A GET here renders nothing and
     # changes nothing.
@@ -15221,7 +15291,7 @@ def _lambda_handler_impl(event, context):
     if sso_token:
         email = _verify_sso_handoff(sso_token)
         if email:
-            location = event.get("rawPath") or "/"
+            location = f"{PUBLIC_BASE_URL}/" if via_public else (event.get("rawPath") or "/")
             tab = query.get("tab")
             if tab:
                 location += f"?tab={urllib.parse.quote(tab, safe='')}"
@@ -15232,25 +15302,10 @@ def _lambda_handler_impl(event, context):
                 "body": "",
             }
 
-    # Permanent tenant link (the "Copy client link" button's URL): verify,
-    # set the same durable identity cookie the SSO handoff sets above,
-    # redirect to a clean URL. Unlike sso, this token never expires -- see
-    # _make_tenant_link_token. An invalid/tampered token falls through to
-    # normal identity resolution, same as a bad sso token above.
-    tenant_link_email = (query.get("tenant") or "").strip().lower()
-    tenant_link_token = query.get("token")
-    if tenant_link_email and tenant_link_token:
-        if _verify_tenant_link_token(tenant_link_email, tenant_link_token):
-            location = event.get("rawPath") or "/"
-            tab = query.get("tab")
-            if tab:
-                location += f"?tab={urllib.parse.quote(tab, safe='')}"
-            return {
-                "statusCode": 302,
-                "headers": {"Location": location},
-                "cookies": [_make_identity_cookie(tenant_link_email)],
-                "body": "",
-            }
+    # Old ?tenant=<email>&token=<token> login format: its key was rotated
+    # (login links are now /dashboard/login/<token>) -- always rejected.
+    if query.get("tenant") and query.get("token"):
+        return _invalid_login_link_response()
 
     # Default tab is resolved below, once we know whether there's a tenant
     # context: Overview for tenants and admin &view_as, My Deals for
