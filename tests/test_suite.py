@@ -1227,6 +1227,50 @@ check("Admin Active Intros: repeat-suppression is gone for admin too (both rows 
 check("Admin Active Intros: '+ Add buyer' still appears once per company group (untouched admin behavior)",
       admin_page_repeat.count('data-company="Repeat Co"') == 1)
 
+# --- Active Intros layout: ACTIONS column + full-cell company link ------
+def _intro_rows(page):
+    tbody = page[page.find("<tbody>"):]
+    return [r for r in re.findall(r"<tr[^>]*>(.*?)</tr>", tbody, re.S) if "<td" in r and "colspan=" not in r]
+
+
+def _row_cells(row):
+    return re.findall(r"<td[^>]*>.*?</td>", row, re.S)
+
+
+_lay_rows = [r for r in _intro_rows(page_repeat) if "Repeat Co" in r]
+check("Active Intros layout: header has 7 columns, the last an (unlabelled) right-aligned actions header",
+      '<th>Notes</th><th class="intro-actions"></th>' in page_repeat
+      and f'<col class="col-actions" style="width:{lf.ACTION_COL_PX}px">' in page_repeat)
+check("Active Intros layout: every intros row has 7 cells",
+      len(_lay_rows) == 2 and all(len(_row_cells(r)) == 7 for r in _lay_rows))
+check("Active Intros layout: the stacked action box renders in the LAST cell, never in the company cell",
+      all(_row_cells(r)[-1].startswith('<td class="intro-actions">')
+          and '<div class="company-update-link">' in _row_cells(r)[-1]
+          and 'class="update-cancel-btn stacked"' in _row_cells(r)[-1]
+          and "company-update-link" not in _row_cells(r)[0] for r in _lay_rows))
+check("Active Intros layout: the company cell is ONE full-cell link to the company page (?company=)",
+      all(re.fullmatch(r'<td class="company company-link-cell"><a class="company-cell-link" '
+                       r'href="\?company=Repeat%20Co&ref=intros"><span class="company-cell-name">Repeat Co</span></a></td>',
+                       _row_cells(r)[0]) for r in _lay_rows))
+check("Active Intros layout CSS: company link is display-block-ish full cell with padding, pointer and hover",
+      "td.company-link-cell { padding: 0; height: 1px; }" in page_repeat_full
+      and "padding: 11px 16px; border-bottom: none; cursor: pointer;" in page_repeat_full
+      and "a.company-cell-link:hover { background:" in page_repeat_full
+      and "th.intro-actions, td.intro-actions { text-align: right;" in page_repeat_full)
+check("Active Intros layout: nothing else is navigation -- only one <a> per row outside buyer links, and "
+      "the Notes textarea / status controls sit outside any link",
+      all(r.count('class="company-cell-link"') == 1 for r in _lay_rows)
+      and all('<textarea class="ei-notes"' in _row_cells(r)[5] and "<a " not in _row_cells(r)[5]
+              and 'class="ei-milestone"' in _row_cells(r)[4] and "<a " not in _row_cells(r)[4]
+              for r in _lay_rows))
+_lay_admin_rows = [r for r in _intro_rows(admin_page_repeat) if "Repeat Co" in r]
+check("Admin Active Intros layout: action box in the last cell; '+ Add buyer' stays in the company cell, "
+      "outside the link",
+      len(_lay_admin_rows) == 2 and all(len(_row_cells(r)) == 7 for r in _lay_admin_rows)
+      and all("company-update-link" in _row_cells(r)[-1] and "company-update-link" not in _row_cells(r)[0]
+              for r in _lay_admin_rows)
+      and sum('</a><button type="button" class="ab-row-trigger"' in _row_cells(r)[0] for r in _lay_admin_rows) == 1)
+
 # Empty state -- a tenant auto-enrolled via their own Sell deal, but with
 # no Buy-side matches at all.
 people_empty = {"people": [{"id": 99, "full_name": "Empty Tenant", "email": "empty@example.com", "custom_fields": {}}]}
@@ -5412,13 +5456,14 @@ check("Active Intros: the outside AMI Labs seller never leaks onto Natoli's page
 # company link -- never glued inline to it. Anchored on the intros-page
 # href (ref=intros), not the bare company name, so this can't accidentally
 # match the nav's own My Deals quick-jump entry for the same company.
-via_anchor = '<a href="?company=Kevin%20Ventures%20Co&ref=intros">'
+via_anchor = '<a class="company-cell-link" href="?company=Kevin%20Ventures%20Co&ref=intros">'
 via_row = intros_natoli[intros_natoli.find(via_anchor):]
 via_row = via_row[:via_row.find("</tr>")]
 check("Active Intros: colleague-owned row's company cell has both the full company name and the via-chip",
       via_row != "" and 'via-colleague-chip">via Kevin</span>' in via_row)
 check("Active Intros: via-chip text/logic unchanged -- immediately after the company <a>, same markup shape",
-      f'{via_anchor}Kevin Ventures Co</a><span class="via-colleague-chip">via Kevin</span>' in via_row)
+      f'{via_anchor}<span class="company-cell-name">Kevin Ventures Co</span>'
+      f'<span class="via-colleague-chip">via Kevin</span></a>' in via_row)
 check("Active Intros CSS: .via-colleague-chip is now block-level with a small top margin (fix #2)",
       ".via-colleague-chip { display: block;" in intros_natoli_full
       and "margin-top: 2px;" in intros_natoli_full)
@@ -7754,6 +7799,29 @@ check("Completed section: '<summary>Completed (2)' with the Won row above the Lo
       and _ro_done.find("status-chip closed") < _ro_done.find("status-chip exit")
       and lf.PAUSED_INTRO_TEXT not in _ro_done)
 check("Active Intros page no longer says 'Closed out' anywhere", "Closed out" not in _ro_intros_full())
+_ro_paused_rows = [r for r in _intro_rows(_ro_closed) if lf.PAUSED_INTRO_TEXT in r]
+_ro_done_rows = _intro_rows(_ro_done)
+check("Paused rows: Re-Open Deal button lives in the ACTIONS (last) cell, not the Status or company cell",
+      len(_ro_paused_rows) == 2
+      and all(len(_row_cells(r)) == 7 for r in _ro_paused_rows)
+      and any('class="reopen-deal-btn" data-deal-id="960001"' in _row_cells(r)[-1] for r in _ro_paused_rows)
+      and all("reopen-deal-btn" not in c for r in _ro_paused_rows for c in _row_cells(r)[:-1])
+      and all(_row_cells(r)[4] == f'<td><span class="status-chip paused">{lf.PAUSED_INTRO_TEXT}</span></td>'
+              for r in _ro_paused_rows))
+check("Paused/Completed rows: 7 cells with a full-cell company link, columns aligned with the live table",
+      _ro_done_rows and all(len(_row_cells(r)) == 7 for r in _ro_done_rows)
+      and all('<a class="company-cell-link" href="?company=' in _row_cells(r)[0]
+              for r in _ro_paused_rows + _ro_done_rows)
+      and all(_row_cells(r)[-1].startswith('<td class="intro-actions">') for r in _ro_done_rows)
+      and _ro_closed.count('<th class="intro-actions"></th>') == 1
+      and _ro_done.count('<th class="intro-actions"></th>') == 1)
+check("Active Intros write paths untouched: tenant page still wires the update_intro save script and "
+      "per-row controls; paused page still posts the Re-Open to ?action=deal_stage target=reopen",
+      "fetch('?action=' + (action || 'update_intro')" in page_repeat_full
+      and all(re.search(r'<textarea class="ei-notes" data-deal-id="94000[23]"', _row_cells(r)[5]) for r in _lay_rows)
+      and "fetch('?action=deal_stage'" in _ro_intros_full() and "target: 'reopen'" in _ro_intros_full())
+check("Company page paused block unchanged: Re-Open Deal still in its status cell",
+      'class="reopen-deal-btn" data-deal-id="960001"' in _ro_comps["Paused Co"])
 _ro_fixture([d for d in _ro_deals if d["id"] in (960001, 960002)])
 check("empty state: only Paused non-empty -> 'see Paused below'",
       "No live introductions right now — see Paused below for past ones." in _ro_intros_full())

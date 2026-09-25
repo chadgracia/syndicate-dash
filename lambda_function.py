@@ -7720,9 +7720,9 @@ def _intro_buyer_cell_html(primary, secondary, more_count, firm_won_index, key=N
 def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_person_id, surface, key=None,
                              view_as=None, anon_key_email=None, firm_won_index=None, company_repeated=False,
                              firm_person_ids=None, colleague_name=None, company_action=True):
-    """company_action=False drops the per-company deal action under the
-    company name (Active Intros' Paused rows: the Re-Open Deal button is
-    their only reopen affordance). Parity refactor: the ONE shared piece of column 1/2 logic for a buy
+    """company_action is accepted for caller parity; on surface="intros"
+    the per-company deal action renders in the row's last cell instead
+    (_intro_actions_cell_html), never in the company cell. Parity refactor: the ONE shared piece of column 1/2 logic for a buy
     deal's row, used by every row-builder below (_buy_deal_row_html,
     _buy_deal_row_edit_html, _pending_buy_deal_row_html,
     _closed_out_row_html) on BOTH surfaces. Everything past column 2
@@ -7766,15 +7766,16 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
     via_html = f'<span class="via-colleague-chip">via {_esc(colleague_name)}</span>' if colleague_name else ""
 
     if surface == "intros":
-        col1_td_open = '<td class="company">'
         company_name = _deal_company_name(deal)
         extra_cls = ""
         if company_name:
-            col1_html = (f'<a href="{_company_href(company_name, "intros", key, view_as)}">'
-                         f'{_esc(company_name)}</a>{via_html}')
-            if company_action:
-                col1_html += _company_update_link_html(tenant_person_id, company_name, anon_key_email)
+            # The whole cell is one link to the company page; the deal
+            # action lives in the row's last cell (_intro_actions_cell_html).
+            col1_td_open = '<td class="company company-link-cell">'
+            col1_html = (f'<a class="company-cell-link" href="{_company_href(company_name, "intros", key, view_as)}">'
+                         f'<span class="company-cell-name">{_esc(company_name)}</span>{via_html}</a>')
         else:
+            col1_td_open = '<td class="company">'
             col1_html = "—"
         if disclosed:
             primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
@@ -7848,6 +7849,8 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
     row_id = f' id="intro-row-{deal_id}"' if is_stalled else ""
     classes = " ".join(c for c in (extra_cls, "stalled-row" if is_stalled else "") if c)
     row_cls = f' class="{classes}"' if classes else ""
+    actions_td = (_intro_actions_cell_html(deal, tenant_person_id, anon_key_email)
+                  if surface == "intros" else "")
 
     if deal.get("_manual"):
         item = deal["_manual_item"]
@@ -7873,7 +7876,7 @@ def _buy_deal_row_html(deal, resolved, people_by_id, tenant_person_id, entry, ke
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
         f'<td>{status_html}</td>'
-        f'<td class="notes-cell">{notes_cell_html}</td></tr>'
+        f'<td class="notes-cell">{notes_cell_html}</td>{actions_td}</tr>'
     )
 
 
@@ -7891,6 +7894,8 @@ def _pending_buy_deal_row_html(deal, people_by_id, tenant_person_id, anon_key_em
         firm_person_ids=firm_person_ids, colleague_name=colleague_name)
     classes = " ".join(c for c in ("pending-row", extra_cls) if c)
     row_cls = f' class="{classes}"'
+    actions_td = (_intro_actions_cell_html(deal, tenant_person_id, anon_key_email)
+                  if surface == "intros" else "")
 
     return (
         f'<tr{row_cls}>{col1_open}{col1}</td>'
@@ -7898,7 +7903,7 @@ def _pending_buy_deal_row_html(deal, people_by_id, tenant_person_id, anon_key_em
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
         f'<td>{_status_pill_html("Matched")}</td>'
-        f'<td class="notes-cell pending-block">{block_html}</td></tr>'
+        f'<td class="notes-cell pending-block">{block_html}</td>{actions_td}</tr>'
     )
 
 
@@ -7939,6 +7944,7 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
     row_id = f' id="intro-row-{deal_id}"' if is_stalled else ""
     classes = " ".join(c for c in (extra_cls, "stalled-row" if is_stalled else "") if c)
     row_cls = f' class="{classes}"' if classes else ""
+    actions_td = _intro_actions_cell_html(deal, tenant_person_id, None) if surface == "intros" else ""
 
     if deal.get("_manual"):
         item = deal["_manual_item"]
@@ -7960,7 +7966,7 @@ def _buy_deal_row_edit_html(deal, people_by_id, tenant_person_id, intro_details,
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
         f'<td>{status_html}</td>'
-        f'<td class="notes-cell">{notes_cell_html}</td></tr>'
+        f'<td class="notes-cell">{notes_cell_html}</td>{actions_td}</tr>'
     )
 
 
@@ -8029,7 +8035,7 @@ def _loss_reason_notes_cell_html(deal, entry, edit_mode):
 def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_key_email, key=None, view_as=None,
                           surface="intros", firm_won_index=None, company_repeated=False, entry=None,
                           edit_mode=False, firm_person_ids=None, colleague_name=None, status_html=None,
-                          company_action=True):
+                          company_action=True, action_html=""):
     """Shared "Closed out" row builder (parity refactor): status_html, when
     given, replaces the outcome chip (a paused intro -- see
     _paused_intro_status_html). Status always
@@ -8064,6 +8070,9 @@ def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_k
         outcome_cls = "closed-out-row-won" if _deal_exit_outcome_name(deal) == "Closed" else "closed-out-row-passed"
     classes = " ".join(c for c in ("closed-out-row", outcome_cls, extra_cls) if c)
     row_cls = f' class="{classes}"'
+    actions_td = (_intro_actions_cell_html(deal, tenant_person_id, anon_key_email,
+                                           company_action=company_action, extra_html=action_html)
+                  if surface == "intros" else "")
 
     return (
         f'<tr{row_cls}>{col1_open}{col1}</td>'
@@ -8071,7 +8080,7 @@ def _closed_out_row_html(deal, disclosed, people_by_id, tenant_person_id, anon_k
         f'<td>{investor_type_cell}</td>'
         f'<td class="num">{_esc(_deal_size_text(deal))}</td>'
         f'<td>{status_html if status_html is not None else _closed_out_status_chip_html(deal, solid_won=is_company)}</td>'
-        f'<td class="notes-cell">{_loss_reason_notes_cell_html(deal, entry, edit_mode)}</td></tr>'
+        f'<td class="notes-cell">{_loss_reason_notes_cell_html(deal, entry, edit_mode)}</td>{actions_td}</tr>'
     )
 
 
@@ -9553,11 +9562,15 @@ def _reopen_deal_button_html(deal, stage, key=None):
             f'data-deal-name="{_esc(_deal_title(deal))}"{key_attr}>{REOPEN_DEAL_LABEL}</button>')
 
 
+def _paused_intro_chip_html():
+    return f'<span class="status-chip paused">{_esc(PAUSED_INTRO_TEXT)}</span>'
+
+
 def _paused_intro_status_html(deal, stage, key=None):
     """Status cell for an intro row paused by its company's closed Sell
-    deal (Active Intros' Closed out section)."""
-    return (f'<span class="status-chip paused">{_esc(PAUSED_INTRO_TEXT)}</span>'
-            f'{_reopen_deal_button_html(deal, stage, key=key)}')
+    deal (company page's paused block; Active Intros puts the button in
+    its ACTIONS column instead)."""
+    return f'{_paused_intro_chip_html()}{_reopen_deal_button_html(deal, stage, key=key)}'
 
 
 def _reopen_deal_script_html():
@@ -9609,6 +9622,18 @@ def _company_update_link_html(person_id, company_name, anon_key_email=None):
         return ""
     action = _deal_action_html(str(deal.get("id")), stage, stacked=True, public=_deal_is_public(deal))
     return f'<div class="company-update-link">{action}</div>' if action else ""
+
+
+def _intro_actions_cell_html(deal, tenant_person_id, anon_key_email, company_action=True, extra_html=""):
+    """Active Intros' right-most ACTIONS cell: the stacked deal action
+    (_company_update_link_html) unless company_action is False, plus
+    extra_html (a paused row's Re-Open Deal button). Always rendered on
+    surface="intros" so columns stay aligned across sections."""
+    company_name = _deal_company_name(deal)
+    inner = ""
+    if company_name and company_action:
+        inner = _company_update_link_html(tenant_person_id, company_name, anon_key_email)
+    return f'<td class="intro-actions">{inner}{extra_html or ""}</td>'
 
 
 def _investor_type_cell_html(buyer_recs):
@@ -10040,8 +10065,11 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         pending_block_by_id = {str(d.get("id")): items for d, _r, _sell, items in _buckets["pending"]}
         # Paused (company's Sell deals all closed): the "Paused" section,
         # counted in neither header.
-        paused_status_by_id = {str(d.get("id")): _paused_intro_status_html(sell, stage,
-                                                                           key=(key if edit_mode else None))
+        # Status shows the chip; the Re-Open Deal button goes in ACTIONS.
+        paused_status_by_id = {str(d.get("id")): _paused_intro_chip_html()
+                               for d, _r, _sell, _stage in _buckets["paused"]}
+        paused_action_by_id = {str(d.get("id")): _reopen_deal_button_html(sell, stage,
+                                                                          key=(key if edit_mode else None))
                                for d, _r, sell, stage in _buckets["paused"]}
         closed_out_disclosed_by_id = dict(closed_out_disclosed_by_id)
         for d, resolved, _sell, _stage in _buckets["paused"]:
@@ -10121,6 +10149,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
             '<th class="num">Size</th>'
             '<th title="Where this introduction stands">Status</th>'
             '<th>Notes</th>'
+            '<th class="intro-actions"></th>'
         )
 
         # "Paused (N)" then "Completed (N)" -- collapsed sections below
@@ -10136,7 +10165,8 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                 entry=intro_details.get(str(d.get("id"))) or {}, edit_mode=edit_mode,
                 firm_person_ids=firm_person_ids, colleague_name=_colleague_name_for(d),
                 status_html=paused_status_by_id.get(str(d.get("id"))),
-                company_action=str(d.get("id")) not in paused_status_by_id)
+                company_action=str(d.get("id")) not in paused_status_by_id,
+                action_html=paused_action_by_id.get(str(d.get("id")), ""))
                 for i, d in enumerate(rows))
             return f"""<details class="closed-out-section {cls}">
       <summary>{_esc(title)} <span class="count">({len(rows)})</span></summary>
@@ -10144,11 +10174,12 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         <table>
           <colgroup>
             <col style="width:13%">
-            <col style="width:24%">
+            <col style="width:22%">
             <col style="width:11%">
             <col style="width:7%">
             <col style="width:18%">
-            <col style="width:27%">
+            <col>
+            <col class="col-actions" style="width:{ACTION_COL_PX}px">
           </colgroup>
           <thead>
             <tr>
@@ -10185,9 +10216,9 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
         else:
             parts = []
             if pending_rows:
-                parts.append(_group_header_row_html(f"Pending ({len(pending_rows)})", 6))
+                parts.append(_group_header_row_html(f"Pending ({len(pending_rows)})", 7))
                 parts.append(
-                    f'<tr><td colspan="6" class="group-note">'
+                    f'<tr><td colspan="7" class="group-note">'
                     f"We're preparing these introductions — buyer identities appear here "
                     f'the moment we connect you.</td></tr>'
                 )
@@ -10216,7 +10247,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
 
             # "Pending" (top) only when there's something pending; "Active"
             # always renders, even with zero rows. Counts = _intro_buckets.
-            parts.append(_group_header_row_html(f"Active ({len(main_rows)})", 6))
+            parts.append(_group_header_row_html(f"Active ({len(main_rows)})", 7))
             if main_rows:
                 if edit_mode:
                     parts += [_buy_deal_row_edit_html(d, people_by_id, person_id, intro_details,
@@ -10240,18 +10271,19 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
                                                   colleague_name=_colleague_name_for(d))
                               for i, (d, resolved) in enumerate(main_rows)]
             else:
-                parts.append(_group_empty_row_html("No active introductions yet.", 6))
+                parts.append(_group_empty_row_html("No active introductions yet.", 7))
 
             rows_html = "".join(parts)
             table_html = f"""<div class="card">
       <table>
         <colgroup>
           <col style="width:13%">
-          <col style="width:24%">
+          <col style="width:22%">
           <col style="width:11%">
           <col style="width:7%">
           <col style="width:18%">
-          <col style="width:27%">
+          <col>
+          <col class="col-actions" style="width:{ACTION_COL_PX}px">
         </colgroup>
         <thead>
           <tr>
@@ -10496,6 +10528,21 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   /* Item 1 (turn 18): clear gap between the company name and the
      Update-deal link beneath it, matching My Deals' own deal-id-sub
      spacing fix. */
+  /* Whole company cell = one link to the company page. */
+  td.company-link-cell {{ padding: 0; height: 1px; }}
+  td.company a.company-cell-link {{ display: flex; flex-direction: column; justify-content: center;
+                                    height: 100%; padding: 11px 16px; border-bottom: none; cursor: pointer;
+                                    transition: background 0.12s; }}
+  td.company a.company-cell-link:hover {{ background: rgba(61,90,115,0.07); }}
+  .company-cell-name {{ align-self: flex-start; border-bottom: 1px solid var(--line); }}
+  a.company-cell-link:hover .company-cell-name {{ border-bottom-color: var(--muted); }}
+  td.company-link-cell .ab-row-trigger {{ margin: 0 16px 11px; }}
+  /* ACTIONS column: stacked deal action / Re-Open Deal, right-aligned. */
+  th.intro-actions, td.intro-actions {{ text-align: right; padding-left: 6px; padding-right: 6px; }}
+  td.intro-actions .company-update-link {{ margin-top: 0; }}
+  td.intro-actions .update-cancel-btn.stacked {{ margin: 0 0 0 auto; }}
+  td.intro-actions .reopen-deal-btn {{ margin: 0; padding: 4px 6px; white-space: normal; text-align: center;
+                                       max-width: 100%; }}
   .company-update-link {{ margin-top: 7px; }}
   .company-update-link a {{ display: inline-block; font-size: 11px; font-weight: 600; padding: 3px 9px;
                             border-radius: 6px; text-decoration: none; }}
