@@ -1644,25 +1644,39 @@ def _verify_sso_handoff(token):
         return None
 
 
-# Public base URL: CloudFront (desk.graciagroup.com, /dashboard* behavior)
-# forwards to this Lambda's Function URL with rawPath still starting
-# "/dashboard" -- _split_public_prefix strips it before routing. Every
-# absolute tenant link (login links, redirects after login) uses this;
-# in-app ?tab= links stay relative. Direct Function URL access (admin
-# ?key= use, rebuild_slim/warm tasks) keeps working unchanged.
-PUBLIC_BASE_URL = "https://desk.graciagroup.com/dashboard"
-PUBLIC_PATH_PREFIX = "/dashboard"
+# Public base URL: CloudFront (desk.graciagroup.com, /dashboard* and
+# /blockbook* behaviors) forwards to this Lambda's Function URL with rawPath
+# still starting with the public prefix -- _split_public_prefix strips either
+# one before routing. Every absolute tenant link (login links, redirects after
+# login) uses PUBLIC_BASE_URL, built from env BASE_PATH (default "/dashboard");
+# in-app ?tab= links stay relative. Direct Function URL access (admin ?key=
+# use, rebuild_slim/warm tasks) keeps working unchanged.
+PUBLIC_HOST_URL = "https://desk.graciagroup.com"
+DEFAULT_BASE_PATH = "/dashboard"
+
+
+def _public_base_url(base_path):
+    """PUBLIC_HOST_URL + base_path ("/blockbook", "blockbook/" -> "/blockbook");
+    unset/blank -> DEFAULT_BASE_PATH."""
+    base_path = (base_path or "").strip().strip("/")
+    return PUBLIC_HOST_URL + ("/" + base_path if base_path else DEFAULT_BASE_PATH)
+
+
+PUBLIC_BASE_URL = _public_base_url(os.environ.get("BASE_PATH"))
+PUBLIC_PATH_PREFIXES = ("/dashboard", "/blockbook")
 PUBLIC_COOKIE_DOMAIN = ".graciagroup.com"
 INVALID_LOGIN_LINK_TEXT = ("This link is invalid or has expired. Please contact "
                            "cgracia@rainmakersecurities.com for a new one.")
 
 
 def _split_public_prefix(raw_path):
-    """(path, via_public): rawPath with a leading "/dashboard" removed, so
-    /dashboard and /dashboard/ route exactly like "/"."""
+    """(path, via_public): rawPath with a leading public prefix ("/dashboard"
+    or "/blockbook", equivalent) removed, so /dashboard, /blockbook/ etc.
+    route exactly like "/"."""
     raw_path = raw_path or "/"
-    if raw_path == PUBLIC_PATH_PREFIX or raw_path.startswith(PUBLIC_PATH_PREFIX + "/"):
-        return raw_path[len(PUBLIC_PATH_PREFIX):] or "/", True
+    for prefix in PUBLIC_PATH_PREFIXES:
+        if raw_path == prefix or raw_path.startswith(prefix + "/"):
+            return raw_path[len(prefix):] or "/", True
     return raw_path, False
 
 

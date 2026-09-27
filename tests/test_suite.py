@@ -8128,6 +8128,102 @@ for _cl_q in ({"view": "client_links"}, {"key": "nope", "view": "client_links"})
           _r["statusCode"] == 403 and 'id="cl-search"' not in _r["body"])
 
 
+# --- Dual public prefix (/dashboard + /blockbook) and BASE_PATH -------------
+import importlib.util as _ilu
+
+
+def _bp_links():
+    """Every generated absolute tenant link, as (label, value) pairs."""
+    _login = _tl_path(f"/dashboard/login/{_tl_new}")
+    _sso = _tl_path("/dashboard", {"sso": _gi_sso, "tab": "overview"})
+    _cl = _tl_get({"key": ADMIN_KEY, "view": "client_links"})["body"]
+    _nav = _tl_get({"key": ADMIN_KEY, "view_as": _tl_email})["body"]
+    _url = lf._tenant_link_url(_tl_email)
+    return {
+        "login link": _url,
+        "post-login redirect": _login["headers"]["Location"],
+        "sso redirect": _sso["headers"]["Location"],
+        "client_links link": re.search(r'data-link="([^"]*/login/' + re.escape(_tl_new) + ')"', _cl).group(1),
+        "nav Copy client link": re.search(r'id="gg-copy-link-btn"[^>]*data-link="([^"]*)"|data-link="([^"]*)"[^>]*id="gg-copy-link-btn"', _nav).group(0),
+    }
+
+
+# (a) /dashboard/... and /blockbook/... route identically
+check("_split_public_prefix: /blockbook is equivalent to /dashboard",
+      [lf._split_public_prefix(p) for p in ("/blockbook", "/blockbook/", "/blockbook/login/abc")]
+      == [lf._split_public_prefix(p) for p in ("/dashboard", "/dashboard/", "/dashboard/login/abc")]
+      == [("/", True), ("/", True), ("/login/abc", True)])
+check("_split_public_prefix: unprefixed and look-alike paths are not public",
+      lf._split_public_prefix("/") == ("/", False) and lf._split_public_prefix(None) == ("/", False)
+      and lf._split_public_prefix("/login/abc") == ("/login/abc", False)
+      and lf._split_public_prefix("/blockbooks") == ("/blockbooks", False))
+for _bp_p in ("/blockbook", "/blockbook/"):
+    _r = _tl_path(_bp_p, None, cookies=_tl_ck)
+    check(f"{_bp_p} renders Overview for a signed-in tenant",
+          _r["statusCode"] == 200 and ">Overview<" in _r["body"])
+check("/blockbook/?tab=mydeals routes exactly like /dashboard/?tab=mydeals",
+      _tl_path("/blockbook/", {"tab": "mydeals"}, cookies=_tl_ck)["body"]
+      == _tl_path("/dashboard/", {"tab": "mydeals"}, cookies=_tl_ck)["body"])
+_bp_ld = _tl_path(f"/dashboard/login/{_tl_new}")
+_bp_lb = _tl_path(f"/blockbook/login/{_tl_new}")
+check("login link: /blockbook/login/<token> behaves exactly like /dashboard/login/<token>",
+      _bp_lb["statusCode"] == _bp_ld["statusCode"] == 302
+      and _bp_lb["headers"] == _bp_ld["headers"]
+      and [c.split(";", 1)[1] for c in _bp_lb["cookies"]] == [c.split(";", 1)[1] for c in _bp_ld["cookies"]]
+      and "Domain=.graciagroup.com" in _bp_lb["cookies"][0])
+check("login link: invalid token under /blockbook -> the same 403 page",
+      _tl_path("/blockbook/login/not-a-real-token")["body"]
+      == _tl_path("/dashboard/login/not-a-real-token")["body"])
+
+# (b) BASE_PATH unset -> links byte-identical to before
+check("BASE_PATH unset -> PUBLIC_BASE_URL is https://desk.graciagroup.com/dashboard",
+      "BASE_PATH" not in os.environ and lf.PUBLIC_BASE_URL == "https://desk.graciagroup.com/dashboard"
+      and lf._public_base_url(None) == lf._public_base_url("") == lf.PUBLIC_BASE_URL)
+_bp_default = _bp_links()
+check("BASE_PATH unset: login link unchanged",
+      _bp_default["login link"] == f"https://desk.graciagroup.com/dashboard/login/{_tl_new}")
+check("BASE_PATH unset: post-login redirect unchanged",
+      _bp_default["post-login redirect"] == "https://desk.graciagroup.com/dashboard/?tab=overview")
+check("BASE_PATH unset: sso redirect unchanged",
+      _bp_default["sso redirect"] == "https://desk.graciagroup.com/dashboard/?tab=overview")
+check("BASE_PATH unset: client_links link unchanged",
+      _bp_default["client_links link"] == f"https://desk.graciagroup.com/dashboard/login/{_tl_new}")
+check("BASE_PATH unset: nav Copy client link unchanged",
+      f'data-link="https://desk.graciagroup.com/dashboard/login/{_tl_new}"' in _bp_default["nav Copy client link"])
+
+# (c) BASE_PATH="/blockbook" -> every generated link uses /blockbook
+os.environ["BASE_PATH"] = "/blockbook"
+try:
+    _bp_spec = _ilu.spec_from_file_location("_lf_basepath_probe", lf.__file__)
+    _bp_mod = _ilu.module_from_spec(_bp_spec)
+    _bp_spec.loader.exec_module(_bp_mod)
+    check("BASE_PATH=/blockbook read from the environment at import",
+          _bp_mod.PUBLIC_BASE_URL == "https://desk.graciagroup.com/blockbook")
+finally:
+    del os.environ["BASE_PATH"]
+check("_public_base_url normalizes slashes",
+      lf._public_base_url("blockbook/") == lf._public_base_url("/blockbook") == "https://desk.graciagroup.com/blockbook")
+_bp_saved = lf.PUBLIC_BASE_URL
+lf.PUBLIC_BASE_URL = _bp_mod.PUBLIC_BASE_URL
+try:
+    _bp_bb = _bp_links()
+finally:
+    lf.PUBLIC_BASE_URL = _bp_saved
+check("BASE_PATH=/blockbook: login link", _bp_bb["login link"] == f"https://desk.graciagroup.com/blockbook/login/{_tl_new}")
+check("BASE_PATH=/blockbook: post-login redirect",
+      _bp_bb["post-login redirect"] == "https://desk.graciagroup.com/blockbook/?tab=overview")
+check("BASE_PATH=/blockbook: sso redirect", _bp_bb["sso redirect"] == "https://desk.graciagroup.com/blockbook/?tab=overview")
+check("BASE_PATH=/blockbook: client_links link",
+      _bp_bb["client_links link"] == f"https://desk.graciagroup.com/blockbook/login/{_tl_new}")
+check("BASE_PATH=/blockbook: nav Copy client link",
+      f'data-link="https://desk.graciagroup.com/blockbook/login/{_tl_new}"' in _bp_bb["nav Copy client link"])
+check("BASE_PATH=/blockbook: no generated link still points at /dashboard",
+      not any("/dashboard" in v for v in _bp_bb.values()))
+check("BASE_PATH=/blockbook: the same token still validates (signing unchanged)",
+      _bp_bb["login link"].rsplit("/login/", 1)[1] == _bp_default["login link"].rsplit("/login/", 1)[1]
+      and lf._verify_tenant_link_token(_tl_new) == _tl_email)
+
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)
