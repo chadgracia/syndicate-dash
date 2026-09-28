@@ -8263,13 +8263,27 @@ check("admin view_as unchanged: plain tenant name, no account menu / sign out",
       '<div class="gg-viewer">Alice Ov</div>' in _am_admin_va and "gg-account" not in _am_admin_va
       and "/signout" not in _am_admin_va)
 
-for _so_path in ("/dashboard/signout", "/blockbook/signout"):
+for _so_prefix in ("/dashboard", "/blockbook"):
+    _so_path = f"{_so_prefix}/signout"
     _so = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": _so_path,
                              "queryStringParameters": {}, "cookies": [tenant_cookie("alice@ovcap.com")]}, None)
     _so_cookies = _so.get("cookies") or []
-    check(f"{_so_path}: 302 to trades ?signout=1, no-store",
-          _so["statusCode"] == 302 and _so["headers"]["Location"] == "https://trades.graciagroup.com/?signout=1"
+    check(f"{_so_path}: 302 to the dashboard sign-in page under the same prefix, no-store",
+          _so["statusCode"] == 302
+          and _so["headers"]["Location"] == f"https://desk.graciagroup.com{_so_prefix}/"
           and _so["headers"].get("Cache-Control") == "no-store")
+    check(f"{_so_path}: never sends the person to trades",
+          "trades.graciagroup.com" not in _so["headers"]["Location"])
+    _ov_fresh()
+    _so_land = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}},
+                                  "rawPath": urllib.parse.urlparse(_so["headers"]["Location"]).path,
+                                  "queryStringParameters": {}, "cookies": []}, None)
+    _so_href = re.search(r'<a class="gg-signin-btn" href="([^"]+)">Sign in</a>', _so_land["body"])
+    _so_state = urllib.parse.parse_qs(urllib.parse.urlparse(
+        _am_html.unescape(_so_href.group(1)) if _so_href else "").query).get("state", [""])[0]
+    check(f"{_so_path}: lands on 'Sign in to your dashboard', state returns to {_so_prefix}/?tab=overview",
+          "Sign in to your dashboard" in _so_land["body"] and _so_state
+          and lf._b64u_decode(_so_state).decode() == f"https://desk.graciagroup.com{_so_prefix}/?tab=overview")
     check(f"{_so_path}: expires gg_id with Domain=.graciagroup.com",
           any(c.startswith("gg_id=;") and "Max-Age=0" in c and "Domain=.graciagroup.com" in c and "Path=/" in c
               and "Secure" in c and "SameSite=Lax" in c for c in _so_cookies))

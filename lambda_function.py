@@ -1758,9 +1758,10 @@ def _handle_login_link(token, via_public):
 
 
 # Sign-out: every cookie this app sets (gg_id in both its Domain and
-# host-only forms, plus the admin view toggle), expired; then trades'
-# own ?signout=1 so its session is cleared too.
-TRADES_SIGNOUT_URL = "https://trades.graciagroup.com/?signout=1"
+# host-only forms, plus the admin view toggle), expired; then the
+# dashboard's own sign-in page under the prefix the person signed out from.
+# Trades' ?signout=1 only expires cookies too (no Cognito /logout), and its
+# identity lives in the .graciagroup.com gg_id expired here.
 SIGNOUT_COOKIES = (
     f"gg_id=; Max-Age=0; Domain={PUBLIC_COOKIE_DOMAIN}; Path=/; Secure; HttpOnly; SameSite=Lax",
     "gg_id=; Max-Age=0; Path=/; Secure; SameSite=Lax",
@@ -1768,9 +1769,19 @@ SIGNOUT_COOKIES = (
 )
 
 
-def _handle_signout():
+def _request_base_url(raw_path):
+    """PUBLIC_HOST_URL + the public prefix this request came in under
+    ("/dashboard" or "/blockbook"); PUBLIC_BASE_URL when it has none."""
+    raw_path = raw_path or "/"
+    for prefix in PUBLIC_PATH_PREFIXES:
+        if raw_path == prefix or raw_path.startswith(prefix + "/"):
+            return PUBLIC_HOST_URL + prefix
+    return PUBLIC_BASE_URL
+
+
+def _handle_signout(raw_path=None):
     return {"statusCode": 302,
-            "headers": {"Location": TRADES_SIGNOUT_URL, "Cache-Control": "no-store"},
+            "headers": {"Location": f"{_request_base_url(raw_path)}/", "Cache-Control": "no-store"},
             "cookies": list(SIGNOUT_COOKIES), "body": ""}
 
 
@@ -1790,7 +1801,7 @@ def _signin_login_url(dest=None):
             f"&redirect_uri={COGNITO_REDIRECT_URI}&state={urllib.parse.quote(state, safe='')}")
 
 
-def _signin_page():
+def _signin_page(base_url=None):
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1812,7 +1823,7 @@ def _signin_page():
 <body>
 <div class="gg-card">
   <h1>Sign in to your dashboard</h1>
-  <a class="gg-signin-btn" href="{_esc(_signin_login_url())}">Sign in</a>
+  <a class="gg-signin-btn" href="{_esc(_signin_login_url(f"{base_url or PUBLIC_BASE_URL}/?tab=overview"))}">Sign in</a>
 </div>
 </body>
 </html>"""
@@ -15497,7 +15508,7 @@ def _lambda_handler_impl(event, context):
         return _handle_login_link(path[len("/login/"):], via_public)
 
     if path.rstrip("/") == "/signout":
-        return _handle_signout()
+        return _handle_signout(event.get("rawPath"))
 
     # The one write route: POST only. A GET here renders nothing and
     # changes nothing.
@@ -15657,7 +15668,7 @@ def _lambda_handler_impl(event, context):
     else:
         identity_email = _read_identity_email(event)
         if not identity_email:
-            return _html_response(_signin_page(), 403)
+            return _html_response(_signin_page(_request_base_url(event.get("rawPath"))), 403)
         tenant = _resolve_tenant(identity_email)
         if not tenant:
             return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True,
