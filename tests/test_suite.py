@@ -8224,6 +8224,115 @@ check("BASE_PATH=/blockbook: the same token still validates (signing unchanged)"
       and lf._verify_tenant_link_token(_tl_new) == _tl_email)
 
 
+
+# ======================================================================
+# SECTION: tenant account menu, /signout, signed-out sign-in page
+# ======================================================================
+
+import html as _am_html
+import urllib.parse
+
+_ov_fixture()
+_am_page = _ov_get("alice@ovcap.com", {"tab": "overview"})["body"]
+_am_hdr = _ov_header(_am_page)
+check("account menu: tenant header has the '<name> ▾' trigger",
+      '<button type="button" class="gg-account-trigger" aria-haspopup="true" aria-expanded="false">Alice Ov &#9662;</button>'
+      in _am_hdr)
+check("account menu: static 'Signed in as <email>' line",
+      '<div class="gg-account-item gg-account-static">Signed in as alice@ovcap.com</div>' in _am_hdr)
+check("account menu: Sign out links to PUBLIC_BASE_URL/signout",
+      f'<a class="gg-account-item" role="menuitem" href="{lf.PUBLIC_BASE_URL}/signout">Sign out</a>' in _am_hdr)
+check("account menu: ID-verified badge still in the header", "ID verified" in _am_hdr)
+for _am_tab in ("mydeals", "intros", "demand"):
+    _ov_fresh()
+    check(f"account menu: present on ?tab={_am_tab}",
+          "Signed in as alice@ovcap.com" in _ov_header(_ov_get("alice@ovcap.com", {"tab": _am_tab})["body"]))
+check("account menu: email is HTML-escaped",
+      "Signed in as a&amp;b&lt;x&gt;@ex.com" in lf._account_menu_html("A", "a&b<x>@ex.com"))
+
+_ov_fresh()
+_am_admin = _ov_header(lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                          "queryStringParameters": {"key": ADMIN_KEY}, "cookies": []}, None)["body"])
+_ov_fresh()
+_am_admin_va = _ov_header(lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                             "queryStringParameters": {"key": ADMIN_KEY, "view_as": "alice@ovcap.com"},
+                                             "cookies": [tenant_cookie("alice@ovcap.com")]}, None)["body"])
+check("admin view unchanged: plain 'Admin' viewer, no account menu",
+      '<div class="gg-viewer">Admin</div>' in _am_admin and "gg-account" not in _am_admin)
+check("admin view_as unchanged: plain tenant name, no account menu / sign out",
+      '<div class="gg-viewer">Alice Ov</div>' in _am_admin_va and "gg-account" not in _am_admin_va
+      and "/signout" not in _am_admin_va)
+
+for _so_path in ("/dashboard/signout", "/blockbook/signout"):
+    _so = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": _so_path,
+                             "queryStringParameters": {}, "cookies": [tenant_cookie("alice@ovcap.com")]}, None)
+    _so_cookies = _so.get("cookies") or []
+    check(f"{_so_path}: 302 to trades ?signout=1, no-store",
+          _so["statusCode"] == 302 and _so["headers"]["Location"] == "https://trades.graciagroup.com/?signout=1"
+          and _so["headers"].get("Cache-Control") == "no-store")
+    check(f"{_so_path}: expires gg_id with Domain=.graciagroup.com",
+          any(c.startswith("gg_id=;") and "Max-Age=0" in c and "Domain=.graciagroup.com" in c and "Path=/" in c
+              and "Secure" in c and "SameSite=Lax" in c for c in _so_cookies))
+    check(f"{_so_path}: expires host-only gg_id",
+          any(c.startswith("gg_id=;") and "Max-Age=0" in c and "Domain=" not in c and "Path=/" in c
+              and "Secure" in c and "SameSite=Lax" in c for c in _so_cookies))
+    check(f"{_so_path}: expires the admin view cookie too",
+          any(c.startswith(f"{lf.ADMIN_VIEW_COOKIE}=;") and "Max-Age=0" in c for c in _so_cookies))
+
+_ov_fresh()
+_si = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/dashboard/",
+                         "queryStringParameters": {"tab": "mydeals"}, "cookies": []}, None)
+_si_body = _si["body"]
+_si_href = re.search(r'<a class="gg-signin-btn" href="([^"]+)">Sign in</a>', _si_body)
+check("no session: sign-in page with heading and button",
+      "Sign in to your dashboard" in _si_body and _si_href is not None)
+_si_url = _am_html.unescape(_si_href.group(1)) if _si_href else ""
+_si_qs = urllib.parse.parse_qs(urllib.parse.urlparse(_si_url).query)
+check("no session: button goes to the trades Cognito hosted login",
+      _si_url.startswith("https://us-east-1dsttcaqx7.auth.us-east-1.amazoncognito.com/login?")
+      and _si_qs.get("client_id") == ["71vrglkidm13jb73u7nje3d1t2"]
+      and _si_qs.get("redirect_uri") == ["https://trades.graciagroup.com"]
+      and _si_qs.get("response_type") == ["code"])
+_si_state = (_si_qs.get("state") or [""])[0]
+check("no session: state = base64url-nopad(PUBLIC_BASE_URL/?tab=overview), trades' format",
+      "=" not in _si_state
+      and lf._b64u_decode(_si_state).decode() == f"{lf.PUBLIC_BASE_URL}/?tab=overview")
+check("no session: a garbage gg_id also gets the sign-in page",
+      "Sign in to your dashboard" in lf.lambda_handler(
+          {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/", "queryStringParameters": {},
+           "cookies": ["gg_id=bm9wZQ"]}, None)["body"])
+
+_ov_fresh()
+_nt = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                         "queryStringParameters": {}, "cookies": [tenant_cookie("stranger@nowhere.io")]}, None)["body"]
+check("signed-in non-tenant: not-a-tenant page plus a Sign out link",
+      "This dashboard is for sellers" in _nt and f'href="{lf.PUBLIC_BASE_URL}/signout">Sign out</a>' in _nt)
+
+# "updated …": production HEADs carry an ETag (the cache version), so the
+# time comes from LastModified, not from parsing the version.
+_ov_fixture()
+_up_s3 = lf._s3_client()
+_up_orig_head = _up_s3.head_object
+_up_when = datetime.now(timezone.utc) - timedelta(hours=3)
+_up_s3.head_object = lambda Bucket, Key: {"ETag": '"abc123"', "LastModified": _up_when}
+try:
+    lf._s3_version_cache.clear()
+    _ov_fresh()
+    check("Overview subtitle: ETag-versioned deals.json still shows 'updated 3 h ago'",
+          lf._overview_subtitle(1801, "alice@ovcap.com", "Alice Ov") == "Ov Capital · updated 3 h ago")
+    _up_s3.head_object = lambda Bucket, Key: {"ETag": '"abc124"'}
+    lf._s3_version_cache.clear()
+    lf._s3_last_modified.clear()
+    _ov_fresh()
+    check("Overview subtitle: unknown refresh time -> '· updated …' dropped",
+          lf._overview_subtitle(1801, "alice@ovcap.com", "Alice Ov") == "Ov Capital")
+finally:
+    _up_s3.head_object = _up_orig_head
+    lf._s3_version_cache.clear()
+    lf._s3_last_modified.clear()
+    _ov_fresh()
+
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)

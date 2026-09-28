@@ -1757,6 +1757,67 @@ def _handle_login_link(token, via_public):
             "cookies": [cookie], "body": ""}
 
 
+# Sign-out: every cookie this app sets (gg_id in both its Domain and
+# host-only forms, plus the admin view toggle), expired; then trades'
+# own ?signout=1 so its session is cleared too.
+TRADES_SIGNOUT_URL = "https://trades.graciagroup.com/?signout=1"
+SIGNOUT_COOKIES = (
+    f"gg_id=; Max-Age=0; Domain={PUBLIC_COOKIE_DOMAIN}; Path=/; Secure; HttpOnly; SameSite=Lax",
+    "gg_id=; Max-Age=0; Path=/; Secure; SameSite=Lax",
+    f"{ADMIN_VIEW_COOKIE}=; Max-Age=0; Path=/; Secure; SameSite=Lax",
+)
+
+
+def _handle_signout():
+    return {"statusCode": 302,
+            "headers": {"Location": TRADES_SIGNOUT_URL, "Cache-Control": "no-store"},
+            "cookies": list(SIGNOUT_COOKIES), "body": ""}
+
+
+# Sign-in: the same Cognito hosted login trades uses (trades'
+# _nav_login_url), state = base64url-nopad(destination). Trades' code
+# exchange accepts any https://desk.graciagroup.com/ destination and
+# returns there with &sso=<handoff>, which this Lambda turns into gg_id.
+COGNITO_LOGIN_URL = "https://us-east-1dsttcaqx7.auth.us-east-1.amazoncognito.com/login"
+COGNITO_CLIENT_ID = "71vrglkidm13jb73u7nje3d1t2"
+COGNITO_REDIRECT_URI = "https://trades.graciagroup.com"
+
+
+def _signin_login_url(dest=None):
+    dest = dest or f"{PUBLIC_BASE_URL}/?tab=overview"
+    state = _b64u(dest.encode())
+    return (f"{COGNITO_LOGIN_URL}?client_id={COGNITO_CLIENT_ID}&response_type=code&scope=openid+email"
+            f"&redirect_uri={COGNITO_REDIRECT_URI}&state={urllib.parse.quote(state, safe='')}")
+
+
+def _signin_page():
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in · Gracia Group</title>
+<style>
+  body {{ margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: #f4f2ee; color: #16181d; padding: 24px; box-sizing: border-box;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
+  .gg-card {{ background: #ffffff; border: 1px solid #e3ded4; border-radius: 12px; padding: 32px;
+             max-width: 420px; width: 100%; text-align: center; box-sizing: border-box; }}
+  h1 {{ font-size: 20px; margin: 0 0 20px; }}
+  .gg-signin-btn {{ display: inline-block; background: #3d5a73; color: #ffffff; text-decoration: none;
+                   font-weight: 600; padding: 10px 28px; border-radius: 8px; }}
+  .gg-signin-btn:hover {{ background: #2f475b; }}
+</style>
+</head>
+<body>
+<div class="gg-card">
+  <h1>Sign in to your dashboard</h1>
+  <a class="gg-signin-btn" href="{_esc(_signin_login_url())}">Sign in</a>
+</div>
+</body>
+</html>"""
+
+
 # Perf fix 5: one boto3 S3 client (and, below, one Dynamo Table binding)
 # reused across every call in the container's lifetime, instead of a
 # fresh boto3.client("s3")/boto3.resource("dynamodb") construction per
@@ -1787,6 +1848,7 @@ def _s3_client():
 # snapshots refresh hourly, so a <=60s-stale version is harmless).
 S3_VERSION_TTL_SECONDS = 60
 _s3_version_cache = {}   # key -> (version, time.monotonic() of the HEAD)
+_s3_last_modified = {}   # key -> LastModified datetime of the last HEAD (the version is the ETag)
 
 
 def _object_version(s3, key):
@@ -1800,6 +1862,8 @@ def _object_version(s3, key):
     etag = head.get("ETag")
     version = str(etag) if etag else head["LastModified"].isoformat()
     _s3_version_cache[key] = (version, now)
+    if head.get("LastModified") is not None:
+        _s3_last_modified[key] = head["LastModified"]
     return version
 
 
@@ -8890,6 +8954,43 @@ NAV_CSS = """
     font-size: 13px;
     white-space: nowrap;
   }
+  .gg-account { position: relative; display: inline-block; }
+  .gg-account-trigger {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    padding: 4px 0;
+  }
+  .gg-account-trigger:hover { color: var(--ink); }
+  .gg-account-menu {
+    display: none;
+    position: absolute;
+    top: 100%;
+    right: 0;
+    min-width: 200px;
+    max-width: min(320px, 92vw);
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.16);
+    z-index: 50;
+    padding: 6px 0;
+  }
+  .gg-account.open .gg-account-menu { display: block; }
+  .gg-account-item {
+    display: block;
+    padding: 6px 12px;
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 13px;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  a.gg-account-item:hover { background: rgba(61,90,115,0.08); }
+  .gg-account-static { color: var(--muted); font-size: 12px; cursor: default; }
   .gg-admin-badge {
     background: #7a1f1f;
     color: #ffffff;
@@ -9327,8 +9428,35 @@ def _mydeals_dropdown_html(person_id, key=None, view_as=None):
     )
 
 
+def _signout_url():
+    return f"{PUBLIC_BASE_URL}/signout"
+
+
+def _account_menu_html(viewer_name, email):
+    """Tenant header account menu ("<name> ▾"), matching trades' My Account
+    menu: a static "Signed in as <email>" line, then Sign out."""
+    return ('<div class="gg-account">'
+            '<button type="button" class="gg-account-trigger" aria-haspopup="true" aria-expanded="false">'
+            f'{_esc(viewer_name)} &#9662;</button>'
+            '<div class="gg-account-menu" role="menu">'
+            f'<div class="gg-account-item gg-account-static">Signed in as {_esc(email)}</div>'
+            f'<a class="gg-account-item" role="menuitem" href="{_esc(_signout_url())}">Sign out</a>'
+            '</div></div>')
+
+
+ACCOUNT_MENU_JS = """<script>
+(function() {
+  var wrap = document.querySelector('.gg-account');
+  var trigger = wrap && wrap.querySelector('.gg-account-trigger');
+  var menu = wrap && wrap.querySelector('.gg-account-menu');
+  if (!trigger || !menu) return;
+  GGDropdown.register(wrap, trigger, menu, {itemSelector: 'a[role="menuitem"]'});
+})();
+</script>"""
+
+
 def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True, edit_flag=False, cef_html="",
-              person_id=None):
+              person_id=None, account_email=None):
     suffix = _tab_qs_suffix(key, view_as)
     overview_href = f"?tab=overview{suffix}"
     overview_cls = "gg-tab gg-tab-primary active" if active_tab == "overview" else "gg-tab gg-tab-primary"
@@ -9343,6 +9471,12 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     # unqualified except for section (a)'s deal names, so even the
     # viewer's own identity stays off it. Every other page keeps showing it.
     viewer_html = _esc(viewer_name) if show_viewer else ""
+    # Account menu (signed-in tenant only: key is None and account_email is
+    # the verified gg_id email). Admin sessions keep the plain name.
+    account_script = ""
+    if show_viewer and key is None and account_email:
+        viewer_html = _account_menu_html(viewer_name, account_email)
+        account_script = ACCOUNT_MENU_JS
 
     # key is only ever non-None for a valid ADMIN_KEY session (see
     # lambda_handler's nav_key) — never for a real tenant, cookie or not —
@@ -9505,6 +9639,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
 </header>
 {DROPDOWN_JS}
 {mydeals_script}
+{account_script}
 {view_toggle_script}"""
 
 
@@ -9994,7 +10129,7 @@ def _intro_buckets(person_id, tenant_email, intro_details, edit_mode=False):
 
 
 def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, view_as=None, edit_mode=False,
-                        cef_html=""):
+                        cef_html="", account_email=None):
     """tenant is None only for admin-without-view_as — the same
     tenant-picker signal render_my_deals_page uses. tenant_email is always
     a real email otherwise (the logged-in tenant's own, or the previewed
@@ -10007,6 +10142,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     edit_mode is only ever True for a valid ADMIN_KEY (see lambda_handler)
     — never for a real tenant."""
     nav = _nav_html("intros", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                    account_email=account_email,
                      person_id=(tenant.get("person_id") if tenant is not None else None))
     tenant_picker = tenant is None
 
@@ -10878,10 +11014,15 @@ def _overview_subtitle(person_id, tenant_email, viewer_name):
     else:
         rec = get_people_by_ids({person_id}).get(person_id) if person_id is not None else None
         name = ((rec or {}).get("company_name") or "").strip() or viewer_name
+    # The cached version is the ETag in production (not a date), so read the
+    # LastModified recorded by the same HEAD.
     try:
-        refreshed = _parse_dt(_cached_object_version(_s3_client(), DEALS_KEY))
+        _cached_object_version(_s3_client(), DEALS_KEY)
+        refreshed = _s3_last_modified.get(DEALS_KEY)
     except Exception:
         refreshed = None
+    if refreshed is None:
+        return name
     return f"{name} · updated {_fmt_relative_time(refreshed)}"
 
 
@@ -11083,13 +11224,14 @@ OVERVIEW_CSS = """
 
 
 def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None, cef_html="",
-                         edit_mode=False, person_id=None, anon_key_email=None):
+                         edit_mode=False, person_id=None, anon_key_email=None, account_email=None):
     """?tab=overview -- the tenant's default landing page (see
     lambda_handler). Five sections: summary tiles, "Needs your
     attention" (My Deals' red chips), "Open deals", "Active intros"
     (most recent updates), "Track record". deals is the same Sell-deal
     list My Deals gets (get_firm_sell_deals -- team/firm scoped)."""
     nav = _nav_html("overview", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                    account_email=account_email,
                     person_id=person_id)
     suffix = _tab_qs_suffix(key, view_as)
     if tenant_picker:
@@ -11469,12 +11611,13 @@ def _my_deals_model(deals, person_id, anon_key_email):
 
 
 def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None, view_as=None, cef_html="",
-                          edit_mode=False, person_id=None, anon_key_email=None):
+                          edit_mode=False, person_id=None, anon_key_email=None, account_email=None):
     """deals is always Sell-order-tagged only (see lambda_handler's mydeals
     branch). person_id/anon_key_email are needed here (not just deals)
     because the Buyers/Intros/Needs-attention columns are company-level
     buy-side signals, not attributes of the Sell deal itself."""
     nav = _nav_html("mydeals", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                    account_email=account_email,
                      person_id=person_id)
 
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
@@ -13984,7 +14127,7 @@ SELL_ORDER_MAILTO_URL = (
 )
 
 
-def _message_page(title, message, show_signin=False, show_sell_cta=False):
+def _message_page(title, message, show_signin=False, show_sell_cta=False, show_signout=False):
     """Standalone pre-auth / not-enabled page. Reuses the board's own dark
     palette (not the nav's) since there's no tab shell to sit under here.
 
@@ -14019,6 +14162,8 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
                                f'companies with completed purchases.</p>'
                                if stats["companies_count"] else "")
             raised_html = f'<p class="raised-headline">{_esc(headline_text)} closed for sellers through this desk</p>{companies_html}'
+    if show_signout:
+        signin_html += f'<p><a class="gg-link" href="{_esc(_signout_url())}">Sign out</a></p>'
     sell_cta_html = ""
     if show_sell_cta:
         sell_cta_html = (
@@ -14072,7 +14217,7 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False):
 
 
 def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
-                 tenant_picker=False, edit_mode=False, person_id=None):
+                 tenant_picker=False, edit_mode=False, person_id=None, account_email=None):
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="demand", edit_mode=edit_mode)
     tenant_picker_html = _tenant_picker_html() if tenant_picker else ""
@@ -14125,6 +14270,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
         </tr>"""
         legend_html = ""
     nav = _nav_html("demand", viewer_name, key=key, view_as=view_as, edit_flag=edit_mode, cef_html=cef_html,
+                    account_email=account_email,
                      person_id=person_id)
     # Tenant layout tightened to ~760px (4 lean columns) so it doesn't
     # float in whitespace; admin's wider 6-column table keeps 1000px.
@@ -15350,6 +15496,9 @@ def _lambda_handler_impl(event, context):
             return _forbidden()
         return _handle_login_link(path[len("/login/"):], via_public)
 
+    if path.rstrip("/") == "/signout":
+        return _handle_signout()
+
     # The one write route: POST only. A GET here renders nothing and
     # changes nothing.
     if query.get("action") == "update_intro":
@@ -15508,19 +15657,17 @@ def _lambda_handler_impl(event, context):
     else:
         identity_email = _read_identity_email(event)
         if not identity_email:
-            return _html_response(_message_page(
-                "Access denied",
-                "Sign in to view the Demand Board.",
-                show_signin=True,
-            ), 403)
+            return _html_response(_signin_page(), 403)
         tenant = _resolve_tenant(identity_email)
         if not tenant:
-            return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True))
+            return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True,
+                                                show_signout=True))
         viewer_name = tenant["name"]
         anon_key_email = identity_email.strip().lower()
 
     nav_key = query.get("key") if is_admin_key else None
     nav_view_as = view_as or None
+    account_email = None if is_admin_key else identity_email
 
     # Edit UI (Intro Status / Next Steps / Buyer Notes, real names/admin
     # controls everywhere else) is admin-only and, when previewing a
@@ -15592,14 +15739,16 @@ def _lambda_handler_impl(event, context):
         deals = get_firm_sell_deals(person_id) if person_id is not None else []
         body = render_overview_page(viewer_name, deals=deals, tenant_picker=(tenant is None),
                                     key=nav_key, view_as=nav_view_as, cef_html=cef_html, edit_mode=edit_mode,
-                                    person_id=person_id, anon_key_email=anon_key_email)
+                                    person_id=person_id, anon_key_email=anon_key_email,
+                                    account_email=account_email)
         return _html_response(body)
 
     if tab == "demand":
         table = get_company_table()
         body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as, cef_html=cef_html,
                             anon_key_email=anon_key_email, tenant_picker=(tenant is None), edit_mode=edit_mode,
-                            person_id=(tenant.get("person_id") if tenant is not None else None))
+                            person_id=(tenant.get("person_id") if tenant is not None else None),
+                            account_email=account_email)
     elif tab == "mydeals":
         if tenant is None:
             body = render_my_deals_page(viewer_name, tenant_picker=True,
@@ -15615,9 +15764,10 @@ def _lambda_handler_impl(event, context):
             deals = (get_firm_sell_deals(person_id) if person_id is not None else [])
             body = render_my_deals_page(viewer_name, deals=deals,
                                          key=nav_key, view_as=nav_view_as, cef_html=cef_html,
-                                         edit_mode=edit_mode, person_id=person_id, anon_key_email=anon_key_email)
+                                         edit_mode=edit_mode, person_id=person_id, anon_key_email=anon_key_email,
+                                         account_email=account_email)
     else:
         body = render_intros_page(viewer_name, tenant=tenant, tenant_email=anon_key_email,
                                    key=nav_key, view_as=nav_view_as, edit_mode=edit_mode,
-                                   cef_html=cef_html)
+                                   cef_html=cef_html, account_email=account_email)
     return _html_response(body)
