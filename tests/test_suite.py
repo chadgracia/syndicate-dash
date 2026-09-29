@@ -8359,6 +8359,28 @@ finally:
     _ov_fresh()
 
 
+# ---- Person title: people.json carries it in "position" ----
+check("_person_title: position used when title absent",
+      lf._person_title({"position": " Quantitative Research "}) == "Quantitative Research")
+check("_person_title: title wins over position", lf._person_title({"title": "CIO", "position": "PM"}) == "CIO")
+check("_person_title: blank title falls back to position", lf._person_title({"title": " ", "position": "PM"}) == "PM")
+check("_person_title: both blank -> ''", lf._person_title({"title": "", "position": None}) == "")
+_pt_rec = {"id": 1006269812, "first_name": "Matko", "last_name": "Botincan", "position": "Quantitative Research",
+           "work_city": "London", "work_country": "United Kingdom", "custom_fields": {}}
+_pt_head = lf._buyer_header_html(_pt_rec, None)
+check("buyer header: position renders on the title line",
+      '<div class="buyer-header-line">Quantitative Research &middot; London, United Kingdom</div>' in _pt_head)
+_pt_blank = lf._buyer_header_html(dict(_pt_rec, position=""), None)
+check("buyer header: no title -> no leading separator",
+      '<div class="buyer-header-line">London, United Kingdom</div>' in _pt_blank)
+check("deal-team card: position renders",
+      '<div class="buyer-page-row">Quantitative Research</div>' in lf._deal_team_member_html(_pt_rec))
+check("deal-team card: no title -> no empty title row",
+      '<div class="buyer-page-row"></div>' not in lf._deal_team_member_html(dict(_pt_rec, position="")))
+check("anonymized buyer card never shows the title",
+      "Quantitative Research" not in lf._buyer_page_anonymized_html(_pt_rec, "seller@example.com", 1006269812))
+
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)

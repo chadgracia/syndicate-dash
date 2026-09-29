@@ -13113,6 +13113,16 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 </html>"""
 
 
+def _person_title(rec):
+    """A person's job title: people.json carries it in "position"; "title"
+    is read first in case a record ever has it. "" when both are blank."""
+    for k in ("title", "position"):
+        v = (rec or {}).get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
 def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_headline="", bio_edit_html=""):
     """Turn 24: the buyer page's single header card, merging what used
     to be two separate blocks (IDENTITY + CAPACITY, turn 23) into one —
@@ -13137,7 +13147,7 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_headline=""
     photo_html = (f'<img class="buyer-header-photo" src="{_photo_href(rec.get("id"), key, view_as)}" '
                   f'alt="" width="64" height="64">')
     name = _esc(_person_display_name(rec) or "—")
-    title = (rec.get("title") or "").strip()
+    title = _person_title(rec)
     cf = rec.get("custom_fields") or {}
     transactor_ids = cf_list(cf, TRANSACTOR_TYPE_FIELD)
     transactor_id = transactor_ids[0] if transactor_ids else None
@@ -13264,7 +13274,7 @@ def _deal_team_member_html(rec, key=None, view_as=None):
     href = _buyer_href(rec.get("id"), key, view_as)
     photo_html = (f'<img class="deal-team-avatar" src="{_photo_href(rec.get("id"), key, view_as)}" '
                   f'alt="" width="28" height="28">')
-    title = (rec.get("title") or "").strip()
+    title = _person_title(rec)
     title_html = f'<div class="buyer-page-row">{_esc(title)}</div>' if title else ""
     contact_parts = []
     email = _person_email_text(rec)
