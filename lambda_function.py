@@ -5230,7 +5230,7 @@ def _bio_points_card_html(points):
 
 
 def _bio_edit_html(person_id, bio_text):
-    """Admin-only (&edit=1) inline editor on the person card. Posts to
+    """Admin-only (edit_mode) inline editor on the person card. Posts to
     ?action=save_bio; the server re-checks ADMIN_KEY, so this is never
     the only gate."""
     return (
@@ -13787,7 +13787,7 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
 
 
 def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=None, view_as=None, edit_mode=False,
-                       cef_html="", bio_edit=False):
+                       cef_html=""):
     """Item 3 (turn 18): ?buyer=<person_id> — replaces the old inline
     <details> expansion on Active Intros with a real page. DISCLOSURE
     GATE: the full profile (turn 24 layout — one header card, then a
@@ -13838,12 +13838,12 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
             if full_access:
                 closer_kind = _closer_kind(rec, _build_firm_won_index())
                 # Public Bio: headline under the location line, points in
-                # the "Before your call" card under the header. bio_edit
-                # (admin + &edit=1 only, see lambda_handler) adds the
-                # inline editor; a tenant never gets it.
+                # the "Before your call" card under the header. edit_mode
+                # (admin key + Admin view) adds the inline editor, even
+                # when the bio is empty; Tenant view / tenants never get it.
                 bio_text = _person_public_bio(rec)
                 bio_headline, bio_points = parse_public_bio(bio_text)
-                bio_edit_on = bool(bio_edit and edit_mode and key)
+                bio_edit_on = bool(edit_mode and key)
                 header_html = _buyer_header_html(rec, closer_kind, key=key, view_as=view_as,
                                                  bio_headline=bio_headline,
                                                  bio_edit_html=(_bio_edit_html(buyer_id, bio_text)
@@ -15727,8 +15727,7 @@ def _lambda_handler_impl(event, context):
     buyer_param = query.get("buyer")
     if buyer_param:
         body = render_buyer_page(buyer_param, viewer_name, tenant, anon_key_email,
-                                  key=nav_key, view_as=nav_view_as, edit_mode=edit_mode, cef_html=cef_html,
-                                  bio_edit=(is_admin_key and query.get("edit") == "1"))
+                                  key=nav_key, view_as=nav_view_as, edit_mode=edit_mode, cef_html=cef_html)
         return _html_response(body)
 
     # Buyer photo (item 1): not an HTML page -- a 302 to Pipeline's signed

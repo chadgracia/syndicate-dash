@@ -5775,18 +5775,19 @@ carol_cleared = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMA
 check("display: an empty Dynamo bio renders nothing (no CRM fallback)",
       "Carol CRM headline" not in carol_cleared and "bio-headline" not in carol_cleared)
 
-admin_noedit = lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
-                                    view_as=TENANT_EMAIL, edit_mode=True, bio_edit=False)
-check("admin view without &edit=1: bio shown, no edit textarea",
-      "Dynamo head" in admin_noedit and 'id="bio-edit-text"' not in admin_noedit)
 admin_edit = lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
-                                  view_as=TENANT_EMAIL, edit_mode=True, bio_edit=True)
-check("admin view with &edit=1: bio textarea prefilled (escaped) + Save",
+                                  view_as=TENANT_EMAIL, edit_mode=True)
+check("admin view (edit_mode): bio textarea prefilled (escaped) + Save",
       'id="bio-edit-text"' in admin_edit and "Dynamo head &lt;i&gt; • Point one • Point &lt;two&gt;" in admin_edit
       and 'id="bio-edit-save"' in admin_edit and "?action=save_bio" in admin_edit)
-check("bio_edit without edit_mode/key (tenant) never renders the editor",
-      'id="bio-edit-text"' not in lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None,
-                                                   view_as=None, edit_mode=False, bio_edit=True))
+admin_empty = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
+                                   view_as=TENANT_EMAIL, edit_mode=True)
+check("admin view: editor shown even when the bio is empty, with placeholder",
+      'id="bio-edit-text"' in admin_empty and 'placeholder="Headline • point • point"' in admin_empty
+      and "?action=save_bio" in admin_empty)
+check("admin Tenant view (edit_mode False): no bio editor",
+      'id="bio-edit-text"' not in lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
+                                                   view_as=TENANT_EMAIL, edit_mode=False))
 
 def _bio_get(query, cookies=None):
     return {"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
@@ -5798,6 +5799,17 @@ check("tenant with &edit=1: page renders but no bio editor",
       and 'id="bio-edit-text"' not in tenant_edit_resp["body"])
 admin_edit_resp = lf.lambda_handler(_bio_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL, "edit": "1"}), None)
 check("admin &view_as&edit=1 via handler: bio editor shown", 'id="bio-edit-text"' in admin_edit_resp["body"])
+admin_cookie_resp = lf.lambda_handler(_bio_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL},
+                                               ["gg_admin_view=admin"]), None)
+check("admin view toggle (cookie, no &edit=1) via handler: bio editor shown",
+      'id="bio-edit-text"' in admin_cookie_resp["body"])
+admin_tenantview_resp = lf.lambda_handler(_bio_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL},
+                                                   ["gg_admin_view=tenant"]), None)
+check("admin Tenant view via handler: no bio editor",
+      admin_tenantview_resp["statusCode"] == 200 and 'id="bio-edit-text"' not in admin_tenantview_resp["body"])
+admin_bare_resp = lf.lambda_handler(_bio_get({"buyer": "2", "key": ADMIN_KEY}), None)
+check("admin without view_as via handler: no tenant picked, no bio editor",
+      'id="bio-edit-text"' not in admin_bare_resp["body"])
 tenant_bulk = lf.lambda_handler(_bio_get({"view": "bios"}, [tenant_cookie(TENANT_EMAIL)]), None)
 check("tenant: bulk bios route is 403 and renders no form",
       tenant_bulk["statusCode"] == 403 and "bios" not in tenant_bulk["body"])
