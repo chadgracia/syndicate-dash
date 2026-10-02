@@ -8526,10 +8526,14 @@ def _st_ref(pid, ticked=True, client="13"):
     c = _st_cs(int(client), {client: {"referrals": [{"person_id": str(pid), "confirmed_unrelated": ticked}]}})
     return c["referrals"][0], c
 _r, _c = _st_ref(5)
-check("referral: buyer with IQF Unnecessary + box ticked -> Confirmed",
+check("referral: buyer with IQF Unnecessary -> Confirmed",
       _r["confirmed"] and _c["confirmed_referrals"] == 1 and _c["pending_referrals"] == 0)
 _r, _c = _st_ref(5, False)
-check("referral: onboarded but box unticked -> not confirmed", not _r["confirmed"] and _c["pending_referrals"] == 1)
+check("referral: stored confirmed_unrelated=false is ignored -> Confirmed",
+      _r["confirmed"] and _c["confirmed_referrals"] == 1 and _c["pending_referrals"] == 0
+      and _c["record"]["referrals"][0]["confirmed_unrelated"] is True)
+check("referral: same-firm referral is not counted as pending onboarding",
+      _st_ref(9, client="2")[1]["pending_referrals"] == 0)
 check("referral: seller (Sell deal) without the engagement form -> pending, needs engagement form",
       (lambda r: not r["confirmed"] and r["missing"] == ["engagement form"] and r["role"] == "Seller")(_st_ref(15)[0]))
 check("referral: buyer (default role) with only the engagement form -> pending, needs IQF",
@@ -8540,7 +8544,7 @@ check("referral: seller (Sell Interest) with the engagement form only -> Confirm
       (lambda r: r["confirmed"] and r["role"] == "Seller")(_st_ref(16)[0]))
 check("referral: buyer (Buy Interest) with IQF Unnecessary and no Investor Level -> Confirmed",
       (lambda r: r["confirmed"] and r["role"] == "Buyer")(_st_ref(17)[0]))
-check("referral: same-firm referral never counts even when onboarded and ticked",
+check("referral: same-firm referral never counts even when onboarded",
       (lambda r: r[0]["related"] and r[0]["onboarded"] and not r[0]["confirmed"] and r[1]["confirmed_referrals"] == 0)(
           _st_ref(9, client="2")))
 check("referral: CEF N/A is not Yes", not _st_ref(10)[0]["confirmed"])
@@ -8556,8 +8560,8 @@ check("referral: shared corporate email domain flagged related", _st_ref(9, clie
 check("referral: shared free-mail domain (gmail) not related", not _st_ref(8, client="2")[0]["related"])
 check("referral: unrelated firm not flagged", not _st_ref(5, client="2")[0]["related"])
 check("referral: only confirmed count toward Preferred",
-      _st_cs(13, {"13": {"referrals": [{"person_id": "7", "confirmed_unrelated": True},
-                                       {"person_id": "5", "confirmed_unrelated": False}]}})["tier"] is None)
+      _st_cs(13, {"13": {"referrals": [{"person_id": "14", "confirmed_unrelated": True},
+                                       {"person_id": "15", "confirmed_unrelated": True}]}})["tier"] is None)
 
 # --- Admin gating
 def _st_get(q, cookies=None):

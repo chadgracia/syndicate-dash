@@ -14762,8 +14762,10 @@ def _standing_client_record(raw):
     refs = []
     for r in raw.get("referrals") or []:
         if isinstance(r, dict) and str(r.get("person_id") or "").strip().isdigit():
+            # confirmed_unrelated is kept for backward compatibility but no
+            # longer means anything: every referral reads as True.
             refs.append({"person_id": str(r["person_id"]).strip(),
-                         "confirmed_unrelated": r.get("confirmed_unrelated") is True,
+                         "confirmed_unrelated": True,
                          "added_at": r.get("added_at")})
     rec["referrals"] = refs
     rec["trade_edits"] = _standing_trade_edits(raw.get("trade_edits"))
@@ -14990,7 +14992,7 @@ def _standing_referral_detail(client_pid, client_rec, ref_pid, by_id):
     the client, and has completed the form(s) their role requires (seller:
     engagement form Yes/N/A; buyer: IQF Yes/Unnecessary; both: both);
     "missing" lists what is still needed. A referral is Confirmed when
-    onboarded AND the relationship checkbox (confirmed_unrelated) is ticked."""
+    onboarded and not same-firm (no relationship checkbox)."""
     ref_pid = str(ref_pid)
     rec = by_id.get(ref_pid)
     cf = (rec or {}).get("custom_fields") or {}
@@ -15068,7 +15070,7 @@ def compute_client_standing(person_id, state=None):
         detail["confirmed_unrelated"] = r["confirmed_unrelated"]
         detail["added_at"] = r.get("added_at")
         # Same-firm referrals (shared company_id / corporate domain) never count.
-        detail["confirmed"] = detail["onboarded"] and r["confirmed_unrelated"] and not detail["related"]
+        detail["confirmed"] = detail["onboarded"] and not detail["related"]
         referrals.append(detail)
     confirmed = sum(1 for r in referrals if r["confirmed"])
     computed = _standing_computed_tier(good_standing, tr["volume"], tr["trades_250k"], tr["trades_1m"], confirmed)
@@ -15081,7 +15083,7 @@ def compute_client_standing(person_id, state=None):
         "won_deals": won_deals, "trades": tr["trades"], "volume": tr["volume"],
         "trades_250k": tr["trades_250k"], "trades_1m": tr["trades_1m"], "unknown_size": tr["unknown_size"],
         "items": items, "done_count": sum(1 for i in items if i["done"]), "good_standing": good_standing,
-        "referrals": referrals, "confirmed_referrals": confirmed, "pending_referrals": len(referrals) - confirmed,
+        "referrals": referrals, "confirmed_referrals": confirmed, "pending_referrals": sum(1 for r in referrals if not (r["confirmed"] or r["related"] or r["self"])),
         "computed_tier": computed, "tier": tier, "discount_pct": STANDING_DISCOUNT_PCT.get(tier, 0),
     }
 
@@ -15358,7 +15360,7 @@ def _validate_standing_client(pid, raw, now, old_refs):
             return None, (f"{pid}: referral #{rp} shares a company or corporate email domain with the client; "
                           "same-firm referrals never count")
         seen.add(rp)
-        refs.append({"person_id": rp, "confirmed_unrelated": r.get("confirmed_unrelated") is True,
+        refs.append({"person_id": rp, "confirmed_unrelated": True,
                      "added_at": old_added.get(rp) or now})
     rec["referrals"] = refs
     edits_in = raw.get("trade_edits", {})
@@ -15704,7 +15706,7 @@ STANDING_PAGE_JS = r"""
       t250: known.filter(function(v) { return v >= D.size_250k; }).length,
       t1m: known.filter(function(v) { return v >= D.size_1m; }).length, unknown: list.length - known.length};
   }
-  function refConfirmed(x) { return !!(x.onboarded && x.confirmed_unrelated); }
+  function refConfirmed(x) { return !!(x.onboarded && !x.related && !x.self); }
   function standing(r) {
     var s = cur(r), rec = s.rec, ts = tradeStats(r);
     var roles = r.roles || {seller: false, buyer: true};
@@ -15824,7 +15826,6 @@ STANDING_PAGE_JS = r"""
     if (x.self) return '<span class="st-warn">this is the client</span>';
     if (x.related) return '<span class="st-warn">Same firm — never counts</span>';
     if (!x.onboarded) return '<span class="st-amber">Pending onboarding — needs ' + esc((x.missing || []).join(' and ')) + '</span>';
-    if (!x.confirmed_unrelated) return '<span class="st-amber">Pending — tick the relationship box to confirm</span>';
     return '<span class="st-yes">Confirmed</span>';
   }
   function refLine(x) {
@@ -15836,8 +15837,6 @@ STANDING_PAGE_JS = r"""
     var s = cur(r);
     var list = s.refs.map(function(x, i) {
       return '<div style="padding:6px 0;border-bottom:1px solid #ececea">' + refLine(x) +
-        '<label><input type="checkbox" data-act="refok" data-i="' + i + '"' + (x.confirmed_unrelated ? ' checked' : '') +
-        '> Not a household member, related entity or colleague of this client</label> ' +
         '<button type="button" data-act="refdel" data-i="' + i + '">Remove</button></div>';
     }).join('') || '<div class="st-muted">No referrals yet.</div>';
     return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><h2>Referrals for ' + esc(r.name) + '</h2>' + list +
@@ -15912,10 +15911,10 @@ STANDING_PAGE_JS = r"""
       edit(r).rec.manual_trades.push({label: label, size_usd: size, date: date || ''}); render();
     }
     else if (act === 'refadd') { var x = JSON.parse(el.getAttribute('data-ref')); var s2 = edit(r);
-      if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = false; s2.refs.push(x); }
+      if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = true; s2.refs.push(x); }
       render(); }
   });
-  var CHANGE_ACTS = {sel: 1, visible: 1, floor: 1, refok: 1, tinc: 1};
+  var CHANGE_ACTS = {sel: 1, visible: 1, floor: 1, tinc: 1};
   body.addEventListener('change', function(e) {
     var el = e.target, act = el.getAttribute('data-act');
     if (!act || !CHANGE_ACTS[act]) return;
@@ -15924,7 +15923,6 @@ STANDING_PAGE_JS = r"""
     var s = edit(r);
     if (act === 'visible') s.rec.visible = el.checked;
     else if (act === 'floor') s.rec.tier_floor = el.value || null;
-    else if (act === 'refok') s.refs[+el.getAttribute('data-i')].confirmed_unrelated = el.checked;
     else if (act === 'tinc') { var did = el.closest('tr[data-deal]').getAttribute('data-deal');
       var te = s.rec.trade_edits[did] || (s.rec.trade_edits[did] = {size_usd: null, excluded: false});
       te.excluded = !el.checked; cleanEdit(s.rec, did); }
@@ -16018,7 +16016,7 @@ STANDING_PAGE_JS = r"""
       clients[r.id] = {visible: !!s.rec.visible, terms_repair: s.rec.terms_repair, payments_repair: s.rec.payments_repair,
         respond_repair: s.rec.respond_repair, tier_floor: s.rec.tier_floor || null, notes: s.rec.notes || '',
         trade_edits: s.rec.trade_edits, manual_trades: s.rec.manual_trades,
-        referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: !!x.confirmed_unrelated}; })};
+        referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: true}; })};
     });
     if (!Object.keys(clients).length) { msg('st-ok', 'Nothing to save.'); return; }
     saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
@@ -16044,8 +16042,8 @@ STANDING_PAGE_JS = r"""
 # A CSV of "who referred this person" guesses (extracted from Pipeline
 # summaries) is loaded into REFERRAL_SUGGESTIONS_KEY; Chad approves or
 # skips each one. Nothing becomes a referral until approved: an approval
-# adds the referred person to the REFERRER's client-standing referrals
-# (relationship box ticked). Same-firm pairs (_standing_related) never
+# adds the referred person to the REFERRER's client-standing referrals.
+# Same-firm pairs (_standing_related) never
 # count: dropped at load, hidden on view, refused on approve. Same
 # rev-conflict and daily backup rules as client-standing.json.
 REFERRAL_SUGGESTIONS_KEY = "syndicate-dash/referral-suggestions.json"
