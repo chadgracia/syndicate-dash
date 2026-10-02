@@ -8360,15 +8360,17 @@ finally:
 
 
 # ======================================================================
-# SECTION: Client Standing -- tier math, referrals, save (rev/backup/
-# history), admin gating, seller surfaces, desk JSON
+# SECTION: Client Standing -- won-deal trades (both sides, sizes), tier
+# rules, referrals (confirmed/pending), repairs, per-person visibility,
+# save (rev/backup/history/migration), admin gating, seller surfaces, JSON
 # ======================================================================
 _ST_IL = lf.INVESTOR_LEVEL_FIELD
+_ST_GOOD = {lf.CEF_FIELD: lf.CEF_YES_ID, lf.IQF_FIELD: 6496840}
 _st_people = {"people": [
     {"id": 1, "full_name": "Sella Seller", "email": TENANT_EMAIL, "custom_fields": {}},
     {"id": 2, "full_name": "Alice Standing", "email": "alice@alphacap.com", "emails": ["alice@gmail.com"],
-     "company_id": 50, "company_name": "Alpha Cap", "won_deals_total": 2,
-     "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, lf.IQF_FIELD: 6496840, _ST_IL: lf.QP_ID}},
+     "company_id": 50, "company_name": "Alpha Cap", "won_deals_total": 3,
+     "custom_fields": dict(_ST_GOOD, **{_ST_IL: lf.QP_ID})},
     {"id": 3, "full_name": "Bob Pending", "email": "bob@betafund.com", "company_id": 51, "company_name": "Beta Fund",
      "custom_fields": {lf.CEF_FIELD: lf.CEF_NO_ID}},
     {"id": 5, "full_name": "Rita Referred", "email": "rita@ritafund.com", "company_id": 60,
@@ -8384,8 +8386,11 @@ _st_people = {"people": [
     {"id": 11, "full_name": "Sam Substantive", "email": "sam@samco.com",
      "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, _ST_IL: lf.SUBSTANTIVE_ID}},
     {"id": 10, "full_name": "Ivy Interest", "email": "ivy@ivyco.com", "custom_fields": {lf.CEF_FIELD: lf.CEF_NA_ID}},
-    {"id": 12, "full_name": "Rex Recordonly", "email": "rex@rexco.com", "custom_fields": {}},
+    {"id": 12, "full_name": "Julio Pekarovic", "email": "julio@jpcap.com", "custom_fields": dict(_ST_GOOD)},
+    {"id": 13, "full_name": "Tia Tiers", "email": "tia@tiaco.com", "custom_fields": dict(_ST_GOOD)},
+    {"id": 14, "full_name": "Nora Nolevel", "email": "nora@noraco.com", "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID}},
 ]}
+_ST_WON, _ST_WON2 = 111802, 2379321
 _st_deals = [
     {"id": 950, "name": "Sella Sell", "company": {"name": "Gamma Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
      "custom_fields": cf_sell(), "people": [{"id": 1}], "updated_at": "2026-08-01T00:00:00Z"},
@@ -8393,27 +8398,35 @@ _st_deals = [
      "custom_fields": cf_status(7207579), "people": [{"id": 1}, {"id": 2}], "updated_at": "2026-08-02T00:00:00Z"},
     {"id": 952, "name": "Bob pending", "company": {"name": "Gamma Co"}, "deal_stage": {"id": lf.STAGE_MATCHED},
      "custom_fields": cf_status(7207578), "people": [{"id": 1}, {"id": 3}], "updated_at": "2026-08-03T00:00:00Z"},
-    {"id": 953, "name": "Alice won 1", "company": {"name": "Old Co"}, "deal_stage": {"id": 111802}, "value": 999999,
+    {"id": 953, "name": "Alice won 1", "company": {"name": "Old Co"}, "deal_stage": {"id": _ST_WON}, "value": 999999,
      "custom_fields": cf_status(None, {lf.TICKET_MAX_FIELD: 3000000}), "people": [{"id": 2}]},
-    {"id": 954, "name": "Alice won 2", "company": {"name": "Old Co2"}, "deal_stage": {"id": 2379321}, "value": 888888,
+    {"id": 954, "name": "Alice won 2", "company": {"name": "Old Co2"}, "deal_stage": {"id": _ST_WON2}, "value": 888888,
      "custom_fields": cf_status(None, {lf.TICKET_MIN_FIELD: 1000000}), "people": [{"id": 2}]},
-    {"id": 955, "name": "Alice sell won (not counted)", "company": {"name": "Old Co3"}, "deal_stage": {"id": 111802},
-     "custom_fields": cf_sell({lf.TICKET_MAX_FIELD: 9000000}), "people": [{"id": 2}]},
+    {"id": 955, "name": "Alice sold $9M", "company": {"name": "Old Co3"}, "deal_stage": {"id": _ST_WON},
+     "custom_fields": cf_sell({lf.TICKET_MAX_FIELD: 250000}), "people": [{"id": 2}]},
+    {"id": 960, "name": "Gecko: $100K Buy", "deal_stage": {"id": _ST_WON}, "value": 7000,
+     "custom_fields": cf_status(None, {lf.TICKET_MAX_FIELD: 100000}), "person_ids": [12]},
+    {"id": 961, "name": "Gecko Robotics: $1M Sell", "deal_stage": {"id": _ST_WON}, "value": 50000,
+     "custom_fields": cf_sell(), "person_ids": [12], "closed_time": "2025/03/02 10:00:00 +0000"},
+    {"id": 962, "name": "Dataminr: $7.48M Sell", "deal_stage": {"id": _ST_WON2}, "value": 300000,
+     "custom_fields": cf_sell(), "person_ids": [12], "closed_time": "2021/04/23 10:00:00 +0000"},
+    {"id": 963, "name": "Lost Co: $50M Sell", "deal_stage": {"id": 111801}, "custom_fields": cf_sell(),
+     "person_ids": [12]},
+    {"id": 964, "name": "Mystery Sell", "deal_stage": {"id": _ST_WON}, "value": 123456,
+     "custom_fields": {}, "person_ids": [12]},
 ]
 _st_s3, _ = use_fixture({lf.PEOPLE_KEY: _st_people, lf.INTEREST_KEY: {"buy": {"Gamma Co": [3, 10], "Other": [999]}},
                          lf.DEALS_KEY: {"deals": _st_deals}})
 
 
-def _st_state(clients=None, sellers=False, buyers=False, rev=4):
-    return lf._normalize_standing_state({"rev": rev, "updated_at": "2026-10-01T00:00:00Z",
-                                         "settings": {"sellers_visible": sellers, "buyers_visible": buyers},
-                                         "clients": clients or {}})
+def _st_state(clients=None, rev=4):
+    return lf._normalize_standing_state({"rev": rev, "updated_at": "2026-10-01T00:00:00Z", "clients": clients or {}})
 
 
-def _st_put(clients=None, sellers=False, buyers=False, rev=4):
-    _st_s3.objs[lf.STANDING_KEY] = {"rev": rev, "updated_at": "2026-10-01T00:00:00Z",
-                                    "settings": {"sellers_visible": sellers, "buyers_visible": buyers},
-                                    "clients": clients or {}}
+def _st_put(clients=None, rev=4, extra=None):
+    obj = {"rev": rev, "updated_at": "2026-10-01T00:00:00Z", "clients": clients or {}}
+    obj.update(extra or {})
+    _st_s3.objs[lf.STANDING_KEY] = obj
     lf._req_cache_reset()
     lf._data_cache.pop(lf.STANDING_KEY, None)
     lf._standing_missing_at["t"] = None
@@ -8424,63 +8437,111 @@ def _st_cs(pid, clients=None):
     return lf.compute_client_standing(pid, state=_st_state(clients))
 
 
-# --- Pipeline-derived values
-_cs = _st_cs(2)
-check("standing: id forms / qualification read from CEF Yes and IQF Yes",
-      _cs["id_forms_done"] and _cs["qualification_done"])
-check("standing: auto trades = Won-stage BUY deals only (sell won deal ignored)", _cs["auto_trades"] == 2)
-check("standing: auto volume = Σ _intro_amount (max else min), never native value", _cs["auto_volume"] == 4000000)
-check("standing: five items in order and wording",
-      [i["label"] for i in _cs["items"]] == ["Identity and compliance forms complete", "Investor qualification on file",
-                                             "Honors agreed terms through closing", "Meets all payment deadlines",
-                                             "Responds promptly after an introduction"])
-check("standing: missing record = defaults, good standing, no tier at 2 trades/$4M",
-      _cs["good_standing"] and not _cs["has_record"] and _cs["tier"] is None and _cs["discount_pct"] == 0)
-check("standing: CEF N/A counts as ID forms done", _st_cs(10)["id_forms_done"])
-check("standing: CEF No -> ID forms open, not good standing", not _st_cs(3)["id_forms_done"] and not _st_cs(3)["good_standing"])
-check("standing: unknown person -> None", _st_cs(424242) is None)
+def _st_manual(*sizes):
+    return [{"label": f"T{i}", "size_usd": s, "date": ""} for i, s in enumerate(sizes)]
 
-# --- Tier math
-check("tier: trades override 3 -> platinum 20%",
-      (lambda c: c["tier"] == "platinum" and c["discount_pct"] == 20)(_st_cs(2, {"2": {"trades_override": 3}})))
-check("tier: volume exactly 10M -> platinum", _st_cs(2, {"2": {"volume_override_usd": 10000000}})["tier"] == "platinum")
-check("tier: volume 9,999,999 -> gold 15%",
-      (lambda c: c["tier"] == "gold" and c["discount_pct"] == 15)(_st_cs(2, {"2": {"volume_override_usd": 9999999}})))
-check("tier: volume exactly 5M -> gold", _st_cs(2, {"2": {"volume_override_usd": 5000000}})["tier"] == "gold")
-check("tier: volume 4,999,999 and no referral -> none", _st_cs(2, {"2": {"volume_override_usd": 4999999}})["tier"] is None)
-check("tier: trades 2 (auto) is not platinum", _st_cs(2, {"2": {"trades_override": 2}})["tier"] is None)
-check("tier: one qualified referral -> preferred 10%",
-      (lambda c: c["tier"] == "preferred" and c["discount_pct"] == 10 and c["qualified_referrals"] == 1)(
-          _st_cs(2, {"2": {"referrals": [{"person_id": "5", "confirmed_unrelated": True}]}})))
+
+# --- Deal sizes: max, else min, else "$<n><K|M|B>" in the name, never value
+check("deal name size: $7.48M", lf._deal_name_size("Dataminr: $7.48M Sell") == 7480000)
+check("deal name size: $100K", lf._deal_name_size("Gecko: $100K Buy") == 100000)
+check("deal name size: $1.2B and lower-case suffix", lf._deal_name_size("Big $1.2b round") == 1200000000)
+check("deal name size: first match wins", lf._deal_name_size("$2M then $9M") == 2000000)
+check("deal name size: no K/M/B suffix -> none", lf._deal_name_size("Co $500 Sell") is None
+      and lf._deal_name_size("$5 Million") is None and lf._deal_name_size("No dollars") is None)
+check("deal size: max beats min beats name",
+      lf._standing_deal_size({"name": "$9M", "custom_fields": {lf.TICKET_MAX_FIELD: 2, lf.TICKET_MIN_FIELD: 1}}) == (2, "max")
+      and lf._standing_deal_size({"name": "$9M", "custom_fields": {lf.TICKET_MIN_FIELD: 1}}) == (1, "min")
+      and lf._standing_deal_size({"name": "$9M", "custom_fields": {}, "value": 5}) == (9000000, "name")
+      and lf._standing_deal_size({"name": "x", "custom_fields": {}, "value": 5}) == (None, "unknown"))
+
+# --- Won deals: every side, each linked person once
+_cs = _st_cs(12)
+check("Julio: 4 won deals across Buy and Sell (lost deal ignored)",
+      _cs["trades"] == 4 and sorted(d["deal_id"] for d in _cs["won_deals"]) == ["960", "961", "962", "964"])
+check("Julio: volume = 100K + 1M + 7.48M from max/name, never native value", _cs["volume"] == 8580000)
+check("Julio: unknown-size deal counts as a trade but not toward volume/250K/1M",
+      _cs["unknown_size"] == 1 and _cs["trades_250k"] == 2 and _cs["trades_1m"] == 2)
+_jd = {d["deal_id"]: d for d in _cs["won_deals"]}
+check("Julio: side and close date per deal",
+      _jd["960"]["side"] == "Buy" and _jd["961"]["side"] == "Sell" and _jd["962"]["date"] == "2021-04-23"
+      and _jd["964"]["auto_size"] is None and _jd["962"]["size_source"] == "name")
+check("Julio: gold by volume >= $5M", _cs["tier"] == "gold")
+_cs = _st_cs(2)
+check("Alice: buy AND sell won deals counted (3 trades, $4.25M)", _cs["trades"] == 3 and _cs["volume"] == 4250000)
+check("Alice: 3 trades >= $250K -> gold even under $5M", _cs["trades_250k"] == 3 and _cs["tier"] == "gold")
+check("Alice: name parse not used when max size is set", _st_cs(2)["volume"] == 4250000)
+
+# --- trade_edits / manual trades
+_cs = _st_cs(12, {"12": {"trade_edits": {"962": {"excluded": True}, "964": {"size_usd": 400000}}}})
+check("trade edits: excluded deal dropped, filled size counted",
+      _cs["trades"] == 3 and _cs["volume"] == 1500000 and _cs["unknown_size"] == 0 and _cs["trades_250k"] == 2)
+_cs = _st_cs(12, {"12": {"manual_trades": [{"label": "Old SPV", "size_usd": 2000000, "date": "2019-01-02"},
+                                           {"label": "No size", "size_usd": None, "date": ""}]}})
+check("manual trades: added to trades, unknown size excluded from volume",
+      _cs["trades"] == 6 and _cs["volume"] == 10580000 and _cs["unknown_size"] == 2 and _cs["tier"] == "platinum")
+
+# --- Tier rules (Tia: good standing, no Pipeline deals)
+check("tier: nothing -> none", _st_cs(13)["tier"] is None and _st_cs(13)["trades"] == 0)
+check("tier: volume exactly $10M -> platinum 20%",
+      (lambda c: c["tier"] == "platinum" and c["discount_pct"] == 20)(_st_cs(13, {"13": {"manual_trades": _st_manual(10000000)}})))
+check("tier: five $1M trades ($5M) -> platinum by trades_1m",
+      _st_cs(13, {"13": {"manual_trades": _st_manual(*[1000000] * 5)}})["tier"] == "platinum")
+check("tier: four $1M trades -> gold (trades_250k), not platinum",
+      _st_cs(13, {"13": {"manual_trades": _st_manual(*[1000000] * 4)}})["tier"] == "gold")
+check("tier: $9,999,999 -> gold 15%",
+      (lambda c: c["tier"] == "gold" and c["discount_pct"] == 15)(_st_cs(13, {"13": {"manual_trades": _st_manual(9999999)}})))
+check("tier: volume exactly $5M -> gold", _st_cs(13, {"13": {"manual_trades": _st_manual(5000000)}})["tier"] == "gold")
+check("tier: three trades of exactly $250K -> gold",
+      _st_cs(13, {"13": {"manual_trades": _st_manual(250000, 250000, 250000)}})["tier"] == "gold")
+check("tier: two $300K + one $249,999 -> none",
+      _st_cs(13, {"13": {"manual_trades": _st_manual(300000, 300000, 249999)}})["tier"] is None)
+check("tier: $4,999,999 single trade -> none", _st_cs(13, {"13": {"manual_trades": _st_manual(4999999)}})["tier"] is None)
+check("tier: one confirmed referral -> preferred 10%",
+      (lambda c: c["tier"] == "preferred" and c["discount_pct"] == 10)(
+          _st_cs(13, {"13": {"referrals": [{"person_id": "5", "confirmed_unrelated": True}]}})))
 for _f in ("terms_repair", "payments_repair", "respond_repair"):
-    _c = _st_cs(2, {"2": {_f: 1, "volume_override_usd": 20000000}})
+    _c = _st_cs(13, {"13": {_f: 1, "manual_trades": _st_manual(20000000)}})
     check(f"tier: {_f}=1 breaks good standing -> no computed tier even at $20M",
           not _c["good_standing"] and _c["tier"] is None and _c["computed_tier"] is None)
-check("tier: CEF open blocks the computed tier", _st_cs(3, {"3": {"volume_override_usd": 20000000}})["tier"] is None)
+check("tier: CEF open blocks the computed tier", _st_cs(3, {"3": {"manual_trades": _st_manual(20000000)}})["tier"] is None)
 check("tier: floor applies without good standing (gold, 15%)",
       (lambda c: c["tier"] == "gold" and c["discount_pct"] == 15)(_st_cs(3, {"3": {"tier_floor": "gold"}})))
 check("tier: higher computed tier beats a lower floor",
-      _st_cs(2, {"2": {"tier_floor": "preferred", "trades_override": 5}})["tier"] == "platinum")
-check("tier: higher floor beats a lower computed tier",
-      _st_cs(2, {"2": {"tier_floor": "platinum", "volume_override_usd": 6000000}})["tier"] == "platinum")
-check("tier: invalid stored floor reads as none", _st_cs(2, {"2": {"tier_floor": "diamond"}})["tier"] is None)
+      _st_cs(13, {"13": {"tier_floor": "preferred", "manual_trades": _st_manual(12000000)}})["tier"] == "platinum")
+check("tier: higher floor beats a lower computed tier", _st_cs(2, {"2": {"tier_floor": "platinum"}})["tier"] == "platinum")
+check("tier: invalid stored floor reads as none", _st_cs(13, {"13": {"tier_floor": "diamond"}})["tier"] is None)
+check("repairs: stored values capped at 6", _st_cs(13, {"13": {"terms_repair": 6}})["record"]["terms_repair"] == 6
+      and _st_cs(13, {"13": {"terms_repair": 7}})["record"]["terms_repair"] == 0)
 
-# --- Referral qualification
-def _st_ref(pid, confirmed=True, client="2"):
-    c = _st_cs(int(client), {client: {"referrals": [{"person_id": str(pid), "confirmed_unrelated": confirmed}]}})
-    return c["referrals"][0], c["qualified_referrals"]
-check("referral: CEF Yes + Accredited + confirmed -> qualified", _st_ref(5)[0]["qualified"] and _st_ref(5)[1] == 1)
-check("referral: unconfirmed -> not counted", not _st_ref(5, False)[0]["qualified"] and _st_ref(5, False)[1] == 0)
-check("referral: CEF Pending -> not qualified", not _st_ref(7)[0]["qualified"])
-check("referral: CEF N/A is not Yes -> not qualified", not _st_ref(10)[0]["qualified"])
-check("referral: Investor Level Substantive -> not qualified", not _st_ref(11)[0]["qualified"])
-check("referral: QC level qualifies", _st_ref(6)[0]["base_ok"])
-check("referral: self-referral never counts", (lambda r: r[0]["self"] and not r[0]["qualified"] and r[1] == 0)(_st_ref(2)))
-check("referral: unknown person never counts", not _st_ref(424242)[0]["qualified"])
-check("referral: same company_id flagged related", _st_ref(6)[0]["related"])
-check("referral: shared corporate email domain flagged related", _st_ref(9)[0]["related"])
-check("referral: shared free-mail domain (gmail) not related", not _st_ref(8)[0]["related"])
-check("referral: unrelated firm not flagged", not _st_ref(5)[0]["related"])
+# --- Referrals: Confirmed / Pending onboarding
+def _st_ref(pid, ticked=True, client="13"):
+    c = _st_cs(int(client), {client: {"referrals": [{"person_id": str(pid), "confirmed_unrelated": ticked}]}})
+    return c["referrals"][0], c
+_r, _c = _st_ref(5)
+check("referral: CEF Yes + Accredited + box ticked -> Confirmed",
+      _r["confirmed"] and _c["confirmed_referrals"] == 1 and _c["pending_referrals"] == 0)
+_r, _c = _st_ref(5, False)
+check("referral: onboarded but box unticked -> not confirmed", not _r["confirmed"] and _c["pending_referrals"] == 1)
+check("referral: CEF Pending -> pending, needs engagement form",
+      (lambda r: not r["confirmed"] and r["missing"] == ["engagement form"])(_st_ref(7)[0]))
+check("referral: CEF Yes, no Investor Level -> pending, needs accreditation",
+      (lambda r: not r["confirmed"] and r["missing"] == ["accreditation"])(_st_ref(14)[0]))
+check("referral: CEF No and no level -> both missing",
+      _st_ref(3)[0]["missing"] == ["engagement form", "accreditation"])
+check("referral: CEF N/A is not Yes", not _st_ref(10)[0]["confirmed"])
+check("referral: Substantive level not accredited", not _st_ref(11)[0]["confirmed"])
+check("referral: QC and QP levels count", _st_ref(6)[0]["onboarded"] and _st_ref(8)[0]["onboarded"])
+check("referral: no 'new to CRM' rule -- a long-standing person still confirms", _st_ref(9)[0]["confirmed"])
+check("referral: self-referral never confirms", (lambda r: r["self"] and not r["confirmed"])(_st_ref(13)[0]))
+check("referral: unknown person -> pending, not in people list",
+      _st_ref(424242)[0]["missing"] == ["not in people list"] and not _st_ref(424242)[0]["confirmed"])
+check("referral: same company_id flagged related", _st_ref(6, client="2")[0]["related"])
+check("referral: shared corporate email domain flagged related", _st_ref(9, client="2")[0]["related"])
+check("referral: shared free-mail domain (gmail) not related", not _st_ref(8, client="2")[0]["related"])
+check("referral: unrelated firm not flagged", not _st_ref(5, client="2")[0]["related"])
+check("referral: only confirmed count toward Preferred",
+      _st_cs(13, {"13": {"referrals": [{"person_id": "7", "confirmed_unrelated": True},
+                                       {"person_id": "5", "confirmed_unrelated": False}]}})["tier"] is None)
 
 # --- Admin gating
 def _st_get(q, cookies=None):
@@ -8492,6 +8553,10 @@ def _st_post(body, q=None):
     return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
                               "queryStringParameters": dict({"action": "save_standing"}, **(q or {})),
                               "body": json.dumps(body), "cookies": []}, None)
+
+
+def _st_page_data(body):
+    return json.loads(re.search(r"var STANDING = (\{.*?\});</script>", body).group(1))
 
 _st_s3.objs.pop(lf.STANDING_KEY, None)
 for _lbl, _q, _ck in (("no key", {"view": "standing"}, None), ("wrong key", {"view": "standing", "key": "nope"}, None),
@@ -8506,84 +8571,91 @@ check("gating: save_standing wrong key -> 403", _st_post({"key": "nope", "rev": 
 check("gating: save_standing via GET -> 405",
       _st_get({"action": "save_standing", "key": ADMIN_KEY})["statusCode"] == 405)
 _st_printed = []
-_st_orig_print = lf.print if hasattr(lf, "print") else None
 lf.print = lambda *a, **k: _st_printed.append(" ".join(str(x) for x in a))
 _st_page = _st_get({"view": "standing", "key": ADMIN_KEY})
 del lf.print
 check("admin scoreboard: 200, private no-store", _st_page["statusCode"] == 200
       and _st_page["headers"]["Cache-Control"] == "private, no-store")
-_st_data = json.loads(re.search(r"var STANDING = (\{.*?\});</script>", _st_page["body"]).group(1))
-_st_ids = sorted(r["id"] for r in _st_data["rows"])
+_st_data = _st_page_data(_st_page["body"])
 check("admin scoreboard: rows = interest buy ids + buy-deal people (unknown ids skipped)",
-      _st_ids == ["1", "10", "2", "3"])
-check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 4") == 1)
-check("admin scoreboard: rows embedded as JSON, not one server-rendered <tr> each",
-      _st_page["body"].split("<script>")[0].count("<tr") == 1 and "Show standing to sellers" in _st_page["body"]
-      and "Show status to buyers" in _st_page["body"])
-check("admin scoreboard: missing file = both settings off, rev 0",
-      _st_data["settings"] == {"sellers_visible": False, "buyers_visible": False} and _st_data["rev"] == 0)
-_st_alice = next(r for r in _st_data["rows"] if r["id"] == "2")
-check("admin scoreboard: row carries Pipeline flags + auto trades/volume",
-      _st_alice["id_forms"] and _st_alice["qual"] and _st_alice["auto_trades"] == 2 and _st_alice["auto_volume"] == 4000000)
+      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "2", "3"])
+check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 5") == 1)
+_st_html = _st_page["body"].split("<script>")[0]
+check("admin scoreboard: rows embedded as JSON, not one server-rendered <tr> each", _st_html.count("<tr") == 1)
+check("admin scoreboard: no global toggles; Visible column, filters and bulk buttons",
+      "Show standing to sellers" not in _st_html and "Show status to buyers" not in _st_html
+      and "<th>Visible</th>" in _st_html and ">Visible only<" in _st_html and ">Hidden only<" in _st_html
+      and ">Make visible<" in _st_html and ">Hide<" in _st_html and "Set Private" not in _st_html)
+check("admin scoreboard: repair columns renamed Terms / Payments / Responds",
+      "<th>Terms</th><th>Payments</th><th>Responds</th>" in _st_html and "repair</th>" not in _st_html)
+check("admin scoreboard: sticky save bar above the table, none at the bottom",
+      _st_html.find('class="st-save"') < _st_html.find("<table>") and "position: sticky" in _st_html
+      and _st_html.count('id="st-savebtn"') == 1)
+check("admin scoreboard: add box titled and right under the search bar",
+      _st_html.find('id="st-q"') < _st_html.find("Add someone not on the scoreboard") < _st_html.find("<table>"))
+check("admin scoreboard: fonts (Source Serif 4, IBM Plex Sans, IBM Plex Mono)",
+      "family=IBM+Plex+Mono" in _st_html and "family=IBM+Plex+Sans" in _st_html and "family=Source+Serif+4" in _st_html)
+check("admin scoreboard: repair step and cap sent to the page",
+      _st_data["miss_step"] == {"terms_repair": 2, "payments_repair": 1, "respond_repair": 1} and _st_data["repair_max"] == 6)
+_st_julio = next(r for r in _st_data["rows"] if r["id"] == "12")
+check("admin scoreboard: row carries won deals with sizes for the Trades panel",
+      sorted(d["deal_id"] for d in _st_julio["won"]) == ["960", "961", "962", "964"]
+      and next(d for d in _st_julio["won"] if d["deal_id"] == "962")["auto_size"] == 7480000
+      and _st_data["deal_url"] == "https://app.pipelinecrm.com/deals/{}")
 _st_srch = json.loads(_st_get({"view": "standing", "key": ADMIN_KEY, "search": "ALPHACAP", "for": "2"})["body"])
 check("admin search: case-insensitive email/company match with referral detail",
       sorted(r["id"] for r in _st_srch["results"]) == ["2", "9"]
       and next(r for r in _st_srch["results"] if r["id"] == "9")["ref"]["related"])
 
-# --- Save: validation, history, rev conflict, backups
-_r = _st_post({"key": ADMIN_KEY, "rev": 0, "clients": {"2": {"private": False, "terms_repair": 6, "payments_repair": 0,
-              "respond_repair": 0, "trades_override": None, "volume_override_usd": None, "tier_floor": None,
-              "referrals": []}}})
-check("save: repair 6 rejected 400, nothing written", _r["statusCode"] == 400 and lf.STANDING_KEY not in _st_s3.objs)
 
-
+# --- Save: validation, history, rev conflict, backups, migration
 def _st_row(**kw):
-    row = {"private": False, "terms_repair": 0, "payments_repair": 0, "respond_repair": 0, "trades_override": None,
-           "volume_override_usd": None, "tier_floor": None, "referrals": [], "notes": ""}
+    row = {"visible": False, "terms_repair": 0, "payments_repair": 0, "respond_repair": 0, "tier_floor": None,
+           "referrals": [], "trade_edits": {}, "manual_trades": [], "notes": ""}
     row.update(kw)
     return row
-_r = _st_post({"key": ADMIN_KEY, "rev": 0, "clients": {"2": _st_row(referrals=[{"person_id": "2"}])}})
-check("save: self-referral rejected 400", _r["statusCode"] == 400)
+for _lbl, _row in (("repair 7", _st_row(terms_repair=7)), ("self-referral", _st_row(referrals=[{"person_id": "2"}])),
+                   ("visible not bool", _st_row(visible="yes")), ("notes over 2000", _st_row(notes="x" * 2001)),
+                   ("bad trade edit key", _st_row(trade_edits={"abc": {"size_usd": 1}})),
+                   ("negative trade size", _st_row(trade_edits={"953": {"size_usd": -1}})),
+                   ("manual trade without label", _st_row(manual_trades=[{"label": " ", "size_usd": 1, "date": ""}])),
+                   ("manual trade bad date", _st_row(manual_trades=[{"label": "x", "size_usd": 1, "date": "4/23/21"}]))):
+    _r = _st_post({"key": ADMIN_KEY, "rev": 0, "clients": {"2": _row}})
+    check(f"save: {_lbl} rejected 400, nothing written", _r["statusCode"] == 400 and lf.STANDING_KEY not in _st_s3.objs)
 _st_s3.put_calls.clear()
-_r = _st_post({"key": ADMIN_KEY, "rev": 0, "settings": {"sellers_visible": True},
-               "clients": {"2": _st_row(terms_repair=2, tier_floor="gold",
-                                        referrals=[{"person_id": "5", "confirmed_unrelated": True}])},
-               "reasons": {"2": "ignored"}})
+_r = _st_post({"key": ADMIN_KEY, "rev": 0, "reasons": {"2": "ignored"},
+               "clients": {"2": _st_row(terms_repair=6, tier_floor="gold",
+                                        referrals=[{"person_id": "5", "confirmed_unrelated": True}])}})
 _st_saved = _st_s3.objs.get(lf.STANDING_KEY) or {}
-check("save: first save on a missing file -> 200, rev 1", _r["statusCode"] == 200 and _st_saved.get("rev") == 1)
-check("save: no backup when there was no file to copy",
-      [c["Key"] for c in _st_s3.put_calls] == [lf.STANDING_KEY])
+check("save: first save on a missing file -> 200, rev 1, repair 6 allowed",
+      _r["statusCode"] == 200 and _st_saved.get("rev") == 1 and _st_saved["clients"]["2"]["terms_repair"] == 6)
+check("save: no backup when there was no file to copy", [c["Key"] for c in _st_s3.put_calls] == [lf.STANDING_KEY])
 _st_h = _st_saved["clients"]["2"]["history"]
 check("save: one history entry per changed field, reason left blank",
       sorted(h["field"] for h in _st_h) == ["referrals", "terms_repair", "tier_floor"]
-      and all(h["reason"] == "" for h in _st_h)
-      and next(h for h in _st_h if h["field"] == "terms_repair")["from"] == 0
-      and next(h for h in _st_h if h["field"] == "terms_repair")["to"] == 2)
-check("save: settings stored, referral added_at set",
-      _st_saved["settings"] == {"sellers_visible": True, "buyers_visible": False}
-      and _st_saved["clients"]["2"]["referrals"][0]["added_at"])
+      and all(h["reason"] == "" for h in _st_h))
+check("save: no settings block written", "settings" not in _st_saved)
 _r = _st_post({"key": ADMIN_KEY, "rev": 0, "clients": {"2": _st_row()}})
 check("save: stale rev -> 409 with the reload message, nothing changed",
       _r["statusCode"] == 409 and json.loads(_r["body"])["error"] == lf.STANDING_CONFLICT_MSG
       and _st_s3.objs[lf.STANDING_KEY]["rev"] == 1)
 _st_s3.put_calls.clear()
-_r = _st_post({"key": ADMIN_KEY, "rev": 1, "clients": {"2": _st_row(terms_repair=2, tier_floor="gold",
-              referrals=[{"person_id": "5", "confirmed_unrelated": True}], private=True)}})
+_r = _st_post({"key": ADMIN_KEY, "rev": 1, "clients": {"2": _st_row(
+    terms_repair=6, tier_floor="gold", referrals=[{"person_id": "5", "confirmed_unrelated": True}], visible=True,
+    trade_edits={"955": {"excluded": True, "size_usd": None}, "953": {"size_usd": None, "excluded": False}},
+    manual_trades=[{"label": "Old SPV", "size_usd": 500000, "date": "2019-05-01"}], notes="Prefers calls")}})
 _st_bkey = f"{lf.STANDING_BACKUP_PREFIX}{lf._iso_utc()[:10]}.json"
+_st_c2 = _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]
 check("save: day's first write copies the current object to the dated backup first",
       _r["statusCode"] == 200 and [c["Key"] for c in _st_s3.put_calls] == [_st_bkey, lf.STANDING_KEY]
       and _st_s3.objs[_st_bkey]["rev"] == 1)
-check("save: unchanged fields add no history (only private changed)",
-      [h["field"] for h in _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"]][-1:] == ["private"]
-      and len(_st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"]) == 4)
-_r = _st_post({"key": ADMIN_KEY, "rev": 2, "clients": {"2": _st_row(notes="x" * 2001)}})
-check("save: notes over 2000 chars rejected 400", _r["statusCode"] == 400)
+check("save: visible, trade edits (no-op edit dropped), manual trades and notes stored + logged",
+      _st_c2["visible"] is True and _st_c2["trade_edits"] == {"955": {"size_usd": None, "excluded": True}}
+      and _st_c2["manual_trades"] == [{"label": "Old SPV", "size_usd": 500000, "date": "2019-05-01"}]
+      and _st_c2["notes"] == "Prefers calls"
+      and [h["field"] for h in _st_c2["history"]][-4:] == ["visible", "trade_edits", "manual_trades", "notes"])
 _st_s3.put_calls.clear()
-_r = _st_post({"key": ADMIN_KEY, "rev": 2, "clients": {"2": _st_row(private=False, notes="Prefers calls")}})
-check("save: notes stored and logged to history like any field",
-      _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["notes"] == "Prefers calls"
-      and {"field": "notes", "from": "", "to": "Prefers calls"}.items()
-      <= _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"][-1].items())
+_r = _st_post({"key": ADMIN_KEY, "rev": 2, "clients": {"2": _st_row(visible=False)}})
 check("save: later writes the same day never rewrite the backup",
       _r["statusCode"] == 200 and [c["Key"] for c in _st_s3.put_calls] == [lf.STANDING_KEY]
       and _st_s3.objs[_st_bkey]["rev"] == 1)
@@ -8596,25 +8668,59 @@ def _st_failing_put(Bucket, Key, Body, ContentType=None):
         raise RuntimeError("boom")
     return _st_orig_put(Bucket=Bucket, Key=Key, Body=Body, ContentType=ContentType)
 _st_s3.put_object = _st_failing_put
-_r = _st_post({"key": ADMIN_KEY, "rev": 3, "clients": {"2": _st_row(private=True)}})
+_r = _st_post({"key": ADMIN_KEY, "rev": 3, "clients": {"2": _st_row(visible=True)}})
 _st_s3.put_object = _st_orig_put
 check("save: write failure -> error, stored file untouched",
       _r["statusCode"] == 502 and "error" in json.loads(_r["body"])
       and json.dumps(_st_s3.objs[lf.STANDING_KEY], sort_keys=True) == _st_before)
 check("save: cache dropped after a successful write (scoreboard shows the new rev)",
-      json.loads(re.search(r"var STANDING = (\{.*?\});</script>",
-                           _st_get({"view": "standing", "key": ADMIN_KEY})["body"]).group(1))["rev"] == 3)
+      _st_page_data(_st_get({"view": "standing", "key": ADMIN_KEY})["body"])["rev"] == 3)
 
-# --- Seller surfaces
+# Required: a confirmed referral flips a good-standing client with no trades to Preferred.
+_st_put({}, rev=0)
+check("referral flip: Tia (good standing, no trades) starts with no tier", lf.compute_client_standing(13)["tier"] is None)
+_r = _st_post({"key": ADMIN_KEY, "rev": 0, "clients": {"13": _st_row(referrals=[{"person_id": "5", "confirmed_unrelated": True}])}})
+lf._req_cache_reset()
+_st_tia = lf.compute_client_standing(13)
+check("referral flip: adding Rita (CEF Yes + Accredited, box ticked) -> Preferred 10%",
+      _r["statusCode"] == 200 and _st_tia["trades"] == 0 and _st_tia["confirmed_referrals"] == 1
+      and _st_tia["tier"] == "preferred" and _st_tia["discount_pct"] == 10)
+
+# Migration: old overrides, "private" and global settings stop counting; first save logs the overrides.
+_st_put({"2": {"private": False, "trades_override": 7, "volume_override_usd": 7654321, "tier_floor": None},
+         "3": {"trades_override": None, "volume_override_usd": 20000000}},
+        rev=20, extra={"settings": {"sellers_visible": True, "buyers_visible": True}})
+_cs = lf.compute_client_standing(2)
+check("migration: overrides ignored (Alice back to 3 Pipeline trades, $4.25M)",
+      _cs["trades"] == 3 and _cs["volume"] == 4250000)
+check("migration: old global settings + private=false do not make anyone visible", _cs["visible"] is False)
+_r = _st_post({"key": ADMIN_KEY, "rev": 20, "clients": {"13": _st_row(notes="x")}})
+_st_mig = _st_s3.objs[lf.STANDING_KEY]["clients"]
+_st_h2 = [h for h in _st_mig["2"]["history"] if h["field"] == "override removed"]
+_st_h3 = [h for h in _st_mig["3"]["history"] if h["field"] == "override removed"]
+check("migration: one history entry per client with old values kept",
+      _r["statusCode"] == 200 and len(_st_h2) == 1 and _st_h2[0]["from"] == {"trades": 7, "volume_usd": 7654321}
+      and _st_h2[0]["reason"] == "override removed: trades 7 / volume 7654321"
+      and len(_st_h3) == 1 and _st_h3[0]["from"] == {"trades": None, "volume_usd": 20000000})
+check("migration: override fields and private removed from the stored record",
+      not any(k in _st_mig["2"] for k in ("trades_override", "volume_override_usd", "private", "legacy_overrides")))
+_st_s3.put_calls.clear()
+_r = _st_post({"key": ADMIN_KEY, "rev": 21, "clients": {"13": _st_row(notes="y")}})
+check("migration: not repeated on the next save",
+      len([h for h in _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"] if h["field"] == "override removed"]) == 1)
+
+# --- Seller surfaces (per-person Visible)
 _ST_SECRET_CLIENTS = {
-    "2": {"private": False, "terms_repair": 3, "payments_repair": 0, "respond_repair": 0, "trades_override": 7,
-          "volume_override_usd": 7654321, "tier_floor": "platinum",
+    "2": {"visible": True, "terms_repair": 3, "payments_repair": 0, "respond_repair": 0, "tier_floor": "platinum",
           "referrals": [{"person_id": "5", "confirmed_unrelated": True, "added_at": "2026-09-01T00:00:00Z"}],
+          "trade_edits": {"953": {"size_usd": 7654321, "excluded": False}},
+          "manual_trades": [{"label": "ZZMANUALTRADE", "size_usd": 1234567, "date": "2020-01-01"}],
           "notes": "ZZINTERNALNOTE",
           "history": [{"at": "2026-09-01T00:00:00Z", "field": "terms_repair", "from": 0, "to": 3,
                        "reason": "ZZSECRETREASON"}]},
-    "3": {"respond_repair": 2, "trades_override": 7, "volume_override_usd": 7654321, "tier_floor": "gold",
+    "3": {"visible": True, "respond_repair": 2, "tier_floor": "gold",
           "referrals": [{"person_id": "5", "confirmed_unrelated": True}]},
+    "10": {"visible": True},
 }
 
 
@@ -8628,96 +8734,92 @@ def _st_tenant_pages():
     }
 
 
-_st_put(_ST_SECRET_CLIENTS, sellers=True)
+_st_put(_ST_SECRET_CLIENTS)
 _st_pages = _st_tenant_pages()
 _st_disc = _st_pages["disclosed buyer page"]
-check("seller card: disclosed buyer page shows 'Client standing' with the five items",
+check("seller card: visible client's disclosed buyer page shows 'Client standing' with the five items",
       ">Client standing<" in _st_disc and all(lbl in _st_disc for _, lbl in lf.STANDING_ITEMS))
 check("seller card: sits under the header card",
       _st_disc.find('class="card buyer-header"') < _st_disc.find(">Client standing<") < _st_disc.find('class="buyer-col-right"'))
-check("seller card: terms item rendered open (grey ring), others done",
+check("seller card: terms item open (grey ring), others done",
       _st_disc.count("border:2px solid #b8bcc4") == 1 and _st_disc.count(">✓</span>") == 4)
 check("seller card: closer chip unchanged, no second trades signal",
       "Proven closer with Rainmaker" in _st_disc
       and not re.search(r"trade|closer|\$|\d+ of", _st_disc.split(">Client standing<")[1].split("</ul>")[0].lower()))
-check("anonymous buyer page: five ticks 'Good standing: 2 of 5' (ID forms, qualification, respond open)",
+check("anonymous buyer page: five ticks 'Good standing: 2 of 5'",
       'aria-label="Good standing: 2 of 5"' in _st_pages["anonymous buyer page"]
       and "Client standing" not in _st_pages["anonymous buyer page"])
 check("pending cell: ticks next to the Buyer code",
       re.search(r'Buyer [A-Z0-9]{4}</span><span class="gs-ticks"[^>]*title="Good standing: 2 of 5"',
                 _st_pages["active intros (pending cell)"]) is not None)
-check("demand tile: ticks on Buyer tiles (Bob 2/5, Ivy 4/5 -- no IQF)",
+check("demand tile: ticks on Buyer tiles (Bob 2/5, Ivy 4/5)",
       'title="Good standing: 2 of 5"' in _st_pages["company page (demand tiles)"]
       and 'title="Good standing: 4 of 5"' in _st_pages["company page (demand tiles)"])
 _st_tick = lf._standing_ticks_html(lf.compute_client_standing(3)["items"])
 check("anonymous ticks carry only the count: no name, id or firm",
-      "Bob" not in _st_tick and "Beta" not in _st_tick and not re.search(r"\d", re.sub(r"Good standing: \d of 5|\d+(px|%)|#[0-9a-f]{6}", "", _st_tick)))
+      "Bob" not in _st_tick and "Beta" not in _st_tick
+      and not re.search(r"\d", re.sub(r"Good standing: \d of 5|\d+(px|%)|#[0-9a-f]{6}", "", _st_tick)))
 check("anonymous surfaces: no buyer names leak with standing on",
       "Bob Pending" not in _st_pages["anonymous buyer page"] and "Bob Pending" not in _st_pages["active intros (pending cell)"]
       and "Ivy Interest" not in _st_pages["company page (demand tiles)"])
 for _name, _html in _st_pages.items():
     _low = _html.lower()
-    check(f"tenant HTML ({_name}): no repair/override/floor/referral/history values, no tier/discount, no 'CEF'",
-          "7654321" not in _html and "7.7M" not in _html and "ZZSECRETREASON" not in _html
-          and "ZZINTERNALNOTE" not in _html and "Rita" not in _html
+    check(f"tenant HTML ({_name}): no repair/trade/floor/referral/notes/history values, no tier/discount, no 'CEF'",
+          "7654321" not in _html and "7,654,321" not in _html and "1234567" not in _html and "ZZMANUALTRADE" not in _html
+          and "ZZSECRETREASON" not in _html and "ZZINTERNALNOTE" not in _html and "Rita" not in _html
           and "platinum" not in _low and "repair" not in _low and "override" not in _low and "tier_floor" not in _low
-          and "referral" not in _low and "discount" not in _low and "CEF" not in _html)
+          and "trade_edits" not in _low and "referral" not in _low and "discount" not in _low and "CEF" not in _html
+          and "to go" not in _low)
 
-_st_put(_ST_SECRET_CLIENTS, sellers=False)
+_st_hidden = json.loads(json.dumps(_ST_SECRET_CLIENTS))
+for _c in _st_hidden.values():
+    _c["visible"] = False
+_st_put(_st_hidden)
 for _name, _html in _st_tenant_pages().items():
-    check(f"sellers_visible=false: {_name} renders no standing at all",
+    check(f"visible=false: {_name} renders no standing at all",
           "Client standing" not in _html and "gs-ticks" not in _html and "Good standing" not in _html)
-_st_priv = json.loads(json.dumps(_ST_SECRET_CLIENTS))
-_st_priv["2"]["private"] = True
-_st_priv["3"]["private"] = True
-_st_priv["10"] = {"private": True}
-_st_put(_st_priv, sellers=True)
+_st_put({}, extra={"settings": {"sellers_visible": True, "buyers_visible": True}})
 for _name, _html in _st_tenant_pages().items():
-    check(f"private client: {_name} renders no standing",
-          "Client standing" not in _html and "gs-ticks" not in _html and "Good standing" not in _html)
+    check(f"no record (default hidden, old global setting ignored): {_name} renders no standing",
+          "gs-ticks" not in _html and "Client standing" not in _html)
 _st_s3.objs[lf.STANDING_KEY] = "not a dict"
 lf._data_cache.pop(lf.STANDING_KEY, None)
 _st_real_get = _st_s3.get_object
 _st_s3.get_object = lambda Bucket, Key: (_ for _ in ()).throw(RuntimeError("s3 down")) if Key == lf.STANDING_KEY \
     else _st_real_get(Bucket=Bucket, Key=Key)
-_st_err_pages = _st_tenant_pages()
 check("load error: every seller surface renders nothing",
-      all("gs-ticks" not in h and "Client standing" not in h for h in _st_err_pages.values()))
-check("load error: desk JSON hides", json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"])
-      == {"visible": False})
+      all("gs-ticks" not in h and "Client standing" not in h for h in _st_tenant_pages().values()))
+check("load error: desk JSON hides",
+      json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"]) == {"visible": False})
 check("load error: scoreboard shows a banner and disables saving",
       "could not be loaded" in _st_get({"view": "standing", "key": ADMIN_KEY})["body"])
 _st_s3.get_object = _st_real_get
 
 # --- Admin preview on buyer pages
-_st_put(_ST_SECRET_CLIENTS, sellers=False)
-_st_adm = _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"]
-check("admin buyer page: full card labeled hidden when sellers setting is off",
-      "Client standing (hidden from sellers)" in _st_adm)
-_st_put(_ST_SECRET_CLIENTS, sellers=True)
+_st_put(_st_hidden)
+check("admin buyer page: full card labeled hidden when the client is not visible",
+      "Client standing (hidden from sellers)" in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
+_st_put(_ST_SECRET_CLIENTS)
 check("admin buyer page (edit mode): labeled 'sellers see this' when visible",
       "Client standing (sellers see this)" in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL,
                                                        "edit": "1"})["body"])
 check("admin anonymized preview: full card shown too",
       "Client standing (sellers see this)" in _st_get({"buyer": "3", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
-_st_put(_st_priv, sellers=True)
-check("admin buyer page: private client labeled hidden",
-      "Client standing (hidden from sellers)" in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
+
 
 # --- Desk JSON
 def _st_json(pid):
     r = _st_get({"view": "standing_json", "pid": str(pid), "key": ADMIN_KEY})
     return r, json.loads(r["body"])
 
-_st_put(_ST_SECRET_CLIENTS, sellers=True, buyers=False)
+_st_put(_st_hidden)
 _r, _d = _st_json(2)
-check("standing_json: buyers_visible=false -> visible false only",
+check("standing_json: not visible -> visible false only",
       _d == {"visible": False} and _r["headers"]["Cache-Control"] == "private, no-store")
-_st_put(_st_priv, buyers=True)
-check("standing_json: private -> visible false", _st_json(2)[1] == {"visible": False})
-_st_put(_ST_SECRET_CLIENTS, buyers=True)
+_st_put(_ST_SECRET_CLIENTS)
 check("standing_json: unknown pid -> visible false", _st_json(424242)[1] == {"visible": False})
 check("standing_json: blank pid -> visible false", _st_json("")[1] == {"visible": False})
+check("standing_json: record-less person -> visible false", _st_json(13)[1] == {"visible": False})
 _r, _d = _st_json(2)
 check("standing_json: floor platinum without good standing", _d["visible"] and _d["tier"] == "platinum"
       and _d["tier_label"] == "Platinum" and _d["discount_pct"] == 20 and _d["good_standing"] is False
@@ -8725,39 +8827,48 @@ check("standing_json: floor platinum without good standing", _d["visible"] and _
 check("standing_json: seven items in order",
       [i["label"] for i in _d["items"]] == [lbl for _, lbl in lf.STANDING_ITEMS]
       + ["Introduced a new accredited investor", "Completed trades"])
-check("standing_json: terms note uses the repair count",
+check("standing_json: terms note keyed to the number",
       _d["items"][2] == {"label": "Honors agreed terms through closing", "done": False,
                          "note": "Complete your next 3 trades on the agreed terms."})
-check("standing_json: referral item", _d["items"][5] == {"label": "Introduced a new accredited investor", "done": True,
-                                                         "note": "1 completed onboarding with Rainmaker"})
-check("standing_json: trades item uses override trades/volume",
-      _d["items"][6] == {"label": "Completed trades", "done": True, "note": "7 trades · $7.7M"})
-check("standing_json: no internal fields (history/reason/floor/repairs)",
-      "ZZSECRETREASON" not in _r["body"] and "ZZINTERNALNOTE" not in _r["body"] and "repair" not in _r["body"] and "history" not in _r["body"])
+check("standing_json: referral note '1 confirmed'",
+      _d["items"][5] == {"label": "Introduced a new accredited investor", "done": True, "note": "1 confirmed"})
+check("standing_json: trades include edited size and manual trade (4 trades)",
+      _d["items"][6] == {"label": "Completed trades", "done": True, "note": "4 trades · $10.1M"})
+check("standing_json: no internal fields (history/notes/manual labels/repairs)",
+      "ZZSECRETREASON" not in _r["body"] and "ZZINTERNALNOTE" not in _r["body"] and "ZZMANUALTRADE" not in _r["body"]
+      and "repair" not in _r["body"] and "history" not in _r["body"] and "Rita" not in _r["body"])
 _r, _d = _st_json(3)
 check("standing_json: ID forms open -> engagement-form note + form_url",
       _d["items"][0] == {"label": "Identity and compliance forms complete", "done": False,
                          "note": "Rainmaker's engagement form is still needed.", "form_url": lf.CEF_FORM_URL})
 check("standing_json: qualification open note",
       _d["items"][1]["note"] == "Rainmaker's qualification form is still needed." and not _d["items"][1]["done"])
-check("standing_json: respond note singular/plural",
+check("standing_json: respond note plural",
       _d["items"][4]["note"] == "Reply within 3 business days on your next 2 introductions.")
 check("standing_json: Bob's floor gold applies without good standing", _d["tier"] == "gold" and _d["discount_pct"] == 15)
-_st_put({"2": {"payments_repair": 1, "terms_repair": 1, "respond_repair": 1}}, buyers=True)
+_st_put({"2": {"visible": True, "payments_repair": 1, "terms_repair": 1, "respond_repair": 1,
+               "referrals": [{"person_id": "5", "confirmed_unrelated": True}, {"person_id": "7", "confirmed_unrelated": True}]},
+         "12": {"visible": True, "referrals": [{"person_id": "7", "confirmed_unrelated": True}]},
+         "13": {"visible": True}})
 _d = _st_json(2)[1]
-check("standing_json: count 1 drops the number; auto trades/volume note",
+check("standing_json: count 1 drops the number; Pipeline trades/volume note",
       _d["items"][3]["note"] == "Meet the payment deadlines on your next trade."
-      and _d["items"][6]["note"] == "2 trades · $4.0M" and _d["items"][5]["done"] is False
-      and _d["items"][5]["note"] == "0 completed onboarding with Rainmaker" and _d["tier"] is None
       and _d["items"][2]["note"] == "Complete your next trade on the agreed terms."
-      and _d["items"][4]["note"] == "Reply within 3 business days on your next introduction.")
-check("admin scoreboard: notes and history embedded for the admin page only",
-      "notes_max" in _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
-      and lf._standing_default_client()["notes"] == "" and "notes" in lf.STANDING_EDIT_FIELDS)
+      and _d["items"][4]["note"] == "Reply within 3 business days on your next introduction."
+      and _d["items"][6]["note"] == "3 trades · $4.2M" and _d["tier"] is None)
+check("standing_json: referral note '1 confirmed, 1 pending onboarding'",
+      _d["items"][5] == {"label": "Introduced a new accredited investor", "done": True,
+                         "note": "1 confirmed, 1 pending onboarding"})
+check("standing_json: referral note '1 pending onboarding' only",
+      _st_json(12)[1]["items"][5] == {"label": "Introduced a new accredited investor", "done": False,
+                                      "note": "1 pending onboarding"})
+check("standing_json: Julio gets credit for all 4 won deals",
+      _st_json(12)[1]["items"][6]["note"] == "4 trades · $8.6M")
+check("standing_json: no referrals, no trades",
+      _st_json(13)[1]["items"][5]["note"] == "0 confirmed" and _st_json(13)[1]["items"][6]["note"] == "0 trades · $0.0M")
 _st_s3.objs.pop(lf.STANDING_KEY, None)
 lf._data_cache.pop(lf.STANDING_KEY, None)
 check("standing_json: missing file -> visible false", _st_json(2)[1] == {"visible": False})
-
 
 # --- A save in one Lambda container must show on reload in another: admin
 # reads ignore the 60s HEAD reuse; tenant surfaces may lag up to 60s.
@@ -8766,14 +8877,13 @@ _st_s3.last_modified[lf.STANDING_KEY] = datetime(2026, 10, 1, tzinfo=timezone.ut
 lf.S3_VERSION_TTL_SECONDS = 60
 try:
     lf._req_cache_reset()
-    lf._load_client_standing()  # this container now holds rev 10 + a fresh HEAD
-    _st_s3.objs[lf.STANDING_KEY]["rev"] = 11  # another container saved
+    lf._load_client_standing()
+    _st_s3.objs[lf.STANDING_KEY]["rev"] = 11
     _st_s3.last_modified[lf.STANDING_KEY] = datetime(2026, 10, 2, tzinfo=timezone.utc)
     lf._req_cache_reset()
     check("stale container: tenant read may reuse the cached copy within 60s", lf._load_client_standing()["rev"] == 10)
     _st_body = _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
-    check("stale container: admin scoreboard re-checks S3 and shows the saved rev",
-          json.loads(re.search(r"var STANDING = (\{.*?\});</script>", _st_body).group(1))["rev"] == 11)
+    check("stale container: admin scoreboard re-checks S3 and shows the saved rev", _st_page_data(_st_body)["rev"] == 11)
     check("scoreboard: name links to the Pipeline person record, not the buyer page",
           "D.person_url.replace" in _st_body and "'?buyer='" not in _st_body)
 finally:

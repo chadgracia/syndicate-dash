@@ -14628,11 +14628,11 @@ def _esc(s):
 
 # ── Client Standing ──────────────────────────────────────────────────────
 # Chad's private scoreboard per buyer (admin ?view=standing), a five-item
-# good-standing display for sellers (gated on settings.sellers_visible and
-# the client's private flag), and the desk's per-buyer JSON
-# (?view=standing_json). Stored ONLY in STANDING_KEY (never Pipeline or
-# Dynamo). compute_client_standing is the one helper every surface reads.
-# Repairs, overrides, tier floor, referrals, history, trades and volume are
+# good-standing display for sellers (only for clients marked visible), and
+# the desk's per-buyer JSON (?view=standing_json, visible clients only).
+# Stored ONLY in STANDING_KEY (never Pipeline or Dynamo).
+# compute_client_standing is the one helper every surface reads. Repairs,
+# trade edits, tier floor, referrals, notes, history, trades and volume are
 # admin-only (the desk JSON may carry the buyer's own trades/volume) and
 # never reach tenant HTML.
 STANDING_KEY = "syndicate-dash/client-standing.json"
@@ -14643,17 +14643,25 @@ STANDING_TIERS = ("preferred", "gold", "platinum")  # ascending
 STANDING_TIER_LABELS = {"preferred": "Preferred", "gold": "Gold", "platinum": "Platinum"}
 STANDING_DISCOUNT_PCT = {"preferred": 10, "gold": 15, "platinum": 20}
 STANDING_PLATINUM_VOLUME_USD = 10_000_000
-STANDING_PLATINUM_TRADES = 3
+STANDING_PLATINUM_TRADES_1M = 5
 STANDING_GOLD_VOLUME_USD = 5_000_000
+STANDING_GOLD_TRADES_250K = 3
+STANDING_SIZE_250K = 250_000
+STANDING_SIZE_1M = 1_000_000
 STANDING_REPAIR_FIELDS = ("respond_repair", "terms_repair", "payments_repair")
-STANDING_REPAIR_MAX = 5
+STANDING_REPAIR_MAX = 6
+# "Missed" adds this many clean trades/introductions to go; "Cleared" -1.
+STANDING_REPAIR_MISS_STEP = {"terms_repair": 2, "payments_repair": 1, "respond_repair": 1}
 STANDING_REFERRAL_LEVEL_IDS = {ACCREDITED_ID, QC_ID, QP_ID}
 STANDING_MAX_REFERRALS = 50
+STANDING_MAX_TRADE_EDITS = 500
+STANDING_MAX_MANUAL_TRADES = 100
+STANDING_LABEL_MAX_LEN = 200
 STANDING_NOTES_MAX_LEN = 2000
 STANDING_PAGE_ROWS = 100
 STANDING_SEARCH_LIMIT = 25
-STANDING_EDIT_FIELDS = ("private", "respond_repair", "terms_repair", "payments_repair", "trades_override",
-                        "volume_override_usd", "tier_floor", "referrals", "notes")
+STANDING_EDIT_FIELDS = ("visible", "respond_repair", "terms_repair", "payments_repair", "tier_floor",
+                        "referrals", "trade_edits", "manual_trades", "notes")
 # (key, tenant-safe label) in display order -- the wording sellers and the
 # desk see. Never "CEF".
 STANDING_ITEMS = (
@@ -14666,17 +14674,20 @@ STANDING_ITEMS = (
 STANDING_LEVEL_LABELS = {QP_ID: "QP", QC_ID: "Qualified Client", ACCREDITED_ID: "Accredited",
                          SUBSTANTIVE_ID: "Substantive"}
 PIPELINE_PERSON_URL = "https://app.pipelinecrm.com/people/{}"
+PIPELINE_DEAL_URL = "https://app.pipelinecrm.com/deals/{}"
+# First "$<number><K|M|B>" in a deal name, e.g. "Dataminr: $7.48M Sell".
+DEAL_NAME_SIZE_RE = re.compile(r"\$\s*(\d[\d,]*(?:\.\d+)?)\s*([KMB])(?![A-Za-z])", re.IGNORECASE)
+DEAL_NAME_SIZE_MULT = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+STANDING_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _standing_default_client():
-    return {"private": False, "respond_repair": 0, "terms_repair": 0, "payments_repair": 0,
-            "trades_override": None, "volume_override_usd": None, "tier_floor": None,
-            "referrals": [], "notes": "", "history": []}
+    return {"visible": False, "respond_repair": 0, "terms_repair": 0, "payments_repair": 0, "tier_floor": None,
+            "referrals": [], "trade_edits": {}, "manual_trades": [], "notes": "", "history": []}
 
 
 def _standing_empty_state():
-    return {"rev": 0, "updated_at": None, "settings": {"sellers_visible": False, "buyers_visible": False},
-            "clients": {}}
+    return {"rev": 0, "updated_at": None, "clients": {}}
 
 
 def _standing_int(v, lo=0, hi=None):
@@ -14697,17 +14708,42 @@ def _standing_amount(v):
     return int(v) if float(v).is_integer() else float(v)
 
 
+def _standing_trade_edits(raw):
+    out = {}
+    if isinstance(raw, dict):
+        for did, e in raw.items():
+            did = str(did).strip()
+            if did.isdigit() and isinstance(e, dict):
+                size = _standing_amount(e.get("size_usd"))
+                excluded = e.get("excluded") is True
+                if size is not None or excluded:
+                    out[did] = {"size_usd": size, "excluded": excluded}
+    return out
+
+
+def _standing_manual_trades(raw):
+    out = []
+    for t in raw if isinstance(raw, list) else []:
+        if isinstance(t, dict) and isinstance(t.get("label"), str) and t["label"].strip():
+            date = t.get("date") if isinstance(t.get("date"), str) and STANDING_DATE_RE.match(t["date"]) else ""
+            out.append({"label": t["label"].strip()[:STANDING_LABEL_MAX_LEN],
+                        "size_usd": _standing_amount(t.get("size_usd")), "date": date})
+    return out
+
+
 def _standing_client_record(raw):
     """A stored client record with every field defaulted/validated (a bad
-    stored value reads as its default, never crashes a render)."""
+    stored value reads as its default, never crashes a render). Legacy
+    fields: "private" and the global settings are ignored (everyone starts
+    hidden; visible defaults False); trades_override / volume_override_usd
+    are no longer computed and are kept only in "legacy_overrides" until
+    the next save moves them into history."""
     rec = _standing_default_client()
     if not isinstance(raw, dict):
         return rec
-    rec["private"] = raw.get("private") is True
+    rec["visible"] = raw.get("visible") is True
     for f in STANDING_REPAIR_FIELDS:
         rec[f] = _standing_int(raw.get(f), 0, STANDING_REPAIR_MAX) or 0
-    rec["trades_override"] = _standing_int(raw.get("trades_override"), 0)
-    rec["volume_override_usd"] = _standing_amount(raw.get("volume_override_usd"))
     rec["tier_floor"] = raw.get("tier_floor") if raw.get("tier_floor") in STANDING_TIERS else None
     refs = []
     for r in raw.get("referrals") or []:
@@ -14716,8 +14752,13 @@ def _standing_client_record(raw):
                          "confirmed_unrelated": r.get("confirmed_unrelated") is True,
                          "added_at": r.get("added_at")})
     rec["referrals"] = refs
+    rec["trade_edits"] = _standing_trade_edits(raw.get("trade_edits"))
+    rec["manual_trades"] = _standing_manual_trades(raw.get("manual_trades"))
     rec["notes"] = raw.get("notes")[:STANDING_NOTES_MAX_LEN] if isinstance(raw.get("notes"), str) else ""
     rec["history"] = [h for h in (raw.get("history") or []) if isinstance(h, dict)]
+    legacy = {"trades": raw.get("trades_override"), "volume_usd": raw.get("volume_override_usd")}
+    if any(v is not None for v in legacy.values()):
+        rec["legacy_overrides"] = legacy
     return rec
 
 
@@ -14727,9 +14768,6 @@ def _normalize_standing_state(parsed):
         return state
     state["rev"] = _standing_int(parsed.get("rev"), 0) or 0
     state["updated_at"] = parsed.get("updated_at")
-    settings = parsed.get("settings") if isinstance(parsed.get("settings"), dict) else {}
-    state["settings"] = {"sellers_visible": settings.get("sellers_visible") is True,
-                         "buyers_visible": settings.get("buyers_visible") is True}
     clients = parsed.get("clients") if isinstance(parsed.get("clients"), dict) else {}
     state["clients"] = {str(pid): _standing_client_record(rec) for pid, rec in clients.items()}
     return state
@@ -14745,9 +14783,9 @@ _standing_missing_at = {"t": None}
 
 def _load_client_standing(fresh=False):
     """The standing state for this request (cached across requests by S3
-    version, like the other S3 JSON). Missing file = empty state (both
-    settings off); any other failure = None, which every tenant surface
-    treats as hidden. fresh=True (admin scoreboard, desk JSON) skips the
+    version, like the other S3 JSON). Missing file = empty state (everyone
+    hidden); any other failure = None, which every tenant surface treats
+    as hidden. fresh=True (admin scoreboard, desk JSON) skips the
     container's 60s HEAD reuse: a save lands in one Lambda container, and
     a reload served by another must not show its stale copy."""
     memo = _req_cache.get("standing")
@@ -14785,25 +14823,83 @@ def _drop_standing_cache():
     _req_cache["standing"] = None
 
 
+def _deal_name_size(name):
+    """USD size parsed from the first "$<number><K|M|B>" in a deal name."""
+    m = DEAL_NAME_SIZE_RE.search(str(name or ""))
+    if not m:
+        return None
+    try:
+        v = float(m.group(1).replace(",", "")) * DEAL_NAME_SIZE_MULT[m.group(2).upper()]
+    except ValueError:
+        return None
+    return int(round(v))
+
+
+def _standing_deal_size(deal):
+    """(size_usd or None, source): Max size, else Min size, else parsed
+    from the deal name, else unknown. NEVER the native value (commission)."""
+    for field, source in ((TICKET_MAX_FIELD, "max"), (TICKET_MIN_FIELD, "min")):
+        v = _deal_cf_number(deal, field)
+        if v is not None:
+            return int(round(v)), source
+    v = _deal_name_size(deal.get("name"))
+    if v is not None:
+        return v, "name"
+    return None, "unknown"
+
+
+def _standing_deal_side(deal):
+    tags = _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+    if DEAL_SIDE_BUY_ID in tags:
+        return "Buy"
+    if DEAL_SIDE_SELL_ID in tags:
+        return "Sell"
+    return "—"
+
+
 @_request_memo("standing_deal_index", lambda: ())
 def _standing_deal_index():
-    """{"won": {person_id: [trades, volume]}, "buy_any": {person_id}} over
-    every BUY-tagged deal in get_deals_list(): won = WON_STAGE_IDS stage,
-    volume = Σ _intro_amount (never the native "value")."""
+    """{"won": {person_id: [won deal, ...]}, "buy_any": {person_id}} over
+    get_deals_list(): every deal at a WON_STAGE_IDS stage, ANY side tag,
+    credits each linked person once (like Pipeline's won_deals_total).
+    buy_any = people on >= 1 Buy-tagged deal at any stage (scoreboard rows)."""
     won = {}
     buy_any = set()
     for d in get_deals_list():
-        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
-            continue
         pids = {str(p) for p in _deal_linked_person_ids(d)}
-        buy_any |= pids
-        if _deal_stage_id(d) in WON_STAGE_IDS:
-            amount = _intro_amount(d) or 0
-            for p in pids:
-                t = won.setdefault(p, [0, 0])
-                t[0] += 1
-                t[1] += amount
+        if DEAL_SIDE_BUY_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            buy_any |= pids
+        if _deal_stage_id(d) not in WON_STAGE_IDS or d.get("id") is None:
+            continue
+        size, source = _standing_deal_size(d)
+        dt = _deal_closed_dt(d)
+        entry = {"deal_id": str(d.get("id")), "name": str(d.get("name") or f"Deal #{d.get('id')}"),
+                 "side": _standing_deal_side(d), "date": dt.strftime("%Y-%m-%d") if dt else "",
+                 "auto_size": size, "size_source": source}
+        for p in pids:
+            won.setdefault(p, []).append(entry)
+    for lst in won.values():
+        lst.sort(key=lambda e: e["date"], reverse=True)
     return {"won": won, "buy_any": buy_any}
+
+
+def _standing_trades(won_deals, client):
+    """Apply trade_edits / manual_trades to a person's won deals. Unknown
+    sizes count as trades but not toward volume or the 250K/1M counts."""
+    trades = []
+    for d in won_deals:
+        e = client["trade_edits"].get(d["deal_id"]) or {}
+        if e.get("excluded"):
+            continue
+        size = e["size_usd"] if e.get("size_usd") is not None else d["auto_size"]
+        trades.append({"label": d["name"], "size_usd": size, "date": d["date"], "deal_id": d["deal_id"]})
+    for t in client["manual_trades"]:
+        trades.append({"label": t["label"], "size_usd": t["size_usd"], "date": t["date"], "deal_id": None})
+    sizes = [t["size_usd"] for t in trades if t["size_usd"] is not None]
+    return {"trades": len(trades), "volume": sum(sizes),
+            "trades_250k": sum(1 for s in sizes if s >= STANDING_SIZE_250K),
+            "trades_1m": sum(1 for s in sizes if s >= STANDING_SIZE_1M),
+            "unknown_size": len(trades) - len(sizes), "list": trades}
 
 
 def _standing_person_flags(rec):
@@ -14825,9 +14921,10 @@ def _standing_related(client_rec, other_rec):
 
 
 def _standing_referral_detail(client_pid, client_rec, ref_pid, by_id):
-    """Qualification facts for one referred person. base_ok = exists, not
-    the client, engagement form Yes, Investor Level accredited-or-better;
-    a referral counts when base_ok AND confirmed_unrelated."""
+    """Onboarding facts for one referred person. onboarded = exists, not
+    the client, engagement form Yes AND Investor Level Accredited/QC/QP;
+    "missing" lists what is still needed. A referral is Confirmed when
+    onboarded AND the relationship checkbox (confirmed_unrelated) is ticked."""
     ref_pid = str(ref_pid)
     rec = by_id.get(ref_pid)
     cf = (rec or {}).get("custom_fields") or {}
@@ -14836,6 +14933,14 @@ def _standing_referral_detail(client_pid, client_rec, ref_pid, by_id):
     is_self = ref_pid == str(client_pid)
     cef_yes = CEF_YES_ID in cef_ids
     level_ok = bool(set(level_ids) & STANDING_REFERRAL_LEVEL_IDS)
+    missing = []
+    if rec is None:
+        missing.append("not in people list")
+    else:
+        if not cef_yes:
+            missing.append("engagement form")
+        if not level_ok:
+            missing.append("accreditation")
     return {
         "person_id": ref_pid,
         "exists": rec is not None,
@@ -14843,10 +14948,9 @@ def _standing_referral_detail(client_pid, client_rec, ref_pid, by_id):
         "name": _person_display_name(rec) if rec else "",
         "firm": (rec or {}).get("company_name") or "",
         "cef_label": CEF_LABELS.get(cef_ids[0], "—") if cef_ids else "—",
-        "cef_yes": cef_yes,
         "level_label": ", ".join(STANDING_LEVEL_LABELS.get(i, str(i)) for i in level_ids) or "—",
-        "level_ok": level_ok,
-        "base_ok": rec is not None and not is_self and cef_yes and level_ok,
+        "onboarded": rec is not None and not is_self and cef_yes and level_ok,
+        "missing": missing,
         "related": (not is_self) and _standing_related(client_rec, rec),
     }
 
@@ -14855,14 +14959,14 @@ def _standing_tier_rank(tier):
     return STANDING_TIERS.index(tier) if tier in STANDING_TIERS else -1
 
 
-def _standing_computed_tier(good_standing, trades, volume, qualified_referrals):
+def _standing_computed_tier(good_standing, volume, trades_250k, trades_1m, confirmed_referrals):
     if not good_standing:
         return None
-    if volume >= STANDING_PLATINUM_VOLUME_USD or trades >= STANDING_PLATINUM_TRADES:
+    if volume >= STANDING_PLATINUM_VOLUME_USD or trades_1m >= STANDING_PLATINUM_TRADES_1M:
         return "platinum"
-    if volume >= STANDING_GOLD_VOLUME_USD:
+    if volume >= STANDING_GOLD_VOLUME_USD or trades_250k >= STANDING_GOLD_TRADES_250K:
         return "gold"
-    if qualified_referrals >= 1:
+    if confirmed_referrals >= 1:
         return "preferred"
     return None
 
@@ -14871,7 +14975,7 @@ def compute_client_standing(person_id, state=None):
     """THE Client Standing helper. None when the person is not in
     people-slim or the standing file could not be read; otherwise every
     derived value (items, good_standing, trades/volume, referrals, tier,
-    discount) plus the stored record and visibility settings."""
+    discount) plus the stored record and its visible flag."""
     if state is None:
         state = _load_client_standing()
     if state is None:
@@ -14884,9 +14988,8 @@ def compute_client_standing(person_id, state=None):
     stored = state["clients"].get(pid)
     client = stored if stored is not None else _standing_default_client()
     flags = _standing_person_flags(rec)
-    auto_trades, auto_volume = _standing_deal_index()["won"].get(pid, [0, 0])
-    trades = client["trades_override"] if client["trades_override"] is not None else auto_trades
-    volume = client["volume_override_usd"] if client["volume_override_usd"] is not None else auto_volume
+    won_deals = _standing_deal_index()["won"].get(pid, [])
+    tr = _standing_trades(won_deals, client)
     done = {
         "id_forms": flags["id_forms_done"],
         "qualification": flags["qualification_done"],
@@ -14901,21 +15004,20 @@ def compute_client_standing(person_id, state=None):
         detail = _standing_referral_detail(pid, rec, r["person_id"], by_id)
         detail["confirmed_unrelated"] = r["confirmed_unrelated"]
         detail["added_at"] = r.get("added_at")
-        detail["qualified"] = detail["base_ok"] and r["confirmed_unrelated"]
+        detail["confirmed"] = detail["onboarded"] and r["confirmed_unrelated"]
         referrals.append(detail)
-    qualified_referrals = sum(1 for r in referrals if r["qualified"])
-    computed = _standing_computed_tier(good_standing, trades, volume, qualified_referrals)
+    confirmed = sum(1 for r in referrals if r["confirmed"])
+    computed = _standing_computed_tier(good_standing, tr["volume"], tr["trades_250k"], tr["trades_1m"], confirmed)
     floor = client["tier_floor"]
     tier = floor if _standing_tier_rank(floor) > _standing_tier_rank(computed) else computed
     return {
-        "person_id": pid, "has_record": stored is not None, "record": client, "private": client["private"],
+        "person_id": pid, "has_record": stored is not None, "record": client, "visible": client["visible"],
         "id_forms_done": flags["id_forms_done"], "qualification_done": flags["qualification_done"],
-        "auto_trades": auto_trades, "auto_volume": auto_volume, "trades": trades, "volume": volume,
+        "won_deals": won_deals, "trades": tr["trades"], "volume": tr["volume"],
+        "trades_250k": tr["trades_250k"], "trades_1m": tr["trades_1m"], "unknown_size": tr["unknown_size"],
         "items": items, "done_count": sum(1 for i in items if i["done"]), "good_standing": good_standing,
-        "referrals": referrals, "qualified_referrals": qualified_referrals,
+        "referrals": referrals, "confirmed_referrals": confirmed, "pending_referrals": len(referrals) - confirmed,
         "computed_tier": computed, "tier": tier, "discount_pct": STANDING_DISCOUNT_PCT.get(tier, 0),
-        "sellers_visible": state["settings"]["sellers_visible"],
-        "buyers_visible": state["settings"]["buyers_visible"],
     }
 
 
@@ -14934,14 +15036,14 @@ def _next_n(n, word):
 
 # ── Seller-facing surfaces ───────────────────────────────────────────────
 def _standing_seller_items(person_id):
-    """The five items for a seller surface, or None when hidden (sellers
-    setting off, client private, unknown person, or any error)."""
+    """The five items for a seller surface, or None when hidden (client not
+    marked visible, unknown person, or any error)."""
     try:
         state = _load_client_standing()
-        if state is None or not state["settings"]["sellers_visible"]:
+        if state is None:
             return None
         cs = compute_client_standing(person_id, state=state)
-        if cs is None or cs["private"]:
+        if cs is None or not cs["visible"]:
             return None
         return cs["items"]
     except Exception as e:
@@ -15001,8 +15103,7 @@ def _standing_buyer_page_card_html(person_id, admin):
         return ('<div class="card standing-card" style="margin-top:12px">'
                 '<div class="buyer-section-heading">Client standing (hidden from sellers)</div>'
                 '<div class="buyer-page-note">Standing file could not be loaded.</div></div>')
-    shown = cs["sellers_visible"] and not cs["private"]
-    heading = "Client standing (sellers see this)" if shown else "Client standing (hidden from sellers)"
+    heading = "Client standing (sellers see this)" if cs["visible"] else "Client standing (hidden from sellers)"
     return _standing_card_html(cs["items"], heading)
 
 
@@ -15013,13 +15114,22 @@ STANDING_ITEM_OPEN_NOTES = {
 }
 
 
+def _standing_referral_note(confirmed, pending):
+    parts = []
+    if confirmed:
+        parts.append(f"{confirmed} confirmed")
+    if pending:
+        parts.append(f"{pending} pending onboarding")
+    return ", ".join(parts) or "0 confirmed"
+
+
 def standing_json_payload(pid):
     try:
         state = _load_client_standing(fresh=True)
-        if state is None or not state["settings"]["buyers_visible"]:
+        if state is None:
             return {"visible": False}
         cs = compute_client_standing(pid, state=state)
-        if cs is None or cs["private"]:
+        if cs is None or not cs["visible"]:
             return {"visible": False}
         rec = cs["record"]
         items = []
@@ -15040,9 +15150,8 @@ def standing_json_payload(pid):
                 if k == "id_forms":
                     item["form_url"] = CEF_FORM_URL
             items.append(item)
-        q = cs["qualified_referrals"]
-        items.append({"label": "Introduced a new accredited investor", "done": q >= 1,
-                      "note": f"{q} completed onboarding with Rainmaker"})
+        items.append({"label": "Introduced a new accredited investor", "done": cs["confirmed_referrals"] >= 1,
+                      "note": _standing_referral_note(cs["confirmed_referrals"], cs["pending_referrals"])})
         items.append({"label": "Completed trades", "done": cs["trades"] >= 1,
                       "note": f"{_plural(cs['trades'], 'trade')} · {_fmt_standing_musd(cs['volume'])}"})
         tier = cs["tier"]
@@ -15055,6 +15164,10 @@ def standing_json_payload(pid):
 
 
 # ── Admin scoreboard: ?key=ADMIN_KEY&view=standing ───────────────────────
+STANDING_ROW_REF_KEYS = ("person_id", "name", "firm", "cef_label", "level_label", "onboarded", "missing",
+                         "related", "self", "exists", "confirmed_unrelated", "added_at")
+
+
 def _standing_row(pid, rec, state):
     """One compact scoreboard row (admin only)."""
     cs = compute_client_standing(pid, state=state)
@@ -15063,12 +15176,9 @@ def _standing_row(pid, rec, state):
         "id": pid, "name": _person_display_name(rec) or f"#{pid}", "firm": rec.get("company_name") or "",
         "email": (_person_all_emails(rec) or [""])[0],
         "id_forms": cs["id_forms_done"], "qual": cs["qualification_done"],
-        "auto_trades": cs["auto_trades"], "auto_volume": cs["auto_volume"],
-        "has_record": cs["has_record"],
+        "won": cs["won_deals"], "has_record": cs["has_record"],
         "rec": {k: client[k] for k in STANDING_EDIT_FIELDS if k != "referrals"},
-        "refs": [{k: r[k] for k in ("person_id", "name", "firm", "cef_label", "level_label", "base_ok",
-                                    "related", "self", "exists", "confirmed_unrelated", "added_at")}
-                 for r in cs["referrals"]],
+        "refs": [{k: r[k] for k in STANDING_ROW_REF_KEYS} for r in cs["referrals"]],
         "history": client["history"],
     }
 
@@ -15091,7 +15201,7 @@ def standing_admin_rows(state):
 
 def standing_search(query, for_pid=None):
     """Admin-only people-slim search (name/email/company, case-insensitive)
-    for the "Not on the scoreboard yet" list and the referral editor."""
+    for the "Add someone not on the scoreboard" box and the referral editor."""
     q = (query or "").strip().lower()
     if len(q) < 2:
         return []
@@ -15126,12 +15236,14 @@ def render_standing_page(key):
     load_error = state is None
     rows = [] if load_error else standing_admin_rows(state)
     data = {
-        "key": key or "", "rev": 0 if load_error else state["rev"], "load_error": load_error,
-        "settings": (state or _standing_empty_state())["settings"], "rows": rows,
+        "key": key or "", "rev": 0 if load_error else state["rev"], "load_error": load_error, "rows": rows,
         "page_rows": STANDING_PAGE_ROWS, "repair_max": STANDING_REPAIR_MAX, "notes_max": STANDING_NOTES_MAX_LEN,
+        "miss_step": STANDING_REPAIR_MISS_STEP,
         "tiers": list(STANDING_TIERS), "tier_labels": STANDING_TIER_LABELS, "discounts": STANDING_DISCOUNT_PCT,
-        "plat_vol": STANDING_PLATINUM_VOLUME_USD, "plat_trades": STANDING_PLATINUM_TRADES,
-        "gold_vol": STANDING_GOLD_VOLUME_USD, "person_url": PIPELINE_PERSON_URL,
+        "plat_vol": STANDING_PLATINUM_VOLUME_USD, "plat_1m": STANDING_PLATINUM_TRADES_1M,
+        "gold_vol": STANDING_GOLD_VOLUME_USD, "gold_250k": STANDING_GOLD_TRADES_250K,
+        "size_250k": STANDING_SIZE_250K, "size_1m": STANDING_SIZE_1M,
+        "person_url": PIPELINE_PERSON_URL, "deal_url": PIPELINE_DEAL_URL,
         "conflict_msg": STANDING_CONFLICT_MSG,
     }
     banner = ('<div class="st-banner st-err">The standing file could not be loaded. Nothing can be saved '
@@ -15144,25 +15256,17 @@ def render_standing_page(key):
 
 def _validate_standing_client(pid, raw, now, old_refs):
     """(record, error) for one posted row. raw carries every editable field."""
-    if not (isinstance(raw, dict)):
+    if not isinstance(raw, dict):
         return None, f"{pid}: row must be an object"
     rec = {}
-    if not isinstance(raw.get("private"), bool):
-        return None, f"{pid}: private must be true/false"
-    rec["private"] = raw["private"]
+    if not isinstance(raw.get("visible"), bool):
+        return None, f"{pid}: visible must be true/false"
+    rec["visible"] = raw["visible"]
     for f in STANDING_REPAIR_FIELDS:
         v = _standing_int(raw.get(f), 0, STANDING_REPAIR_MAX)
         if v is None:
             return None, f"{pid}: {f} must be 0-{STANDING_REPAIR_MAX}"
         rec[f] = v
-    t = raw.get("trades_override")
-    if t is not None and _standing_int(t, 0) is None:
-        return None, f"{pid}: trades override must be a whole number >= 0 or blank"
-    rec["trades_override"] = None if t is None else _standing_int(t, 0)
-    v = raw.get("volume_override_usd")
-    if v is not None and _standing_amount(v) is None:
-        return None, f"{pid}: volume override must be a number >= 0 or blank"
-    rec["volume_override_usd"] = None if v is None else _standing_amount(v)
     floor = raw.get("tier_floor")
     if floor is not None and floor not in STANDING_TIERS:
         return None, f"{pid}: tier floor must be preferred, gold, platinum or blank"
@@ -15184,6 +15288,41 @@ def _validate_standing_client(pid, raw, now, old_refs):
         refs.append({"person_id": rp, "confirmed_unrelated": r.get("confirmed_unrelated") is True,
                      "added_at": old_added.get(rp) or now})
     rec["referrals"] = refs
+    edits_in = raw.get("trade_edits", {})
+    if not isinstance(edits_in, dict) or len(edits_in) > STANDING_MAX_TRADE_EDITS:
+        return None, f"{pid}: trade edits must be an object (max {STANDING_MAX_TRADE_EDITS})"
+    edits = {}
+    for did, e in edits_in.items():
+        if not (str(did).isdigit() and str(did).isascii()) or not isinstance(e, dict):
+            return None, f"{pid}: trade edit keys must be deal ids"
+        size = e.get("size_usd")
+        if size is not None and _standing_amount(size) is None:
+            return None, f"{pid}: trade size must be a number >= 0 or blank"
+        if not isinstance(e.get("excluded", False), bool):
+            return None, f"{pid}: trade include flag must be true/false"
+        size = _standing_amount(size) if size is not None else None
+        if size is not None or e.get("excluded"):
+            edits[str(did)] = {"size_usd": size, "excluded": e.get("excluded") is True}
+    rec["trade_edits"] = edits
+    manual_in = raw.get("manual_trades", [])
+    if not isinstance(manual_in, list) or len(manual_in) > STANDING_MAX_MANUAL_TRADES:
+        return None, f"{pid}: manual trades must be a list (max {STANDING_MAX_MANUAL_TRADES})"
+    manual = []
+    for t in manual_in:
+        if not isinstance(t, dict):
+            return None, f"{pid}: each manual trade must be an object"
+        label = t.get("label")
+        if not isinstance(label, str) or not label.strip() or len(label) > STANDING_LABEL_MAX_LEN:
+            return None, f"{pid}: manual trade label is required (max {STANDING_LABEL_MAX_LEN} characters)"
+        size = t.get("size_usd")
+        if size is not None and _standing_amount(size) is None:
+            return None, f"{pid}: manual trade size must be a number >= 0 or blank"
+        date = t.get("date") or ""
+        if not isinstance(date, str) or (date and not STANDING_DATE_RE.match(date)):
+            return None, f"{pid}: manual trade date must be YYYY-MM-DD or blank"
+        manual.append({"label": label.strip(), "size_usd": None if size is None else _standing_amount(size),
+                       "date": date})
+    rec["manual_trades"] = manual
     notes = raw.get("notes", "")
     if not isinstance(notes, str) or len(notes) > STANDING_NOTES_MAX_LEN:
         return None, f"{pid}: notes must be text of at most {STANDING_NOTES_MAX_LEN} characters"
@@ -15197,11 +15336,17 @@ def _standing_hist_value(field, v):
     return v
 
 
+def _standing_stored_client(rec):
+    """A client record as written to S3 (legacy carry-over keys dropped)."""
+    return {k: v for k, v in rec.items() if k != "legacy_overrides"}
+
+
 def _handle_save_standing(event):
-    """POST ?action=save_standing -- admin only. Body {key, rev, settings?,
-    clients: {pid: {every editable field}}}. Rejected whole on any invalid
-    row; 409 when the stored rev moved; daily backup before the day's
-    first write; one history entry (reason blank) per changed field."""
+    """POST ?action=save_standing -- admin only. Body {key, rev, clients:
+    {pid: {every editable field}}}. Rejected whole on any invalid row; 409
+    when the stored rev moved; daily backup before the day's first write;
+    one history entry (reason blank) per changed field. Legacy trades/volume
+    overrides on ANY stored client move into one history entry each."""
     body = _parse_json_body(event)
     query = event.get("queryStringParameters") or {}
     admin_key = os.environ.get("ADMIN_KEY")
@@ -15211,12 +15356,8 @@ def _handle_save_standing(event):
     if rev is None:
         return _json_response({"error": "rev must be a whole number"}, 400)
     clients_in = body.get("clients") or {}
-    settings_in = body.get("settings")
     if not isinstance(clients_in, dict):
         return _json_response({"error": "clients must be an object"}, 400)
-    if settings_in is not None and not (isinstance(settings_in, dict) and all(
-            k in ("sellers_visible", "buyers_visible") and isinstance(v, bool) for k, v in settings_in.items())):
-        return _json_response({"error": "settings must be sellers_visible/buyers_visible true/false"}, 400)
     for pid in clients_in:
         if not (str(pid).isdigit() and str(pid).isascii()):
             return _json_response({"error": f"person id {pid!r} must be numeric"}, 400)
@@ -15239,10 +15380,12 @@ def _handle_save_standing(event):
 
     now = _iso_utc()
     new_state = copy.deepcopy(current)
-    for k, v in (settings_in or {}).items():
-        if new_state["settings"][k] != v:
-            print(f"client-standing setting {k}: {new_state['settings'][k]} -> {v}")
-            new_state["settings"][k] = v
+    for rec in new_state["clients"].values():
+        legacy = rec.pop("legacy_overrides", None)
+        if legacy:
+            rec["history"].append({"at": now, "field": "override removed", "from": legacy, "to": None,
+                                   "reason": f"override removed: trades {legacy['trades']} / "
+                                             f"volume {legacy['volume_usd']}"})
     changed_fields = 0
     for pid, raw in clients_in.items():
         pid = str(pid)
@@ -15261,6 +15404,7 @@ def _handle_save_standing(event):
         new_state["clients"][pid] = rec
     new_state["rev"] = current["rev"] + 1
     new_state["updated_at"] = now
+    new_state["clients"] = {pid: _standing_stored_client(r) for pid, r in new_state["clients"].items()}
 
     if current_raw is not None:
         backup_key = f"{STANDING_BACKUP_PREFIX}{now[:10]}.json"
@@ -15307,80 +15451,101 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Client standing · Gracia Group</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600&display=swap" rel="stylesheet">
 <style>
-  body { margin: 0; background: #f4f2ee; color: #16181d; padding: 32px 16px 96px;
-         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
-  .wrap { max-width: 1500px; margin: 0 auto; }
-  h1 { font-size: 20px; }
+  :root { --ink: #16181d; --muted: #6b7280; --line: #ececea; --amber: #a15c07; --amber-bg: #fdf3e1;
+          --green: #1f7a4d; --green-bg: #e7f5ec; --red: #b91c1c; --accent: #3d5a73; }
+  body { margin: 0; background: #ffffff; color: var(--ink); padding: 32px 20px 64px;
+         font: 400 14px/1.45 "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+  .wrap { max-width: 1560px; margin: 0 auto; }
+  h1, h2, .st-serif { font-family: "Source Serif 4", Georgia, serif; font-weight: 600; }
+  h1 { font-size: 26px; margin: 0 0 16px; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }
-  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #e5e7eb; vertical-align: middle; }
-  th { font-size: 11px; color: #374151; text-transform: uppercase; letter-spacing: .03em; white-space: nowrap; }
-  input[type=search], input[type=text], input[type=number] { padding: 5px 7px; font-size: 13px;
-         border: 1px solid #d1d5db; border-radius: 5px; box-sizing: border-box; }
-  input[type=number] { width: 110px; }
-  input.st-vol { width: 130px; text-align: right; }
-  textarea.st-notes { width: 180px; min-height: 28px; font: 12px/1.35 inherit; resize: vertical; overflow: hidden;
-         border: 1px solid #d1d5db; border-radius: 5px; padding: 4px 6px; box-sizing: border-box; }
-  .st-hint { font-size: 11px; color: #6b7280; margin-top: 2px; white-space: nowrap; }
-  .st-banner { padding: 10px 12px; border-radius: 6px; margin: 8px 0; font-weight: 600; }
-  .st-err { background: #fde8e8; color: #b91c1c; }
-  .st-ok { background: #e7f5ec; color: #1f7a4d; }
-  .st-settings { display: flex; gap: 24px; flex-wrap: wrap; background: #fff; padding: 10px 12px;
-                 border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 12px; }
-  .st-on { color: #1f7a4d; font-weight: 700; } .st-off { color: #6b7280; font-weight: 700; }
-  .st-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
-  .st-rep { white-space: nowrap; } .st-rep button { width: 22px; padding: 0; }
-  .st-rep span { display: inline-block; min-width: 14px; text-align: center; font-weight: 600; }
-  .st-yes { color: #1f7a4d; font-weight: 700; text-decoration: none; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em;
+       white-space: nowrap; }
+  .num, input.num { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; }
+  input[type=search], input[type=text], input[type=date] { padding: 6px 8px; font: inherit; font-size: 13px;
+         border: 1px solid #d6d6d2; border-radius: 6px; box-sizing: border-box; background: #fff; }
+  button { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid #d6d6d2; border-radius: 6px;
+           background: #fff; color: var(--ink); cursor: pointer; }
+  button:hover { background: #f6f6f4; }
+  button:disabled { opacity: .5; cursor: default; }
+  select { font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid #d6d6d2; border-radius: 6px; background: #fff; }
+  a { color: var(--accent); }
+  .st-banner { padding: 10px 12px; border-radius: 6px; margin: 8px 0; font-weight: 500; }
+  .st-err { background: #fde8e8; color: var(--red); }
+  .st-ok { background: var(--green-bg); color: var(--green); }
+  .st-bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+  .st-add { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 4px 0 12px; background: #fafaf8; }
+  .st-add .st-results div { padding: 4px 0; border-bottom: 1px solid var(--line); }
+  .st-add .st-results div:last-child { border-bottom: none; }
+  .st-tablewrap { position: relative; }
+  .st-save { position: sticky; top: 0; z-index: 5; background: #fff; border-bottom: 1px solid var(--line);
+             padding: 10px 0; display: flex; gap: 12px; align-items: center; }
+  .st-save #st-dirty { font-weight: 500; }
+  .st-save #st-savebtn { font-size: 14px; padding: 6px 18px; background: var(--ink); color: #fff; border-color: var(--ink); }
+  .st-save #st-savebtn:disabled { background: #9ca3af; border-color: #9ca3af; }
+  .st-save #st-msg { flex: 1; }
+  .st-save #st-msg .st-banner { margin: 0; padding: 6px 10px; }
+  .st-ok-mark { color: var(--green); font-weight: 600; }
+  .st-togo { color: var(--amber); background: var(--amber-bg); border-radius: 4px; padding: 1px 6px; font-weight: 500;
+             white-space: nowrap; }
+  .st-rep { white-space: nowrap; } .st-rep .st-btns { display: block; margin-top: 4px; }
+  .st-rep .st-btns button { font-size: 11px; padding: 1px 6px; }
+  .st-yes { color: var(--green); font-weight: 600; text-decoration: none; }
   .st-no { color: #9ca3af; text-decoration: none; }
-  tr.st-changed td { background: #fff8e1; }
-  .st-tier { font-weight: 600; white-space: nowrap; } .st-muted { color: #6b7280; font-size: 12px; }
-  .st-warn { color: #b91c1c; font-weight: 600; }
-  .st-panel td { background: #f9fafb; }
+  tr.st-changed td { background: #fffbeb; }
+  .st-tier { font-weight: 600; white-space: nowrap; } .st-muted { color: var(--muted); font-size: 12px; }
+  .st-warn { color: var(--red); font-weight: 500; }
+  .st-amber { color: var(--amber); font-weight: 500; }
+  .st-panel td { background: #fafaf8; }
+  .st-panel table { background: transparent; margin: 6px 0; }
+  .st-panel th, .st-panel td { padding: 6px 8px; }
   .st-results div { padding: 3px 0; }
-  .st-save { position: fixed; left: 0; right: 0; bottom: 0; background: #16181d; color: #fff; padding: 10px 16px;
-             display: flex; gap: 12px; align-items: center; justify-content: flex-end; }
-  .st-save button { font-size: 14px; padding: 6px 18px; }
-  a { color: #3d5a73; }
+  textarea.st-notes { width: 190px; min-height: 30px; font: 12px/1.4 "IBM Plex Sans", sans-serif; resize: vertical;
+         overflow: hidden; border: 1px solid #d6d6d2; border-radius: 6px; padding: 5px 7px; box-sizing: border-box; }
+  input.st-size { width: 130px; text-align: right; }
   [hidden] { display: none !important; }
 </style>
 </head>
 <body><div class="wrap">
 <h1>Client standing</h1>
 __BANNER__
-<div id="st-msg"></div>
-<div class="st-settings">
-  <label><input type="checkbox" id="st-sellers"> Show standing to sellers — <span id="st-sellers-state"></span></label>
-  <label><input type="checkbox" id="st-buyers"> Show status to buyers — <span id="st-buyers-state"></span></label>
-</div>
 <div class="st-bar">
-  <input type="search" id="st-q" placeholder="Search name, firm, email or id…" style="min-width:300px">
+  <input type="search" id="st-q" placeholder="Search name, firm, email or id…" style="min-width:320px">
   <select id="st-tier"><option value="">Any tier</option><option value="none">No tier</option>
     <option value="preferred">Preferred</option><option value="gold">Gold</option><option value="platinum">Platinum</option></select>
+  <select id="st-vis"><option value="">Visible and hidden</option><option value="visible">Visible only</option>
+    <option value="hidden">Hidden only</option></select>
   <label><input type="checkbox" id="st-bad"> Not in good standing</label>
-  <label><input type="checkbox" id="st-priv"> Private only</label>
   <select id="st-sort"><option value="clients">Clients first, then name</option><option value="name">Name</option></select>
   <span id="st-count" class="st-muted"></span>
 </div>
+<div id="st-more" class="st-add" hidden><h2>Add someone not on the scoreboard</h2>
+<div id="st-add-results" class="st-results"></div></div>
 <div class="st-bar" id="st-bulk">
   <span class="st-muted" id="st-selcount">0 selected</span>
-  <button type="button" data-bulk="private_on">Set Private on</button>
-  <button type="button" data-bulk="private_off">Set Private off</button>
+  <button type="button" data-bulk="visible_on">Make visible</button>
+  <button type="button" data-bulk="visible_off">Hide</button>
   <button type="button" data-bulk="reset_repairs">Reset repairs to 0</button>
-  <button type="button" data-bulk="clear_overrides">Clear trades/volume overrides</button>
 </div>
+<div class="st-tablewrap">
+<div class="st-save"><span id="st-dirty">No unsaved changes</span>
+  <button type="button" id="st-savebtn">Save changes</button><div id="st-msg"></div></div>
 <table>
 <thead><tr><th><input type="checkbox" id="st-all"></th><th>Name</th><th>Firm</th><th>ID forms</th><th>Qualification</th>
-<th>Terms repair</th><th>Payments repair</th><th>Responds repair</th><th>Trades</th><th>Volume</th><th>Referrals</th>
-<th>Tier floor</th><th>Private</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
+<th>Terms</th><th>Payments</th><th>Responds</th><th>Trades</th><th>Referrals</th>
+<th>Tier floor</th><th>Visible</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
 </table>
+</div>
 <div class="st-bar" id="st-pager"><button type="button" id="st-prev">← Previous 100</button><span id="st-page" class="st-muted"></span>
 <button type="button" id="st-next">Next 100 →</button></div>
-<div id="st-more" hidden><h2 style="font-size:14px;margin:18px 0 6px">Not on the scoreboard yet</h2>
-<div id="st-add-results" class="st-results"></div></div>
 </div>
-<div class="st-save"><span id="st-dirty">No unsaved changes</span><button type="button" id="st-savebtn">Save changes</button></div>
 <script>var STANDING = __DATA__;</script>
 <script>__SCRIPT__</script>
 </body></html>"""
@@ -15389,14 +15554,16 @@ __BANNER__
 STANDING_PAGE_JS = r"""
 (function() {
   var D = STANDING, rows = D.rows, byId = {}, orig = {}, edits = {}, forceSave = {};
-  var selected = {}, openPanel = null, openHist = {}, page = 0, settings = {sellers_visible: !!D.settings.sellers_visible,
-    buyers_visible: !!D.settings.buyers_visible};
-  var COLS = 16;
+  var selected = {}, openRefs = null, openTrades = {}, openHist = {}, page = 0;
+  var COLS = 15;
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
     return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
   function usd(v) { return '$' + Math.round(v || 0).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
-  function track(r) { byId[r.id] = r; if (r.rec.notes == null) r.rec.notes = '';
+  function parseUsd(v) { v = String(v || '').replace(/[$,\s]/g, '').replace(/\.\d*$/, '');
+    if (v === '') return null; var n = Number(v); return (isFinite(n) && n >= 0) ? n : NaN; }
+  function track(r) { byId[r.id] = r;
+    r.rec.notes = r.rec.notes || ''; r.rec.trade_edits = r.rec.trade_edits || {}; r.rec.manual_trades = r.rec.manual_trades || [];
     orig[r.id] = {rec: clone(r.rec), refs: clone(r.refs)}; }
   function addRow(r) { if (byId[r.id]) return; rows.push(r); track(r); }
   rows.slice().forEach(track);
@@ -15405,32 +15572,40 @@ STANDING_PAGE_JS = r"""
   function sig(s) { return JSON.stringify([s.rec, s.refs.map(function(x) {
     return [x.person_id, !!x.confirmed_unrelated]; })]); }
   function changed(r) { return !!forceSave[r.id] || (!!edits[r.id] && sig(edits[r.id]) !== sig(orig[r.id])); }
-  function settingsChanged() { return settings.sellers_visible !== !!D.settings.sellers_visible ||
-    settings.buyers_visible !== !!D.settings.buyers_visible; }
   function rank(t) { return D.tiers.indexOf(t); }
+  function tradeStats(r) {
+    var rec = cur(r).rec, list = [];
+    r.won.forEach(function(d) { var e = rec.trade_edits[d.deal_id] || {};
+      if (e.excluded) return; list.push(e.size_usd != null ? e.size_usd : d.auto_size); });
+    rec.manual_trades.forEach(function(t) { list.push(t.size_usd); });
+    var known = list.filter(function(v) { return v != null; });
+    return {trades: list.length, vol: known.reduce(function(a, b) { return a + b; }, 0),
+      t250: known.filter(function(v) { return v >= D.size_250k; }).length,
+      t1m: known.filter(function(v) { return v >= D.size_1m; }).length, unknown: list.length - known.length};
+  }
+  function refConfirmed(x) { return !!(x.onboarded && x.confirmed_unrelated); }
   function standing(r) {
-    var s = cur(r), rec = s.rec;
-    var trades = rec.trades_override != null ? rec.trades_override : r.auto_trades;
-    var vol = rec.volume_override_usd != null ? rec.volume_override_usd : r.auto_volume;
+    var s = cur(r), rec = s.rec, ts = tradeStats(r);
     var good = r.id_forms && r.qual && rec.terms_repair === 0 && rec.payments_repair === 0 && rec.respond_repair === 0;
-    var q = s.refs.filter(function(x) { return x.base_ok && x.confirmed_unrelated; }).length;
+    var conf = s.refs.filter(refConfirmed).length;
     var comp = null;
-    if (good) { comp = (vol >= D.plat_vol || trades >= D.plat_trades) ? 'platinum' : (vol >= D.gold_vol ? 'gold' :
-      (q >= 1 ? 'preferred' : null)); }
+    if (good) { comp = (ts.vol >= D.plat_vol || ts.t1m >= D.plat_1m) ? 'platinum' :
+      ((ts.vol >= D.gold_vol || ts.t250 >= D.gold_250k) ? 'gold' : (conf >= 1 ? 'preferred' : null)); }
     var tier = rank(rec.tier_floor) > rank(comp) ? rec.tier_floor : comp;
-    return {good: good, tier: tier, q: q, trades: trades, vol: vol};
+    return {good: good, tier: tier, conf: conf, pend: s.refs.length - conf, ts: ts};
   }
   function filtered() {
     var q = document.getElementById('st-q').value.trim().toLowerCase();
     var tf = document.getElementById('st-tier').value, bad = document.getElementById('st-bad').checked;
-    var priv = document.getElementById('st-priv').checked, sort = document.getElementById('st-sort').value;
+    var vis = document.getElementById('st-vis').value, sort = document.getElementById('st-sort').value;
     var out = rows.filter(function(r) {
       if (q && (r.name + ' ' + r.firm + ' ' + r.id + ' ' + r.email).toLowerCase().indexOf(q) === -1) return false;
       var st = standing(r);
       if (tf === 'none' && st.tier) return false;
       if (tf && tf !== 'none' && st.tier !== tf) return false;
       if (bad && st.good) return false;
-      if (priv && !cur(r).rec.private) return false;
+      if (vis === 'visible' && !cur(r).rec.visible) return false;
+      if (vis === 'hidden' && cur(r).rec.visible) return false;
       return true;
     });
     out.sort(function(a, b) {
@@ -15440,24 +15615,28 @@ STANDING_PAGE_JS = r"""
     return out;
   }
   function rep(r, f) { var v = cur(r).rec[f];
-    return '<span class="st-rep"><button type="button" data-act="dec" data-f="' + f + '">−</button><span>' + v +
-      '</span><button type="button" data-act="inc" data-f="' + f + '">+</button></span>'; }
+    return '<span class="st-rep">' + (v === 0 ? '<span class="st-ok-mark">✓</span>' : '<span class="st-togo num">' + v + ' to go</span>') +
+      '<span class="st-btns"><button type="button" data-act="miss" data-f="' + f + '"' + (v >= D.repair_max ? ' disabled' : '') +
+      '>Missed</button> <button type="button" data-act="clear" data-f="' + f + '"' + (v === 0 ? ' disabled' : '') +
+      '>Cleared</button></span></span>'; }
   function tierHtml(r) { var st = standing(r);
     return esc(st.tier ? (D.tier_labels[st.tier] + ' · ' + D.discounts[st.tier] + '%') : '—') +
-      (st.good ? '' : '<div class="st-muted">not in good standing</div>'); }
-  function tradesHint(r) { var o = cur(r).rec.trades_override;
-    return o == null ? '' : 'Pipeline: ' + r.auto_trades + ' · <a href="#" data-act="reset" data-f="trades_override">reset</a>'; }
-  function volHint(r) { var o = cur(r).rec.volume_override_usd;
-    return o == null ? '' : 'Pipeline: ' + usd(r.auto_volume) + ' · <a href="#" data-act="reset" data-f="volume_override_usd">reset</a>'; }
+      (st.good ? '' : '<div class="st-muted" style="font-weight:400">not in good standing</div>'); }
+  function tradesCell(r) { var ts = standing(r).ts;
+    return '<a href="#" data-act="trades">Trades (' + ts.trades + ')</a><div class="num">' + usd(ts.vol) + '</div>' +
+      '<div class="st-muted num">≥$250K: ' + ts.t250 + ' · ≥$1M: ' + ts.t1m + '</div>' +
+      (ts.unknown ? '<div class="st-amber">' + ts.unknown + ' size unknown</div>' : ''); }
+  function refsCell(r) { var st = standing(r);
+    return '<a href="#" data-act="refs">' + st.conf + ' confirmed · ' + st.pend + ' pending</a>'; }
   function fmtVal(v) {
     if (v == null || v === '') return '—';
     if (Array.isArray(v)) return v.length ? v.map(function(x) { return x && x.person_id ? '#' + x.person_id +
-      (x.confirmed_unrelated ? ' ✓' : '') : JSON.stringify(x); }).join(', ') : '(none)';
+      (x.confirmed_unrelated ? ' ✓' : '') : (x && x.label ? x.label + ' ' + (x.size_usd != null ? usd(x.size_usd) : '?') : JSON.stringify(x)); }).join(', ') : '(none)';
     if (typeof v === 'object') return JSON.stringify(v);
     return String(v);
   }
   function rowHtml(r) {
-    var s = cur(r), rec = s.rec, st = standing(r);
+    var s = cur(r), rec = s.rec;
     var personUrl = D.person_url.replace('{}', encodeURIComponent(r.id));
     var floorOpts = ['', 'preferred', 'gold', 'platinum'].map(function(t) {
       return '<option value="' + t + '"' + ((rec.tier_floor || '') === t ? ' selected' : '') + '>' +
@@ -15465,47 +15644,74 @@ STANDING_PAGE_JS = r"""
     var hist = r.history || [];
     return '<tr data-id="' + esc(r.id) + '"' + (changed(r) ? ' class="st-changed"' : '') + '>' +
       '<td><input type="checkbox" data-act="sel"' + (selected[r.id] ? ' checked' : '') + '></td>' +
-      '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) +
-        '</a>' + (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') + '</td>' +
+      '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) + '</a>' +
+        (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') + '</td>' +
       '<td>' + esc(r.firm) + '</td>' +
       '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' + (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a></td>' +
       '<td><span class="' + (r.qual ? 'st-yes">✓' : 'st-no">○') + '</span></td>' +
       '<td>' + rep(r, 'terms_repair') + '</td><td>' + rep(r, 'payments_repair') + '</td><td>' + rep(r, 'respond_repair') + '</td>' +
-      '<td><input type="number" min="0" step="1" data-act="trades" value="' + st.trades + '">' +
-        '<div class="st-hint" data-role="thint">' + tradesHint(r) + '</div></td>' +
-      '<td><input type="text" inputmode="numeric" class="st-vol" data-act="volume" value="' + usd(st.vol) + '">' +
-        '<div class="st-hint" data-role="vhint">' + volHint(r) + '</div></td>' +
-      '<td><a href="#" data-act="refs">' + st.q + ' / ' + s.refs.length + '</a></td>' +
+      '<td data-role="trades">' + tradesCell(r) + '</td>' +
+      '<td data-role="refs">' + refsCell(r) + '</td>' +
       '<td><select data-act="floor">' + floorOpts + '</select></td>' +
-      '<td><input type="checkbox" data-act="private"' + (rec.private ? ' checked' : '') + '></td>' +
+      '<td><input type="checkbox" data-act="visible"' + (rec.visible ? ' checked' : '') + '></td>' +
       '<td class="st-tier" data-role="tier">' + tierHtml(r) + '</td>' +
       '<td><textarea class="st-notes" data-act="notes" maxlength="' + D.notes_max + '" rows="1">' + esc(rec.notes) + '</textarea></td>' +
       '<td>' + (hist.length ? '<a href="#" data-act="hist">History (' + hist.length + ')</a>' : '<span class="st-muted">History (0)</span>') + '</td></tr>' +
-      (openPanel === r.id ? panelHtml(r) : '') + (openHist[r.id] ? histHtml(r) : '');
+      (openTrades[r.id] ? tradesHtml(r) : '') + (openRefs === r.id ? refsHtml(r) : '') + (openHist[r.id] ? histHtml(r) : '');
+  }
+  function tradesHtml(r) {
+    var rec = cur(r).rec;
+    var won = r.won.map(function(d) {
+      var e = rec.trade_edits[d.deal_id] || {}, size = e.size_usd != null ? e.size_usd : d.auto_size;
+      return '<tr data-deal="' + esc(d.deal_id) + '"><td><a target="_blank" rel="noopener" href="' +
+        esc(D.deal_url.replace('{}', encodeURIComponent(d.deal_id))) + '">' + esc(d.name) + '</a></td><td>' + esc(d.side) +
+        '</td><td class="num">' + esc(d.date || '—') + '</td><td><input type="text" inputmode="numeric" class="st-size num" data-act="tsize" value="' +
+        (size == null ? '' : usd(size)) + '" placeholder="size">' +
+        (size == null ? ' <span class="st-amber">size unknown</span>' : '') +
+        (e.size_usd != null && d.auto_size !== e.size_usd ? ' <span class="st-muted">Pipeline: ' + (d.auto_size == null ? 'unknown' : usd(d.auto_size)) + '</span>' : '') +
+        '</td><td><label><input type="checkbox" data-act="tinc"' + (e.excluded ? '' : ' checked') + '> Include</label></td></tr>';
+    }).join('') || '<tr><td colspan="5" class="st-muted">No won deals in Pipeline.</td></tr>';
+    var manual = rec.manual_trades.map(function(t, i) {
+      return '<tr><td>' + esc(t.label) + ' <span class="st-muted">(not in Pipeline)</span></td><td>—</td><td class="num">' + esc(t.date || '—') +
+        '</td><td class="num">' + (t.size_usd == null ? '<span class="st-amber">size unknown</span>' : usd(t.size_usd)) +
+        '</td><td><button type="button" data-act="mdel" data-i="' + i + '">Remove</button></td></tr>';
+    }).join('');
+    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><h2>Trades for ' + esc(r.name) + '</h2>' +
+      '<table><thead><tr><th>Deal</th><th>Side</th><th>Closed</th><th>Size</th><th></th></tr></thead><tbody>' + won + manual + '</tbody></table>' +
+      '<div class="st-bar"><strong style="font-weight:500">+ Add trade not in Pipeline</strong>' +
+      '<input type="text" data-role="mlabel" placeholder="Label" style="min-width:220px">' +
+      '<input type="text" inputmode="numeric" class="num" data-role="msize" placeholder="Size $" style="width:130px">' +
+      '<input type="date" data-role="mdate"><button type="button" data-act="madd">Add trade</button>' +
+      '<span class="st-warn" data-role="merr"></span></div></td></tr>';
   }
   function histHtml(r) {
     var items = (r.history || []).slice().reverse().map(function(h) {
       return '<div>' + esc(String(h.at || '').slice(0, 10)) + ' · ' + esc(h.field) + ' · ' + esc(fmtVal(h.from)) +
         ' → ' + esc(fmtVal(h.to)) + '</div>'; }).join('');
-    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><strong>History for ' + esc(r.name) +
-      '</strong><div class="st-results">' + items + '</div></td></tr>';
+    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><h2>History for ' + esc(r.name) +
+      '</h2><div class="st-results">' + items + '</div></td></tr>';
+  }
+  function refStatus(x) {
+    if (x.self) return '<span class="st-warn">this is the client</span>';
+    if (!x.onboarded) return '<span class="st-amber">Pending onboarding — needs ' + esc((x.missing || []).join(' and ')) + '</span>';
+    if (!x.confirmed_unrelated) return '<span class="st-amber">Pending — tick the relationship box to confirm</span>';
+    return '<span class="st-yes">Confirmed</span>';
   }
   function refLine(x) {
     return '<div>' + esc(x.name || ('#' + x.person_id)) + (x.firm ? ' · ' + esc(x.firm) : '') +
-      ' · form: ' + esc(x.cef_label) + ' · level: ' + esc(x.level_label) + ' · ' +
-      (x.self ? '<span class="st-warn">this is the client</span>' : !x.exists ? '<span class="st-warn">not in people list</span>' :
-        x.base_ok ? '<span class="st-yes">qualifies</span>' : '<span class="st-no">does not qualify</span>') +
+      ' · form: ' + esc(x.cef_label) + ' · level: ' + esc(x.level_label) + ' · ' + refStatus(x) +
       (x.related ? ' <span class="st-warn">⚠ shares a company or email domain with the client</span>' : '') + '</div>';
   }
-  function panelHtml(r) {
+  function refsHtml(r) {
     var s = cur(r);
     var list = s.refs.map(function(x, i) {
-      return '<div style="padding:4px 0;border-bottom:1px solid #e5e7eb">' + refLine(x) +
+      return '<div style="padding:6px 0;border-bottom:1px solid #ececea">' + refLine(x) +
         '<label><input type="checkbox" data-act="refok" data-i="' + i + '"' + (x.confirmed_unrelated ? ' checked' : '') +
-        '> Confirmed new and unrelated</label> <button type="button" data-act="refdel" data-i="' + i + '">Remove</button></div>';
+        '> Not a household member, related entity or colleague of this client</label> ' +
+        '<button type="button" data-act="refdel" data-i="' + i + '">Remove</button></div>';
     }).join('') || '<div class="st-muted">No referrals yet.</div>';
-    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><strong>Referrals for ' + esc(r.name) + '</strong>' + list +
-      '<div style="margin-top:8px"><input type="search" data-act="refsearch" placeholder="Search people to add as a referral" style="min-width:300px">' +
+    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><h2>Referrals for ' + esc(r.name) + '</h2>' + list +
+      '<div style="margin-top:8px"><input type="search" data-act="refsearch" placeholder="Search people to add as a referral" style="min-width:320px">' +
       '<div class="st-results" data-role="refresults"></div></div></td></tr>';
   }
   function grow(ta) { ta.style.height = 'auto'; ta.style.height = (ta.scrollHeight + 2) + 'px'; }
@@ -15525,27 +15731,22 @@ STANDING_PAGE_JS = r"""
     document.getElementById('st-all').checked = slice.length > 0 && slice.every(function(r) { return selected[r.id]; });
     renderDirty();
   }
-  // In-place refresh of one row's derived bits while its inputs keep focus.
-  function refreshRow(tr, r) {
+  // In-place refresh of one row's derived cells while an input keeps focus.
+  function refreshRow(r) {
+    var tr = document.querySelector('#st-body tr[data-id="' + r.id + '"]:not(.st-panel)');
+    if (!tr) return;
     tr.className = changed(r) ? 'st-changed' : '';
-    var q = function(role) { return tr.querySelector('[data-role=' + role + ']'); };
-    var st = standing(r);
-    q('tier').innerHTML = tierHtml(r);
-    q('thint').innerHTML = tradesHint(r);
-    q('vhint').innerHTML = volHint(r);
+    tr.querySelector('[data-role=tier]').innerHTML = tierHtml(r);
+    tr.querySelector('[data-role=trades]').innerHTML = tradesCell(r);
     renderDirty();
   }
   function renderDirty() {
-    var n = rows.filter(changed).length + (settingsChanged() ? 1 : 0);
+    var n = rows.filter(changed).length;
     document.getElementById('st-dirty').textContent = n ? (n + ' unsaved change' + (n === 1 ? '' : 's')) : 'No unsaved changes';
-    ['sellers', 'buyers'].forEach(function(k) {
-      var on = settings[k + '_visible'];
-      document.getElementById('st-' + k).checked = on;
-      var el = document.getElementById('st-' + k + '-state');
-      el.className = on ? 'st-on' : 'st-off'; el.textContent = on ? 'ON' : 'OFF';
-    });
   }
   function rowOf(el) { var tr = el.closest('tr[data-id]'); return tr ? byId[tr.getAttribute('data-id')] : null; }
+  function cleanEdit(rec, did) { var e = rec.trade_edits[did];
+    if (e && e.size_usd == null && !e.excluded) delete rec.trade_edits[did]; }
   var body = document.getElementById('st-body');
   // Buttons/links never take focus, so a focused input never blurs (and
   // never re-renders) between mousedown and click: the click always lands.
@@ -15554,47 +15755,60 @@ STANDING_PAGE_JS = r"""
   });
   body.addEventListener('click', function(e) {
     var el = e.target.closest('[data-act]'); if (!el) return; var r = rowOf(el); if (!r) return;
-    var act = el.getAttribute('data-act');
-    if (act === 'inc' || act === 'dec') { var f = el.getAttribute('data-f'), s = edit(r);
-      s.rec[f] = Math.max(0, Math.min(D.repair_max, s.rec[f] + (act === 'inc' ? 1 : -1))); render(); }
-    else if (act === 'refs') { e.preventDefault(); openPanel = openPanel === r.id ? null : r.id; render(); }
+    var act = el.getAttribute('data-act'), f = el.getAttribute('data-f');
+    if (act === 'miss' || act === 'clear') { var s = edit(r);
+      s.rec[f] = Math.max(0, Math.min(D.repair_max, s.rec[f] + (act === 'miss' ? (D.miss_step[f] || 1) : -1))); render(); }
+    else if (act === 'refs') { e.preventDefault(); openRefs = openRefs === r.id ? null : r.id; render(); }
+    else if (act === 'trades') { e.preventDefault(); if (openTrades[r.id]) delete openTrades[r.id]; else openTrades[r.id] = 1; render(); }
     else if (act === 'hist') { e.preventDefault(); if (openHist[r.id]) delete openHist[r.id]; else openHist[r.id] = 1; render(); }
-    else if (act === 'reset') { e.preventDefault(); edit(r).rec[el.getAttribute('data-f')] = null; render(); }
     else if (act === 'refdel') { edit(r).refs.splice(+el.getAttribute('data-i'), 1); render(); }
+    else if (act === 'mdel') { edit(r).rec.manual_trades.splice(+el.getAttribute('data-i'), 1); render(); }
+    else if (act === 'madd') {
+      var panel = el.closest('td'), label = panel.querySelector('[data-role=mlabel]').value.trim();
+      var size = parseUsd(panel.querySelector('[data-role=msize]').value), date = panel.querySelector('[data-role=mdate]').value;
+      var err = panel.querySelector('[data-role=merr]');
+      if (!label) { err.textContent = 'Label is required.'; return; }
+      if (size !== size) { err.textContent = 'Size must be a dollar amount.'; return; }
+      edit(r).rec.manual_trades.push({label: label, size_usd: size, date: date || ''}); render();
+    }
     else if (act === 'refadd') { var x = JSON.parse(el.getAttribute('data-ref')); var s2 = edit(r);
       if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = false; s2.refs.push(x); }
       render(); }
   });
-  var CHANGE_ACTS = {sel: 1, private: 1, floor: 1, refok: 1};
-  // Volume box: re-show the effective amount as $12,345,678 when it loses focus.
-  body.addEventListener('focusout', function(e) {
-    var el = e.target, r = el.getAttribute('data-act') === 'volume' ? rowOf(el) : null;
-    if (r) el.value = usd(standing(r).vol);
-  });
+  var CHANGE_ACTS = {sel: 1, visible: 1, floor: 1, refok: 1, tinc: 1};
   body.addEventListener('change', function(e) {
     var el = e.target, act = el.getAttribute('data-act');
     if (!act || !CHANGE_ACTS[act]) return;
     var r = rowOf(el); if (!r) return;
     if (act === 'sel') { if (el.checked) selected[r.id] = 1; else delete selected[r.id]; render(); return; }
     var s = edit(r);
-    if (act === 'private') s.rec.private = el.checked;
+    if (act === 'visible') s.rec.visible = el.checked;
     else if (act === 'floor') s.rec.tier_floor = el.value || null;
     else if (act === 'refok') s.refs[+el.getAttribute('data-i')].confirmed_unrelated = el.checked;
+    else if (act === 'tinc') { var did = el.closest('tr[data-deal]').getAttribute('data-deal');
+      var te = s.rec.trade_edits[did] || (s.rec.trade_edits[did] = {size_usd: null, excluded: false});
+      te.excluded = !el.checked; cleanEdit(s.rec, did); }
     render();
   });
   body.addEventListener('input', function(e) {
     var el = e.target, act = el.getAttribute('data-act'), r = rowOf(el); if (!r) return;
     if (act === 'refsearch') { search(el.value, r.id, el.parentNode.querySelector('[data-role=refresults]')); return; }
-    if (act === 'notes') { edit(r).rec.notes = el.value.slice(0, D.notes_max); grow(el); refreshRow(el.closest('tr'), r); return; }
-    if (act === 'trades' || act === 'volume') {
-      var v = act === 'volume' ? el.value.replace(/[$,\s]/g, '').replace(/\.\d*$/, '') : el.value.trim();
-      var n = v === '' ? null : Number(v);
-      var field = act === 'trades' ? 'trades_override' : 'volume_override_usd';
-      var auto = act === 'trades' ? r.auto_trades : r.auto_volume;
-      if (n !== null && (!isFinite(n) || n < 0 || (act === 'trades' && Math.floor(n) !== n))) return;
-      edit(r).rec[field] = (n === null || n === auto) ? null : n;
-      refreshRow(el.closest('tr'), r);
+    if (act === 'notes') { edit(r).rec.notes = el.value.slice(0, D.notes_max); grow(el); refreshRow(r); return; }
+    if (act === 'tsize') {
+      var did = el.closest('tr[data-deal]').getAttribute('data-deal'), n = parseUsd(el.value);
+      if (n !== n) return;
+      var d = r.won.filter(function(w) { return w.deal_id === did; })[0], s = edit(r);
+      var te = s.rec.trade_edits[did] || (s.rec.trade_edits[did] = {size_usd: null, excluded: false});
+      te.size_usd = (n === null || (d && n === d.auto_size)) ? null : n;
+      cleanEdit(s.rec, did); refreshRow(r);
     }
+  });
+  // Size boxes: re-show the effective amount as $12,345,678 on blur.
+  body.addEventListener('focusout', function(e) {
+    var el = e.target; if (el.getAttribute('data-act') !== 'tsize') return; var r = rowOf(el); if (!r) return;
+    var did = el.closest('tr[data-deal]').getAttribute('data-deal'), d = r.won.filter(function(w) { return w.deal_id === did; })[0];
+    var te = cur(r).rec.trade_edits[did] || {}, size = te.size_usd != null ? te.size_usd : (d ? d.auto_size : null);
+    el.value = size == null ? '' : usd(size);
   });
   var timers = {};
   function search(q, forId, box, after) {
@@ -15617,23 +15831,24 @@ STANDING_PAGE_JS = r"""
   }
   var addBox = document.getElementById('st-add-results'), more = document.getElementById('st-more');
   function searchMore() {
-    search(document.getElementById('st-q').value, null, addBox, function(n) { more.hidden = !n; });
+    var q = document.getElementById('st-q').value;
+    if (q.trim().length < 2) { more.hidden = true; addBox.innerHTML = ''; }
+    search(q, null, addBox, function(n) { more.hidden = !n; });
   }
   addBox.addEventListener('mousedown', function(e) { if (e.target.closest('button')) e.preventDefault(); });
   addBox.addEventListener('click', function(e) {
     var b = e.target.closest('[data-addclient]'); if (!b) return;
     var p = JSON.parse(b.getAttribute('data-addclient'));
     addRow({id: p.id, name: p.name, firm: p.firm, email: p.email, id_forms: p.id_forms, qual: p.qual,
-      auto_trades: p.auto_trades, auto_volume: p.auto_volume, has_record: true, rec: p.rec, refs: p.refs,
-      history: p.history || []});
+      won: p.won || [], has_record: true, rec: p.rec, refs: p.refs, history: p.history || []});
     if (!p.has_record) forceSave[p.id] = 1;
     page = 0; render(); searchMore();
   });
   document.getElementById('st-q').addEventListener('input', function() { page = 0; render(); searchMore(); });
-  ['st-tier', 'st-bad', 'st-priv', 'st-sort'].forEach(function(id) {
+  ['st-tier', 'st-bad', 'st-vis', 'st-sort'].forEach(function(id) {
     document.getElementById(id).addEventListener('change', function() { page = 0; render(); });
   });
-  document.getElementById('st-prev').addEventListener('click', function() { if (page > 0) { page--; render(); } });
+  document.getElementById('st-prev').addEventListener('click', function() { if (page > 0) { page--; render(); window.scrollTo(0, 0); } });
   document.getElementById('st-next').addEventListener('click', function() { page++; render(); window.scrollTo(0, 0); });
   document.getElementById('st-all').addEventListener('change', function(e) {
     var list = filtered().slice(page * D.page_rows, (page + 1) * D.page_rows);
@@ -15642,15 +15857,11 @@ STANDING_PAGE_JS = r"""
   document.getElementById('st-bulk').addEventListener('click', function(e) {
     var op = e.target.getAttribute('data-bulk'); if (!op) return;
     Object.keys(selected).forEach(function(id) { var r = byId[id]; if (!r) return; var s = edit(r);
-      if (op === 'private_on') s.rec.private = true;
-      else if (op === 'private_off') s.rec.private = false;
+      if (op === 'visible_on') s.rec.visible = true;
+      else if (op === 'visible_off') s.rec.visible = false;
       else if (op === 'reset_repairs') { s.rec.terms_repair = 0; s.rec.payments_repair = 0; s.rec.respond_repair = 0; }
-      else if (op === 'clear_overrides') { s.rec.trades_override = null; s.rec.volume_override_usd = null; }
     });
     render();
-  });
-  ['sellers', 'buyers'].forEach(function(k) {
-    document.getElementById('st-' + k).addEventListener('change', function(e) { settings[k + '_visible'] = e.target.checked; renderDirty(); });
   });
   function msg(cls, text) { document.getElementById('st-msg').innerHTML = '<div class="st-banner ' + cls + '">' + esc(text) + '</div>'; }
   var saveBtn = document.getElementById('st-savebtn');
@@ -15658,16 +15869,15 @@ STANDING_PAGE_JS = r"""
   saveBtn.addEventListener('click', function() {
     var clients = {};
     rows.filter(changed).forEach(function(r) { var s = cur(r);
-      clients[r.id] = {private: !!s.rec.private, terms_repair: s.rec.terms_repair, payments_repair: s.rec.payments_repair,
-        respond_repair: s.rec.respond_repair, trades_override: s.rec.trades_override,
-        volume_override_usd: s.rec.volume_override_usd, tier_floor: s.rec.tier_floor || null, notes: s.rec.notes || '',
+      clients[r.id] = {visible: !!s.rec.visible, terms_repair: s.rec.terms_repair, payments_repair: s.rec.payments_repair,
+        respond_repair: s.rec.respond_repair, tier_floor: s.rec.tier_floor || null, notes: s.rec.notes || '',
+        trade_edits: s.rec.trade_edits, manual_trades: s.rec.manual_trades,
         referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: !!x.confirmed_unrelated}; })};
     });
-    var payload = {key: D.key, rev: D.rev, clients: clients};
-    if (settingsChanged()) payload.settings = {sellers_visible: settings.sellers_visible, buyers_visible: settings.buyers_visible};
-    if (!Object.keys(clients).length && !payload.settings) { msg('st-ok', 'Nothing to save.'); return; }
+    if (!Object.keys(clients).length) { msg('st-ok', 'Nothing to save.'); return; }
     saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
-    fetch('?action=save_standing', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)})
+    fetch('?action=save_standing', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: D.key, rev: D.rev, clients: clients})})
       .then(function(r) { return r.json().then(function(d) { return {status: r.status, d: d}; }); })
       .then(function(res) {
         if (res.status === 200 && res.d.ok) { msg('st-ok', 'Saved.'); window.location.reload(); return; }
@@ -15677,7 +15887,7 @@ STANDING_PAGE_JS = r"""
         msg('st-err', 'Save failed. Nothing was saved. (' + err + ')'); });
   });
   window.addEventListener('beforeunload', function(e) {
-    if (saveBtn.textContent !== 'Saving…' && (rows.some(changed) || settingsChanged())) { e.preventDefault(); e.returnValue = ''; }
+    if (saveBtn.textContent !== 'Saving…' && rows.some(changed)) { e.preventDefault(); e.returnValue = ''; }
   });
   render();
 })();
