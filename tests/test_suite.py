@@ -9029,8 +9029,12 @@ check("import view: never resolves to the referred person themself", _vr["13"]["
 check("import view: Approve all clean = pending Reference/intro uniquely resolved only",
       sorted(k for k, r in _vr.items() if r["clean"]) == ["5", "7", "8"] and _vr["10"]["state"] == "resolved"
       and not _vr["10"]["clean"] and _vr["10"]["kind"] == "cc")
-check("import page: CC'ed amber note and two-click bulk approve, no confirm()",
-      "CC\\'ed — check" in lf.STANDING_IMPORT_PAGE_JS and "click again to confirm" in lf.STANDING_IMPORT_PAGE_JS
+check("import page: review by exception -- resolved rows start Approved, Un-approve, Needs a referrer first, no bulk button",
+      "CC\\'ed — check" in lf.STANDING_IMPORT_PAGE_JS and "Un-approve" in lf.STANDING_IMPORT_PAGE_JS
+      and "Needs a referrer (" in lf.STANDING_IMPORT_PAGE_JS and "will be added" in lf.STANDING_IMPORT_PAGE_JS
+      and "r.state === 'resolved' && r.referrer) queued[r.key] = {action: 'approve'" in lf.STANDING_IMPORT_PAGE_JS
+      and "Approve all clean" not in _st_get({"view": "standing_import", "key": ADMIN_KEY})["body"]
+      and '<option value="">All</option>' in _st_get({"view": "standing_import", "key": ADMIN_KEY})["body"].split('id="st-status"')[1][:40]
       and "confirm(" not in lf.STANDING_IMPORT_PAGE_JS)
 
 _imp_sr = _st_s3.objs[lf.STANDING_KEY]["rev"]

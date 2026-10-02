@@ -16439,7 +16439,8 @@ STANDING_IMPORT_PAGE_HTML = """<!DOCTYPE html>
   button { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid #d6d6d2; border-radius: 6px; background: #fff; cursor: pointer; }
   button:disabled { opacity: .5; cursor: default; }
   button.st-primary { background: var(--ink); color: #fff; border-color: var(--ink); font-size: 14px; padding: 6px 16px; }
-  button.st-armed { background: var(--amber); border-color: var(--amber); color: #fff; }
+  tr.st-group td { background: #f4f4f1; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  tr.st-cc-row td { background: #fffaf0; }
   a { color: var(--accent); }
   .st-muted { color: var(--muted); font-size: 12px; }
   .st-bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
@@ -16470,11 +16471,10 @@ __BANNER__
 </details>
 <div class="st-bar">
   <input type="search" id="st-q" placeholder="Search names, firms, evidence…" style="min-width:280px">
-  <select id="st-status"><option value="pending">Pending only</option><option value="approved">Approved</option>
-    <option value="skipped">Skipped</option><option value="">All</option></select>
+  <select id="st-status"><option value="">All</option><option value="needs">Needs a referrer</option>
+    <option value="approved">Approved</option><option value="skipped">Skipped</option></select>
   <select id="st-kind"><option value="">Any kind</option><option value="reference">Reference/intro</option><option value="cc">CC'ed</option></select>
   <span id="st-count" class="st-muted"></span>
-  <button type="button" id="st-clean">Approve all clean</button>
 </div>
 <div class="st-save"><span id="st-dirty">No queued decisions</span>
   <button type="button" class="st-primary" id="st-savebtn">Save</button><div id="st-msg"></div></div>
@@ -16490,26 +16490,35 @@ __BANNER__
 
 STANDING_IMPORT_PAGE_JS = r"""
 (function() {
-  var D = IMPORT, rows = D.rows, byKey = {}, queued = {}, picks = {}, openEv = {}, armed = false, armTimer = null;
-  rows.forEach(function(r) { byKey[r.key] = r; });
+  // Review by exception: every Pending row whose referrer resolves to one
+  // person starts queued as Approved (both kinds); Chad un-approves the few
+  // that are wrong. Nothing is written until Save.
+  var D = IMPORT, rows = D.rows, byKey = {}, queued = {}, picks = {}, openEv = {};
+  rows.forEach(function(r) { byKey[r.key] = r;
+    if (r.status === 'pending' && r.state === 'resolved' && r.referrer) queued[r.key] = {action: 'approve', referrer_id: r.referrer.id}; });
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
     return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function personLink(id, text) { return '<a target="_blank" rel="noopener" href="' +
     esc(D.person_url.replace('{}', encodeURIComponent(id))) + '">' + esc(text) + '</a>'; }
   function referrerOf(r) { return picks[r.key] || (r.state === 'resolved' ? r.referrer : null); }
+  function needsReferrer(r) { return r.status === 'pending' && !referrerOf(r); }
+  // Status as it will be after Save.
+  function effStatus(r) { var q = queued[r.key];
+    if (q) return q.action === 'approve' ? 'approved' : q.action === 'skip' ? 'skipped' : 'pending';
+    return needsReferrer(r) ? 'needs' : r.status; }
+  function sortRank(r) { return needsReferrer(r) ? 0 : (r.kind === 'cc' ? 1 : 2); }
   function filtered() {
     var q = document.getElementById('st-q').value.trim().toLowerCase(), st = document.getElementById('st-status').value;
     var kind = document.getElementById('st-kind').value;
     return rows.filter(function(r) {
-      if (st && r.status !== st) return false;
+      if (st && effStatus(r) !== st) return false;
       if (kind && r.kind !== kind) return false;
       if (q) { var ref = referrerOf(r) || {};
         var hay = [r.referred_name, r.referred_company, r.referrer_name, r.referrer_email, ref.name, ref.firm, r.evidence].join(' ').toLowerCase();
         if (hay.indexOf(q) === -1) return false; }
       return true;
-    });
+    }).sort(function(a, b) { return sortRank(a) - sortRank(b); });
   }
-  function cleanRows() { return rows.filter(function(r) { return r.clean && !queued[r.key] && !picks[r.key]; }); }
   function referrerCell(r) {
     var ref = r.status === 'approved' ? r.referrer : referrerOf(r), h = '';
     if (ref) { h = personLink(ref.id, ref.name) + (ref.firm ? ' · ' + esc(ref.firm) : '') +
@@ -16531,35 +16540,44 @@ STANDING_IMPORT_PAGE_JS = r"""
   function evCell(r) { var e = r.evidence || '';
     if (e.length <= 160 || openEv[r.key]) return esc(e) + (e.length > 160 ? ' <a href="#" data-act="ev">less</a>' : '');
     return esc(e.slice(0, 160)) + '… <a href="#" data-act="ev">more</a>'; }
-  function statusCell(r) { var q = queued[r.key];
-    var s = '<span class="st-status-' + r.status + '">' + {pending: 'Pending', approved: 'Approved', skipped: 'Skipped'}[r.status] + '</span>';
-    if (q) s += '<span class="st-queued">Will ' + (q.action === 'approve' ? 'approve' : q.action === 'skip' ? 'skip' : 'undo') +
-      ' on Save</span> <a href="#" data-act="unqueue">cancel</a>';
+  function statusCell(r) { var q = queued[r.key], st = effStatus(r);
+    var label = {needs: 'Needs a referrer', pending: 'Pending', approved: 'Approved', skipped: 'Skipped'}[st];
+    var s = '<span class="st-status-' + (st === 'needs' ? 'pending' : st) + '">' + label + '</span>';
+    if (q && r.status !== 'pending') s += '<span class="st-queued">Will undo on Save</span>';
+    else if (q) s += '<div class="st-muted">not saved yet</div>';
     return s; }
   function actionsCell(r) {
-    if (queued[r.key]) return '';
-    if (r.status === 'pending') return '<button type="button" data-act="approve"' + (referrerOf(r) ? '' : ' disabled') +
-      '>Approve</button> <button type="button" data-act="skip">Skip</button>';
+    var q = queued[r.key];
+    if (r.status === 'pending') {
+      if (q && q.action === 'approve') return '<button type="button" data-act="skip">Un-approve</button>';
+      if (q && q.action === 'skip') return referrerOf(r) ? '<button type="button" data-act="approve">Approve</button>' :
+        '<button type="button" data-act="unqueue">Back to needs a referrer</button>';
+      return '<button type="button" data-act="skip">Skip</button>';
+    }
+    if (q) return '<a href="#" data-act="unqueue">cancel undo</a>';
     return '<button type="button" data-act="undo">Undo</button>'; }
+  function rowHtml(r) {
+    return '<tr data-key="' + esc(r.key) + '"' + (r.kind === 'cc' && !needsReferrer(r) ? ' class="st-cc-row"' : '') + '>' +
+      '<td>' + (r.referred_exists ? personLink(r.referred_id, r.referred_name || ('#' + r.referred_id)) : esc(r.referred_name || ('#' + r.referred_id)) +
+        ' <span class="st-muted">(not in people list)</span>') + (r.referred_company ? '<div class="st-muted">' + esc(r.referred_company) + '</div>' : '') + '</td>' +
+      '<td>' + referrerCell(r) + '</td><td>' + kindCell(r) + '</td>' +
+      '<td class="st-ev">' + evCell(r) + '</td><td>' + statusCell(r) + '</td><td style="white-space:nowrap">' + actionsCell(r) + '</td></tr>';
+  }
   function render() {
-    var list = filtered();
-    document.getElementById('st-body').innerHTML = list.map(function(r) {
-      return '<tr data-key="' + esc(r.key) + '"' + (queued[r.key] ? ' class="st-q"' : '') + '>' +
-        '<td>' + (r.referred_exists ? personLink(r.referred_id, r.referred_name || ('#' + r.referred_id)) : esc(r.referred_name || ('#' + r.referred_id)) +
-          ' <span class="st-muted">(not in people list)</span>') + (r.referred_company ? '<div class="st-muted">' + esc(r.referred_company) + '</div>' : '') + '</td>' +
-        '<td>' + referrerCell(r) + '</td><td>' + kindCell(r) + '</td>' +
-        '<td class="st-ev">' + evCell(r) + '</td><td>' + statusCell(r) + '</td><td style="white-space:nowrap">' + actionsCell(r) + '</td></tr>';
-    }).join('') || '<tr><td colspan="6" class="st-muted">No suggestions match.</td></tr>';
+    var list = filtered(), needs = list.filter(needsReferrer), rest = list.filter(function(r) { return !needsReferrer(r); });
+    var html = '';
+    if (needs.length) html += '<tr class="st-group"><td colspan="6">Needs a referrer (' + needs.length + ')</td></tr>' + needs.map(rowHtml).join('');
+    if (needs.length && rest.length) html += '<tr class="st-group"><td colspan="6">Suggestions (' + rest.length + ')</td></tr>';
+    html += rest.map(rowHtml).join('');
+    document.getElementById('st-body').innerHTML = html || '<tr><td colspan="6" class="st-muted">No suggestions match.</td></tr>';
     document.getElementById('st-count').textContent = list.length + ' of ' + rows.length + ' suggestions' +
       (D.hidden_same_firm ? ' · ' + D.hidden_same_firm + ' same-firm hidden' : '');
-    var n = Object.keys(queued).length;
-    document.getElementById('st-dirty').textContent = n ? (n + ' queued decision' + (n === 1 ? '' : 's') + ' — Save to apply') : 'No queued decisions';
-    var clean = cleanRows().length, cb = document.getElementById('st-clean');
-    cb.disabled = !clean;
-    cb.className = armed ? 'st-armed' : '';
-    cb.textContent = armed ? ('Approve ' + clean + ' — click again to confirm') : ('Approve all clean (' + clean + ')');
+    var c = {approve: 0, skip: 0, undo: 0};
+    Object.keys(queued).forEach(function(k) { c[queued[k].action]++; });
+    document.getElementById('st-dirty').textContent = (c.approve + c.skip + c.undo) ?
+      (c.approve + ' referral' + (c.approve === 1 ? '' : 's') + ' will be added · ' + c.skip + ' skipped' +
+       (c.undo ? ' · ' + c.undo + ' undone' : '') + ' — Save to apply') : 'Nothing to save';
   }
-  function disarm() { armed = false; clearTimeout(armTimer); }
   function rowOf(el) { var tr = el.closest('tr[data-key]'); return tr ? byKey[tr.getAttribute('data-key')] : null; }
   var body = document.getElementById('st-body');
   body.addEventListener('mousedown', function(e) { if (e.target.closest('button, a[data-act]')) e.preventDefault(); });
@@ -16571,16 +16589,20 @@ STANDING_IMPORT_PAGE_JS = r"""
     else if (act === 'skip') queued[r.key] = {action: 'skip'};
     else if (act === 'undo') queued[r.key] = {action: 'undo'};
     else if (act === 'unqueue') delete queued[r.key];
-    else if (act === 'unpick') delete picks[r.key];
+    else if (act === 'unpick') { delete picks[r.key]; if (r.state !== 'resolved') delete queued[r.key];
+      else queued[r.key] = {action: 'approve', referrer_id: r.referrer.id}; }
     else if (act === 'ev') { if (openEv[r.key]) delete openEv[r.key]; else openEv[r.key] = 1; }
-    else if (act === 'use') { picks[r.key] = JSON.parse(el.getAttribute('data-person')); }
+    else if (act === 'use') { picks[r.key] = JSON.parse(el.getAttribute('data-person'));
+      queued[r.key] = {action: 'approve', referrer_id: picks[r.key].id}; }
     else return;
-    disarm(); render();
+    render();
   });
   body.addEventListener('change', function(e) {
     var el = e.target; if (el.getAttribute('data-act') !== 'pickc') return; var r = rowOf(el); if (!r) return;
-    if (el.value === '') delete picks[r.key]; else picks[r.key] = Object.assign({related: false}, r.candidates[+el.value]);
-    disarm(); render();
+    if (el.value === '') { delete picks[r.key]; delete queued[r.key]; }
+    else { picks[r.key] = Object.assign({related: false}, r.candidates[+el.value]);
+      queued[r.key] = {action: 'approve', referrer_id: picks[r.key].id}; }
+    render();
   });
   var timers = {};
   body.addEventListener('input', function(e) {
@@ -16601,13 +16623,7 @@ STANDING_IMPORT_PAGE_JS = r"""
   });
   ['st-q', 'st-status', 'st-kind'].forEach(function(id) {
     var el = document.getElementById(id);
-    el.addEventListener(id === 'st-q' ? 'input' : 'change', function() { disarm(); render(); });
-  });
-  document.getElementById('st-clean').addEventListener('click', function() {
-    var clean = cleanRows(); if (!clean.length) return;
-    if (!armed) { armed = true; clearTimeout(armTimer); armTimer = setTimeout(function() { armed = false; render(); }, 8000); render(); return; }
-    clean.forEach(function(r) { queued[r.key] = {action: 'approve', referrer_id: r.referrer.id}; });
-    disarm(); render();
+    el.addEventListener(id === 'st-q' ? 'input' : 'change', function() { render(); });
   });
   function msg(id, cls, text) { document.getElementById(id).innerHTML = '<span class="st-banner ' + cls + '">' + esc(text) + '</span>'; }
   document.getElementById('st-header').textContent = D.header;
