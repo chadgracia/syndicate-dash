@@ -73,6 +73,7 @@ writes, no other CRM writes, no email.
 """
 
 import base64
+import copy
 import concurrent.futures
 import functools
 import threading
@@ -124,7 +125,7 @@ _req_cache = {
     "firm_matched_buy_deals": {}, "firm_closed_out_buy_deals": {},
     "tenant_index": None, "id_status": {},
     "intro_details": {}, "manual_intros": {}, "models": {}, "memo_dynamo": False,
-    "feature_requests": {}, "manual_intro_calls": {}, "aggregate_scan": None,
+    "feature_requests": {}, "manual_intro_calls": {}, "aggregate_scan": None, "standing": None,
 }
 
 
@@ -151,6 +152,7 @@ def _req_cache_reset():
     _req_cache["feature_requests"] = {}
     _req_cache["manual_intro_calls"] = {}
     _req_cache["aggregate_scan"] = None
+    _req_cache["standing"] = None
 
 
 def _perf_start(page):
@@ -7728,7 +7730,7 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
         range_html = f'<div class="buyer-range">{_esc(range_text)}</div>' if range_text else ""
         blocks.append(
             f'<div class="pending-buyer">'
-            f'<span class="buyer-code">Buyer {_esc(code)}</span> '
+            f'<span class="buyer-code">Buyer {_esc(code)}</span>{_standing_ticks_for(pid)} '
             f'{tier_html}'
             f'{range_html}</div>'
         )
@@ -12140,7 +12142,7 @@ def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None
         code = _anon_buyer_code(anon_key_email, buyer["person_id"])
         return f"""<div class="buyer-tile">
       <span class="{dot_cls}" title="{dot_title}"></span>
-      <div class="buyer-code">Buyer {_esc(code)}</div>
+      <div class="buyer-code">Buyer {_esc(code)}{_standing_ticks_for(buyer["person_id"])}</div>
       {tier_html}
       {range_html}
     </div>"""
@@ -13781,7 +13783,7 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<div class="buyer-page-row">{_esc(range_text)}</div>' if range_text else ""
     tier_row = f'<div class="buyer-page-row">{tier_html}</div>' if tier_html else ""
-    return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}</div>'
+    return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}{_standing_ticks_for(buyer_id)}</div>'
             f'{tier_row}{range_html}'
             f'<div class="buyer-page-note">Identity available after introduction.</div></div>')
 
@@ -13848,6 +13850,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                                                  bio_headline=bio_headline,
                                                  bio_edit_html=(_bio_edit_html(buyer_id, bio_text)
                                                                 if bio_edit_on else ""))
+                header_html += _standing_buyer_page_card_html(buyer_id, admin=key is not None)
 
                 # About-the-firm: only ever looked up for an entity buyer
                 # (a natural person has no firm to look up) and only when
@@ -13894,6 +13897,8 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                     edit_script_html += _bio_edit_script_html(key)
             else:
                 body_html = _buyer_page_anonymized_html(rec, anon_key_email, buyer_id)
+                if key is not None:
+                    body_html += _standing_buyer_page_card_html(buyer_id, admin=True)
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -14513,6 +14518,988 @@ def _esc(s):
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace('"', "&quot;"))
+
+
+# ── Client Standing ──────────────────────────────────────────────────────
+# Chad's private scoreboard per buyer (admin ?view=standing), a five-item
+# good-standing display for sellers (gated on settings.sellers_visible and
+# the client's private flag), and the desk's per-buyer JSON
+# (?view=standing_json). Stored ONLY in STANDING_KEY (never Pipeline or
+# Dynamo). compute_client_standing is the one helper every surface reads.
+# Repairs, overrides, tier floor, referrals, history, trades and volume are
+# admin-only (the desk JSON may carry the buyer's own trades/volume) and
+# never reach tenant HTML.
+STANDING_KEY = "syndicate-dash/client-standing.json"
+STANDING_BACKUP_PREFIX = "syndicate-dash/client-standing-backups/"
+STANDING_TIERS_URL = "https://desk.graciagroup.com/?view=commission-tiers"
+STANDING_CONFLICT_MSG = "Someone saved since you loaded this page. Reload and try again."
+STANDING_TIERS = ("preferred", "gold", "platinum")  # ascending
+STANDING_TIER_LABELS = {"preferred": "Preferred", "gold": "Gold", "platinum": "Platinum"}
+STANDING_DISCOUNT_PCT = {"preferred": 10, "gold": 15, "platinum": 20}
+STANDING_PLATINUM_VOLUME_USD = 10_000_000
+STANDING_PLATINUM_TRADES = 3
+STANDING_GOLD_VOLUME_USD = 5_000_000
+STANDING_REPAIR_FIELDS = ("respond_repair", "terms_repair", "payments_repair")
+STANDING_REPAIR_MAX = 5
+STANDING_REFERRAL_LEVEL_IDS = {ACCREDITED_ID, QC_ID, QP_ID}
+STANDING_MAX_REFERRALS = 50
+STANDING_REASON_MAX_LEN = 500
+STANDING_PAGE_ROWS = 100
+STANDING_SEARCH_LIMIT = 25
+STANDING_EDIT_FIELDS = ("private", "respond_repair", "terms_repair", "payments_repair", "trades_override",
+                        "volume_override_usd", "tier_floor", "referrals")
+# (key, tenant-safe label) in display order -- the wording sellers and the
+# desk see. Never "CEF".
+STANDING_ITEMS = (
+    ("id_forms", "Identity and compliance forms complete"),
+    ("qualification", "Investor qualification on file"),
+    ("terms", "Honors agreed terms through closing"),
+    ("payments", "Meets all payment deadlines"),
+    ("respond", "Responds promptly after an introduction"),
+)
+STANDING_LEVEL_LABELS = {QP_ID: "QP", QC_ID: "Qualified Client", ACCREDITED_ID: "Accredited",
+                         SUBSTANTIVE_ID: "Substantive"}
+PIPELINE_PERSON_URL = "https://app.pipelinecrm.com/people/{}"
+
+
+def _standing_default_client():
+    return {"private": False, "respond_repair": 0, "terms_repair": 0, "payments_repair": 0,
+            "trades_override": None, "volume_override_usd": None, "tier_floor": None,
+            "referrals": [], "history": []}
+
+
+def _standing_empty_state():
+    return {"rev": 0, "updated_at": None, "settings": {"sellers_visible": False, "buyers_visible": False},
+            "clients": {}}
+
+
+def _standing_int(v, lo=0, hi=None):
+    """v as an int in [lo, hi], else None (bools rejected)."""
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    if not isinstance(v, int) or v < lo or (hi is not None and v > hi):
+        return None
+    return v
+
+
+def _standing_amount(v):
+    """A non-negative USD amount (int or float), else None."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0 or v == float("inf"):
+        return None
+    return int(v) if float(v).is_integer() else float(v)
+
+
+def _standing_client_record(raw):
+    """A stored client record with every field defaulted/validated (a bad
+    stored value reads as its default, never crashes a render)."""
+    rec = _standing_default_client()
+    if not isinstance(raw, dict):
+        return rec
+    rec["private"] = raw.get("private") is True
+    for f in STANDING_REPAIR_FIELDS:
+        rec[f] = _standing_int(raw.get(f), 0, STANDING_REPAIR_MAX) or 0
+    rec["trades_override"] = _standing_int(raw.get("trades_override"), 0)
+    rec["volume_override_usd"] = _standing_amount(raw.get("volume_override_usd"))
+    rec["tier_floor"] = raw.get("tier_floor") if raw.get("tier_floor") in STANDING_TIERS else None
+    refs = []
+    for r in raw.get("referrals") or []:
+        if isinstance(r, dict) and str(r.get("person_id") or "").strip().isdigit():
+            refs.append({"person_id": str(r["person_id"]).strip(),
+                         "confirmed_unrelated": r.get("confirmed_unrelated") is True,
+                         "added_at": r.get("added_at")})
+    rec["referrals"] = refs
+    rec["history"] = [h for h in (raw.get("history") or []) if isinstance(h, dict)]
+    return rec
+
+
+def _normalize_standing_state(parsed):
+    state = _standing_empty_state()
+    if not isinstance(parsed, dict):
+        return state
+    state["rev"] = _standing_int(parsed.get("rev"), 0) or 0
+    state["updated_at"] = parsed.get("updated_at")
+    settings = parsed.get("settings") if isinstance(parsed.get("settings"), dict) else {}
+    state["settings"] = {"sellers_visible": settings.get("sellers_visible") is True,
+                         "buyers_visible": settings.get("buyers_visible") is True}
+    clients = parsed.get("clients") if isinstance(parsed.get("clients"), dict) else {}
+    state["clients"] = {str(pid): _standing_client_record(rec) for pid, rec in clients.items()}
+    return state
+
+
+def _s3_is_missing(e):
+    code = str(((getattr(e, "response", None) or {}).get("Error") or {}).get("Code") or "")
+    return code in ("404", "NoSuchKey", "NotFound") or "NoSuchKey" in str(e)
+
+
+_standing_missing_at = {"t": None}
+
+
+def _load_client_standing():
+    """The standing state for this request (cached across requests by S3
+    version, like the other S3 JSON). Missing file = empty state (both
+    settings off); any other failure = None, which every tenant surface
+    treats as hidden."""
+    memo = _req_cache.get("standing")
+    if memo is not None:
+        return memo[0]
+    missing_at = _standing_missing_at["t"]
+    if missing_at is not None and time.monotonic() - missing_at < S3_VERSION_TTL_SECONDS:
+        state = _standing_empty_state()
+        _req_cache["standing"] = (state,)
+        return state
+    try:
+        state = _versioned_s3_json(STANDING_KEY, "s3_standing", _normalize_standing_state)
+        _standing_missing_at["t"] = None
+    except Exception as e:
+        if _s3_is_missing(e):
+            # No file yet: remembered for S3_VERSION_TTL_SECONDS so pages
+            # don't HEAD a missing key on every request.
+            _standing_missing_at["t"] = time.monotonic()
+            state = _standing_empty_state()
+        else:
+            print(f"client-standing read failed: {type(e).__name__}: {e}")
+            state = None
+    _req_cache["standing"] = (state,)
+    return state
+
+
+def _drop_standing_cache():
+    _standing_missing_at["t"] = None
+    _data_cache.pop(STANDING_KEY, None)
+    _s3_version_cache.pop(STANDING_KEY, None)
+    _req_cache["object_version"].pop(STANDING_KEY, None)
+    _req_cache["standing"] = None
+
+
+@_request_memo("standing_deal_index", lambda: ())
+def _standing_deal_index():
+    """{"won": {person_id: [trades, volume]}, "buy_any": {person_id}} over
+    every BUY-tagged deal in get_deals_list(): won = WON_STAGE_IDS stage,
+    volume = Σ _intro_amount (never the native "value")."""
+    won = {}
+    buy_any = set()
+    for d in get_deals_list():
+        if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+            continue
+        pids = {str(p) for p in _deal_linked_person_ids(d)}
+        buy_any |= pids
+        if _deal_stage_id(d) in WON_STAGE_IDS:
+            amount = _intro_amount(d) or 0
+            for p in pids:
+                t = won.setdefault(p, [0, 0])
+                t[0] += 1
+                t[1] += amount
+    return {"won": won, "buy_any": buy_any}
+
+
+def _standing_person_flags(rec):
+    cf = (rec or {}).get("custom_fields") or {}
+    return {"id_forms_done": bool(set(cf_list(cf, CEF_FIELD)) & {CEF_YES_ID, CEF_NA_ID}),
+            "qualification_done": bool(set(cf_list(cf, IQF_FIELD)) & IQF_OK_IDS)}
+
+
+def _standing_related(client_rec, other_rec):
+    """True when two people share a company_id or a corporate email domain."""
+    if not client_rec or not other_rec:
+        return False
+    a, b = client_rec.get("company_id"), other_rec.get("company_id")
+    if a not in (None, "") and b not in (None, "") and str(a) == str(b):
+        return True
+    doms_a = {_email_domain(e) for e in _person_all_emails(client_rec)}
+    doms_b = {_email_domain(e) for e in _person_all_emails(other_rec)}
+    return any(_is_corporate_domain(d) for d in doms_a & doms_b)
+
+
+def _standing_referral_detail(client_pid, client_rec, ref_pid, by_id):
+    """Qualification facts for one referred person. base_ok = exists, not
+    the client, engagement form Yes, Investor Level accredited-or-better;
+    a referral counts when base_ok AND confirmed_unrelated."""
+    ref_pid = str(ref_pid)
+    rec = by_id.get(ref_pid)
+    cf = (rec or {}).get("custom_fields") or {}
+    cef_ids = cf_list(cf, CEF_FIELD)
+    level_ids = cf_list(cf, INVESTOR_LEVEL_FIELD)
+    is_self = ref_pid == str(client_pid)
+    cef_yes = CEF_YES_ID in cef_ids
+    level_ok = bool(set(level_ids) & STANDING_REFERRAL_LEVEL_IDS)
+    return {
+        "person_id": ref_pid,
+        "exists": rec is not None,
+        "self": is_self,
+        "name": _person_display_name(rec) if rec else "",
+        "firm": (rec or {}).get("company_name") or "",
+        "cef_label": CEF_LABELS.get(cef_ids[0], "—") if cef_ids else "—",
+        "cef_yes": cef_yes,
+        "level_label": ", ".join(STANDING_LEVEL_LABELS.get(i, str(i)) for i in level_ids) or "—",
+        "level_ok": level_ok,
+        "base_ok": rec is not None and not is_self and cef_yes and level_ok,
+        "related": (not is_self) and _standing_related(client_rec, rec),
+    }
+
+
+def _standing_tier_rank(tier):
+    return STANDING_TIERS.index(tier) if tier in STANDING_TIERS else -1
+
+
+def _standing_computed_tier(good_standing, trades, volume, qualified_referrals):
+    if not good_standing:
+        return None
+    if volume >= STANDING_PLATINUM_VOLUME_USD or trades >= STANDING_PLATINUM_TRADES:
+        return "platinum"
+    if volume >= STANDING_GOLD_VOLUME_USD:
+        return "gold"
+    if qualified_referrals >= 1:
+        return "preferred"
+    return None
+
+
+def compute_client_standing(person_id, state=None):
+    """THE Client Standing helper. None when the person is not in
+    people-slim or the standing file could not be read; otherwise every
+    derived value (items, good_standing, trades/volume, referrals, tier,
+    discount) plus the stored record and visibility settings."""
+    if state is None:
+        state = _load_client_standing()
+    if state is None:
+        return None
+    pid = str(person_id or "").strip()
+    by_id = _people_data()["by_id"]
+    rec = by_id.get(pid)
+    if not pid or rec is None:
+        return None
+    stored = state["clients"].get(pid)
+    client = stored if stored is not None else _standing_default_client()
+    flags = _standing_person_flags(rec)
+    auto_trades, auto_volume = _standing_deal_index()["won"].get(pid, [0, 0])
+    trades = client["trades_override"] if client["trades_override"] is not None else auto_trades
+    volume = client["volume_override_usd"] if client["volume_override_usd"] is not None else auto_volume
+    done = {
+        "id_forms": flags["id_forms_done"],
+        "qualification": flags["qualification_done"],
+        "terms": client["terms_repair"] == 0,
+        "payments": client["payments_repair"] == 0,
+        "respond": client["respond_repair"] == 0,
+    }
+    items = [{"key": k, "label": label, "done": done[k]} for k, label in STANDING_ITEMS]
+    good_standing = all(done.values())
+    referrals = []
+    for r in client["referrals"]:
+        detail = _standing_referral_detail(pid, rec, r["person_id"], by_id)
+        detail["confirmed_unrelated"] = r["confirmed_unrelated"]
+        detail["added_at"] = r.get("added_at")
+        detail["qualified"] = detail["base_ok"] and r["confirmed_unrelated"]
+        referrals.append(detail)
+    qualified_referrals = sum(1 for r in referrals if r["qualified"])
+    computed = _standing_computed_tier(good_standing, trades, volume, qualified_referrals)
+    floor = client["tier_floor"]
+    tier = floor if _standing_tier_rank(floor) > _standing_tier_rank(computed) else computed
+    return {
+        "person_id": pid, "has_record": stored is not None, "record": client, "private": client["private"],
+        "id_forms_done": flags["id_forms_done"], "qualification_done": flags["qualification_done"],
+        "auto_trades": auto_trades, "auto_volume": auto_volume, "trades": trades, "volume": volume,
+        "items": items, "done_count": sum(1 for i in items if i["done"]), "good_standing": good_standing,
+        "referrals": referrals, "qualified_referrals": qualified_referrals,
+        "computed_tier": computed, "tier": tier, "discount_pct": STANDING_DISCOUNT_PCT.get(tier, 0),
+        "sellers_visible": state["settings"]["sellers_visible"],
+        "buyers_visible": state["settings"]["buyers_visible"],
+    }
+
+
+def _fmt_standing_musd(v):
+    return f"${(v or 0) / 1_000_000:.1f}M"
+
+
+def _plural(n, word):
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+# ── Seller-facing surfaces ───────────────────────────────────────────────
+def _standing_seller_items(person_id):
+    """The five items for a seller surface, or None when hidden (sellers
+    setting off, client private, unknown person, or any error)."""
+    try:
+        state = _load_client_standing()
+        if state is None or not state["settings"]["sellers_visible"]:
+            return None
+        cs = compute_client_standing(person_id, state=state)
+        if cs is None or cs["private"]:
+            return None
+        return cs["items"]
+    except Exception as e:
+        print(f"client-standing seller view failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _standing_card_html(items, heading="Client standing"):
+    rows = "".join(
+        '<li style="display:flex;align-items:center;gap:8px;margin-top:6px;font-size:14px">'
+        + ('<span aria-hidden="true" style="display:inline-flex;align-items:center;justify-content:center;'
+           'width:16px;height:16px;border-radius:50%;background:#1f7a4d;color:#fff;font-size:11px;'
+           'font-weight:700;flex-shrink:0">✓</span>'
+           if i["done"] else
+           '<span aria-hidden="true" style="display:inline-block;width:12px;height:12px;border-radius:50%;'
+           'border:2px solid #b8bcc4;flex-shrink:0"></span>')
+        + f'<span>{_esc(i["label"])}</span>'
+        + f'<span style="position:absolute;left:-9999px">{"done" if i["done"] else "not done"}</span></li>'
+        for i in items)
+    return (f'<div class="card standing-card" style="margin-top:12px">'
+            f'<div class="buyer-section-heading">{_esc(heading)}</div>'
+            f'<ul style="list-style:none;margin:0;padding:0;position:relative">{rows}</ul></div>')
+
+
+def _standing_ticks_html(items):
+    """Five small inline ticks for anonymous surfaces: green filled = done,
+    grey ring = not done. Nothing identifying -- only the count."""
+    n = sum(1 for i in items if i["done"])
+    label = f"Good standing: {n} of {len(items)}"
+    dots = "".join(
+        '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:2px;'
+        + ('background:#1f7a4d;border:1px solid #1f7a4d"></span>' if i["done"]
+           else 'background:transparent;border:1px solid #b8bcc4"></span>')
+        for i in items)
+    return (f'<span class="gs-ticks" role="img" title="{label}" aria-label="{label}" '
+            f'style="display:inline-flex;align-items:center;vertical-align:middle;margin-left:6px">{dots}</span>')
+
+
+def _standing_ticks_for(person_id):
+    items = _standing_seller_items(person_id)
+    return _standing_ticks_html(items) if items else ""
+
+
+def _standing_buyer_page_card_html(person_id, admin):
+    """Disclosed buyer page card. Admin (any ?key= view) always sees the
+    full card, labeled with whether sellers see it."""
+    if not admin:
+        items = _standing_seller_items(person_id)
+        return _standing_card_html(items) if items else ""
+    try:
+        state = _load_client_standing()
+        cs = compute_client_standing(person_id, state=state) if state is not None else None
+    except Exception as e:
+        print(f"client-standing admin card failed: {type(e).__name__}: {e}")
+        cs = None
+    if cs is None:
+        return ('<div class="card standing-card" style="margin-top:12px">'
+                '<div class="buyer-section-heading">Client standing (hidden from sellers)</div>'
+                '<div class="buyer-page-note">Standing file could not be loaded.</div></div>')
+    shown = cs["sellers_visible"] and not cs["private"]
+    heading = "Client standing (sellers see this)" if shown else "Client standing (hidden from sellers)"
+    return _standing_card_html(cs["items"], heading)
+
+
+# ── Desk JSON: ?key=ADMIN_KEY&view=standing_json&pid=<id> ────────────────
+STANDING_ITEM_OPEN_NOTES = {
+    "id_forms": "Rainmaker's engagement form is still needed.",
+    "qualification": "Rainmaker's qualification form is still needed.",
+}
+
+
+def standing_json_payload(pid):
+    try:
+        state = _load_client_standing()
+        if state is None or not state["settings"]["buyers_visible"]:
+            return {"visible": False}
+        cs = compute_client_standing(pid, state=state)
+        if cs is None or cs["private"]:
+            return {"visible": False}
+        rec = cs["record"]
+        items = []
+        for i in cs["items"]:
+            item = {"label": i["label"], "done": i["done"], "note": ""}
+            if not i["done"]:
+                k = i["key"]
+                if k == "respond":
+                    item["note"] = (f"Reply within 3 business days on your next "
+                                    f"{_plural(rec['respond_repair'], 'introduction')}.")
+                elif k == "terms":
+                    item["note"] = f"Complete your next {_plural(rec['terms_repair'], 'trade')} on the agreed terms."
+                elif k == "payments":
+                    item["note"] = (f"Meet the payment deadlines on your next "
+                                    f"{_plural(rec['payments_repair'], 'trade')}.")
+                else:
+                    item["note"] = STANDING_ITEM_OPEN_NOTES[k]
+                if k == "id_forms":
+                    item["form_url"] = CEF_FORM_URL
+            items.append(item)
+        q = cs["qualified_referrals"]
+        items.append({"label": "Introduced a new accredited investor", "done": q >= 1,
+                      "note": f"{q} completed onboarding with Rainmaker"})
+        items.append({"label": "Completed trades", "done": cs["trades"] >= 1,
+                      "note": f"{_plural(cs['trades'], 'trade')} · {_fmt_standing_musd(cs['volume'])}"})
+        tier = cs["tier"]
+        return {"visible": True, "tier": tier, "tier_label": STANDING_TIER_LABELS.get(tier),
+                "discount_pct": STANDING_DISCOUNT_PCT.get(tier, 0), "good_standing": cs["good_standing"],
+                "items": items, "tiers_url": STANDING_TIERS_URL}
+    except Exception as e:
+        print(f"standing_json failed: {type(e).__name__}: {e}")
+        return {"visible": False}
+
+
+# ── Admin scoreboard: ?key=ADMIN_KEY&view=standing ───────────────────────
+def _standing_row(pid, rec, state):
+    """One compact scoreboard row (admin only)."""
+    cs = compute_client_standing(pid, state=state)
+    client = cs["record"]
+    return {
+        "id": pid, "name": _person_display_name(rec) or f"#{pid}", "firm": rec.get("company_name") or "",
+        "email": (_person_all_emails(rec) or [""])[0],
+        "id_forms": cs["id_forms_done"], "qual": cs["qualification_done"],
+        "auto_trades": cs["auto_trades"], "auto_volume": cs["auto_volume"],
+        "has_record": cs["has_record"],
+        "rec": {k: client[k] for k in STANDING_EDIT_FIELDS if k != "referrals"},
+        "refs": [{k: r[k] for k in ("person_id", "name", "firm", "cef_label", "level_label", "base_ok",
+                                    "related", "self", "exists", "confirmed_unrelated", "added_at")}
+                 for r in cs["referrals"]],
+        "history_count": len(client["history"]),
+    }
+
+
+def standing_admin_rows(state):
+    """Union of interest_people.json "buy" ids, people on >= 1 Buy-tagged
+    deal (any stage) and anyone with a client record; people not in
+    people-slim are skipped (nothing to show)."""
+    by_id = _people_data()["by_id"]
+    ids = set()
+    for pids in (_interest_buy_map() or {}).values():
+        for p in pids or []:
+            ids.add(str(p))
+    ids |= _standing_deal_index()["buy_any"]
+    ids |= set(state["clients"].keys())
+    rows = [_standing_row(pid, by_id[pid], state) for pid in ids if pid in by_id]
+    print(f"standing rows: {len(rows)}")
+    return rows
+
+
+def standing_search(query, for_pid=None):
+    """Admin-only people-slim search (name/email/company, case-insensitive)
+    for the Add client box and the referral editor."""
+    q = (query or "").strip().lower()
+    if len(q) < 2:
+        return []
+    state = _load_client_standing() or _standing_empty_state()
+    by_id = _people_data()["by_id"]
+    client_rec = by_id.get(str(for_pid)) if for_pid else None
+    out = []
+    for rec in _people_list():
+        pid = rec.get("id")
+        if pid is None:
+            continue
+        hay = " ".join([_person_display_name(rec), rec.get("company_name") or ""] + _person_all_emails(rec)).lower()
+        if q not in hay:
+            continue
+        pid = str(pid)
+        row = _standing_row(pid, rec, state)
+        if for_pid:
+            row["ref"] = _standing_referral_detail(for_pid, client_rec, pid, by_id)
+        out.append(row)
+        if len(out) >= STANDING_SEARCH_LIMIT:
+            break
+    return out
+
+
+def _standing_json_for_script(data):
+    return json.dumps(data, separators=(",", ":")).replace("<", "\\u003c").replace(">", "\\u003e").replace(
+        "&", "\\u0026")
+
+
+def render_standing_page(key):
+    state = _load_client_standing()
+    load_error = state is None
+    rows = [] if load_error else standing_admin_rows(state)
+    data = {
+        "key": key or "", "rev": 0 if load_error else state["rev"], "load_error": load_error,
+        "settings": (state or _standing_empty_state())["settings"], "rows": rows,
+        "page_rows": STANDING_PAGE_ROWS, "repair_max": STANDING_REPAIR_MAX,
+        "tiers": list(STANDING_TIERS), "tier_labels": STANDING_TIER_LABELS, "discounts": STANDING_DISCOUNT_PCT,
+        "plat_vol": STANDING_PLATINUM_VOLUME_USD, "plat_trades": STANDING_PLATINUM_TRADES,
+        "gold_vol": STANDING_GOLD_VOLUME_USD, "person_url": PIPELINE_PERSON_URL,
+        "conflict_msg": STANDING_CONFLICT_MSG,
+    }
+    banner = ('<div class="st-banner st-err">The standing file could not be loaded. Nothing can be saved '
+              'until it loads; reload to try again.</div>') if load_error else ""
+    return (STANDING_PAGE_HTML
+            .replace("__SCRIPT__", STANDING_PAGE_JS)
+            .replace("__BANNER__", banner)
+            .replace("__DATA__", _standing_json_for_script(data)))
+
+
+def _validate_standing_client(pid, raw, now, old_refs):
+    """(record, error) for one posted row. raw carries every editable field."""
+    if not (isinstance(raw, dict)):
+        return None, f"{pid}: row must be an object"
+    rec = {}
+    if not isinstance(raw.get("private"), bool):
+        return None, f"{pid}: private must be true/false"
+    rec["private"] = raw["private"]
+    for f in STANDING_REPAIR_FIELDS:
+        v = _standing_int(raw.get(f), 0, STANDING_REPAIR_MAX)
+        if v is None:
+            return None, f"{pid}: {f} must be 0-{STANDING_REPAIR_MAX}"
+        rec[f] = v
+    t = raw.get("trades_override")
+    if t is not None and _standing_int(t, 0) is None:
+        return None, f"{pid}: trades override must be a whole number >= 0 or blank"
+    rec["trades_override"] = None if t is None else _standing_int(t, 0)
+    v = raw.get("volume_override_usd")
+    if v is not None and _standing_amount(v) is None:
+        return None, f"{pid}: volume override must be a number >= 0 or blank"
+    rec["volume_override_usd"] = None if v is None else _standing_amount(v)
+    floor = raw.get("tier_floor")
+    if floor is not None and floor not in STANDING_TIERS:
+        return None, f"{pid}: tier floor must be preferred, gold, platinum or blank"
+    rec["tier_floor"] = floor
+    refs_in = raw.get("referrals")
+    if not isinstance(refs_in, list) or len(refs_in) > STANDING_MAX_REFERRALS:
+        return None, f"{pid}: referrals must be a list (max {STANDING_MAX_REFERRALS})"
+    old_added = {r["person_id"]: r.get("added_at") for r in old_refs}
+    refs, seen = [], set()
+    for r in refs_in:
+        rp = str((r or {}).get("person_id") or "").strip() if isinstance(r, dict) else ""
+        if not (rp.isdigit() and rp.isascii()):
+            return None, f"{pid}: referral person_id must be numeric"
+        if rp == pid:
+            return None, f"{pid}: a client cannot refer themselves"
+        if rp in seen:
+            continue
+        seen.add(rp)
+        refs.append({"person_id": rp, "confirmed_unrelated": r.get("confirmed_unrelated") is True,
+                     "added_at": old_added.get(rp) or now})
+    rec["referrals"] = refs
+    return rec, None
+
+
+def _standing_hist_value(field, v):
+    if field == "referrals":
+        return [{"person_id": r["person_id"], "confirmed_unrelated": r["confirmed_unrelated"]} for r in v]
+    return v
+
+
+def _handle_save_standing(event):
+    """POST ?action=save_standing -- admin only. Body {key, rev, settings?,
+    clients: {pid: {every editable field}}, reasons: {pid: text}}. Rejected
+    whole on any invalid row; 409 when the stored rev moved; daily backup
+    before the day's first write; one history entry per changed field."""
+    body = _parse_json_body(event)
+    query = event.get("queryStringParameters") or {}
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (admin_key and (body.get("key") == admin_key or query.get("key") == admin_key)):
+        return _json_response({"error": "forbidden"}, 403)
+    rev = _standing_int(body.get("rev"), 0)
+    if rev is None:
+        return _json_response({"error": "rev must be a whole number"}, 400)
+    clients_in = body.get("clients") or {}
+    reasons = body.get("reasons") or {}
+    settings_in = body.get("settings")
+    if not isinstance(clients_in, dict) or not isinstance(reasons, dict):
+        return _json_response({"error": "clients/reasons must be objects"}, 400)
+    if settings_in is not None and not (isinstance(settings_in, dict) and all(
+            k in ("sellers_visible", "buyers_visible") and isinstance(v, bool) for k, v in settings_in.items())):
+        return _json_response({"error": "settings must be sellers_visible/buyers_visible true/false"}, 400)
+    for pid in clients_in:
+        if not (str(pid).isdigit() and str(pid).isascii()):
+            return _json_response({"error": f"person id {pid!r} must be numeric"}, 400)
+
+    s3 = _s3_client()
+    try:
+        try:
+            s3.head_object(Bucket=BUCKET, Key=STANDING_KEY)
+            current_raw = json.loads(s3.get_object(Bucket=BUCKET, Key=STANDING_KEY)["Body"].read())
+        except Exception as e:
+            if not _s3_is_missing(e):
+                raise
+            current_raw = None
+    except Exception as e:
+        print(f"save_standing read failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not read the standing file. Nothing was saved."}, 502)
+    current = _normalize_standing_state(current_raw) if current_raw is not None else _standing_empty_state()
+    if current["rev"] != rev:
+        return _json_response({"error": STANDING_CONFLICT_MSG}, 409)
+
+    now = _iso_utc()
+    new_state = copy.deepcopy(current)
+    for k, v in (settings_in or {}).items():
+        if new_state["settings"][k] != v:
+            print(f"client-standing setting {k}: {new_state['settings'][k]} -> {v}")
+            new_state["settings"][k] = v
+    changed_fields = 0
+    for pid, raw in clients_in.items():
+        pid = str(pid)
+        old = new_state["clients"].get(pid) or _standing_default_client()
+        new_vals, err = _validate_standing_client(pid, raw, now, old["referrals"])
+        if err:
+            return _json_response({"error": err}, 400)
+        reason = str(reasons.get(pid) or "").strip()[:STANDING_REASON_MAX_LEN]
+        rec = copy.deepcopy(old)
+        for field in STANDING_EDIT_FIELDS:
+            before = _standing_hist_value(field, old[field])
+            after = _standing_hist_value(field, new_vals[field])
+            if before != after:
+                rec["history"].append({"at": now, "field": field, "from": before, "to": after, "reason": reason})
+                changed_fields += 1
+            rec[field] = new_vals[field]
+        new_state["clients"][pid] = rec
+    new_state["rev"] = current["rev"] + 1
+    new_state["updated_at"] = now
+
+    if current_raw is not None:
+        backup_key = f"{STANDING_BACKUP_PREFIX}{now[:10]}.json"
+        try:
+            try:
+                s3.head_object(Bucket=BUCKET, Key=backup_key)
+                backup_exists = True
+            except Exception as e:
+                if not _s3_is_missing(e):
+                    raise
+                backup_exists = False
+            if not backup_exists:
+                s3.put_object(Bucket=BUCKET, Key=backup_key, ContentType="application/json",
+                              Body=json.dumps(current_raw, separators=(",", ":")).encode("utf-8"))
+        except Exception as e:
+            print(f"save_standing backup failed: {type(e).__name__}: {e}")
+            return _json_response({"error": "Could not write the daily backup. Nothing was saved."}, 502)
+    try:
+        s3.put_object(Bucket=BUCKET, Key=STANDING_KEY, ContentType="application/json",
+                      Body=json.dumps(new_state, separators=(",", ":")).encode("utf-8"))
+    except Exception as e:
+        print(f"save_standing write failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Save failed. Nothing was saved."}, 502)
+    _drop_standing_cache()
+    return _json_response({"ok": True, "rev": new_state["rev"], "changed_fields": changed_fields,
+                           "clients": len(clients_in)})
+
+
+def _handle_standing_view(query):
+    """GET ?key=ADMIN_KEY&view=standing (caller verified the key). With
+    &search=<q> (optional &for=<client pid>) returns JSON search results."""
+    if "search" in query:
+        try:
+            return _json_response({"results": standing_search(query.get("search"), query.get("for") or None)})
+        except Exception as e:
+            print(f"standing search failed: {type(e).__name__}: {e}")
+            return _json_response({"error": "Search failed"}, 502)
+    return _html_response(render_standing_page(query.get("key")))
+
+
+STANDING_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Client standing · Gracia Group</title>
+<style>
+  body { margin: 0; background: #f4f2ee; color: #16181d; padding: 32px 16px 96px;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+  .wrap { max-width: 1500px; margin: 0 auto; }
+  h1 { font-size: 20px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }
+  th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #e5e7eb; vertical-align: middle; }
+  th { font-size: 11px; color: #374151; text-transform: uppercase; letter-spacing: .03em; white-space: nowrap; }
+  input[type=search], input[type=text], input[type=number] { padding: 5px 7px; font-size: 13px;
+         border: 1px solid #d1d5db; border-radius: 5px; box-sizing: border-box; }
+  input[type=number] { width: 84px; }
+  .st-banner { padding: 10px 12px; border-radius: 6px; margin: 8px 0; font-weight: 600; }
+  .st-err { background: #fde8e8; color: #b91c1c; }
+  .st-ok { background: #e7f5ec; color: #1f7a4d; }
+  .st-settings { display: flex; gap: 24px; flex-wrap: wrap; background: #fff; padding: 10px 12px;
+                 border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 12px; }
+  .st-on { color: #1f7a4d; font-weight: 700; } .st-off { color: #6b7280; font-weight: 700; }
+  .st-bar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  .st-rep { white-space: nowrap; } .st-rep button { width: 22px; padding: 0; }
+  .st-rep span { display: inline-block; min-width: 14px; text-align: center; font-weight: 600; }
+  .st-yes { color: #1f7a4d; font-weight: 700; text-decoration: none; }
+  .st-no { color: #9ca3af; text-decoration: none; }
+  tr.st-changed td { background: #fff8e1; }
+  .st-tier { font-weight: 600; white-space: nowrap; } .st-muted { color: #6b7280; font-size: 12px; }
+  .st-warn { color: #b91c1c; font-weight: 600; }
+  .st-panel td { background: #f9fafb; }
+  .st-results div { padding: 3px 0; }
+  .st-save { position: fixed; left: 0; right: 0; bottom: 0; background: #16181d; color: #fff; padding: 10px 16px;
+             display: flex; gap: 12px; align-items: center; justify-content: flex-end; }
+  .st-save button { font-size: 14px; padding: 6px 18px; }
+  a { color: #3d5a73; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body><div class="wrap">
+<h1>Client standing</h1>
+__BANNER__
+<div id="st-msg"></div>
+<div class="st-settings">
+  <label><input type="checkbox" id="st-sellers"> Show standing to sellers — <span id="st-sellers-state"></span></label>
+  <label><input type="checkbox" id="st-buyers"> Show status to buyers — <span id="st-buyers-state"></span></label>
+</div>
+<div class="st-bar">
+  <input type="search" id="st-add" placeholder="Add client: search name, email or company…" style="min-width:320px">
+</div>
+<div id="st-add-results" class="st-results"></div>
+<div class="st-bar">
+  <input type="search" id="st-q" placeholder="Search name, firm or id…" style="min-width:260px">
+  <select id="st-tier"><option value="">Any tier</option><option value="none">No tier</option>
+    <option value="preferred">Preferred</option><option value="gold">Gold</option><option value="platinum">Platinum</option></select>
+  <label><input type="checkbox" id="st-bad"> Not in good standing</label>
+  <label><input type="checkbox" id="st-priv"> Private only</label>
+  <select id="st-sort"><option value="clients">Clients first, then name</option><option value="name">Name</option></select>
+  <span id="st-count" class="st-muted"></span>
+</div>
+<div class="st-bar" id="st-bulk">
+  <span class="st-muted" id="st-selcount">0 selected</span>
+  <button type="button" data-bulk="private_on">Set Private on</button>
+  <button type="button" data-bulk="private_off">Set Private off</button>
+  <button type="button" data-bulk="reset_repairs">Reset repairs to 0</button>
+  <button type="button" data-bulk="clear_overrides">Clear trades/volume overrides</button>
+</div>
+<table>
+<thead><tr><th><input type="checkbox" id="st-all"></th><th>Name</th><th>Firm</th><th>ID forms</th><th>Qualification</th>
+<th>Terms repair</th><th>Payments repair</th><th>Responds repair</th><th>Trades</th><th>Volume</th><th>Referrals</th>
+<th>Tier floor</th><th>Private</th><th>Tier</th><th>Reason</th></tr></thead>
+<tbody id="st-body"></tbody>
+</table>
+<div class="st-bar"><button type="button" id="st-prev">Prev</button><span id="st-page" class="st-muted"></span>
+<button type="button" id="st-next">Next</button></div>
+</div>
+<div class="st-save"><span id="st-dirty">No unsaved changes</span><button type="button" id="st-savebtn">Save changes</button></div>
+<script>var STANDING = __DATA__;</script>
+<script>__SCRIPT__</script>
+</body></html>"""
+
+
+STANDING_PAGE_JS = r"""
+(function() {
+  var D = STANDING, rows = D.rows, byId = {}, orig = {}, edits = {}, reasons = {}, forceSave = {};
+  var selected = {}, openPanel = null, page = 0, settings = {sellers_visible: !!D.settings.sellers_visible,
+    buyers_visible: !!D.settings.buyers_visible};
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
+  function clone(o) { return JSON.parse(JSON.stringify(o)); }
+  function musd(v) { return '$' + ((v || 0) / 1e6).toFixed(1) + 'M'; }
+  function addRow(r) { if (byId[r.id]) return; rows.push(r); byId[r.id] = r;
+    orig[r.id] = {rec: clone(r.rec), refs: clone(r.refs)}; }
+  rows.slice().forEach(function(r) { byId[r.id] = r; orig[r.id] = {rec: clone(r.rec), refs: clone(r.refs)}; });
+  function cur(r) { return edits[r.id] || orig[r.id]; }
+  function edit(r) { if (!edits[r.id]) edits[r.id] = clone(orig[r.id]); return edits[r.id]; }
+  function sig(s) { return JSON.stringify([s.rec, s.refs.map(function(x) {
+    return [x.person_id, !!x.confirmed_unrelated]; })]); }
+  function changed(r) { return !!forceSave[r.id] || (!!edits[r.id] && sig(edits[r.id]) !== sig(orig[r.id])); }
+  function settingsChanged() { return settings.sellers_visible !== !!D.settings.sellers_visible ||
+    settings.buyers_visible !== !!D.settings.buyers_visible; }
+  function rank(t) { return D.tiers.indexOf(t); }
+  function standing(r) {
+    var s = cur(r), rec = s.rec;
+    var trades = rec.trades_override != null ? rec.trades_override : r.auto_trades;
+    var vol = rec.volume_override_usd != null ? rec.volume_override_usd : r.auto_volume;
+    var good = r.id_forms && r.qual && rec.terms_repair === 0 && rec.payments_repair === 0 && rec.respond_repair === 0;
+    var q = s.refs.filter(function(x) { return x.base_ok && x.confirmed_unrelated; }).length;
+    var comp = null;
+    if (good) { comp = (vol >= D.plat_vol || trades >= D.plat_trades) ? 'platinum' : (vol >= D.gold_vol ? 'gold' :
+      (q >= 1 ? 'preferred' : null)); }
+    var tier = rank(rec.tier_floor) > rank(comp) ? rec.tier_floor : comp;
+    return {good: good, tier: tier, q: q, trades: trades, vol: vol};
+  }
+  function filtered() {
+    var q = document.getElementById('st-q').value.trim().toLowerCase();
+    var tf = document.getElementById('st-tier').value, bad = document.getElementById('st-bad').checked;
+    var priv = document.getElementById('st-priv').checked, sort = document.getElementById('st-sort').value;
+    var out = rows.filter(function(r) {
+      if (q && (r.name + ' ' + r.firm + ' ' + r.id + ' ' + r.email).toLowerCase().indexOf(q) === -1) return false;
+      var st = standing(r);
+      if (tf === 'none' && st.tier) return false;
+      if (tf && tf !== 'none' && st.tier !== tf) return false;
+      if (bad && st.good) return false;
+      if (priv && !cur(r).rec.private) return false;
+      return true;
+    });
+    out.sort(function(a, b) {
+      if (sort === 'clients' && a.has_record !== b.has_record) return a.has_record ? -1 : 1;
+      return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : (a.name.toLowerCase() > b.name.toLowerCase() ? 1 : 0);
+    });
+    return out;
+  }
+  function rep(r, f) { var v = cur(r).rec[f];
+    return '<span class="st-rep"><button type="button" data-act="dec" data-f="' + f + '">−</button><span>' + v +
+      '</span><button type="button" data-act="inc" data-f="' + f + '">+</button></span>'; }
+  function rowHtml(r) {
+    var s = cur(r), rec = s.rec, st = standing(r);
+    var personUrl = D.person_url.replace('{}', encodeURIComponent(r.id));
+    var tierTxt = st.tier ? (D.tier_labels[st.tier] + ' · ' + D.discounts[st.tier] + '%') : '—';
+    var floorOpts = ['', 'preferred', 'gold', 'platinum'].map(function(t) {
+      return '<option value="' + t + '"' + ((rec.tier_floor || '') === t ? ' selected' : '') + '>' +
+        (t ? D.tier_labels[t] : '—') + '</option>'; }).join('');
+    return '<tr data-id="' + esc(r.id) + '"' + (changed(r) ? ' class="st-changed"' : '') + '>' +
+      '<td><input type="checkbox" data-act="sel"' + (selected[r.id] ? ' checked' : '') + '></td>' +
+      '<td><a href="?buyer=' + encodeURIComponent(r.id) + '&key=' + encodeURIComponent(D.key) + '">' + esc(r.name) +
+        '</a>' + (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') + '</td>' +
+      '<td>' + esc(r.firm) + '</td>' +
+      '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' + (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a></td>' +
+      '<td><span class="' + (r.qual ? 'st-yes">✓' : 'st-no">○') + '</span></td>' +
+      '<td>' + rep(r, 'terms_repair') + '</td><td>' + rep(r, 'payments_repair') + '</td><td>' + rep(r, 'respond_repair') + '</td>' +
+      '<td><span class="st-muted">auto ' + r.auto_trades + '</span><br><input type="number" min="0" step="1" data-act="trades" placeholder="override" value="' +
+        (rec.trades_override == null ? '' : rec.trades_override) + '"></td>' +
+      '<td><span class="st-muted">auto ' + musd(r.auto_volume) + '</span><br><input type="number" min="0" step="1" data-act="volume" placeholder="override $" value="' +
+        (rec.volume_override_usd == null ? '' : rec.volume_override_usd) + '"></td>' +
+      '<td><a href="#" data-act="refs">' + st.q + ' / ' + s.refs.length + '</a></td>' +
+      '<td><select data-act="floor">' + floorOpts + '</select></td>' +
+      '<td><input type="checkbox" data-act="private"' + (rec.private ? ' checked' : '') + '></td>' +
+      '<td class="st-tier">' + esc(tierTxt) + (st.good ? '' : '<div class="st-muted">not in good standing</div>') + '</td>' +
+      '<td><input type="text" data-act="reason" placeholder="reason" value="' + esc(reasons[r.id] || '') + '"></td></tr>' +
+      (openPanel === r.id ? panelHtml(r) : '');
+  }
+  function refLine(x) {
+    return '<div>' + esc(x.name || ('#' + x.person_id)) + (x.firm ? ' · ' + esc(x.firm) : '') +
+      ' · form: ' + esc(x.cef_label) + ' · level: ' + esc(x.level_label) + ' · ' +
+      (x.self ? '<span class="st-warn">this is the client</span>' : !x.exists ? '<span class="st-warn">not in people list</span>' :
+        x.base_ok ? '<span class="st-yes">qualifies</span>' : '<span class="st-no">does not qualify</span>') +
+      (x.related ? ' <span class="st-warn">⚠ shares a company or email domain with the client</span>' : '') + '</div>';
+  }
+  function panelHtml(r) {
+    var s = cur(r);
+    var list = s.refs.map(function(x, i) {
+      return '<div style="padding:4px 0;border-bottom:1px solid #e5e7eb">' + refLine(x) +
+        '<label><input type="checkbox" data-act="refok" data-i="' + i + '"' + (x.confirmed_unrelated ? ' checked' : '') +
+        '> Confirmed new and unrelated</label> <button type="button" data-act="refdel" data-i="' + i + '">Remove</button></div>';
+    }).join('') || '<div class="st-muted">No referrals yet.</div>';
+    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="15"><strong>Referrals for ' + esc(r.name) + '</strong>' + list +
+      '<div style="margin-top:8px"><input type="search" data-act="refsearch" placeholder="Search people to add a referral…" style="min-width:300px">' +
+      '<div class="st-results" data-role="refresults"></div></div></td></tr>';
+  }
+  function render() {
+    var list = filtered(), pages = Math.max(1, Math.ceil(list.length / D.page_rows));
+    if (page >= pages) page = pages - 1;
+    var slice = list.slice(page * D.page_rows, (page + 1) * D.page_rows);
+    document.getElementById('st-body').innerHTML = slice.map(rowHtml).join('') ||
+      '<tr><td colspan="15" class="st-muted">No matches</td></tr>';
+    document.getElementById('st-page').textContent = 'Page ' + (page + 1) + ' of ' + pages;
+    document.getElementById('st-count').textContent = list.length + ' of ' + rows.length + ' people';
+    document.getElementById('st-selcount').textContent = Object.keys(selected).length + ' selected';
+    document.getElementById('st-all').checked = slice.length > 0 && slice.every(function(r) { return selected[r.id]; });
+    renderDirty();
+  }
+  function renderDirty() {
+    var n = rows.filter(changed).length + (settingsChanged() ? 1 : 0);
+    document.getElementById('st-dirty').textContent = n ? (n + ' unsaved change' + (n === 1 ? '' : 's')) : 'No unsaved changes';
+    ['sellers', 'buyers'].forEach(function(k) {
+      var on = settings[k + '_visible'];
+      document.getElementById('st-' + k).checked = on;
+      var el = document.getElementById('st-' + k + '-state');
+      el.className = on ? 'st-on' : 'st-off'; el.textContent = on ? 'ON' : 'OFF';
+    });
+  }
+  function rowOf(el) { var tr = el.closest('tr[data-id]'); return tr ? byId[tr.getAttribute('data-id')] : null; }
+  var body = document.getElementById('st-body');
+  body.addEventListener('click', function(e) {
+    var el = e.target.closest('[data-act]'); if (!el) return; var r = rowOf(el); if (!r) return;
+    var act = el.getAttribute('data-act');
+    if (act === 'inc' || act === 'dec') { var f = el.getAttribute('data-f'), s = edit(r);
+      s.rec[f] = Math.max(0, Math.min(D.repair_max, s.rec[f] + (act === 'inc' ? 1 : -1))); render(); }
+    else if (act === 'refs') { e.preventDefault(); openPanel = openPanel === r.id ? null : r.id; render(); }
+    else if (act === 'refdel') { edit(r).refs.splice(+el.getAttribute('data-i'), 1); render(); }
+    else if (act === 'refadd') { var x = JSON.parse(el.getAttribute('data-ref')); var s2 = edit(r);
+      if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = false; s2.refs.push(x); }
+      render(); }
+  });
+  body.addEventListener('change', function(e) {
+    var el = e.target, act = el.getAttribute('data-act'), r = rowOf(el); if (!r || !act) return;
+    if (act === 'sel') { if (el.checked) selected[r.id] = 1; else delete selected[r.id]; render(); return; }
+    if (act === 'reason') { reasons[r.id] = el.value; return; }
+    var s = edit(r);
+    if (act === 'private') s.rec.private = el.checked;
+    else if (act === 'floor') s.rec.tier_floor = el.value || null;
+    else if (act === 'refok') s.refs[+el.getAttribute('data-i')].confirmed_unrelated = el.checked;
+    else if (act === 'trades' || act === 'volume') {
+      var v = el.value.trim(), n = v === '' ? null : Number(v);
+      if (n !== null && (!isFinite(n) || n < 0 || (act === 'trades' && Math.floor(n) !== n))) { el.value = ''; n = null; }
+      s.rec[act === 'trades' ? 'trades_override' : 'volume_override_usd'] = n;
+    }
+    render();
+  });
+  body.addEventListener('input', function(e) {
+    var el = e.target, act = el.getAttribute('data-act'), r = rowOf(el); if (!r) return;
+    if (act === 'reason') { reasons[r.id] = el.value; return; }
+    if (act === 'refsearch') { search(el.value, r.id, el.parentNode.querySelector('[data-role=refresults]')); }
+  });
+  var timers = {};
+  function search(q, forId, box) {
+    clearTimeout(timers[forId || '_']);
+    timers[forId || '_'] = setTimeout(function() {
+      if (q.trim().length < 2) { box.innerHTML = ''; return; }
+      fetch('?key=' + encodeURIComponent(D.key) + '&view=standing&search=' + encodeURIComponent(q) +
+        (forId ? '&for=' + encodeURIComponent(forId) : '')).then(function(r) { return r.json(); }).then(function(d) {
+        var res = (d && d.results) || [];
+        box.innerHTML = res.map(function(p) {
+          if (forId) { return '<div>' + refLine(p.ref) + ' <button type="button" data-act="refadd" data-ref="' +
+            esc(JSON.stringify(p.ref)) + '"' + (p.ref.self ? ' disabled' : '') + '>Add</button></div>'; }
+          return '<div>' + esc(p.name) + (p.firm ? ' · ' + esc(p.firm) : '') + (p.email ? ' · ' + esc(p.email) : '') +
+            (byId[p.id] ? ' <span class="st-muted">(already listed)</span>' :
+              ' <button type="button" data-addclient="' + esc(JSON.stringify(p)) + '">Add client</button>') + '</div>';
+        }).join('') || '<div class="st-muted">No matches</div>';
+      }).catch(function(err) { box.innerHTML = '<div class="st-warn">Search failed: ' + esc(err) + '</div>'; });
+    }, 250);
+  }
+  var addBox = document.getElementById('st-add-results');
+  document.getElementById('st-add').addEventListener('input', function(e) { search(e.target.value, null, addBox); });
+  addBox.addEventListener('click', function(e) {
+    var b = e.target.closest('[data-addclient]'); if (!b) return;
+    var p = JSON.parse(b.getAttribute('data-addclient'));
+    addRow({id: p.id, name: p.name, firm: p.firm, email: p.email, id_forms: p.id_forms, qual: p.qual,
+      auto_trades: p.auto_trades, auto_volume: p.auto_volume, has_record: true, rec: p.rec, refs: p.refs, history_count: 0});
+    if (!p.has_record) forceSave[p.id] = 1;
+    document.getElementById('st-q').value = p.name; page = 0; addBox.innerHTML = ''; render();
+  });
+  ['st-q', 'st-tier', 'st-bad', 'st-priv', 'st-sort'].forEach(function(id) {
+    var el = document.getElementById(id);
+    el.addEventListener(el.tagName === 'INPUT' && el.type === 'search' ? 'input' : 'change', function() { page = 0; render(); });
+  });
+  document.getElementById('st-prev').addEventListener('click', function() { if (page > 0) { page--; render(); } });
+  document.getElementById('st-next').addEventListener('click', function() { page++; render(); });
+  document.getElementById('st-all').addEventListener('change', function(e) {
+    var list = filtered().slice(page * D.page_rows, (page + 1) * D.page_rows);
+    list.forEach(function(r) { if (e.target.checked) selected[r.id] = 1; else delete selected[r.id]; }); render();
+  });
+  document.getElementById('st-bulk').addEventListener('click', function(e) {
+    var op = e.target.getAttribute('data-bulk'); if (!op) return;
+    Object.keys(selected).forEach(function(id) { var r = byId[id]; if (!r) return; var s = edit(r);
+      if (op === 'private_on') s.rec.private = true;
+      else if (op === 'private_off') s.rec.private = false;
+      else if (op === 'reset_repairs') { s.rec.terms_repair = 0; s.rec.payments_repair = 0; s.rec.respond_repair = 0; }
+      else if (op === 'clear_overrides') { s.rec.trades_override = null; s.rec.volume_override_usd = null; }
+    });
+    render();
+  });
+  ['sellers', 'buyers'].forEach(function(k) {
+    document.getElementById('st-' + k).addEventListener('change', function(e) { settings[k + '_visible'] = e.target.checked; renderDirty(); });
+  });
+  function msg(cls, text) { document.getElementById('st-msg').innerHTML = '<div class="st-banner ' + cls + '">' + esc(text) + '</div>'; }
+  var saveBtn = document.getElementById('st-savebtn');
+  if (D.load_error) saveBtn.disabled = true;
+  saveBtn.addEventListener('click', function() {
+    var clients = {}, rs = {};
+    rows.filter(changed).forEach(function(r) { var s = cur(r);
+      clients[r.id] = {private: !!s.rec.private, terms_repair: s.rec.terms_repair, payments_repair: s.rec.payments_repair,
+        respond_repair: s.rec.respond_repair, trades_override: s.rec.trades_override,
+        volume_override_usd: s.rec.volume_override_usd, tier_floor: s.rec.tier_floor || null,
+        referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: !!x.confirmed_unrelated}; })};
+      if (reasons[r.id]) rs[r.id] = reasons[r.id];
+    });
+    var payload = {key: D.key, rev: D.rev, clients: clients, reasons: rs};
+    if (settingsChanged()) payload.settings = {sellers_visible: settings.sellers_visible, buyers_visible: settings.buyers_visible};
+    if (!Object.keys(clients).length && !payload.settings) { msg('st-ok', 'Nothing to save.'); return; }
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    fetch('?action=save_standing', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)})
+      .then(function(r) { return r.json().then(function(d) { return {status: r.status, d: d}; }); })
+      .then(function(res) {
+        if (res.status === 200 && res.d.ok) { msg('st-ok', 'Saved.'); window.location.reload(); return; }
+        saveBtn.disabled = false; saveBtn.textContent = 'Save changes';
+        msg('st-err', res.status === 409 ? D.conflict_msg : ((res.d && res.d.error) || 'Save failed. Nothing was saved.'));
+      }).catch(function(err) { saveBtn.disabled = false; saveBtn.textContent = 'Save changes';
+        msg('st-err', 'Save failed. Nothing was saved. (' + err + ')'); });
+  });
+  window.addEventListener('beforeunload', function(e) {
+    if (saveBtn.textContent !== 'Saving…' && (rows.some(changed) || settingsChanged())) { e.preventDefault(); e.returnValue = ''; }
+  });
+  render();
+})();
+"""
 
 
 def _forbidden():
@@ -15552,6 +16539,11 @@ def _lambda_handler_impl(event, context):
             return _json_response({"error": "POST only"}, 405)
         return _handle_save_bio(event)
 
+    if query.get("action") == "save_standing":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_save_standing(event)
+
     # Bulk Public Bio page: GET renders, POST saves (form post back to
     # the same URL). Same ADMIN_KEY query check as every admin GET route.
     if query.get("view") == "bios":
@@ -15595,6 +16587,18 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _html_response(render_client_links_page())
+
+    # Client Standing: admin scoreboard (+ its &search= JSON) and the
+    # desk's per-buyer JSON. Admin key only.
+    if query.get("view") == "standing":
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_standing_view(query)
+
+    if query.get("view") == "standing_json":
+        if not is_admin_key:
+            return _forbidden()
+        return _json_response(standing_json_payload(query.get("pid")))
 
     if query.get("tenants") == "list":
         if not is_admin_key:
