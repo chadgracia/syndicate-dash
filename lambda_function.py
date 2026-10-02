@@ -1646,6 +1646,55 @@ def _verify_sso_handoff(token):
         return None
 
 
+def _make_handoff_token(email):
+    """Trades-format SSO handoff token (identical to chadgracia/trades
+    _make_handoff_token): base64url(f"{email}|{exp}|{sig}"), padding
+    stripped, exp = now + 3600, sig = HMAC-SHA256(IDENTITY_SECRET,
+    f"{email}|{exp}").hexdigest(). None when IDENTITY_SECRET or email is
+    missing (no link, never a fallback key)."""
+    if not (IDENTITY_SECRET and email):
+        return None
+    exp = int(time.time()) + 3600
+    sig = hmac.new(IDENTITY_SECRET.encode(), f"{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{email}|{exp}|{sig}".encode()).decode().rstrip("=")
+
+
+# "Add deal": the shared New Order form in chadgracia/deal-update-form
+# creates the Pipeline deal -- this repo only links to it, signed in via a
+# trades-format ?sso= handoff for the viewer (tenant session) or the
+# &view_as tenant (admin). Plain admin (no tenant context) gets no link.
+ADD_DEAL_FORM_URL = "https://desk.graciagroup.com/update/?action=new"
+ADD_DEAL_HELP_TEXT = "New deals appear here within the hour."
+
+
+def _add_deal_email(key=None, view_as=None, account_email=None):
+    """Whose email the Add deal handoff is minted for: admin (key set) ->
+    the &view_as tenant, else None; tenant session -> the verified
+    account email."""
+    if key is not None:
+        return view_as.strip().lower() if view_as else None
+    return account_email or None
+
+
+def _add_deal_url(email):
+    token = _make_handoff_token(email)
+    if not token:
+        return None
+    return f"{ADD_DEAL_FORM_URL}&sso={urllib.parse.quote(token, safe='')}"
+
+
+def _add_deal_link_html(email, cls, is_admin=False, role=""):
+    """"+ Add deal" link (new tab), or "" when there's no email/secret.
+    Admin view_as renders a tooltip naming whose account it opens as."""
+    url = _add_deal_url(email)
+    if not url:
+        return ""
+    title_attr = f' title="Opens as {_esc(email)}"' if is_admin else ""
+    role_attr = f' role="{role}"' if role else ""
+    return (f'<a class="{cls}" href="{_esc(url)}" target="_blank" rel="noopener"{title_attr}{role_attr}>'
+            '+ Add deal</a>')
+
+
 # Public base URL: CloudFront (desk.graciagroup.com, /dashboard* and
 # /blockbook* behaviors) forwards to this Lambda's Function URL with rawPath
 # still starting with the public prefix -- _split_public_prefix strips either
@@ -8931,6 +8980,8 @@ NAV_CSS = """
     font-size: 13px;
   }
   .gg-mydeals-menu-item:hover { background: rgba(61,90,115,0.08); }
+  .gg-mydeals-menu-add { font-weight: 700; color: var(--accent); }
+  .gg-mydeals-menu-add + .gg-mydeals-menu-group { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 4px; }
   .gg-mydeals-menu-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .gg-mydeals-menu-via { color: var(--muted); font-size: 11px; margin-left: 6px; }
   .gg-mydeals-menu-badge { color: var(--muted); font-size: 11px; font-weight: 600; flex-shrink: 0; }
@@ -9391,21 +9442,25 @@ def _mydeals_dropdown_entries(person_id):
     return ordered
 
 
-def _mydeals_dropdown_html(person_id, key=None, view_as=None):
+def _mydeals_dropdown_html(person_id, key=None, view_as=None, add_deal_email=None):
     """The My Deals tab's quick-jump dropdown, rendered on every page via
     _nav_html: the caret button plus the menu itself, or "" when there's
     nothing to show (admin-without-view_as, or a tenant with no Sell
     deals on file at all) -- the caret only exists to open something.
     Capped at 40 entries with a trailing "View all in My Deals ->" item
     beyond that (entries stay in the same Live/On Hold/Closed/Cancelled,
-    A-Z order -- the cap just truncates the tail)."""
+    A-Z order -- the cap just truncates the tail). add_deal_email (see
+    _add_deal_email) puts "+ Add deal" first, above the groups, and keeps
+    the menu even with no deals."""
     entries = _mydeals_dropdown_entries(person_id)
-    if not entries:
+    add_deal_html = _add_deal_link_html(add_deal_email, "gg-mydeals-menu-item gg-mydeals-menu-add",
+                                        is_admin=key is not None, role="menuitem")
+    if not entries and not add_deal_html:
         return ""
     MAX_ENTRIES = 40
     shown, overflow = entries[:MAX_ENTRIES], len(entries) > MAX_ENTRIES
 
-    groups_html = []
+    groups_html = [add_deal_html] if add_deal_html else []
     for group in ("Live", "On Hold", "Closed", "Cancelled"):
         group_entries = [e for e in shown if e["group"] == group]
         if not group_entries:
@@ -9618,7 +9673,8 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     # _mydeals_dropdown_html). Rendered on every page, not just My Deals
     # itself, since _nav_html is the one place every render_* function
     # already shares.
-    mydeals_menu_html = _mydeals_dropdown_html(person_id, key=key, view_as=view_as)
+    mydeals_menu_html = _mydeals_dropdown_html(person_id, key=key, view_as=view_as,
+                                               add_deal_email=_add_deal_email(key, view_as, account_email))
     mydeals_script = ""
     if mydeals_menu_html:
         mydeals_script = """<script>
@@ -11636,13 +11692,22 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="my-deals", edit_mode=edit_mode)
 
+    # "+ Add deal" (header button + empty state): tenant -> own email,
+    # admin view_as -> that tenant's; plain admin (tenant picker) -> none.
+    add_deal_btn = "" if tenant_picker else _add_deal_link_html(
+        _add_deal_email(key, view_as, account_email), "add-deal-btn", is_admin=key is not None)
+    head_html = '<h1>My Deals</h1>'
+    if add_deal_btn:
+        head_html = (f'<div class="mydeals-head"><h1>My Deals</h1><div class="add-deal-wrap">{add_deal_btn}'
+                     f'<div class="add-deal-help">{_esc(ADD_DEAL_HELP_TEXT)}</div></div></div>')
+
     summary_html = ""
     subtle_html = ""
     edit_script = ""
     if tenant_picker:
         body_html = _tenant_picker_html()
     elif not deals:
-        body_html = '<div class="gg-placeholder">No deals yet.</div>'
+        body_html = f'<div class="gg-placeholder"><p>You have no deals yet.</p>{add_deal_btn}</div>'
     else:
         model = _my_deals_model(deals, person_id, anon_key_email)
         rows = model["rows"]
@@ -12026,6 +12091,13 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     font-size: 15px;
   }}
   .gg-placeholder.small {{ margin: 0; padding: 24px; }}
+  .mydeals-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
+  .add-deal-wrap {{ text-align: right; margin-top: 4px; }}
+  .add-deal-btn {{ display: inline-block; background: var(--accent); color: #fff; border: none; padding: 5px 12px;
+                  border-radius: 6px; font-size: 12px; font-weight: 600; text-decoration: none; cursor: pointer; }}
+  .add-deal-btn:hover {{ opacity: 0.9; }}
+  .add-deal-help {{ font-size: 11px; color: var(--muted); margin-top: 4px; }}
+  .gg-placeholder .add-deal-btn {{ margin-top: 6px; }}
   .gg-tenant-picker {{ max-width: 640px; margin: 48px auto; padding: 0 24px; }}
   .gg-tenant-picker-lead {{ text-align: center; color: var(--muted); font-size: 15px; margin-bottom: 14px; }}
   .gg-tenant-picker-list {{ list-style: none; padding: 0; margin: 0; border: 1px solid var(--line); border-radius: 8px; }}
@@ -12038,7 +12110,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 <body>
 {nav}
 <div class="wrap">
-  <h1>My Deals</h1>
+  {head_html}
   {feature_box_html}
   {summary_html}
   {subtle_html}

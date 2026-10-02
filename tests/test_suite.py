@@ -8759,6 +8759,84 @@ lf._data_cache.pop(lf.STANDING_KEY, None)
 check("standing_json: missing file -> visible false", _st_json(2)[1] == {"visible": False})
 
 
+
+# ======================================================================
+# SECTION: Add deal -- deal-update-form ?action=new + trades sso handoff
+# ======================================================================
+import hashlib as _ad_hashlib
+import hmac as _ad_hmac
+import urllib.parse as _ad_up
+
+_ad_email = "adam@adddeal.com"
+use_fixture({"people.json": {"people": [{"id": 5601, "full_name": "Adam Add", "email": _ad_email,
+                                         "company_name": "AddCo", "custom_fields": {}}]},
+             "interest_people.json": {"buy": {}},
+             "deals.json": {"deals": [{"id": 56010, "name": "AddCo sell", "company": {"name": "AddCo"},
+                                       "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                                       "people": [{"id": 5601}], "updated_at": "2026-08-01T00:00:00Z"}]}})
+
+
+def _ad_trades_verify(token):
+    """chadgracia/trades handoff verify, inline: sig match + unexpired."""
+    raw = _b64.urlsafe_b64decode(token + "=" * (-len(token) % 4)).decode()
+    email, exp, sig = raw.split("|")
+    expected = _ad_hmac.new(b"test-secret", f"{email}|{exp}".encode(), _ad_hashlib.sha256).hexdigest()
+    return email, int(exp), _ad_hmac.compare_digest(expected, sig)
+
+
+def _ad_tokens(html):
+    return [_ad_up.unquote(m) for m in re.findall(
+        r'href="https://desk\.graciagroup\.com/update/\?action=new&amp;sso=([^"&]+)"', html)]
+
+
+_ad_tok = lf._make_handoff_token(_ad_email)
+_ad_e, _ad_exp, _ad_ok = _ad_trades_verify(_ad_tok)
+check("Add deal: handoff token round-trips trades verify (email, sig match)",
+      _ad_e == _ad_email and _ad_ok and "=" not in _ad_tok)
+check("Add deal: handoff exp is ~1h ahead", abs(_ad_exp - (int(time.time()) + 3600)) <= 5)
+check("Add deal: this repo's _verify_sso_handoff accepts the token", lf._verify_sso_handoff(_ad_tok) == _ad_email)
+
+_ad_tenant = _tl_get({"tab": "mydeals"}, cookies=[tenant_cookie(_ad_email)])["body"]
+_ad_tt = _ad_tokens(_ad_tenant)
+check("Add deal: tenant My Deals renders dropdown item + header button, both sso for the viewer",
+      len(_ad_tt) == 2 and all(_ad_trades_verify(t)[0] == _ad_email and _ad_trades_verify(t)[2] for t in _ad_tt))
+check("Add deal: dropdown item is the first menu entry, new tab",
+      re.search(r'<div class="gg-mydeals-menu" role="menu"><a class="gg-mydeals-menu-item gg-mydeals-menu-add" '
+                r'href="[^"]+" target="_blank" rel="noopener" role="menuitem">\+ Add deal</a>', _ad_tenant) is not None)
+check("Add deal: header button + helper text, new tab, no tenant tooltip",
+      re.search(r'<a class="add-deal-btn" href="[^"]+" target="_blank" rel="noopener">\+ Add deal</a>'
+                r'<div class="add-deal-help">New deals appear here within the hour\.</div>', _ad_tenant) is not None)
+check("Add deal: other tenant tabs carry the dropdown item too",
+      len(_ad_tokens(_tl_get({"tab": "overview"}, cookies=[tenant_cookie(_ad_email)])["body"])) == 1)
+
+_ad_empty = lf.render_my_deals_page("Adam Add", deals=[], key=None, view_as=None, account_email=_ad_email)
+check("Add deal: empty state says 'You have no deals yet.' plus the button",
+      re.search(r'<div class="gg-placeholder"><p>You have no deals yet\.</p><a class="add-deal-btn" href="[^"]+" '
+                r'target="_blank" rel="noopener">\+ Add deal</a></div>', _ad_empty) is not None)
+
+_ad_admin = _tl_get({"tab": "mydeals", "key": ADMIN_KEY, "view_as": _ad_email.upper()})["body"]
+_ad_at = _ad_tokens(_ad_admin)
+check("Add deal: admin view_as mints for the view_as tenant email",
+      len(_ad_at) == 2 and all(_ad_trades_verify(t)[0] == _ad_email and _ad_trades_verify(t)[2] for t in _ad_at))
+check("Add deal: admin view_as carries the 'Opens as <email>' tooltip",
+      _ad_admin.count(f'title="Opens as {_ad_email}"') == 2)
+check("Add deal: ADMIN_KEY never in the Add deal links",
+      all(ADMIN_KEY not in _b64.urlsafe_b64decode(t + "=" * (-len(t) % 4)).decode() for t in _ad_at)
+      and not re.search(r'action=new[^"]*' + re.escape(ADMIN_KEY), _ad_admin))
+
+_ad_plain = _tl_get({"tab": "mydeals", "key": ADMIN_KEY})["body"]
+check("Add deal: plain admin (no view_as) renders no Add deal link",
+      "+ Add deal" not in _ad_plain and "action=new" not in _ad_plain)
+check("Add deal: ADMIN_KEY never appears in rendered tenant HTML",
+      ADMIN_KEY not in _ad_tenant and ADMIN_KEY not in _ad_empty)
+
+_ad_saved = lf.IDENTITY_SECRET
+lf.IDENTITY_SECRET = ""
+check("Add deal: no IDENTITY_SECRET -> no token, no link",
+      lf._make_handoff_token(_ad_email) is None
+      and "+ Add deal" not in lf.render_my_deals_page("Adam Add", deals=[], account_email=_ad_email))
+lf.IDENTITY_SECRET = _ad_saved
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)
