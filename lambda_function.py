@@ -7807,8 +7807,8 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
         range_html = f'<div class="buyer-range">{_esc(range_text)}</div>' if range_text else ""
         blocks.append(
             f'<div class="pending-buyer">'
-            f'<span class="buyer-code">Buyer {_esc(code)}</span>{_standing_ticks_for(pid)} '
-            f'{tier_html}'
+            f'<span class="buyer-code">Buyer {_esc(code)}</span> '
+            f'{tier_html}{_standing_star_for(pid)}'
             f'{range_html}</div>'
         )
     return "".join(blocks)
@@ -12252,7 +12252,7 @@ def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None
         return f"""<div class="buyer-tile">
       <span class="{dot_cls}" title="{dot_title}"></span>
       <div class="buyer-code">Buyer {_esc(code)}</div>
-      {tier_html}
+      {tier_html}{_standing_star_for(buyer["person_id"])}
       {range_html}
     </div>"""
 
@@ -13891,8 +13891,9 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
     min_v, max_v = get_person_ticket_range(cf)
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<div class="buyer-page-row">{_esc(range_text)}</div>' if range_text else ""
-    tier_row = f'<div class="buyer-page-row">{tier_html}</div>' if tier_html else ""
-    return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}{_standing_ticks_for(buyer_id)}</div>'
+    star_html = _standing_star_for(buyer_id)
+    tier_row = f'<div class="buyer-page-row">{tier_html}{star_html}</div>' if (tier_html or star_html) else ""
+    return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}</div>'
             f'{tier_row}{range_html}'
             f'<div class="buyer-page-note">Identity available after introduction.</div></div>')
 
@@ -14696,7 +14697,7 @@ STANDING_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _standing_default_client():
-    return {"visible": False, "share_with_sellers": False, "respond_repair": 0, "terms_repair": 0,
+    return {"visible": False, "share_with_sellers": True, "respond_repair": 0, "terms_repair": 0,
             "payments_repair": 0, "tier_floor": None,
             "referrals": [], "trade_edits": {}, "manual_trades": [], "notes": "", "history": []}
 
@@ -14746,6 +14747,22 @@ def _standing_manual_trades(raw):
     return out
 
 
+STANDING_SHARE_REASON = "set by client on desk"
+
+
+def _standing_client_share_entry(history):
+    """The client's latest share_with_sellers change (made on the desk), or None."""
+    for h in reversed(history or []):
+        if h.get("field") == "share_with_sellers" and h.get("reason") == STANDING_SHARE_REASON:
+            return h
+    return None
+
+
+def _standing_client_share(history):
+    h = _standing_client_share_entry(history)
+    return not (h is not None and h.get("to") is False)
+
+
 def _standing_client_record(raw):
     """A stored client record with every field defaulted/validated (a bad
     stored value reads as its default, never crashes a render). Legacy
@@ -14757,9 +14774,11 @@ def _standing_client_record(raw):
     if not isinstance(raw, dict):
         return rec
     rec["visible"] = raw.get("visible") is True
-    # Client consent to show standing to sellers. Set only by the client via
-    # the desk (?action=standing_share); missing on old records = False.
-    rec["share_with_sellers"] = raw.get("share_with_sellers") is True
+    rec["history"] = [h for h in (raw.get("history") or []) if isinstance(h, dict)]
+    # Sharing with sellers is opt-out: True unless the client's own latest
+    # change (?action=standing_share, reason STANDING_SHARE_REASON) set it
+    # False. The stored flag is ignored -- the history entry is the record.
+    rec["share_with_sellers"] = _standing_client_share(rec["history"])
     for f in STANDING_REPAIR_FIELDS:
         rec[f] = _standing_int(raw.get(f), 0, STANDING_REPAIR_MAX) or 0
     rec["tier_floor"] = raw.get("tier_floor") if raw.get("tier_floor") in STANDING_TIERS else None
@@ -14776,7 +14795,6 @@ def _standing_client_record(raw):
     rec["trade_edits"] = _standing_trade_edits(raw.get("trade_edits"))
     rec["manual_trades"] = _standing_manual_trades(raw.get("manual_trades"))
     rec["notes"] = raw.get("notes")[:STANDING_NOTES_MAX_LEN] if isinstance(raw.get("notes"), str) else ""
-    rec["history"] = [h for h in (raw.get("history") or []) if isinstance(h, dict)]
     legacy = {"trades": raw.get("trades_override"), "volume_usd": raw.get("volume_override_usd")}
     if any(v is not None for v in legacy.values()):
         rec["legacy_overrides"] = legacy
@@ -15161,23 +15179,63 @@ def _standing_card_html(items, heading="Client standing"):
             f'<ul style="list-style:none;margin:0;padding:0;position:relative">{rows}</ul></div>')
 
 
-def _standing_ticks_html(items):
-    """Five small inline ticks for anonymous surfaces: green filled = done,
-    grey ring = not done. Nothing identifying -- only the count."""
-    n = sum(1 for i in items if i["done"])
-    label = f"Good standing: {n} of {len(items)}"
-    dots = "".join(
-        '<span style="display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:2px;'
-        + ('background:#1f7a4d;border:1px solid #1f7a4d"></span>' if i["done"]
-           else 'background:transparent;border:1px solid #b8bcc4"></span>')
-        for i in items)
-    return (f'<span class="gs-ticks" role="img" title="{label}" aria-label="{label}" '
-            f'style="display:inline-flex;align-items:center;vertical-align:middle;margin-left:6px">{dots}</span>')
+STANDING_STAR_STYLE = {
+    # star -> (fill colour, title/aria-label). Nothing else is ever shown.
+    "gold": ("#C9A227", "Proven"),
+    "green": ("#1f7a4d", "Ready to transact"),
+    "yellow": ("#E9B949", "In progress"),
+}
+STANDING_STAR_PATH = "M12 2.6l2.9 5.9 6.5.9-4.7 4.6 1.1 6.5L12 17.4l-5.8 3.1 1.1-6.5-4.7-4.6 6.5-.9z"
+STANDING_NOT_SHARED_TEXT = "Prefers not to share"
+STANDING_NOT_SHARED_CARD_TEXT = "Client prefers not to share this information."
 
 
-def _standing_ticks_for(person_id):
-    items = _standing_seller_items(person_id)
-    return _standing_ticks_html(items) if items else ""
+def _standing_star_from_cs(cs):
+    if cs is None or not cs["visible"]:
+        return None
+    if not cs["share_with_sellers"]:
+        return "hidden"
+    rec = cs["record"]
+    clean = rec["terms_repair"] == 0 and rec["respond_repair"] == 0
+    if not clean:
+        return "yellow"
+    onboarded = all(i["done"] for i in cs["items"] if i["key"] in ("id_forms", "qualification"))
+    return "gold" if cs["trades"] >= 1 and onboarded else "green"
+
+
+def standing_star(pid):
+    """THE seller-facing star: None (render nothing) when the client is not
+    visible, unknown, or on any error; "hidden" when visible but opted out of
+    sharing; else "gold" (closed a trade, onboarded for their role, terms and
+    respond clean), "green" (terms and respond clean; onboarding not
+    required), "yellow" (any terms/respond repair). Payments never count."""
+    try:
+        state = _load_client_standing()
+        if state is None:
+            return None
+        return _standing_star_from_cs(compute_client_standing(pid, state=state))
+    except Exception as e:
+        print(f"client-standing star failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _standing_star_html(star):
+    """A small filled star (title/aria-label only) or the muted opt-out text.
+    No item detail, count, tier, id or name."""
+    if star == "hidden":
+        return (f'<span class="gs-noshare" style="margin-left:6px;font-size:11px;color:#8a8f98">'
+                f'{STANDING_NOT_SHARED_TEXT}</span>')
+    if star not in STANDING_STAR_STYLE:
+        return ""
+    fill, label = STANDING_STAR_STYLE[star]
+    return (f'<span class="gs-star" role="img" title="{label}" aria-label="{label}" '
+            'style="display:inline-flex;vertical-align:middle;margin-left:6px">'
+            f'<svg viewBox="0 0 24 24" width="13" height="13" aria-hidden="true">'
+            f'<path fill="{fill}" d="{STANDING_STAR_PATH}"/></svg></span>')
+
+
+def _standing_star_for(pid):
+    return _standing_star_html(standing_star(pid))
 
 
 def _standing_buyer_page_card_html(person_id, admin):
@@ -15185,7 +15243,12 @@ def _standing_buyer_page_card_html(person_id, admin):
     full card, labeled with whether sellers see it."""
     if not admin:
         items = _standing_seller_items(person_id)
-        return _standing_card_html(items) if items else ""
+        if items:
+            return _standing_card_html(items)
+        if standing_star(person_id) == "hidden":
+            return ('<div class="card standing-card" style="margin-top:12px">'
+                    f'<div class="buyer-page-note" style="color:#8a8f98">{STANDING_NOT_SHARED_CARD_TEXT}</div></div>')
+        return ""
     try:
         state = _load_client_standing()
         cs = compute_client_standing(person_id, state=state) if state is not None else None
@@ -15199,7 +15262,7 @@ def _standing_buyer_page_card_html(person_id, admin):
     if cs["seller_visible"]:
         heading = "Client standing (sellers see this)"
     elif cs["visible"]:
-        heading = "Client standing (hidden from sellers — client has not agreed to share)"
+        heading = "Client standing (hidden from sellers — client opted out of sharing)"
     else:
         heading = "Client standing (hidden from sellers)"
     return _standing_card_html(cs["items"], heading)
@@ -15271,11 +15334,10 @@ STANDING_ROW_REF_KEYS = ("person_id", "name", "firm", "role", "cef_label", "iqf_
 
 
 def _standing_share_at(client):
-    """When share_with_sellers last changed (the consent record), or None."""
-    for h in reversed(client.get("history") or []):
-        if h.get("field") == "share_with_sellers":
-            return h.get("at")
-    return None
+    """When the client last changed share_with_sellers on the desk (the
+    opt-out record), or None."""
+    h = _standing_client_share_entry(client.get("history"))
+    return h.get("at") if h else None
 
 
 def _standing_row(pid, rec, state):
@@ -15628,7 +15690,7 @@ def _handle_standing_share(event):
         _standing_migrate_legacy(new_state, now)
         rec = new_state["clients"][pid]
         rec["history"].append({"at": now, "field": "share_with_sellers", "from": old["share_with_sellers"],
-                               "to": share, "reason": "set by client on desk"})
+                               "to": share, "reason": STANDING_SHARE_REASON})
         rec["share_with_sellers"] = share
         try:
             _standing_finish_write(s3, current_raw, current, new_state, now, "standing_share")
@@ -15878,9 +15940,9 @@ STANDING_PAGE_JS = r"""
       '<td data-role="refs">' + refsCell(r) + '</td>' +
       '<td><select data-act="floor">' + floorOpts + '</select></td>' +
       '<td><input type="checkbox" data-act="visible"' + (rec.visible ? ' checked' : '') + '></td>' +
-      '<td title="' + esc(r.share ? (r.share_at ? 'Client agreed on ' + String(r.share_at).slice(0, 10) : 'Client agreed') :
-        (r.share_at ? 'Client stopped sharing on ' + String(r.share_at).slice(0, 10) : 'Client has not agreed')) + '">' +
-        (r.share ? '<span class="st-yes">✓</span>' : '<span class="st-muted">—</span>') + '</td>' +
+      '<td' + (r.share && r.share_at ? ' title="Opted back in ' + esc(String(r.share_at).slice(0, 10)) + '"' : '') + '>' +
+        (r.share ? '<span class="st-yes">✓</span>' : '<span class="st-muted">Opted out' +
+          (r.share_at ? ' ' + esc(String(r.share_at).slice(0, 10)) : '') + '</span>') + '</td>' +
       '<td class="st-tier" data-role="tier">' + tierHtml(r) + '</td>' +
       '<td><textarea class="st-notes" data-act="notes" maxlength="' + D.notes_max + '" rows="1">' + esc(rec.notes) + '</textarea></td>' +
       '<td>' + (hist.length ? '<a href="#" data-act="hist">History (' + hist.length + ')</a>' : '<span class="st-muted">History (0)</span>') + '</td></tr>' +
