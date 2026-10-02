@@ -8374,7 +8374,7 @@ _st_people = {"people": [
     {"id": 3, "full_name": "Bob Pending", "email": "bob@betafund.com", "company_id": 51, "company_name": "Beta Fund",
      "custom_fields": {lf.CEF_FIELD: lf.CEF_NO_ID}},
     {"id": 5, "full_name": "Rita Referred", "email": "rita@ritafund.com", "company_id": 60,
-     "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, _ST_IL: lf.ACCREDITED_ID}},
+     "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, _ST_IL: lf.ACCREDITED_ID, lf.IQF_FIELD: 6596073}},
     {"id": 6, "full_name": "Ron Related", "email": "ron@ronco.com", "company_id": 50,
      "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, _ST_IL: lf.QC_ID}},
     {"id": 7, "full_name": "Nina Pending", "email": "nina@ninaco.com",
@@ -8382,7 +8382,7 @@ _st_people = {"people": [
     {"id": 8, "full_name": "Gus Gmail", "email": "gus@gmail.com",
      "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, _ST_IL: lf.QP_ID}},
     {"id": 9, "full_name": "Dee Domain", "email": "dee@alphacap.com", "company_id": 99,
-     "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, _ST_IL: lf.QP_ID}},
+     "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, _ST_IL: lf.QP_ID, lf.IQF_FIELD: 6496840}},
     {"id": 11, "full_name": "Sam Substantive", "email": "sam@samco.com",
      "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, _ST_IL: lf.SUBSTANTIVE_ID}},
     {"id": 10, "full_name": "Ivy Interest", "email": "ivy@ivyco.com", "custom_fields": {lf.CEF_FIELD: lf.CEF_NA_ID}},
@@ -8390,6 +8390,12 @@ _st_people = {"people": [
     {"id": 13, "full_name": "Tia Tiers", "email": "tia@tiaco.com", "custom_fields": dict(_ST_GOOD)},
     {"id": 14, "full_name": "Nora Nolevel", "email": "nora@noraco.com", "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID}},
     {"id": 15, "full_name": "Sid Seller", "email": "sid@sidco.com", "custom_fields": {}},
+    {"id": 16, "full_name": "Sue Sellint", "email": "sue@sueco.com",
+     "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, lf.SELL_INTEREST_FIELD: [7300001]}},
+    {"id": 17, "full_name": "Bea Buyint", "email": "bea@beaco.com", "custom_fields": {lf.IQF_FIELD: 6596073}},
+    {"id": 18, "full_name": "Bertan İlbak", "email": "bertan@ilbak.com.tr", "custom_fields": {}},
+    {"id": 19, "full_name": "Sam Same", "email": "sam1@firmone.com", "company_name": "Firm One", "custom_fields": {}},
+    {"id": 20, "full_name": "Sam Same", "email": "sam2@firmtwo.com", "company_name": "Firm Two", "custom_fields": {}},
 ]}
 _ST_WON, _ST_WON2 = 111802, 2379321
 _st_deals = [
@@ -8417,7 +8423,7 @@ _st_deals = [
      "custom_fields": {}, "person_ids": [12]},
     {"id": 965, "name": "Sid Co: $2M Sell", "deal_stage": {"id": _ST_WON}, "custom_fields": cf_sell(), "person_ids": [15]},
 ]
-_st_s3, _ = use_fixture({lf.PEOPLE_KEY: _st_people, lf.INTEREST_KEY: {"buy": {"Gamma Co": [3, 10], "Other": [999]}},
+_st_s3, _ = use_fixture({lf.PEOPLE_KEY: _st_people, lf.INTEREST_KEY: {"buy": {"Gamma Co": [3, 10], "Other": [999], "Delta Co": [17]}},
                          lf.DEALS_KEY: {"deals": _st_deals}})
 
 
@@ -8520,19 +8526,27 @@ def _st_ref(pid, ticked=True, client="13"):
     c = _st_cs(int(client), {client: {"referrals": [{"person_id": str(pid), "confirmed_unrelated": ticked}]}})
     return c["referrals"][0], c
 _r, _c = _st_ref(5)
-check("referral: CEF Yes + Accredited + box ticked -> Confirmed",
+check("referral: buyer with IQF Unnecessary + box ticked -> Confirmed",
       _r["confirmed"] and _c["confirmed_referrals"] == 1 and _c["pending_referrals"] == 0)
 _r, _c = _st_ref(5, False)
 check("referral: onboarded but box unticked -> not confirmed", not _r["confirmed"] and _c["pending_referrals"] == 1)
-check("referral: CEF Pending -> pending, needs engagement form",
-      (lambda r: not r["confirmed"] and r["missing"] == ["engagement form"])(_st_ref(7)[0]))
-check("referral: CEF Yes, no Investor Level -> pending, needs accreditation",
-      (lambda r: not r["confirmed"] and r["missing"] == ["accreditation"])(_st_ref(14)[0]))
-check("referral: CEF No and no level -> both missing",
-      _st_ref(3)[0]["missing"] == ["engagement form", "accreditation"])
+check("referral: seller (Sell deal) without the engagement form -> pending, needs engagement form",
+      (lambda r: not r["confirmed"] and r["missing"] == ["engagement form"] and r["role"] == "Seller")(_st_ref(15)[0]))
+check("referral: buyer (default role) with only the engagement form -> pending, needs IQF",
+      (lambda r: not r["confirmed"] and r["missing"] == ["IQF"] and r["role"] == "Buyer")(_st_ref(14)[0]))
+check("referral: buyer + seller with neither form -> both missing",
+      _st_ref(1)[0]["missing"] == ["engagement form", "IQF"] and _st_ref(1)[0]["role"] == "Buyer + seller")
+check("referral: seller (Sell Interest) with the engagement form only -> Confirmed",
+      (lambda r: r["confirmed"] and r["role"] == "Seller")(_st_ref(16)[0]))
+check("referral: buyer (Buy Interest) with IQF Unnecessary and no Investor Level -> Confirmed",
+      (lambda r: r["confirmed"] and r["role"] == "Buyer")(_st_ref(17)[0]))
+check("referral: same-firm referral never counts even when onboarded and ticked",
+      (lambda r: r[0]["related"] and r[0]["onboarded"] and not r[0]["confirmed"] and r[1]["confirmed_referrals"] == 0)(
+          _st_ref(9, client="2")))
 check("referral: CEF N/A is not Yes", not _st_ref(10)[0]["confirmed"])
 check("referral: Substantive level not accredited", not _st_ref(11)[0]["confirmed"])
-check("referral: QC and QP levels count", _st_ref(6)[0]["onboarded"] and _st_ref(8)[0]["onboarded"])
+check("referral: Investor Level no longer required (Gus: buyer, engagement form, no IQF -> needs IQF only)",
+      _st_ref(8)[0]["missing"] == ["IQF"])
 check("referral: no 'new to CRM' rule -- a long-standing person still confirms", _st_ref(9)[0]["confirmed"])
 check("referral: self-referral never confirms", (lambda r: r["self"] and not r["confirmed"])(_st_ref(13)[0]))
 check("referral: unknown person -> pending, not in people list",
@@ -8580,8 +8594,13 @@ check("admin scoreboard: 200, private no-store", _st_page["statusCode"] == 200
       and _st_page["headers"]["Cache-Control"] == "private, no-store")
 _st_data = _st_page_data(_st_page["body"])
 check("admin scoreboard: rows = interest buy ids + buy-deal people + won-deal people (unknown ids skipped)",
-      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "15", "2", "3"])
-check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 6") == 1)
+      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "15", "17", "2", "3"])
+check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 7") == 1)
+_st_roles = {r["id"]: r["roles"] for r in _st_data["rows"]}
+check("admin scoreboard: rows carry roles (Sella both, Bob buyer, Sid seller)",
+      _st_roles["1"] == {"seller": True, "buyer": True} and _st_roles["3"] == {"seller": False, "buyer": True}
+      and _st_roles["15"] == {"seller": True, "buyer": False}
+      and "Buyer + seller" in lf.STANDING_PAGE_JS and "n/a</span>" in lf.STANDING_PAGE_JS)
 check("admin scoreboard: Select column header separate from Visible; bulk buttons start disabled",
       "Select</label></th>" in _st_page["body"] and 'data-bulk="visible_on" disabled' in _st_page["body"])
 _st_html = _st_page["body"].split("<script>")[0]
@@ -8750,19 +8769,19 @@ check("seller card: terms item open (grey ring), others done",
 check("seller card: closer chip unchanged, no second trades signal",
       "Proven closer with Rainmaker" in _st_disc
       and not re.search(r"trade|closer|\$|\d+ of", _st_disc.split(">Client standing<")[1].split("</ul>")[0].lower()))
-check("anonymous buyer page: five ticks 'Good standing: 2 of 5'",
-      'aria-label="Good standing: 2 of 5"' in _st_pages["anonymous buyer page"]
+check("anonymous buyer page: ticks count only applicable items ('Good standing: 2 of 4' for buyer Bob)",
+      'aria-label="Good standing: 2 of 4"' in _st_pages["anonymous buyer page"]
       and "Client standing" not in _st_pages["anonymous buyer page"])
 check("pending cell: ticks next to the Buyer code",
-      re.search(r'Buyer [A-Z0-9]{4}</span><span class="gs-ticks"[^>]*title="Good standing: 2 of 5"',
+      re.search(r'Buyer [A-Z0-9]{4}</span><span class="gs-ticks"[^>]*title="Good standing: 2 of 4"',
                 _st_pages["active intros (pending cell)"]) is not None)
-check("demand tile: ticks on Buyer tiles (Bob 2/5, Ivy 4/5)",
-      'title="Good standing: 2 of 5"' in _st_pages["company page (demand tiles)"]
-      and 'title="Good standing: 4 of 5"' in _st_pages["company page (demand tiles)"])
+check("demand tile: ticks on Buyer tiles (Bob 2/4, Ivy 3/4 -- engagement form n/a for buyers)",
+      'title="Good standing: 2 of 4"' in _st_pages["company page (demand tiles)"]
+      and 'title="Good standing: 3 of 4"' in _st_pages["company page (demand tiles)"])
 _st_tick = lf._standing_ticks_html(lf.compute_client_standing(3)["items"])
 check("anonymous ticks carry only the count: no name, id or firm",
       "Bob" not in _st_tick and "Beta" not in _st_tick
-      and not re.search(r"\d", re.sub(r"Good standing: \d of 5|\d+(px|%)|#[0-9a-f]{6}", "", _st_tick)))
+      and not re.search(r"\d", re.sub(r"Good standing: \d of \d|\d+(px|%)|#[0-9a-f]{6}", "", _st_tick)))
 check("anonymous surfaces: no buyer names leak with standing on",
       "Bob Pending" not in _st_pages["anonymous buyer page"] and "Bob Pending" not in _st_pages["active intros (pending cell)"]
       and "Ivy Interest" not in _st_pages["company page (demand tiles)"])
@@ -8828,27 +8847,36 @@ _r, _d = _st_json(2)
 check("standing_json: floor platinum without good standing", _d["visible"] and _d["tier"] == "platinum"
       and _d["tier_label"] == "Platinum" and _d["discount_pct"] == 20 and _d["good_standing"] is False
       and _d["tiers_url"] == "https://desk.graciagroup.com/?view=commission-tiers")
-check("standing_json: seven items in order",
+check("standing_json: buyer + seller -> all five items, then referral + trades",
       [i["label"] for i in _d["items"]] == [lbl for _, lbl in lf.STANDING_ITEMS]
-      + ["Introduced a new accredited investor", "Completed trades"])
+      + ["Introduced a new client who completed onboarding with Rainmaker", "Completed trades"])
 check("standing_json: terms note keyed to the number",
       _d["items"][2] == {"label": "Honors agreed terms through closing", "done": False,
                          "note": "Complete your next 3 trades on the agreed terms."})
 check("standing_json: referral note '1 confirmed'",
-      _d["items"][5] == {"label": "Introduced a new accredited investor", "done": True, "note": "1 confirmed"})
+      _d["items"][5] == {"label": lf.STANDING_REFERRAL_LABEL, "done": True, "note": "1 confirmed"})
 check("standing_json: trades include edited size and manual trade (4 trades)",
       _d["items"][6] == {"label": "Completed trades", "done": True, "note": "4 trades · $10.1M"})
 check("standing_json: no internal fields (history/notes/manual labels/repairs)",
       "ZZSECRETREASON" not in _r["body"] and "ZZINTERNALNOTE" not in _r["body"] and "ZZMANUALTRADE" not in _r["body"]
       and "repair" not in _r["body"] and "history" not in _r["body"] and "Rita" not in _r["body"])
 _r, _d = _st_json(3)
-check("standing_json: ID forms open -> engagement-form note + form_url",
-      _d["items"][0] == {"label": "Identity and compliance forms complete", "done": False,
-                         "note": "Rainmaker's engagement form is still needed.", "form_url": lf.CEF_FORM_URL})
+_st_lbl = {i["label"]: i for i in _d["items"]}
+check("standing_json: buyer -> engagement form item omitted (not applicable)",
+      "Identity and compliance forms complete" not in _st_lbl and len(_d["items"]) == 6)
 check("standing_json: qualification open note",
-      _d["items"][1]["note"] == "Rainmaker's qualification form is still needed." and not _d["items"][1]["done"])
+      _st_lbl["Investor qualification on file"] == {"label": "Investor qualification on file", "done": False,
+                                                     "note": "Rainmaker's qualification form is still needed."})
 check("standing_json: respond note plural",
-      _d["items"][4]["note"] == "Reply within 3 business days on your next 2 introductions.")
+      _st_lbl["Responds promptly after an introduction"]["note"]
+      == "Reply within 3 business days on your next 2 introductions.")
+_st_put(dict(_ST_SECRET_CLIENTS, **{"15": {"visible": True}}))
+_st_sid = _st_json(15)[1]
+check("standing_json: seller -> ID forms open note + form_url; qualification omitted",
+      _st_sid["items"][0] == {"label": "Identity and compliance forms complete", "done": False,
+                              "note": "Rainmaker's engagement form is still needed.", "form_url": lf.CEF_FORM_URL}
+      and "Investor qualification on file" not in [i["label"] for i in _st_sid["items"]])
+_st_put(_ST_SECRET_CLIENTS)
 check("standing_json: Bob's floor gold applies without good standing", _d["tier"] == "gold" and _d["discount_pct"] == 15)
 _st_put({"2": {"visible": True, "payments_repair": 1, "terms_repair": 1, "respond_repair": 1,
                "referrals": [{"person_id": "5", "confirmed_unrelated": True}, {"person_id": "7", "confirmed_unrelated": True}]},
@@ -8861,19 +8889,195 @@ check("standing_json: count 1 drops the number; Pipeline trades/volume note",
       and _d["items"][4]["note"] == "Reply within 3 business days on your next introduction."
       and _d["items"][6]["note"] == "3 trades · $4.2M" and _d["tier"] is None)
 check("standing_json: referral note '1 confirmed, 1 pending onboarding'",
-      _d["items"][5] == {"label": "Introduced a new accredited investor", "done": True,
+      _d["items"][5] == {"label": lf.STANDING_REFERRAL_LABEL, "done": True,
                          "note": "1 confirmed, 1 pending onboarding"})
 check("standing_json: referral note '1 pending onboarding' only",
-      _st_json(12)[1]["items"][5] == {"label": "Introduced a new accredited investor", "done": False,
+      _st_json(12)[1]["items"][5] == {"label": lf.STANDING_REFERRAL_LABEL, "done": False,
                                       "note": "1 pending onboarding"})
 check("standing_json: Julio gets credit for all 4 won deals",
       _st_json(12)[1]["items"][6]["note"] == "4 trades · $8.6M")
 check("standing_json: no referrals -> done false and no note; no trades",
-      _st_json(13)[1]["items"][5] == {"label": "Introduced a new accredited investor", "done": False}
-      and _st_json(13)[1]["items"][6]["note"] == "0 trades · $0.0M")
+      _st_json(13)[1]["items"][4] == {"label": lf.STANDING_REFERRAL_LABEL, "done": False}
+      and _st_json(13)[1]["items"][5]["note"] == "0 trades · $0.0M")
 _st_s3.objs.pop(lf.STANDING_KEY, None)
 lf._data_cache.pop(lf.STANDING_KEY, None)
 check("standing_json: missing file -> visible false", _st_json(2)[1] == {"visible": False})
+
+# --- Roles: which onboarding forms apply
+lf._req_cache_reset()
+check("roles: Sell deal only -> seller", lf._standing_roles(15) == {"seller": True, "buyer": False})
+check("roles: Sell Interest (custom_label_3759156) only -> seller", lf._standing_roles(16) == {"seller": True, "buyer": False})
+check("roles: Buy Interest only -> buyer", lf._standing_roles(17) == {"seller": False, "buyer": True})
+check("roles: Buy deal only -> buyer", lf._standing_roles(3) == {"seller": False, "buyer": True})
+check("roles: nothing found -> buyer (default)", lf._standing_roles(13) == {"seller": False, "buyer": True})
+check("roles: Sell + Buy deals -> both", lf._standing_roles(1) == {"seller": True, "buyer": True}
+      and lf._standing_roles(12) == {"seller": True, "buyer": True})
+check("slim: Sell Interest field kept in the slim index", lf.SELL_INTEREST_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
+_st_put({"16": {"visible": True}, "17": {"visible": True}})
+_cs = lf.compute_client_standing(16)
+check("not applicable: seller with engagement form only is in good standing (IQF not required)",
+      _cs["good_standing"] and [i["key"] for i in _cs["items"]] == ["id_forms", "terms", "payments", "respond"])
+check("not applicable: buyer with IQF only is in good standing (engagement form not required)",
+      lf.compute_client_standing(17)["good_standing"])
+check("not applicable: anonymous ticks count applicable items only ('4 of 4')",
+      'title="Good standing: 4 of 4"' in lf._standing_ticks_for(16))
+_st_card = lf._standing_card_html(lf._standing_seller_items(16))
+check("not applicable: seller card omits the qualification item",
+      "Identity and compliance forms complete" in _st_card and "Investor qualification on file" not in _st_card)
+check("not applicable: standing_json omits it too",
+      "Investor qualification on file" not in [i["label"] for i in _st_json(16)[1]["items"]]
+      and "Identity and compliance forms complete" not in [i["label"] for i in _st_json(17)[1]["items"]])
+
+# --- Slim index rebuilds when its field set changes (new custom_label)
+_st_s3.last_modified[lf.PEOPLE_KEY] = datetime(2026, 9, 30, tzinfo=timezone.utc)
+check("slim: rebuild_slim builds the slim file", lf._task_rebuild_slim()["rebuilt"] is True)
+check("slim: rebuild_slim is a no-op when version and field set match", lf._task_rebuild_slim()["rebuilt"] is False)
+_st_s3.objs[lf.PEOPLE_SLIM_KEY]["fields_schema"] = "old-field-set"
+check("slim: rebuild_slim rebuilds when the field set changed", lf._task_rebuild_slim()["rebuilt"] is True
+      and _st_s3.objs[lf.PEOPLE_SLIM_KEY]["fields_schema"] == lf._people_slim_schema())
+_st_s3.last_modified.pop(lf.PEOPLE_KEY, None)
+reset_caches()
+lf.boto3 = FakeBoto3
+FakeBoto3.S3 = _st_s3
+
+# --- Manual referral editor: same-firm referrals are blocked
+_st_put({}, rev=0)
+_r = _st_post({"key": ADMIN_KEY, "rev": 0, "clients": {"2": _st_row(referrals=[{"person_id": "9", "confirmed_unrelated": True}])}})
+check("referral editor: adding a same-domain person is refused with the reason",
+      _r["statusCode"] == 400 and "same-firm" in json.loads(_r["body"])["error"])
+_st_put({"2": {"referrals": [{"person_id": "9", "confirmed_unrelated": True}]}}, rev=3)
+_r = _st_post({"key": ADMIN_KEY, "rev": 3, "clients": {"2": _st_row(notes="x", referrals=[{"person_id": "9", "confirmed_unrelated": True}])}})
+check("referral editor: an already-stored same-firm referral does not block saving the row", _r["statusCode"] == 200)
+check("referral editor: page blocks the Add button for same-firm people",
+      "Can\\'t add: same company or email domain as the client" in lf.STANDING_PAGE_JS)
+
+# --- Referral-suggestions import
+_IMP_HEADER = "referred_person_id,referred_name,referred_company,referrer_person_id,referrer_name,referrer_email,kind,evidence"
+_IMP_CSV = "﻿" + _IMP_HEADER + "\n" + "\n".join([
+    '5,Rita Referred,Rita Fund,,Tia Tiers,TIA@tiaco.com,Reference,"Tia said ""great fit"", intro\'d by email"',
+    '7,Nina Pending,,,Bertan İlbak,,Reference,Bertan introduced Nina',
+    '8,Gus Gmail,,12,Wrong Name,,Reference,from Julio',
+    '14,Nora Nolevel,,,sam same,,Reference,Sam sent her',
+    '11,Sam Substantive,,,Nobody Here,,Reference,someone',
+    '2,Alice Standing,Alpha Cap,,Dee Domain,,Reference,colleague',
+    '13,Tia Tiers,,,Tia Tiers,tia@tiaco.com,Reference,self mention',
+    '10,Ivy Interest,,,Rita Referred,,CC\'ed,cc on thread',
+    '6,Ron Related,,,Nobody Two,,Reference,unknown',
+])
+_imp_rows, _imp_err = lf.parse_referral_suggestions_csv(_IMP_CSV)
+check("import CSV: BOM, quotes, embedded commas/quotes and UTF-8 names parse",
+      _imp_err is None and len(_imp_rows) == 9 and _imp_rows[1]["referrer_name"] == "Bertan İlbak"
+      and _imp_rows[0]["evidence"] == 'Tia said "great fit", intro\'d by email' and _imp_rows[0]["referrer_email"] == "tia@tiaco.com"
+      and _imp_rows[2]["referrer_person_id"] == "12" and _imp_rows[7]["kind"] == "cc" and _imp_rows[0]["kind"] == "reference")
+check("import CSV: bad header rejected with the expected header in the message",
+      (lambda r: r[0] is None and _IMP_HEADER in r[1])(lf.parse_referral_suggestions_csv("a,b,c\n1,2,3")))
+check("import CSV: old header with same_firm_flag rejected",
+      lf.parse_referral_suggestions_csv(_IMP_HEADER.replace("referrer_person_id", "same_firm_flag") + "\n")[0] is None)
+check("import CSV: non-numeric referred_person_id rejects the whole paste",
+      lf.parse_referral_suggestions_csv(_IMP_HEADER + "\nabc,x,,,y,,Reference,e")[0] is None)
+check("import CSV: more than 1,000 rows rejected",
+      lf.parse_referral_suggestions_csv(_IMP_HEADER + "\n" + "\n".join(f"{i},n,,,r,,Reference,e" for i in range(1, 1002)))[0] is None)
+
+
+def _imp_post(action, body):
+    return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": action}, "body": json.dumps(body), "cookies": []}, None)
+
+
+def _imp_view():
+    r = _st_get({"view": "standing_import", "key": ADMIN_KEY})
+    return r, json.loads(re.search(r"var IMPORT = (\{.*?\});</script>", r["body"]).group(1))
+
+for _lbl, _q, _ck in (("no key", {"view": "standing_import"}, None), ("wrong key", {"view": "standing_import", "key": "x"}, None),
+                      ("tenant", {"view": "standing_import"}, [tenant_cookie(TENANT_EMAIL)])):
+    check(f"import gating: {_lbl} -> 403", _st_get(_q, _ck)["statusCode"] == 403)
+check("import gating: load without key -> 403", _imp_post("standing_import_load", {"rev": 0, "csv": _IMP_CSV})["statusCode"] == 403)
+check("import gating: save without key -> 403",
+      _imp_post("standing_import_save", {"standing_rev": 0, "suggestions_rev": 0, "decisions": [{"key": "x", "action": "skip"}]})["statusCode"] == 403)
+check("import gating: GET load -> 405", _st_get({"action": "standing_import_load", "key": ADMIN_KEY})["statusCode"] == 405)
+check("scoreboard links to the import page",
+      'view=standing_import">Import referral suggestions</a>' in _st_get({"view": "standing", "key": ADMIN_KEY})["body"])
+
+_st_put({}, rev=0)
+_st_s3.objs.pop(lf.REFERRAL_SUGGESTIONS_KEY, None)
+_r = _imp_post("standing_import_load", {"key": ADMIN_KEY, "rev": 0, "csv": "bad,header\n1,2"})
+check("import load: bad header -> 400, nothing stored", _r["statusCode"] == 400 and lf.REFERRAL_SUGGESTIONS_KEY not in _st_s3.objs)
+_r = _imp_post("standing_import_load", {"key": ADMIN_KEY, "rev": 0, "csv": _IMP_CSV})
+_d = json.loads(_r["body"])
+check("import load: 8 added, 1 same-firm pair dropped", _r["statusCode"] == 200 and _d["added"] == 8 and _d["same_firm"] == 1
+      and _st_s3.objs[lf.REFERRAL_SUGGESTIONS_KEY]["rev"] == 1)
+_r = _imp_post("standing_import_load", {"key": ADMIN_KEY, "rev": 1, "csv": _IMP_CSV})
+_d = json.loads(_r["body"])
+check("import load: re-loading the same CSV adds nothing (dedupe)", _r["statusCode"] == 200 and _d["added"] == 0
+      and _d["duplicates"] == 8 and len(_st_s3.objs[lf.REFERRAL_SUGGESTIONS_KEY]["suggestions"]) == 8)
+check("import load: stale rev -> 409", _imp_post("standing_import_load", {"key": ADMIN_KEY, "rev": 0, "csv": _IMP_CSV})["statusCode"] == 409)
+check("import load: second write of the day backed up the first version",
+      _st_s3.objs[f"{lf.REFERRAL_SUGGESTIONS_BACKUP_PREFIX}{lf._iso_utc()[:10]}.json"]["rev"] == 1)
+_r, _v = _imp_view()
+_vr = {r["referred_id"]: r for r in _v["rows"]}
+check("import view: 200 and same-firm pair never listed", _r["statusCode"] == 200 and "2" not in _vr and len(_v["rows"]) == 8)
+check("import view: email resolves first (Tia via TIA@tiaco.com)",
+      _vr["5"]["state"] == "resolved" and _vr["5"]["referrer"]["id"] == "13" and _vr["5"]["via"] == "email")
+check("import view: referrer_person_id resolves before name",
+      _vr["8"]["referrer"]["id"] == "12" and _vr["8"]["via"] == "person_id")
+check("import view: UTF-8 name resolves case-insensitively", _vr["7"]["referrer"]["id"] == "18" and _vr["7"]["via"] == "name")
+check("import view: two people with the name -> Ambiguous with both candidates",
+      _vr["14"]["state"] == "ambiguous" and sorted(c["id"] for c in _vr["14"]["candidates"]) == ["19", "20"]
+      and {c["firm"] for c in _vr["14"]["candidates"]} == {"Firm One", "Firm Two"})
+check("import view: no match -> Not found", _vr["11"]["state"] == "not_found" and _vr["11"]["referrer"] is None)
+check("import view: never resolves to the referred person themself", _vr["13"]["state"] == "not_found")
+check("import view: Approve all clean = pending Reference/intro uniquely resolved only",
+      sorted(k for k, r in _vr.items() if r["clean"]) == ["5", "7", "8"] and _vr["10"]["state"] == "resolved"
+      and not _vr["10"]["clean"] and _vr["10"]["kind"] == "cc")
+check("import page: CC'ed amber note and two-click bulk approve, no confirm()",
+      "CC\\'ed — check" in lf.STANDING_IMPORT_PAGE_JS and "click again to confirm" in lf.STANDING_IMPORT_PAGE_JS
+      and "confirm(" not in lf.STANDING_IMPORT_PAGE_JS)
+
+_imp_sr = _st_s3.objs[lf.STANDING_KEY]["rev"]
+_imp_key = {r["referred_id"]: r["key"] for r in _v["rows"]}
+_r = _imp_post("standing_import_save", {"key": ADMIN_KEY, "standing_rev": _imp_sr, "suggestions_rev": 2, "decisions": [
+    {"key": _imp_key["13"], "action": "approve", "referrer_id": "13"}]})
+check("import save: self as referrer refused, nothing written",
+      _r["statusCode"] == 400 and _st_s3.objs[lf.REFERRAL_SUGGESTIONS_KEY]["rev"] == 2)
+_r = _imp_post("standing_import_save", {"key": ADMIN_KEY, "standing_rev": _imp_sr, "suggestions_rev": 2, "decisions": [
+    {"key": _imp_key["6"], "action": "approve", "referrer_id": "2"}]})
+check("import save: a picked same-firm referrer is refused", _r["statusCode"] == 400 and "same" in json.loads(_r["body"])["error"])
+_r = _imp_post("standing_import_save", {"key": ADMIN_KEY, "standing_rev": _imp_sr, "suggestions_rev": 1, "decisions": [
+    {"key": _imp_key["5"], "action": "skip"}]})
+check("import save: stale suggestions rev -> 409", _r["statusCode"] == 409)
+_r = _imp_post("standing_import_save", {"key": ADMIN_KEY, "standing_rev": _imp_sr + 5, "suggestions_rev": 2, "decisions": [
+    {"key": _imp_key["5"], "action": "skip"}]})
+check("import save: stale standing rev -> 409", _r["statusCode"] == 409)
+_r = _imp_post("standing_import_save", {"key": ADMIN_KEY, "standing_rev": _imp_sr, "suggestions_rev": 2, "decisions": [
+    {"key": _imp_key["5"], "action": "approve", "referrer_id": "13"},
+    {"key": _imp_key["14"], "action": "approve", "referrer_id": "19"},
+    {"key": _imp_key["11"], "action": "skip"}]})
+_st_c13 = _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]
+check("import save: approve adds a ticked referral to the referrer's record (created, hidden) + history",
+      _r["statusCode"] == 200 and _st_c13["referrals"][0]["person_id"] == "5" and _st_c13["referrals"][0]["confirmed_unrelated"] is True
+      and _st_c13["visible"] is False and _st_c13["history"][-1]["reason"] == "referral imported from summary")
+check("import save: ambiguous row approved with the picked candidate",
+      _st_s3.objs[lf.STANDING_KEY]["clients"]["19"]["referrals"][0]["person_id"] == "14")
+_imp_status = {s["referred_person_id"]: s["status"] for s in _st_s3.objs[lf.REFERRAL_SUGGESTIONS_KEY]["suggestions"]}
+check("import save: statuses stored (approved / skipped / pending)",
+      _imp_status["5"] == "approved" and _imp_status["14"] == "approved" and _imp_status["11"] == "skipped" and _imp_status["7"] == "pending")
+lf._req_cache_reset()
+check("import: approved referral counts under the role rule (Rita: buyer, IQF Unnecessary -> Tia Preferred)",
+      lf.compute_client_standing(13)["confirmed_referrals"] == 1 and lf.compute_client_standing(13)["tier"] == "preferred")
+check("import: Nora (needs IQF) approved but still Pending onboarding for Sam",
+      lf.compute_client_standing(19)["confirmed_referrals"] == 0 and lf.compute_client_standing(19)["pending_referrals"] == 1)
+_r = _imp_post("standing_import_save", {"key": ADMIN_KEY, "standing_rev": _st_s3.objs[lf.STANDING_KEY]["rev"], "suggestions_rev": 3,
+                                        "decisions": [{"key": _imp_key["5"], "action": "approve"}]})
+check("import save: approving an already-approved row is refused", _r["statusCode"] == 400)
+_r = _imp_post("standing_import_save", {"key": ADMIN_KEY, "standing_rev": _st_s3.objs[lf.STANDING_KEY]["rev"], "suggestions_rev": 3,
+                                        "decisions": [{"key": _imp_key["5"], "action": "undo"}, {"key": _imp_key["11"], "action": "undo"}]})
+_st_c13 = _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]
+_imp_status = {s["referred_person_id"]: s["status"] for s in _st_s3.objs[lf.REFERRAL_SUGGESTIONS_KEY]["suggestions"]}
+check("import undo: removes the referral again with a history entry; both rows back to Pending",
+      _r["statusCode"] == 200 and _st_c13["referrals"] == [] and _st_c13["history"][-1]["reason"] == "imported referral undone"
+      and _imp_status["5"] == "pending" and _imp_status["11"] == "pending")
+_r, _v = _imp_view()
+check("import view: undone row is clean again", {r["referred_id"]: r for r in _v["rows"]}["5"]["clean"] is True)
 
 # --- A save in one Lambda container must show on reload in another: admin
 # reads ignore the 60s HEAD reuse; tenant surfaces may lag up to 60s.

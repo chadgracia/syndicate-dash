@@ -74,6 +74,8 @@ writes, no other CRM writes, no email.
 
 import base64
 import copy
+import csv
+import io
 import concurrent.futures
 import functools
 import threading
@@ -1980,9 +1982,15 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name"
                       "won_deals_total", "custom_fields")
 # Every custom_label_N this file references (a test keeps this in sync).
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
-    1958, 3052210, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3759163,
+    1958, 3052210, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3759156, 3759163,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
     3998063, 4006089, 4006402, 4008329))
+
+
+def _people_slim_schema():
+    """Fingerprint of the slim field set: rebuild_slim also rebuilds when the
+    slim file was written with a different set (a newly added field)."""
+    return ",".join(sorted(PEOPLE_SLIM_FIELDS)) + "|" + ",".join(sorted(PEOPLE_SLIM_CUSTOM_FIELDS))
 
 
 def _slim_person(rec):
@@ -2009,6 +2017,7 @@ def _build_people_slim(s3):
         with _perf_timer("s3_people_slim_write"):
             s3.put_object(Bucket=BUCKET, Key=PEOPLE_SLIM_KEY, ContentType="application/json",
                           Body=json.dumps({"source_version": source_version, "built_at": _iso_utc(),
+                                           "fields_schema": _people_slim_schema(),
                                            "people": people}, separators=(",", ":")).encode("utf-8"))
         _s3_version_cache.pop(PEOPLE_SLIM_KEY, None)
     except Exception as e:
@@ -14652,7 +14661,9 @@ STANDING_REPAIR_FIELDS = ("respond_repair", "terms_repair", "payments_repair")
 STANDING_REPAIR_MAX = 6
 # "Missed" adds this many clean trades/introductions to go; "Cleared" -1.
 STANDING_REPAIR_MISS_STEP = {"terms_repair": 2, "payments_repair": 1, "respond_repair": 1}
-STANDING_REFERRAL_LEVEL_IDS = {ACCREDITED_ID, QC_ID, QP_ID}
+# Person "Sell Interest" (non-empty = has a sell interest) -- one of the
+# two seller signals for _standing_roles.
+SELL_INTEREST_FIELD = "custom_label_3759156"
 STANDING_MAX_REFERRALS = 50
 STANDING_MAX_TRADE_EDITS = 500
 STANDING_MAX_MANUAL_TRADES = 100
@@ -14664,6 +14675,9 @@ STANDING_EDIT_FIELDS = ("visible", "respond_repair", "terms_repair", "payments_r
                         "referrals", "trade_edits", "manual_trades", "notes")
 # (key, tenant-safe label) in display order -- the wording sellers and the
 # desk see. Never "CEF".
+# id_forms applies only to sellers, qualification only to buyers
+# (_standing_roles); a non-applicable item never blocks good standing and is
+# omitted from seller surfaces and the desk JSON.
 STANDING_ITEMS = (
     ("id_forms", "Identity and compliance forms complete"),
     ("qualification", "Investor qualification on file"),
@@ -14671,8 +14685,8 @@ STANDING_ITEMS = (
     ("payments", "Meets all payment deadlines"),
     ("respond", "Responds promptly after an introduction"),
 )
-STANDING_LEVEL_LABELS = {QP_ID: "QP", QC_ID: "Qualified Client", ACCREDITED_ID: "Accredited",
-                         SUBSTANTIVE_ID: "Substantive"}
+STANDING_REFERRAL_LABEL = "Introduced a new client who completed onboarding with Rainmaker"
+IQF_LABELS = {6496840: "Yes", 6596073: "Unnecessary"}
 PIPELINE_PERSON_URL = "https://app.pipelinecrm.com/people/{}"
 PIPELINE_DEAL_URL = "https://app.pipelinecrm.com/deals/{}"
 # First "$<number><K|M|B>" in a deal name, e.g. "Dataminr: $7.48M Sell".
@@ -14859,16 +14873,21 @@ def _standing_deal_side(deal):
 
 @_request_memo("standing_deal_index", lambda: ())
 def _standing_deal_index():
-    """{"won": {person_id: [won deal, ...]}, "buy_any": {person_id}} over
-    get_deals_list(): every deal at a WON_STAGE_IDS stage, ANY side tag,
-    credits each linked person once (like Pipeline's won_deals_total).
-    buy_any = people on >= 1 Buy-tagged deal at any stage (scoreboard rows)."""
+    """{"won": {person_id: [won deal, ...]}, "buy_any": {person_id},
+    "sell_any": {person_id}} over get_deals_list(): every deal at a
+    WON_STAGE_IDS stage, ANY side tag, credits each linked person once
+    (like Pipeline's won_deals_total). buy_any / sell_any = people on >= 1
+    Buy- / Sell-tagged deal at any stage (scoreboard rows, roles)."""
     won = {}
     buy_any = set()
+    sell_any = set()
     for d in get_deals_list():
         pids = {str(p) for p in _deal_linked_person_ids(d)}
-        if DEAL_SIDE_BUY_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
+        tags = _deal_cf_option_ids(d, DEAL_SIDE_FIELD)
+        if DEAL_SIDE_BUY_ID in tags:
             buy_any |= pids
+        if DEAL_SIDE_SELL_ID in tags:
+            sell_any |= pids
         if _deal_stage_id(d) not in WON_STAGE_IDS or d.get("id") is None:
             continue
         size, source = _standing_deal_size(d)
@@ -14880,7 +14899,7 @@ def _standing_deal_index():
             won.setdefault(p, []).append(entry)
     for lst in won.values():
         lst.sort(key=lambda e: e["date"], reverse=True)
-    return {"won": won, "buy_any": buy_any}
+    return {"won": won, "buy_any": buy_any, "sell_any": sell_any}
 
 
 def _standing_trades(won_deals, client):
@@ -14900,6 +14919,52 @@ def _standing_trades(won_deals, client):
             "trades_250k": sum(1 for s in sizes if s >= STANDING_SIZE_250K),
             "trades_1m": sum(1 for s in sizes if s >= STANDING_SIZE_1M),
             "unknown_size": len(trades) - len(sizes), "list": trades}
+
+
+@_request_memo("standing_interest_buy_ids", lambda: ())
+def _standing_interest_buy_ids():
+    """Every person id with a Buy Interest (interest_people.json "buy")."""
+    ids = set()
+    for pids in (_interest_buy_map() or {}).values():
+        for p in pids or []:
+            ids.add(str(p))
+    return ids
+
+
+def _cf_nonempty(cf, key):
+    v = (cf or {}).get(key)
+    if isinstance(v, (list, tuple)):
+        return any(x not in (None, "") for x in v)
+    return v not in (None, "")
+
+
+def _standing_roles(pid, rec=None):
+    """{"seller": bool, "buyer": bool} -- which onboarding forms apply.
+    seller = on >= 1 Sell-tagged deal (any stage) or a non-empty Sell
+    Interest; buyer = on >= 1 Buy-tagged deal or a Buy Interest, and also
+    the default when neither role is found."""
+    pid = str(pid)
+    if rec is None:
+        rec = _people_data()["by_id"].get(pid)
+    idx = _standing_deal_index()
+    seller = pid in idx["sell_any"] or _cf_nonempty((rec or {}).get("custom_fields"), SELL_INTEREST_FIELD)
+    buyer = pid in idx["buy_any"] or pid in _standing_interest_buy_ids()
+    return {"seller": seller, "buyer": buyer or not seller}
+
+
+def _standing_forms_missing(rec, roles):
+    """Onboarding forms still needed for this person's role(s)."""
+    flags = _standing_person_flags(rec)
+    missing = []
+    if roles["seller"] and not flags["id_forms_done"]:
+        missing.append("engagement form")
+    if roles["buyer"] and not flags["qualification_done"]:
+        missing.append("IQF")
+    return missing
+
+
+def _standing_role_label(roles):
+    return "Buyer + seller" if roles["seller"] and roles["buyer"] else ("Seller" if roles["seller"] else "Buyer")
 
 
 def _standing_person_flags(rec):
@@ -14922,34 +14987,28 @@ def _standing_related(client_rec, other_rec):
 
 def _standing_referral_detail(client_pid, client_rec, ref_pid, by_id):
     """Onboarding facts for one referred person. onboarded = exists, not
-    the client, engagement form Yes AND Investor Level Accredited/QC/QP;
+    the client, and has completed the form(s) their role requires (seller:
+    engagement form Yes/N/A; buyer: IQF Yes/Unnecessary; both: both);
     "missing" lists what is still needed. A referral is Confirmed when
     onboarded AND the relationship checkbox (confirmed_unrelated) is ticked."""
     ref_pid = str(ref_pid)
     rec = by_id.get(ref_pid)
     cf = (rec or {}).get("custom_fields") or {}
     cef_ids = cf_list(cf, CEF_FIELD)
-    level_ids = cf_list(cf, INVESTOR_LEVEL_FIELD)
+    iqf_ids = cf_list(cf, IQF_FIELD)
     is_self = ref_pid == str(client_pid)
-    cef_yes = CEF_YES_ID in cef_ids
-    level_ok = bool(set(level_ids) & STANDING_REFERRAL_LEVEL_IDS)
-    missing = []
-    if rec is None:
-        missing.append("not in people list")
-    else:
-        if not cef_yes:
-            missing.append("engagement form")
-        if not level_ok:
-            missing.append("accreditation")
+    roles = _standing_roles(ref_pid, rec) if rec is not None else {"seller": False, "buyer": True}
+    missing = ["not in people list"] if rec is None else _standing_forms_missing(rec, roles)
     return {
         "person_id": ref_pid,
         "exists": rec is not None,
         "self": is_self,
         "name": _person_display_name(rec) if rec else "",
         "firm": (rec or {}).get("company_name") or "",
+        "role": _standing_role_label(roles),
         "cef_label": CEF_LABELS.get(cef_ids[0], "—") if cef_ids else "—",
-        "level_label": ", ".join(STANDING_LEVEL_LABELS.get(i, str(i)) for i in level_ids) or "—",
-        "onboarded": rec is not None and not is_self and cef_yes and level_ok,
+        "iqf_label": IQF_LABELS.get(iqf_ids[0], "—") if iqf_ids else "—",
+        "onboarded": rec is not None and not is_self and not missing,
         "missing": missing,
         "related": (not is_self) and _standing_related(client_rec, rec),
     }
@@ -14988,8 +15047,10 @@ def compute_client_standing(person_id, state=None):
     stored = state["clients"].get(pid)
     client = stored if stored is not None else _standing_default_client()
     flags = _standing_person_flags(rec)
+    roles = _standing_roles(pid, rec)
     won_deals = _standing_deal_index()["won"].get(pid, [])
     tr = _standing_trades(won_deals, client)
+    applies = {"id_forms": roles["seller"], "qualification": roles["buyer"]}
     done = {
         "id_forms": flags["id_forms_done"],
         "qualification": flags["qualification_done"],
@@ -14997,14 +15058,17 @@ def compute_client_standing(person_id, state=None):
         "payments": client["payments_repair"] == 0,
         "respond": client["respond_repair"] == 0,
     }
-    items = [{"key": k, "label": label, "done": done[k]} for k, label in STANDING_ITEMS]
-    good_standing = all(done.values())
+    # Only the items that apply to this person's role(s): a not-applicable
+    # form never blocks good standing and is never shown.
+    items = [{"key": k, "label": label, "done": done[k]} for k, label in STANDING_ITEMS if applies.get(k, True)]
+    good_standing = all(i["done"] for i in items)
     referrals = []
     for r in client["referrals"]:
         detail = _standing_referral_detail(pid, rec, r["person_id"], by_id)
         detail["confirmed_unrelated"] = r["confirmed_unrelated"]
         detail["added_at"] = r.get("added_at")
-        detail["confirmed"] = detail["onboarded"] and r["confirmed_unrelated"]
+        # Same-firm referrals (shared company_id / corporate domain) never count.
+        detail["confirmed"] = detail["onboarded"] and r["confirmed_unrelated"] and not detail["related"]
         referrals.append(detail)
     confirmed = sum(1 for r in referrals if r["confirmed"])
     computed = _standing_computed_tier(good_standing, tr["volume"], tr["trades_250k"], tr["trades_1m"], confirmed)
@@ -15012,6 +15076,7 @@ def compute_client_standing(person_id, state=None):
     tier = floor if _standing_tier_rank(floor) > _standing_tier_rank(computed) else computed
     return {
         "person_id": pid, "has_record": stored is not None, "record": client, "visible": client["visible"],
+        "roles": roles,
         "id_forms_done": flags["id_forms_done"], "qualification_done": flags["qualification_done"],
         "won_deals": won_deals, "trades": tr["trades"], "volume": tr["volume"],
         "trades_250k": tr["trades_250k"], "trades_1m": tr["trades_1m"], "unknown_size": tr["unknown_size"],
@@ -15150,7 +15215,7 @@ def standing_json_payload(pid):
                 if k == "id_forms":
                     item["form_url"] = CEF_FORM_URL
             items.append(item)
-        ref_item = {"label": "Introduced a new accredited investor", "done": cs["confirmed_referrals"] >= 1}
+        ref_item = {"label": STANDING_REFERRAL_LABEL, "done": cs["confirmed_referrals"] >= 1}
         if cs["referrals"]:
             ref_item["note"] = _standing_referral_note(cs["confirmed_referrals"], cs["pending_referrals"])
         items.append(ref_item)
@@ -15166,7 +15231,7 @@ def standing_json_payload(pid):
 
 
 # ── Admin scoreboard: ?key=ADMIN_KEY&view=standing ───────────────────────
-STANDING_ROW_REF_KEYS = ("person_id", "name", "firm", "cef_label", "level_label", "onboarded", "missing",
+STANDING_ROW_REF_KEYS = ("person_id", "name", "firm", "role", "cef_label", "iqf_label", "onboarded", "missing",
                          "related", "self", "exists", "confirmed_unrelated", "added_at")
 
 
@@ -15177,7 +15242,7 @@ def _standing_row(pid, rec, state):
     return {
         "id": pid, "name": _person_display_name(rec) or f"#{pid}", "firm": rec.get("company_name") or "",
         "email": (_person_all_emails(rec) or [""])[0],
-        "id_forms": cs["id_forms_done"], "qual": cs["qualification_done"],
+        "id_forms": cs["id_forms_done"], "qual": cs["qualification_done"], "roles": cs["roles"],
         "won": cs["won_deals"], "has_record": cs["has_record"],
         "rec": {k: client[k] for k in STANDING_EDIT_FIELDS if k != "referrals"},
         "refs": [{k: r[k] for k in STANDING_ROW_REF_KEYS} for r in cs["referrals"]],
@@ -15254,6 +15319,7 @@ def render_standing_page(key):
               'until it loads; reload to try again.</div>') if load_error else ""
     return (STANDING_PAGE_HTML
             .replace("__SCRIPT__", STANDING_PAGE_JS)
+            .replace("__IMPORT_HREF__", _esc(f"?key={urllib.parse.quote(key or '', safe='')}&view=standing_import"))
             .replace("__BANNER__", banner)
             .replace("__DATA__", _standing_json_for_script(data)))
 
@@ -15288,6 +15354,9 @@ def _validate_standing_client(pid, raw, now, old_refs):
             return None, f"{pid}: a client cannot refer themselves"
         if rp in seen:
             continue
+        if rp not in old_added and _suggestion_same_firm(pid, rp):
+            return None, (f"{pid}: referral #{rp} shares a company or corporate email domain with the client; "
+                          "same-firm referrals never count")
         seen.add(rp)
         refs.append({"person_id": rp, "confirmed_unrelated": r.get("confirmed_unrelated") is True,
                      "added_at": old_added.get(rp) or now})
@@ -15345,6 +15414,80 @@ def _standing_stored_client(rec):
     return {k: v for k, v in rec.items() if k != "legacy_overrides"}
 
 
+class _S3WriteError(Exception):
+    """A guarded S3 JSON write failed; .message is safe to show Chad."""
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+
+
+def _s3_read_json_fresh(s3, key):
+    """The stored JSON at key read straight from S3 (no cache), or None when
+    the key does not exist. Raises on any other failure."""
+    try:
+        s3.head_object(Bucket=BUCKET, Key=key)
+    except Exception as e:
+        if _s3_is_missing(e):
+            return None
+        raise
+    return json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+
+
+def _s3_write_with_daily_backup(s3, key, backup_prefix, current_raw, new_obj, now, label):
+    """Copy current_raw to <backup_prefix>YYYY-MM-DD.json before the day's
+    first write (skipped when that backup exists or there is nothing to
+    copy), then write new_obj. Raises _S3WriteError; nothing is written to
+    key when the backup fails."""
+    if current_raw is not None:
+        backup_key = f"{backup_prefix}{now[:10]}.json"
+        try:
+            try:
+                s3.head_object(Bucket=BUCKET, Key=backup_key)
+                backup_exists = True
+            except Exception as e:
+                if not _s3_is_missing(e):
+                    raise
+                backup_exists = False
+            if not backup_exists:
+                s3.put_object(Bucket=BUCKET, Key=backup_key, ContentType="application/json",
+                              Body=json.dumps(current_raw, separators=(",", ":")).encode("utf-8"))
+        except Exception as e:
+            print(f"{label} backup failed: {type(e).__name__}: {e}")
+            raise _S3WriteError("Could not write the daily backup. Nothing was saved.")
+    try:
+        s3.put_object(Bucket=BUCKET, Key=key, ContentType="application/json",
+                      Body=json.dumps(new_obj, separators=(",", ":")).encode("utf-8"))
+    except Exception as e:
+        print(f"{label} write failed: {type(e).__name__}: {e}")
+        raise _S3WriteError("Save failed. Nothing was saved.")
+
+
+def _standing_migrate_legacy(state, now):
+    """Move legacy trades/volume overrides on every client into one history
+    entry each (old values kept in "from") -- runs on every standing write."""
+    for rec in state["clients"].values():
+        legacy = rec.pop("legacy_overrides", None)
+        if legacy:
+            rec["history"].append({"at": now, "field": "override removed", "from": legacy, "to": None,
+                                   "reason": f"override removed: trades {legacy['trades']} / "
+                                             f"volume {legacy['volume_usd']}"})
+
+
+def _standing_finish_write(s3, current_raw, current, new_state, now, label):
+    new_state["rev"] = current["rev"] + 1
+    new_state["updated_at"] = now
+    new_state["clients"] = {pid: _standing_stored_client(r) for pid, r in new_state["clients"].items()}
+    _s3_write_with_daily_backup(s3, STANDING_KEY, STANDING_BACKUP_PREFIX, current_raw, new_state, now, label)
+    _drop_standing_cache()
+
+
+def _admin_key_ok(event, body):
+    query = event.get("queryStringParameters") or {}
+    admin_key = os.environ.get("ADMIN_KEY")
+    return bool(admin_key) and (body.get("key") == admin_key or query.get("key") == admin_key)
+
+
 def _handle_save_standing(event):
     """POST ?action=save_standing -- admin only. Body {key, rev, clients:
     {pid: {every editable field}}}. Rejected whole on any invalid row; 409
@@ -15352,9 +15495,7 @@ def _handle_save_standing(event):
     one history entry (reason blank) per changed field. Legacy trades/volume
     overrides on ANY stored client move into one history entry each."""
     body = _parse_json_body(event)
-    query = event.get("queryStringParameters") or {}
-    admin_key = os.environ.get("ADMIN_KEY")
-    if not (admin_key and (body.get("key") == admin_key or query.get("key") == admin_key)):
+    if not _admin_key_ok(event, body):
         return _json_response({"error": "forbidden"}, 403)
     rev = _standing_int(body.get("rev"), 0)
     if rev is None:
@@ -15368,13 +15509,7 @@ def _handle_save_standing(event):
 
     s3 = _s3_client()
     try:
-        try:
-            s3.head_object(Bucket=BUCKET, Key=STANDING_KEY)
-            current_raw = json.loads(s3.get_object(Bucket=BUCKET, Key=STANDING_KEY)["Body"].read())
-        except Exception as e:
-            if not _s3_is_missing(e):
-                raise
-            current_raw = None
+        current_raw = _s3_read_json_fresh(s3, STANDING_KEY)
     except Exception as e:
         print(f"save_standing read failed: {type(e).__name__}: {e}")
         return _json_response({"error": "Could not read the standing file. Nothing was saved."}, 502)
@@ -15384,12 +15519,7 @@ def _handle_save_standing(event):
 
     now = _iso_utc()
     new_state = copy.deepcopy(current)
-    for rec in new_state["clients"].values():
-        legacy = rec.pop("legacy_overrides", None)
-        if legacy:
-            rec["history"].append({"at": now, "field": "override removed", "from": legacy, "to": None,
-                                   "reason": f"override removed: trades {legacy['trades']} / "
-                                             f"volume {legacy['volume_usd']}"})
+    _standing_migrate_legacy(new_state, now)
     changed_fields = 0
     for pid, raw in clients_in.items():
         pid = str(pid)
@@ -15406,33 +15536,10 @@ def _handle_save_standing(event):
                 changed_fields += 1
             rec[field] = new_vals[field]
         new_state["clients"][pid] = rec
-    new_state["rev"] = current["rev"] + 1
-    new_state["updated_at"] = now
-    new_state["clients"] = {pid: _standing_stored_client(r) for pid, r in new_state["clients"].items()}
-
-    if current_raw is not None:
-        backup_key = f"{STANDING_BACKUP_PREFIX}{now[:10]}.json"
-        try:
-            try:
-                s3.head_object(Bucket=BUCKET, Key=backup_key)
-                backup_exists = True
-            except Exception as e:
-                if not _s3_is_missing(e):
-                    raise
-                backup_exists = False
-            if not backup_exists:
-                s3.put_object(Bucket=BUCKET, Key=backup_key, ContentType="application/json",
-                              Body=json.dumps(current_raw, separators=(",", ":")).encode("utf-8"))
-        except Exception as e:
-            print(f"save_standing backup failed: {type(e).__name__}: {e}")
-            return _json_response({"error": "Could not write the daily backup. Nothing was saved."}, 502)
     try:
-        s3.put_object(Bucket=BUCKET, Key=STANDING_KEY, ContentType="application/json",
-                      Body=json.dumps(new_state, separators=(",", ":")).encode("utf-8"))
-    except Exception as e:
-        print(f"save_standing write failed: {type(e).__name__}: {e}")
-        return _json_response({"error": "Save failed. Nothing was saved."}, 502)
-    _drop_standing_cache()
+        _standing_finish_write(s3, current_raw, current, new_state, now, "save_standing")
+    except _S3WriteError as e:
+        return _json_response({"error": e.message}, 502)
     return _json_response({"ok": True, "rev": new_state["rev"], "changed_fields": changed_fields,
                            "clients": len(clients_in)})
 
@@ -15520,6 +15627,7 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
 </head>
 <body><div class="wrap">
 <h1>Client standing</h1>
+<div class="st-muted" style="margin:-8px 0 12px"><a href="__IMPORT_HREF__">Import referral suggestions</a></div>
 __BANNER__
 <div class="st-bar">
   <input type="search" id="st-q" placeholder="Search name, firm, email or id…" style="min-width:320px">
@@ -15599,7 +15707,8 @@ STANDING_PAGE_JS = r"""
   function refConfirmed(x) { return !!(x.onboarded && x.confirmed_unrelated); }
   function standing(r) {
     var s = cur(r), rec = s.rec, ts = tradeStats(r);
-    var good = r.id_forms && r.qual && rec.terms_repair === 0 && rec.payments_repair === 0 && rec.respond_repair === 0;
+    var roles = r.roles || {seller: false, buyer: true};
+    var good = (!roles.seller || r.id_forms) && (!roles.buyer || r.qual) && rec.terms_repair === 0 && rec.payments_repair === 0 && rec.respond_repair === 0;
     var conf = s.refs.filter(refConfirmed).length;
     var comp = null;
     if (good) { comp = (ts.vol >= D.plat_vol || ts.t1m >= D.plat_1m) ? 'platinum' :
@@ -15648,6 +15757,9 @@ STANDING_PAGE_JS = r"""
     if (typeof v === 'object') return JSON.stringify(v);
     return String(v);
   }
+  function roleOf(r) { return r.roles || {seller: false, buyer: true}; }
+  function roleLabel(r) { var o = roleOf(r);
+    return o.seller && o.buyer ? 'Buyer + seller' : (o.seller ? 'Seller' : 'Buyer'); }
   function rowHtml(r) {
     var s = cur(r), rec = s.rec;
     var personUrl = D.person_url.replace('{}', encodeURIComponent(r.id));
@@ -15659,10 +15771,13 @@ STANDING_PAGE_JS = r"""
       '<td class="st-selcol"><input type="checkbox" data-act="sel" aria-label="Select ' + esc(r.name) + '"' +
         (selected[r.id] ? ' checked' : '') + '></td>' +
       '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) + '</a>' +
-        (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') + '</td>' +
+        (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') +
+        '<div class="st-muted">' + roleLabel(r) + '</div></td>' +
       '<td>' + esc(r.firm) + '</td>' +
-      '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' + (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a></td>' +
-      '<td><span class="' + (r.qual ? 'st-yes">✓' : 'st-no">○') + '</span></td>' +
+      '<td>' + (roleOf(r).seller ? '<a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' +
+        (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a>' : '<span class="st-muted">n/a</span>') + '</td>' +
+      '<td>' + (roleOf(r).buyer ? '<span class="' + (r.qual ? 'st-yes">✓' : 'st-no">○') + '</span>' :
+        '<span class="st-muted">n/a</span>') + '</td>' +
       '<td>' + rep(r, 'terms_repair') + '</td><td>' + rep(r, 'payments_repair') + '</td><td>' + rep(r, 'respond_repair') + '</td>' +
       '<td data-role="trades">' + tradesCell(r) + '</td>' +
       '<td data-role="refs">' + refsCell(r) + '</td>' +
@@ -15707,14 +15822,15 @@ STANDING_PAGE_JS = r"""
   }
   function refStatus(x) {
     if (x.self) return '<span class="st-warn">this is the client</span>';
+    if (x.related) return '<span class="st-warn">Same firm — never counts</span>';
     if (!x.onboarded) return '<span class="st-amber">Pending onboarding — needs ' + esc((x.missing || []).join(' and ')) + '</span>';
     if (!x.confirmed_unrelated) return '<span class="st-amber">Pending — tick the relationship box to confirm</span>';
     return '<span class="st-yes">Confirmed</span>';
   }
   function refLine(x) {
     return '<div>' + esc(x.name || ('#' + x.person_id)) + (x.firm ? ' · ' + esc(x.firm) : '') +
-      ' · form: ' + esc(x.cef_label) + ' · level: ' + esc(x.level_label) + ' · ' + refStatus(x) +
-      (x.related ? ' <span class="st-warn">⚠ shares a company or email domain with the client</span>' : '') + '</div>';
+      ' · ' + esc(x.role || '') + ' · engagement form: ' + esc(x.cef_label) + ' · IQF: ' + esc(x.iqf_label) + ' · ' + refStatus(x) +
+      (x.related ? ' <span class="st-warn">(shares a company or corporate email domain with the client)</span>' : '') + '</div>';
   }
   function refsHtml(r) {
     var s = cur(r);
@@ -15845,7 +15961,8 @@ STANDING_PAGE_JS = r"""
         if (!forId) res = res.filter(function(p) { return !byId[p.id]; });
         box.innerHTML = res.map(function(p) {
           if (forId) { return '<div>' + refLine(p.ref) + ' <button type="button" data-act="refadd" data-ref="' +
-            esc(JSON.stringify(p.ref)) + '"' + (p.ref.self ? ' disabled' : '') + '>Add</button></div>'; }
+            esc(JSON.stringify(p.ref)) + '"' + (p.ref.self || p.ref.related ? ' disabled' : '') + '>Add</button>' +
+            (p.ref.related ? ' <span class="st-warn">Can\'t add: same company or email domain as the client</span>' : '') + '</div>'; }
           return '<div>' + esc(p.name) + (p.firm ? ' · ' + esc(p.firm) : '') + (p.email ? ' · ' + esc(p.email) : '') +
             ' <button type="button" data-addclient="' + esc(JSON.stringify(p)) + '">Add client</button></div>';
         }).join('') || (forId ? '<div class="st-muted">No matches</div>' : '');
@@ -15864,7 +15981,7 @@ STANDING_PAGE_JS = r"""
     var b = e.target.closest('[data-addclient]'); if (!b) return;
     var p = JSON.parse(b.getAttribute('data-addclient'));
     addRow({id: p.id, name: p.name, firm: p.firm, email: p.email, id_forms: p.id_forms, qual: p.qual,
-      won: p.won || [], has_record: true, rec: p.rec, refs: p.refs, history: p.history || []});
+      won: p.won || [], roles: p.roles, has_record: true, rec: p.rec, refs: p.refs, history: p.history || []});
     if (!p.has_record) forceSave[p.id] = 1;
     page = 0; render(); searchMore();
   });
@@ -15917,6 +16034,609 @@ STANDING_PAGE_JS = r"""
   });
   window.addEventListener('beforeunload', function(e) {
     if (saveBtn.textContent !== 'Saving…' && rows.some(changed)) { e.preventDefault(); e.returnValue = ''; }
+  });
+  render();
+})();
+"""
+
+
+# ── Referral-suggestions import (admin ?view=standing_import) ───────────
+# A CSV of "who referred this person" guesses (extracted from Pipeline
+# summaries) is loaded into REFERRAL_SUGGESTIONS_KEY; Chad approves or
+# skips each one. Nothing becomes a referral until approved: an approval
+# adds the referred person to the REFERRER's client-standing referrals
+# (relationship box ticked). Same-firm pairs (_standing_related) never
+# count: dropped at load, hidden on view, refused on approve. Same
+# rev-conflict and daily backup rules as client-standing.json.
+REFERRAL_SUGGESTIONS_KEY = "syndicate-dash/referral-suggestions.json"
+REFERRAL_SUGGESTIONS_BACKUP_PREFIX = "syndicate-dash/referral-suggestions-backups/"
+REFERRAL_IMPORT_HEADER = ("referred_person_id", "referred_name", "referred_company", "referrer_person_id",
+                          "referrer_name", "referrer_email", "kind", "evidence")
+REFERRAL_IMPORT_MAX_ROWS = 1000
+REFERRAL_IMPORT_EVIDENCE_MAX = 4000
+REFERRAL_IMPORT_CONFLICT_MSG = "The suggestions changed since you loaded this page. Reload and try again."
+REFERRAL_IMPORT_HISTORY_REASON = "referral imported from summary"
+REFERRAL_IMPORT_UNDO_REASON = "imported referral undone"
+REFERRAL_KIND_LABELS = {"reference": "Reference/intro", "cc": "CC'ed"}
+
+
+def _suggestions_empty():
+    return {"rev": 0, "updated_at": None, "suggestions": []}
+
+
+def _normalize_suggestions(parsed):
+    out = _suggestions_empty()
+    if not isinstance(parsed, dict):
+        return out
+    out["rev"] = _standing_int(parsed.get("rev"), 0) or 0
+    out["updated_at"] = parsed.get("updated_at")
+    out["suggestions"] = [s for s in (parsed.get("suggestions") or []) if isinstance(s, dict) and s.get("key")]
+    return out
+
+
+def _referral_kind(raw):
+    """CSV kind -> "cc" (CC'ed) or "reference" (anything else)."""
+    v = " ".join(str(raw or "").lower().replace("'", "").split())
+    return "cc" if v in ("cc", "cced", "ccd", "cc ed") or v.startswith("cc") else "reference"
+
+
+def parse_referral_suggestions_csv(text):
+    """(rows, error). Standard CSV quoting, UTF-8, exact header, <= 1,000
+    data rows; the whole paste is rejected on any bad header or row."""
+    text = str(text or "").lstrip("﻿")
+    if not text.strip():
+        return None, "Paste the CSV first."
+    try:
+        reader = list(csv.reader(io.StringIO(text)))
+    except csv.Error as e:
+        return None, f"Could not read the CSV: {e}"
+    while reader and not any(c.strip() for c in reader[0]):
+        reader.pop(0)
+    header = tuple(c.strip().lower() for c in (reader[0] if reader else []))
+    if header != REFERRAL_IMPORT_HEADER:
+        return None, "The first line must be exactly: " + ",".join(REFERRAL_IMPORT_HEADER)
+    rows = []
+    for line_no, cells in enumerate(reader[1:], start=2):
+        if not any(c.strip() for c in cells):
+            continue
+        if len(cells) != len(REFERRAL_IMPORT_HEADER):
+            return None, f"Line {line_no}: expected {len(REFERRAL_IMPORT_HEADER)} columns, found {len(cells)}."
+        row = dict(zip(REFERRAL_IMPORT_HEADER, (c.strip() for c in cells)))
+        if not (row["referred_person_id"].isdigit() and row["referred_person_id"].isascii()):
+            return None, f"Line {line_no}: referred_person_id must be a number."
+        if row["referrer_person_id"] and not (row["referrer_person_id"].isdigit() and row["referrer_person_id"].isascii()):
+            return None, f"Line {line_no}: referrer_person_id must be a number or blank."
+        if not row["referrer_name"] and not row["referrer_email"]:
+            return None, f"Line {line_no}: referrer_name or referrer_email is required."
+        rows.append({
+            "referred_person_id": row["referred_person_id"],
+            "referred_name": row["referred_name"][:STANDING_LABEL_MAX_LEN],
+            "referred_company": row["referred_company"][:STANDING_LABEL_MAX_LEN],
+            "referrer_person_id": row["referrer_person_id"],
+            "referrer_name": row["referrer_name"][:STANDING_LABEL_MAX_LEN],
+            "referrer_email": row["referrer_email"].lower()[:STANDING_LABEL_MAX_LEN],
+            "kind": _referral_kind(row["kind"]),
+            "evidence": row["evidence"][:REFERRAL_IMPORT_EVIDENCE_MAX],
+        })
+        if len(rows) > REFERRAL_IMPORT_MAX_ROWS:
+            return None, f"Too many rows: at most {REFERRAL_IMPORT_MAX_ROWS} per paste."
+    if not rows:
+        return None, "The CSV has a header but no rows."
+    return rows, None
+
+
+def _norm_name(name):
+    return " ".join(str(name or "").lower().split())
+
+
+@_request_memo("people_lookup_index", lambda: ())
+def _people_lookup_index():
+    """{"email": {email: [pid]}, "name": {normalized full name: [pid]}}."""
+    by_email, by_name = {}, {}
+    for rec in _people_list():
+        pid = rec.get("id")
+        if pid is None:
+            continue
+        pid = str(pid)
+        for e in _person_all_emails(rec):
+            by_email.setdefault(e, []).append(pid)
+        n = _norm_name(_person_display_name(rec))
+        if n:
+            by_name.setdefault(n, []).append(pid)
+    return {"email": by_email, "name": by_name}
+
+
+def _resolve_referrer(sug):
+    """{"state": "resolved"|"ambiguous"|"not_found", "referrer_id", "via",
+    "candidates"}: a saved pick first, then referrer_person_id (when it is
+    in people-slim), then referrer_email (exact, any email on a record),
+    then case-insensitive exact full name. Never the referred person
+    themself."""
+    by_id = _people_data()["by_id"]
+    referred = str(sug.get("referred_person_id"))
+    for via, pid in (("picked", str(sug.get("picked_referrer_id") or "")),
+                     ("person_id", str(sug.get("referrer_person_id") or ""))):
+        if pid and pid != referred and pid in by_id:
+            return {"state": "resolved", "referrer_id": pid, "via": via, "candidates": []}
+    idx = _people_lookup_index()
+    for via, ids in (("email", idx["email"].get((sug.get("referrer_email") or "").strip().lower(), [])),
+                     ("name", idx["name"].get(_norm_name(sug.get("referrer_name")), []))):
+        ids = sorted({i for i in ids if i != referred})
+        if len(ids) == 1:
+            return {"state": "resolved", "referrer_id": ids[0], "via": via, "candidates": []}
+        if len(ids) > 1:
+            return {"state": "ambiguous", "referrer_id": None, "via": via, "candidates": ids}
+    return {"state": "not_found", "referrer_id": None, "via": None, "candidates": []}
+
+
+def _suggestion_keys(row):
+    """(primary key, alt key): referred + resolved referrer id when the
+    referrer resolves, else referred + lowercased referrer name; the alt key
+    (always referred + name) stops a re-load from duplicating a row whose
+    resolution changed."""
+    alt = f"{row['referred_person_id']}|n:{_norm_name(row['referrer_name'] or row['referrer_email'])}"
+    res = _resolve_referrer(row)
+    key = f"{row['referred_person_id']}|{res['referrer_id']}" if res["state"] == "resolved" else alt
+    return key, alt
+
+
+def _suggestion_same_firm(referrer_id, referred_id):
+    by_id = _people_data()["by_id"]
+    a, b = by_id.get(str(referrer_id or "")), by_id.get(str(referred_id or ""))
+    return bool(a and b and _standing_related(a, b))
+
+
+def _referral_person_brief(pid):
+    rec = _people_data()["by_id"].get(str(pid)) if pid else None
+    if rec is None:
+        return None
+    return {"id": str(pid), "name": _person_display_name(rec) or f"#{pid}", "firm": rec.get("company_name") or "",
+            "email": (_person_all_emails(rec) or [""])[0]}
+
+
+def _suggestion_view(sug):
+    """One review-queue row (admin only), or None when the resolved
+    referrer is same-firm with the referred person (never listed).
+    Same-firm candidates are dropped from an Ambiguous pick list.
+    clean = pending, Reference/intro, uniquely resolved (not a manual pick)."""
+    by_id = _people_data()["by_id"]
+    referred = str(sug["referred_person_id"])
+    referred_rec = by_id.get(referred)
+    res = _resolve_referrer(sug)
+    referrer_id = sug.get("approved_referrer_id") if sug.get("status") == "approved" else res["referrer_id"]
+    if referrer_id and _suggestion_same_firm(referrer_id, referred):
+        return None
+    referrer = _referral_person_brief(referrer_id)
+    candidates = [b for b in (_referral_person_brief(c) for c in res["candidates"]
+                              if not _suggestion_same_firm(c, referred)) if b]
+    state = "resolved" if sug.get("status") == "approved" else res["state"]
+    if state == "ambiguous" and not candidates:
+        state = "not_found"
+    return {
+        "key": sug["key"], "status": sug.get("status") or "pending", "kind": sug.get("kind") or "reference",
+        "referred_id": str(sug["referred_person_id"]),
+        "referred_name": (_person_display_name(referred_rec) if referred_rec else "") or sug.get("referred_name") or "",
+        "referred_company": (referred_rec or {}).get("company_name") or sug.get("referred_company") or "",
+        "referred_exists": referred_rec is not None,
+        "referrer_name": sug.get("referrer_name") or "", "referrer_email": sug.get("referrer_email") or "",
+        "state": state, "via": res["via"], "referrer": referrer, "candidates": candidates,
+        "evidence": sug.get("evidence") or "",
+        "clean": (sug.get("status") or "pending") == "pending" and sug.get("kind") == "reference"
+                 and res["state"] == "resolved" and res["via"] != "picked",
+    }
+
+
+def _handle_standing_import_load(event):
+    """POST ?action=standing_import_load {key, rev, csv}: parse, dedupe
+    against stored suggestions (primary or alt key) and append new rows as
+    Pending. Admin only; rev-checked; daily backup before the write."""
+    body = _parse_json_body(event)
+    if not _admin_key_ok(event, body):
+        return _json_response({"error": "forbidden"}, 403)
+    rev = _standing_int(body.get("rev"), 0)
+    if rev is None:
+        return _json_response({"error": "rev must be a whole number"}, 400)
+    rows, err = parse_referral_suggestions_csv(body.get("csv"))
+    if err:
+        return _json_response({"error": err}, 400)
+    s3 = _s3_client()
+    try:
+        current_raw = _s3_read_json_fresh(s3, REFERRAL_SUGGESTIONS_KEY)
+    except Exception as e:
+        print(f"standing_import_load read failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not read the suggestions file. Nothing was saved."}, 502)
+    current = _normalize_suggestions(current_raw) if current_raw is not None else _suggestions_empty()
+    if current["rev"] != rev:
+        return _json_response({"error": REFERRAL_IMPORT_CONFLICT_MSG}, 409)
+    now = _iso_utc()
+    new = copy.deepcopy(current)
+    seen = set()
+    for s in new["suggestions"]:
+        seen.add(s["key"])
+        seen.add(s.get("alt_key"))
+    added = duplicates = same_firm = 0
+    for row in rows:
+        res = _resolve_referrer(row)
+        if res["state"] == "resolved" and _suggestion_same_firm(res["referrer_id"], row["referred_person_id"]):
+            same_firm += 1
+            continue
+        key, alt = _suggestion_keys(row)
+        if key in seen or alt in seen:
+            duplicates += 1
+            continue
+        seen.update((key, alt))
+        new["suggestions"].append(dict(row, key=key, alt_key=alt, status="pending", loaded_at=now))
+        added += 1
+    new["rev"] = current["rev"] + 1
+    new["updated_at"] = now
+    try:
+        _s3_write_with_daily_backup(s3, REFERRAL_SUGGESTIONS_KEY, REFERRAL_SUGGESTIONS_BACKUP_PREFIX, current_raw,
+                                    new, now, "standing_import_load")
+    except _S3WriteError as e:
+        return _json_response({"error": e.message}, 502)
+    return _json_response({"ok": True, "added": added, "duplicates": duplicates, "same_firm": same_firm,
+                           "rev": new["rev"]})
+
+
+def _handle_standing_import_save(event):
+    """POST ?action=standing_import_save {key, standing_rev, suggestions_rev,
+    decisions: [{key, action: approve|skip|undo, referrer_id?}]}. Validated
+    as a whole (400, nothing written), both revs checked (409), then ONE
+    client-standing.json write (approve adds / undo removes the referral on
+    the referrer's record, each with a history entry) followed by the
+    suggestions-file write."""
+    body = _parse_json_body(event)
+    if not _admin_key_ok(event, body):
+        return _json_response({"error": "forbidden"}, 403)
+    standing_rev = _standing_int(body.get("standing_rev"), 0)
+    sugg_rev = _standing_int(body.get("suggestions_rev"), 0)
+    decisions = body.get("decisions")
+    if standing_rev is None or sugg_rev is None:
+        return _json_response({"error": "standing_rev and suggestions_rev must be whole numbers"}, 400)
+    if not isinstance(decisions, list) or not decisions or len(decisions) > REFERRAL_IMPORT_MAX_ROWS:
+        return _json_response({"error": "No decisions to save."}, 400)
+    s3 = _s3_client()
+    try:
+        sugg_raw = _s3_read_json_fresh(s3, REFERRAL_SUGGESTIONS_KEY)
+        standing_raw = _s3_read_json_fresh(s3, STANDING_KEY)
+    except Exception as e:
+        print(f"standing_import_save read failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not read the stored files. Nothing was saved."}, 502)
+    sugg = _normalize_suggestions(sugg_raw) if sugg_raw is not None else _suggestions_empty()
+    standing = _normalize_standing_state(standing_raw) if standing_raw is not None else _standing_empty_state()
+    if sugg["rev"] != sugg_rev:
+        return _json_response({"error": REFERRAL_IMPORT_CONFLICT_MSG}, 409)
+    if standing["rev"] != standing_rev:
+        return _json_response({"error": STANDING_CONFLICT_MSG}, 409)
+
+    by_id = _people_data()["by_id"]
+    now = _iso_utc()
+    new_sugg = copy.deepcopy(sugg)
+    new_standing = copy.deepcopy(standing)
+    _standing_migrate_legacy(new_standing, now)
+    by_key = {s["key"]: s for s in new_sugg["suggestions"]}
+    standing_changed = False
+    counts = {"approve": 0, "skip": 0, "undo": 0}
+    for d in decisions:
+        if not isinstance(d, dict) or d.get("action") not in counts:
+            return _json_response({"error": "Each decision needs an action: approve, skip or undo."}, 400)
+        s = by_key.get(str(d.get("key") or ""))
+        if s is None:
+            return _json_response({"error": f"Unknown suggestion {d.get('key')!r}. Reload and try again."}, 400)
+        referred = str(s["referred_person_id"])
+        status = s.get("status") or "pending"
+        action = d["action"]
+        if action in ("approve", "skip") and status != "pending":
+            return _json_response({"error": f"{s.get('referred_name') or referred}: already {status}."}, 400)
+        if action == "approve":
+            referrer_id = str(d.get("referrer_id") or "").strip()
+            res = _resolve_referrer(s)
+            if referrer_id and referrer_id != res["referrer_id"]:
+                s["picked_referrer_id"] = referrer_id  # a manual pick (ambiguous / not found)
+            referrer_id = referrer_id or (res["referrer_id"] or "")
+            if not referrer_id or referrer_id not in by_id:
+                return _json_response({"error": f"{s.get('referred_name') or referred}: pick the referrer first."}, 400)
+            if referrer_id == referred:
+                return _json_response({"error": f"{s.get('referred_name') or referred}: a person cannot refer "
+                                                "themselves."}, 400)
+            if _suggestion_same_firm(referrer_id, referred):
+                return _json_response({"error": f"{s.get('referred_name') or referred}: the referrer is at the same "
+                                                "firm (company or email domain); same-firm referrals never count."}, 400)
+            rec = new_standing["clients"].get(referrer_id) or _standing_default_client()
+            if not any(r["person_id"] == referred for r in rec["referrals"]):
+                rec["referrals"].append({"person_id": referred, "confirmed_unrelated": True, "added_at": now})
+                rec["history"].append({"at": now, "field": "referrals", "from": None,
+                                       "to": {"person_id": referred, "confirmed_unrelated": True},
+                                       "reason": REFERRAL_IMPORT_HISTORY_REASON})
+                new_standing["clients"][referrer_id] = rec
+                standing_changed = True
+            s.update(status="approved", approved_referrer_id=referrer_id, decided_at=now)
+        elif action == "skip":
+            s.update(status="skipped", decided_at=now)
+        else:  # undo
+            if status == "approved":
+                rid = str(s.get("approved_referrer_id") or "")
+                rec = new_standing["clients"].get(rid)
+                if rec is not None and any(r["person_id"] == referred for r in rec["referrals"]):
+                    rec["referrals"] = [r for r in rec["referrals"] if r["person_id"] != referred]
+                    rec["history"].append({"at": now, "field": "referrals", "from": {"person_id": referred},
+                                           "to": None, "reason": REFERRAL_IMPORT_UNDO_REASON})
+                    standing_changed = True
+            elif status != "skipped":
+                return _json_response({"error": f"{s.get('referred_name') or referred}: nothing to undo."}, 400)
+            for k in ("approved_referrer_id", "decided_at"):
+                s.pop(k, None)
+            s["status"] = "pending"
+        counts[action] += 1
+    standing_written = False
+    try:
+        if standing_changed:
+            _standing_finish_write(s3, standing_raw, standing, new_standing, now, "standing_import_save")
+            standing_written = True
+        new_sugg["rev"] = sugg["rev"] + 1
+        new_sugg["updated_at"] = now
+        _s3_write_with_daily_backup(s3, REFERRAL_SUGGESTIONS_KEY, REFERRAL_SUGGESTIONS_BACKUP_PREFIX, sugg_raw,
+                                    new_sugg, now, "standing_import_save")
+    except _S3WriteError as e:
+        msg = e.message
+        if standing_written:
+            msg = ("Referrals were saved, but the suggestion statuses could not be saved. Reload: approved rows "
+                   "may show as Pending; approving them again will not duplicate the referral.")
+        return _json_response({"error": msg}, 502)
+    return _json_response({"ok": True, "counts": counts, "standing_changed": standing_changed})
+
+
+def render_standing_import_page(key):
+    s3 = _s3_client()
+    load_error = None
+    try:
+        raw = _s3_read_json_fresh(s3, REFERRAL_SUGGESTIONS_KEY)
+        sugg = _normalize_suggestions(raw) if raw is not None else _suggestions_empty()
+    except Exception as e:
+        print(f"standing_import read failed: {type(e).__name__}: {e}")
+        sugg, load_error = _suggestions_empty(), "The suggestions file could not be loaded."
+    state = _load_client_standing(fresh=True)
+    if state is None:
+        load_error = load_error or "The client standing file could not be loaded."
+    rows = [v for v in (_suggestion_view(s) for s in sugg["suggestions"]) if v is not None]
+    data = {"key": key or "", "rev": sugg["rev"], "standing_rev": state["rev"] if state else 0,
+            "load_error": bool(load_error), "rows": rows, "person_url": PIPELINE_PERSON_URL,
+            "kind_labels": REFERRAL_KIND_LABELS, "hidden_same_firm": len(sugg["suggestions"]) - len(rows), "header": ",".join(REFERRAL_IMPORT_HEADER),
+            "max_rows": REFERRAL_IMPORT_MAX_ROWS}
+    banner = f'<div class="st-banner st-err">{_esc(load_error)} Nothing can be saved until it loads.</div>' \
+        if load_error else ""
+    back = f"?key={urllib.parse.quote(key or '', safe='')}&view=standing"
+    return (STANDING_IMPORT_PAGE_HTML
+            .replace("__SCRIPT__", STANDING_IMPORT_PAGE_JS)
+            .replace("__BACK_HREF__", _esc(back))
+            .replace("__BANNER__", banner)
+            .replace("__DATA__", _standing_json_for_script(data)))
+
+
+STANDING_IMPORT_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Referral suggestions · Gracia Group</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600&display=swap" rel="stylesheet">
+<style>
+  :root { --ink: #16181d; --muted: #6b7280; --line: #ececea; --amber: #a15c07; --amber-bg: #fdf3e1;
+          --green: #1f7a4d; --green-bg: #e7f5ec; --red: #b91c1c; --accent: #3d5a73; }
+  body { margin: 0; background: #ffffff; color: var(--ink); padding: 32px 20px 64px;
+         font: 400 14px/1.45 "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+  .wrap { max-width: 1400px; margin: 0 auto; }
+  h1, h2 { font-family: "Source Serif 4", Georgia, serif; font-weight: 600; }
+  h1 { font-size: 26px; margin: 0 0 6px; } h2 { font-size: 16px; margin: 18px 0 8px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 9px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  textarea { width: 100%; min-height: 120px; font: 12px/1.4 "IBM Plex Mono", ui-monospace, monospace; box-sizing: border-box;
+             border: 1px solid #d6d6d2; border-radius: 6px; padding: 8px; }
+  input[type=search], select { font: inherit; font-size: 13px; padding: 5px 7px; border: 1px solid #d6d6d2; border-radius: 6px; }
+  button { font: inherit; font-size: 12px; padding: 3px 9px; border: 1px solid #d6d6d2; border-radius: 6px; background: #fff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  button.st-primary { background: var(--ink); color: #fff; border-color: var(--ink); font-size: 14px; padding: 6px 16px; }
+  button.st-armed { background: var(--amber); border-color: var(--amber); color: #fff; }
+  a { color: var(--accent); }
+  .st-muted { color: var(--muted); font-size: 12px; }
+  .st-bar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 10px 0; }
+  .st-banner { padding: 8px 12px; border-radius: 6px; font-weight: 500; }
+  .st-err { background: #fde8e8; color: var(--red); } .st-ok { background: var(--green-bg); color: var(--green); }
+  .st-save { position: sticky; top: 0; z-index: 5; background: #fff; border-bottom: 1px solid var(--line);
+             padding: 10px 0; display: flex; gap: 12px; align-items: center; }
+  .st-flag { color: var(--red); font-weight: 500; display: block; }
+  .st-cc { color: var(--amber); font-weight: 500; display: block; }
+  .st-status-pending { color: var(--muted); } .st-status-approved { color: var(--green); font-weight: 600; }
+  .st-status-skipped { color: var(--muted); text-decoration: line-through; }
+  .st-queued { color: var(--amber); font-weight: 600; display: block; }
+  tr.st-q td { background: #fffbeb; }
+  .st-ev { max-width: 420px; color: #374151; }
+  details.st-load { border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; background: #fafaf8; }
+  details.st-load summary { cursor: pointer; font-weight: 500; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body><div class="wrap">
+<h1>Referral suggestions</h1>
+<div class="st-muted"><a href="__BACK_HREF__">← Back to the client standing scoreboard</a> · Nothing becomes a referral until you approve it and click Save.</div>
+__BANNER__
+<details class="st-load" id="st-load"><summary>Load suggestions from CSV</summary>
+  <p class="st-muted">Header must be exactly: <code id="st-header"></code> — up to <span id="st-max"></span> rows. Re-loading the same CSV never duplicates rows.</p>
+  <textarea id="st-csv" placeholder="Paste the CSV here"></textarea>
+  <div class="st-bar"><button type="button" class="st-primary" id="st-loadbtn">Load</button><span id="st-loadmsg"></span></div>
+</details>
+<div class="st-bar">
+  <input type="search" id="st-q" placeholder="Search names, firms, evidence…" style="min-width:280px">
+  <select id="st-status"><option value="pending">Pending only</option><option value="approved">Approved</option>
+    <option value="skipped">Skipped</option><option value="">All</option></select>
+  <select id="st-kind"><option value="">Any kind</option><option value="reference">Reference/intro</option><option value="cc">CC'ed</option></select>
+  <span id="st-count" class="st-muted"></span>
+  <button type="button" id="st-clean">Approve all clean</button>
+</div>
+<div class="st-save"><span id="st-dirty">No queued decisions</span>
+  <button type="button" class="st-primary" id="st-savebtn">Save</button><div id="st-msg"></div></div>
+<table>
+<thead><tr><th>Referred</th><th>Referrer</th><th>Kind</th><th>Evidence</th><th>Status</th><th></th></tr></thead>
+<tbody id="st-body"></tbody>
+</table>
+</div>
+<script>var IMPORT = __DATA__;</script>
+<script>__SCRIPT__</script>
+</body></html>"""
+
+
+STANDING_IMPORT_PAGE_JS = r"""
+(function() {
+  var D = IMPORT, rows = D.rows, byKey = {}, queued = {}, picks = {}, openEv = {}, armed = false, armTimer = null;
+  rows.forEach(function(r) { byKey[r.key] = r; });
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
+  function personLink(id, text) { return '<a target="_blank" rel="noopener" href="' +
+    esc(D.person_url.replace('{}', encodeURIComponent(id))) + '">' + esc(text) + '</a>'; }
+  function referrerOf(r) { return picks[r.key] || (r.state === 'resolved' ? r.referrer : null); }
+  function filtered() {
+    var q = document.getElementById('st-q').value.trim().toLowerCase(), st = document.getElementById('st-status').value;
+    var kind = document.getElementById('st-kind').value;
+    return rows.filter(function(r) {
+      if (st && r.status !== st) return false;
+      if (kind && r.kind !== kind) return false;
+      if (q) { var ref = referrerOf(r) || {};
+        var hay = [r.referred_name, r.referred_company, r.referrer_name, r.referrer_email, ref.name, ref.firm, r.evidence].join(' ').toLowerCase();
+        if (hay.indexOf(q) === -1) return false; }
+      return true;
+    });
+  }
+  function cleanRows() { return rows.filter(function(r) { return r.clean && !queued[r.key] && !picks[r.key]; }); }
+  function referrerCell(r) {
+    var ref = r.status === 'approved' ? r.referrer : referrerOf(r), h = '';
+    if (ref) { h = personLink(ref.id, ref.name) + (ref.firm ? ' · ' + esc(ref.firm) : '') +
+      (picks[r.key] ? ' <span class="st-muted">(picked)</span> <a href="#" data-act="unpick">change</a>' : ''); }
+    else if (r.state === 'ambiguous') {
+      h = '<span class="st-cc">Ambiguous — "' + esc(r.referrer_name) + '"</span><select data-act="pickc"><option value="">Pick one…</option>' +
+        r.candidates.map(function(c, i) { return '<option value="' + i + '">' + esc(c.name + ' · ' + (c.firm || '—') + ' · ' + (c.email || '—')) + '</option>'; }).join('') +
+        '</select>';
+    } else {
+      h = '<span class="st-cc">Not found — "' + esc(r.referrer_name || r.referrer_email) + '"</span>' +
+        '<input type="search" data-act="psearch" placeholder="Search people…" style="width:200px"><div data-role="presults"></div>';
+    }
+    if (r.referrer_email && r.status !== 'approved') h += '<div class="st-muted">' + esc(r.referrer_email) + '</div>';
+    return h;
+  }
+  function kindCell(r) { return esc(D.kind_labels[r.kind] || r.kind) +
+    (r.kind === 'cc' ? '<span class="st-cc">CC\'ed — check</span>' : '') +
+    (picks[r.key] && picks[r.key].related == null ? '<div class="st-muted">same-firm check on save</div>' : ''); }
+  function evCell(r) { var e = r.evidence || '';
+    if (e.length <= 160 || openEv[r.key]) return esc(e) + (e.length > 160 ? ' <a href="#" data-act="ev">less</a>' : '');
+    return esc(e.slice(0, 160)) + '… <a href="#" data-act="ev">more</a>'; }
+  function statusCell(r) { var q = queued[r.key];
+    var s = '<span class="st-status-' + r.status + '">' + {pending: 'Pending', approved: 'Approved', skipped: 'Skipped'}[r.status] + '</span>';
+    if (q) s += '<span class="st-queued">Will ' + (q.action === 'approve' ? 'approve' : q.action === 'skip' ? 'skip' : 'undo') +
+      ' on Save</span> <a href="#" data-act="unqueue">cancel</a>';
+    return s; }
+  function actionsCell(r) {
+    if (queued[r.key]) return '';
+    if (r.status === 'pending') return '<button type="button" data-act="approve"' + (referrerOf(r) ? '' : ' disabled') +
+      '>Approve</button> <button type="button" data-act="skip">Skip</button>';
+    return '<button type="button" data-act="undo">Undo</button>'; }
+  function render() {
+    var list = filtered();
+    document.getElementById('st-body').innerHTML = list.map(function(r) {
+      return '<tr data-key="' + esc(r.key) + '"' + (queued[r.key] ? ' class="st-q"' : '') + '>' +
+        '<td>' + (r.referred_exists ? personLink(r.referred_id, r.referred_name || ('#' + r.referred_id)) : esc(r.referred_name || ('#' + r.referred_id)) +
+          ' <span class="st-muted">(not in people list)</span>') + (r.referred_company ? '<div class="st-muted">' + esc(r.referred_company) + '</div>' : '') + '</td>' +
+        '<td>' + referrerCell(r) + '</td><td>' + kindCell(r) + '</td>' +
+        '<td class="st-ev">' + evCell(r) + '</td><td>' + statusCell(r) + '</td><td style="white-space:nowrap">' + actionsCell(r) + '</td></tr>';
+    }).join('') || '<tr><td colspan="6" class="st-muted">No suggestions match.</td></tr>';
+    document.getElementById('st-count').textContent = list.length + ' of ' + rows.length + ' suggestions' +
+      (D.hidden_same_firm ? ' · ' + D.hidden_same_firm + ' same-firm hidden' : '');
+    var n = Object.keys(queued).length;
+    document.getElementById('st-dirty').textContent = n ? (n + ' queued decision' + (n === 1 ? '' : 's') + ' — Save to apply') : 'No queued decisions';
+    var clean = cleanRows().length, cb = document.getElementById('st-clean');
+    cb.disabled = !clean;
+    cb.className = armed ? 'st-armed' : '';
+    cb.textContent = armed ? ('Approve ' + clean + ' — click again to confirm') : ('Approve all clean (' + clean + ')');
+  }
+  function disarm() { armed = false; clearTimeout(armTimer); }
+  function rowOf(el) { var tr = el.closest('tr[data-key]'); return tr ? byKey[tr.getAttribute('data-key')] : null; }
+  var body = document.getElementById('st-body');
+  body.addEventListener('mousedown', function(e) { if (e.target.closest('button, a[data-act]')) e.preventDefault(); });
+  body.addEventListener('click', function(e) {
+    var el = e.target.closest('[data-act]'); if (!el) return; var r = rowOf(el); if (!r) return;
+    var act = el.getAttribute('data-act');
+    if (el.tagName === 'A') e.preventDefault();
+    if (act === 'approve') { var ref = referrerOf(r); if (!ref) return; queued[r.key] = {action: 'approve', referrer_id: ref.id}; }
+    else if (act === 'skip') queued[r.key] = {action: 'skip'};
+    else if (act === 'undo') queued[r.key] = {action: 'undo'};
+    else if (act === 'unqueue') delete queued[r.key];
+    else if (act === 'unpick') delete picks[r.key];
+    else if (act === 'ev') { if (openEv[r.key]) delete openEv[r.key]; else openEv[r.key] = 1; }
+    else if (act === 'use') { picks[r.key] = JSON.parse(el.getAttribute('data-person')); }
+    else return;
+    disarm(); render();
+  });
+  body.addEventListener('change', function(e) {
+    var el = e.target; if (el.getAttribute('data-act') !== 'pickc') return; var r = rowOf(el); if (!r) return;
+    if (el.value === '') delete picks[r.key]; else picks[r.key] = Object.assign({related: false}, r.candidates[+el.value]);
+    disarm(); render();
+  });
+  var timers = {};
+  body.addEventListener('input', function(e) {
+    var el = e.target; if (el.getAttribute('data-act') !== 'psearch') return; var r = rowOf(el); if (!r) return;
+    var box = el.parentNode.querySelector('[data-role=presults]'), q = el.value.trim();
+    clearTimeout(timers[r.key]);
+    timers[r.key] = setTimeout(function() {
+      if (q.length < 2) { box.innerHTML = ''; return; }
+      fetch('?key=' + encodeURIComponent(D.key) + '&view=standing&search=' + encodeURIComponent(q))
+        .then(function(x) { return x.json(); }).then(function(d) {
+          var res = ((d && d.results) || []).filter(function(p) { return p.id !== r.referred_id; });
+          box.innerHTML = res.map(function(p) {
+            var person = {id: p.id, name: p.name, firm: p.firm, email: p.email, related: null};
+            return '<div>' + esc(p.name) + (p.firm ? ' · ' + esc(p.firm) : '') + ' <button type="button" data-act="use" data-person="' +
+              esc(JSON.stringify(person)) + '">Use</button></div>'; }).join('') || '<div class="st-muted">No matches</div>';
+        }).catch(function(err) { box.innerHTML = '<div class="st-flag">Search failed: ' + esc(err) + '</div>'; });
+    }, 250);
+  });
+  ['st-q', 'st-status', 'st-kind'].forEach(function(id) {
+    var el = document.getElementById(id);
+    el.addEventListener(id === 'st-q' ? 'input' : 'change', function() { disarm(); render(); });
+  });
+  document.getElementById('st-clean').addEventListener('click', function() {
+    var clean = cleanRows(); if (!clean.length) return;
+    if (!armed) { armed = true; clearTimeout(armTimer); armTimer = setTimeout(function() { armed = false; render(); }, 8000); render(); return; }
+    clean.forEach(function(r) { queued[r.key] = {action: 'approve', referrer_id: r.referrer.id}; });
+    disarm(); render();
+  });
+  function msg(id, cls, text) { document.getElementById(id).innerHTML = '<span class="st-banner ' + cls + '">' + esc(text) + '</span>'; }
+  document.getElementById('st-header').textContent = D.header;
+  document.getElementById('st-max').textContent = D.max_rows;
+  if (!rows.length) document.getElementById('st-load').open = true;
+  var loadBtn = document.getElementById('st-loadbtn'), saveBtn = document.getElementById('st-savebtn');
+  if (D.load_error) { loadBtn.disabled = true; saveBtn.disabled = true; }
+  function post(action, payload, btn, msgId, busy) {
+    btn.disabled = true; var label = btn.textContent; btn.textContent = busy;
+    fetch('?action=' + action, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)})
+      .then(function(r) { return r.json().then(function(d) { return {status: r.status, d: d}; }); })
+      .then(function(res) {
+        if (res.status === 200 && res.d.ok) { msg(msgId, 'st-ok', action === 'standing_import_load' ?
+          ('Loaded ' + res.d.added + ' new, ' + res.d.duplicates + ' already here, ' + res.d.same_firm + ' same-firm dropped.') : 'Saved.'); window.location.reload(); return; }
+        btn.disabled = false; btn.textContent = label; msg(msgId, 'st-err', (res.d && res.d.error) || 'Failed. Nothing was saved.');
+      }).catch(function(err) { btn.disabled = false; btn.textContent = label; msg(msgId, 'st-err', 'Failed. Nothing was saved. (' + err + ')'); });
+  }
+  loadBtn.addEventListener('click', function() {
+    post('standing_import_load', {key: D.key, rev: D.rev, csv: document.getElementById('st-csv').value}, loadBtn, 'st-loadmsg', 'Loading…');
+  });
+  saveBtn.addEventListener('click', function() {
+    var decisions = Object.keys(queued).map(function(k) { var q = queued[k], d = {key: k, action: q.action};
+      if (q.referrer_id) d.referrer_id = q.referrer_id; return d; });
+    if (!decisions.length) { msg('st-msg', 'st-ok', 'Nothing to save.'); return; }
+    post('standing_import_save', {key: D.key, standing_rev: D.standing_rev, suggestions_rev: D.rev, decisions: decisions},
+      saveBtn, 'st-msg', 'Saving…');
+  });
+  window.addEventListener('beforeunload', function(e) {
+    if (saveBtn.textContent !== 'Saving…' && Object.keys(queued).length) { e.preventDefault(); e.returnValue = ''; }
   });
   render();
 })();
@@ -16833,12 +17553,14 @@ def _task_rebuild_slim():
     _s3_version_cache.pop(PEOPLE_KEY, None)
     source_version = _object_version(s3, PEOPLE_KEY)
     recorded = None
+    recorded_schema = None
     try:
         obj = s3.get_object(Bucket=BUCKET, Key=PEOPLE_SLIM_KEY)
-        recorded = (json.loads(obj["Body"].read()) or {}).get("source_version")
+        slim = json.loads(obj["Body"].read()) or {}
+        recorded, recorded_schema = slim.get("source_version"), slim.get("fields_schema")
     except Exception:
         pass
-    if recorded == source_version:
+    if recorded == source_version and recorded_schema == _people_slim_schema():
         return {"task": "rebuild_slim", "rebuilt": False, "source_version": source_version}
     _, built_from = _build_people_slim(s3)
     print(f"people-slim rebuilt: {recorded} -> {built_from}")
@@ -16971,6 +17693,16 @@ def _lambda_handler_impl(event, context):
             return _json_response({"error": "POST only"}, 405)
         return _handle_save_standing(event)
 
+    if query.get("action") == "standing_import_load":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_standing_import_load(event)
+
+    if query.get("action") == "standing_import_save":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_standing_import_save(event)
+
     # Bulk Public Bio page: GET renders, POST saves (form post back to
     # the same URL). Same ADMIN_KEY query check as every admin GET route.
     if query.get("view") == "bios":
@@ -17021,6 +17753,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_standing_view(query)
+
+    if query.get("view") == "standing_import":
+        if not is_admin_key:
+            return _forbidden()
+        return _html_response(render_standing_import_page(query.get("key")))
 
     if query.get("view") == "standing_json":
         if not is_admin_key:
