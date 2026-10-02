@@ -7682,7 +7682,8 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     </div>"""
 
 
-def _buyer_name_cell_html(primary, secondary, more_count, show_contact, link=False, key=None, view_as=None):
+def _buyer_name_cell_html(primary, secondary, more_count, show_contact, link=False, key=None, view_as=None,
+                          after_name_html=""):
     """Buyer name(s) for the Company page's Matched/Closed-out Buyers
     table — up to TWO names (primary contact first, then the next
     linked person in deals.json order — see _select_display_buyers),
@@ -7718,7 +7719,7 @@ def _buyer_name_cell_html(primary, secondary, more_count, show_contact, link=Fal
         if secondary is not None:
             names.append(_esc(_person_display_name(secondary) or "—"))
     more_html = f' <span class="buyer-cell-more">+{more_count} more</span>' if more_count > 0 else ""
-    names_html = ", ".join(names) + more_html
+    names_html = ", ".join(names) + more_html + after_name_html
     if not show_contact:
         return f'<div>{names_html}</div>'
     bits = [b for b in (_person_email_text(primary), _person_phone_text(primary)) if b]
@@ -7958,8 +7959,11 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
         extra_cls = ""
         if disclosed:
             primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
+            # Standing star (or "Prefers not to share") for the primary buyer
+            # -- same standing_star rules as the anonymous surfaces; never ticks.
             col1_html = _buyer_name_cell_html(primary, secondary, more_count, show_contact=True, link=True,
-                                               key=key, view_as=view_as)
+                                               key=key, view_as=view_as,
+                                               after_name_html=_standing_star_for(primary.get("id")) if primary else "")
             col1_html += _buyer_contact_detail_html(primary)
             _unused_it, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
             col2_html = _esc(company_text)

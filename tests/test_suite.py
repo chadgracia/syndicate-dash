@@ -8891,6 +8891,17 @@ for _star in ("gold", "green", "yellow", "hidden"):
           not re.search(r"\d", re.sub(r"#[0-9A-Fa-f]{6}|viewBox=\"[^\"]*\"|width=\"\d+\"|height=\"\d+\"|"
                                       r"margin-left:\d+px|font-size:\d+px|d=\"[^\"]*\"", "", _h))
           and not any(lbl in _h for _, lbl in lf.STANDING_ITEMS) and "Bob" not in _h)
+def _st_intro_row(html_):
+    _m = [r for r in re.findall(r"<tr[^>]*>.*?</tr>", html_, re.S) if "Alice Standing" in r and "buyer-link" in r]
+    return _m[0] if _m else ""
+_st_ir = _st_intro_row(_st_tiles)
+check("company page Introduced row: star next to the buyer name (Alice, terms repair -> yellow)",
+      _st_ir and re.search(r'Alice Standing<span class="buyer-link-suffix">[^<]*</span></a>'
+                           r'<span class="gs-star" role="img" title="In progress"', _st_ir) is not None)
+check("company page Introduced row: no item detail, counts, tier or ticks",
+      _st_ir and "gs-ticks" not in _st_ir and "Good standing" not in _st_ir
+      and not any(lbl in _st_ir for _, lbl in lf.STANDING_ITEMS) and "platinum" not in _st_ir.lower())
+check("company page: no check-mark ticks anywhere", "gs-ticks" not in _st_tiles and "Good standing" not in _st_tiles)
 check("star html: None/unknown renders nothing", lf._standing_star_html(None) == "" and lf._standing_star_html("x") == "")
 check("anonymous surfaces: no buyer names or ids leak with the star on",
       "Bob Pending" not in _st_anon and "Bob Pending" not in _st_pend and "Ivy Interest" not in _st_tiles
@@ -8916,6 +8927,8 @@ _st_np = _st_tenant_pages()
 check("opted out: anonymous surfaces show 'Prefers not to share' instead of a star",
       all("Prefers not to share" in _st_np[k] for k in ("anonymous buyer page", "active intros (pending cell)",
                                                        "company page (demand tiles)")))
+check("opted out: company page Introduced row shows 'Prefers not to share', no star",
+      (lambda r: "Prefers not to share" in r and "gs-star" not in r)(_st_intro_row(_st_np["company page (demand tiles)"])))
 check("opted out: disclosed buyer page shows the muted line instead of the card",
       "Client prefers not to share this information." in _st_np["disclosed buyer page"]
       and ">Client standing<" not in _st_np["disclosed buyer page"])
@@ -8935,6 +8948,9 @@ _st_hidden = json.loads(json.dumps(_ST_SECRET_CLIENTS))
 for _c in _st_hidden.values():
     _c["visible"] = False
 _st_put(_st_hidden)
+check("visible=false: company page Introduced row unchanged (no star, no opt-out text)",
+      (lambda r: r and "gs-star" not in r and "Prefers not" not in r)(
+          _st_intro_row(_st_get({"company": "Gamma Co"}, [tenant_cookie(TENANT_EMAIL)])["body"])))
 for _name, _html in _st_tenant_pages().items():
     check(f"visible=false: {_name} renders no standing at all",
           "Client standing" not in _html and "gs-star" not in _html and "Good standing" not in _html
