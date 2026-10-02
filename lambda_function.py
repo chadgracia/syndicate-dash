@@ -1646,6 +1646,55 @@ def _verify_sso_handoff(token):
         return None
 
 
+def _make_handoff_token(email):
+    """Trades-format SSO handoff token (identical to chadgracia/trades
+    _make_handoff_token): base64url(f"{email}|{exp}|{sig}"), padding
+    stripped, exp = now + 3600, sig = HMAC-SHA256(IDENTITY_SECRET,
+    f"{email}|{exp}").hexdigest(). None when IDENTITY_SECRET or email is
+    missing (no link, never a fallback key)."""
+    if not (IDENTITY_SECRET and email):
+        return None
+    exp = int(time.time()) + 3600
+    sig = hmac.new(IDENTITY_SECRET.encode(), f"{email}|{exp}".encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{email}|{exp}|{sig}".encode()).decode().rstrip("=")
+
+
+# "Add deal": the shared New Order form in chadgracia/deal-update-form
+# creates the Pipeline deal -- this repo only links to it, signed in via a
+# trades-format ?sso= handoff for the viewer (tenant session) or the
+# &view_as tenant (admin). Plain admin (no tenant context) gets no link.
+ADD_DEAL_FORM_URL = "https://desk.graciagroup.com/update/?action=new"
+ADD_DEAL_HELP_TEXT = "New deals appear here within the hour."
+
+
+def _add_deal_email(key=None, view_as=None, account_email=None):
+    """Whose email the Add deal handoff is minted for: admin (key set) ->
+    the &view_as tenant, else None; tenant session -> the verified
+    account email."""
+    if key is not None:
+        return view_as.strip().lower() if view_as else None
+    return account_email or None
+
+
+def _add_deal_url(email):
+    token = _make_handoff_token(email)
+    if not token:
+        return None
+    return f"{ADD_DEAL_FORM_URL}&sso={urllib.parse.quote(token, safe='')}"
+
+
+def _add_deal_link_html(email, cls, is_admin=False, role=""):
+    """"+ Add deal" link (new tab), or "" when there's no email/secret.
+    Admin view_as renders a tooltip naming whose account it opens as."""
+    url = _add_deal_url(email)
+    if not url:
+        return ""
+    title_attr = f' title="Opens as {_esc(email)}"' if is_admin else ""
+    role_attr = f' role="{role}"' if role else ""
+    return (f'<a class="{cls}" href="{_esc(url)}" target="_blank" rel="noopener"{title_attr}{role_attr}>'
+            '+ Add deal</a>')
+
+
 # Public base URL: CloudFront (desk.graciagroup.com, /dashboard* and
 # /blockbook* behaviors) forwards to this Lambda's Function URL with rawPath
 # still starting with the public prefix -- _split_public_prefix strips either
@@ -6029,7 +6078,7 @@ DEAL_STAGE_EMAIL_TO = "cgracia@rainmakersecurities.com"
 DEAL_STAGE_EMAIL_FROM = "agent@agent.graciagroup.com"
 
 
-def _send_deal_stage_email(deal, deal_id, tenant_name, target):
+def _send_deal_stage_email(deal, deal_id, tenant_name, target, note=""):
     """Best-effort SES notification — failure here must never roll back
     the Pipeline write or the Dynamo overlay (see _handle_deal_stage),
     only get flagged in the audit item. Returns True/False, never
@@ -6045,6 +6094,8 @@ def _send_deal_stage_email(deal, deal_id, tenant_name, target):
         f"Tenant: {tenant_name}\n"
         f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n"
     )
+    if note:
+        body += f"Note: {note}\n"
     try:
         ses = boto3.client("ses", region_name="us-east-1")
         ses.send_email(
@@ -6099,6 +6150,14 @@ def _tenant_can_act_on_deal(identity_email, deal):
     if owner == str(identity_email).strip().lower():
         return True
     return (_resolve_tenant(owner) or {}).get("person_id") in scope
+
+
+ANTHROPIC_HOLD_NOTE = "Anthropic sell: kept on Hold"
+ANTHROPIC_HOLD_TENANT_MSG = "Received — we'll review and confirm before listing."
+
+
+def _is_anthropic_deal(deal):
+    return "anthropic" in (_deal_company_name(deal) or "").lower()
 
 
 def _handle_deal_stage(event):
@@ -6166,18 +6225,27 @@ def _handle_deal_stage(event):
         if not _is_closed_down_stage(old_stage_id):
             return _json_response({"error": "deal is not closed down"}, 409)
 
+    # Anthropic sell deals are never set live from here: a Re-Open lands on
+    # Hold for Chad to review (same Pipeline-first write + audit).
+    anthropic_hold = target == "reopen" and _is_anthropic_deal(deal)
+    if anthropic_hold:
+        target_stage_id = HOLD_STAGE_ID
+
     ok, err = _pipeline_update_deal_stage(deal_id, target_stage_id)
     if not ok:
         return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
     tenant_name = (_resolve_tenant(tenant_email) or {}).get("name", tenant_email)
-    email_ok = _send_deal_stage_email(deal, deal_id, tenant_name, target)
+    email_ok = _send_deal_stage_email(deal, deal_id, tenant_name, target,
+                                      note=ANTHROPIC_HOLD_NOTE if anthropic_hold else "")
 
     ok, err = _dynamo_write_deal_stage_override(tenant_email, deal_id, target_stage_id, actor, old_stage_id,
                                                  not email_ok)
     if not ok:
         return _json_response({"error": f"Pipeline updated but save failed: {err}"}, 502)
 
+    if anthropic_hold:
+        return _json_response({"ok": True, "message": ANTHROPIC_HOLD_TENANT_MSG})
     return _json_response({"ok": True})
 
 
@@ -8931,6 +8999,8 @@ NAV_CSS = """
     font-size: 13px;
   }
   .gg-mydeals-menu-item:hover { background: rgba(61,90,115,0.08); }
+  .gg-mydeals-menu-add { font-weight: 700; color: var(--accent); }
+  .gg-mydeals-menu-add + .gg-mydeals-menu-group { border-top: 1px solid var(--line); margin-top: 4px; padding-top: 4px; }
   .gg-mydeals-menu-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .gg-mydeals-menu-via { color: var(--muted); font-size: 11px; margin-left: 6px; }
   .gg-mydeals-menu-badge { color: var(--muted); font-size: 11px; font-weight: 600; flex-shrink: 0; }
@@ -9391,21 +9461,25 @@ def _mydeals_dropdown_entries(person_id):
     return ordered
 
 
-def _mydeals_dropdown_html(person_id, key=None, view_as=None):
+def _mydeals_dropdown_html(person_id, key=None, view_as=None, add_deal_email=None):
     """The My Deals tab's quick-jump dropdown, rendered on every page via
     _nav_html: the caret button plus the menu itself, or "" when there's
     nothing to show (admin-without-view_as, or a tenant with no Sell
     deals on file at all) -- the caret only exists to open something.
     Capped at 40 entries with a trailing "View all in My Deals ->" item
     beyond that (entries stay in the same Live/On Hold/Closed/Cancelled,
-    A-Z order -- the cap just truncates the tail)."""
+    A-Z order -- the cap just truncates the tail). add_deal_email (see
+    _add_deal_email) puts "+ Add deal" first, above the groups, and keeps
+    the menu even with no deals."""
     entries = _mydeals_dropdown_entries(person_id)
-    if not entries:
+    add_deal_html = _add_deal_link_html(add_deal_email, "gg-mydeals-menu-item gg-mydeals-menu-add",
+                                        is_admin=key is not None, role="menuitem")
+    if not entries and not add_deal_html:
         return ""
     MAX_ENTRIES = 40
     shown, overflow = entries[:MAX_ENTRIES], len(entries) > MAX_ENTRIES
 
-    groups_html = []
+    groups_html = [add_deal_html] if add_deal_html else []
     for group in ("Live", "On Hold", "Closed", "Cancelled"):
         group_entries = [e for e in shown if e["group"] == group]
         if not group_entries:
@@ -9618,7 +9692,8 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     # _mydeals_dropdown_html). Rendered on every page, not just My Deals
     # itself, since _nav_html is the one place every render_* function
     # already shares.
-    mydeals_menu_html = _mydeals_dropdown_html(person_id, key=key, view_as=view_as)
+    mydeals_menu_html = _mydeals_dropdown_html(person_id, key=key, view_as=view_as,
+                                               add_deal_email=_add_deal_email(key, view_as, account_email))
     mydeals_script = ""
     if mydeals_menu_html:
         mydeals_script = """<script>
@@ -9709,6 +9784,7 @@ def _company_intros_paused(person_id, company, intro_details=None):
 
 
 REOPEN_DEAL_LABEL = "Re-Open Deal"
+REOPEN_CONFIRM_ANTHROPIC = "This sends the deal to Gracia Group for review before it's listed again."
 PAUSED_INTRO_TEXT = "Paused — deal closed"
 
 
@@ -9721,7 +9797,16 @@ def _reopen_deal_button_html(deal, stage, key=None):
         return ""
     key_attr = f' data-key="{_esc(key)}"' if key else ""
     return (f'<button type="button" class="reopen-deal-btn" data-deal-id="{_esc(str(deal.get("id")))}" '
-            f'data-deal-name="{_esc(_deal_title(deal))}"{key_attr}>{REOPEN_DEAL_LABEL}</button>')
+            f'data-deal-name="{_esc(_deal_title(deal))}" data-confirm="{_esc(_reopen_confirm_text(deal))}"'
+            f'{key_attr}>{REOPEN_DEAL_LABEL}</button>')
+
+
+def _reopen_confirm_text(deal):
+    """Re-Open confirmation wording; Anthropic deals go to Hold for review
+    (see _handle_deal_stage), so they never promise Inquiry."""
+    tail = (REOPEN_CONFIRM_ANTHROPIC if _is_anthropic_deal(deal) else
+            "This sets the deal back to Inquiry and returns it to your active pipeline.")
+    return f"Re-open {_deal_title(deal)}? {tail}"
 
 
 def _paused_intro_chip_html():
@@ -9749,8 +9834,7 @@ def _reopen_deal_script_html():
 (function() {
   document.querySelectorAll('.reopen-deal-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
-      var name = btn.getAttribute('data-deal-name');
-      if (!window.confirm('Re-open ' + name + '? This sets the deal back to Inquiry and returns it to your active pipeline.')) return;
+      if (!window.confirm(btn.getAttribute('data-confirm'))) return;
       btn.disabled = true;
       fetch('?action=deal_stage', {
         method: 'POST',
@@ -9760,7 +9844,7 @@ def _reopen_deal_script_html():
       }).then(function(r) {
         return r.json().then(function(data) { return { ok: r.ok, data: data }; });
       }).then(function(res) {
-        if (res.ok) { window.location.reload(); }
+        if (res.ok) { if (res.data && res.data.message) alert(res.data.message); window.location.reload(); }
         else { btn.disabled = false; alert((res.data && res.data.error) || 'Error'); }
       }).catch(function(err) { btn.disabled = false; alert('Error: ' + err); });
     });
@@ -11636,13 +11720,22 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="my-deals", edit_mode=edit_mode)
 
+    # "+ Add deal" (header button + empty state): tenant -> own email,
+    # admin view_as -> that tenant's; plain admin (tenant picker) -> none.
+    add_deal_btn = "" if tenant_picker else _add_deal_link_html(
+        _add_deal_email(key, view_as, account_email), "add-deal-btn", is_admin=key is not None)
+    head_html = '<h1>My Deals</h1>'
+    if add_deal_btn:
+        head_html = (f'<div class="mydeals-head"><h1>My Deals</h1><div class="add-deal-wrap">{add_deal_btn}'
+                     f'<div class="add-deal-help">{_esc(ADD_DEAL_HELP_TEXT)}</div></div></div>')
+
     summary_html = ""
     subtle_html = ""
     edit_script = ""
     if tenant_picker:
         body_html = _tenant_picker_html()
     elif not deals:
-        body_html = '<div class="gg-placeholder">No deals yet.</div>'
+        body_html = f'<div class="gg-placeholder"><p>You have no deals yet.</p>{add_deal_btn}</div>'
     else:
         model = _my_deals_model(deals, person_id, anon_key_email)
         rows = model["rows"]
@@ -12026,6 +12119,13 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     font-size: 15px;
   }}
   .gg-placeholder.small {{ margin: 0; padding: 24px; }}
+  .mydeals-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }}
+  .add-deal-wrap {{ text-align: right; margin-top: 4px; }}
+  .add-deal-btn {{ display: inline-block; background: var(--accent); color: #fff; border: none; padding: 5px 12px;
+                  border-radius: 6px; font-size: 12px; font-weight: 600; text-decoration: none; cursor: pointer; }}
+  .add-deal-btn:hover {{ opacity: 0.9; }}
+  .add-deal-help {{ font-size: 11px; color: var(--muted); margin-top: 4px; }}
+  .gg-placeholder .add-deal-btn {{ margin-top: 6px; }}
   .gg-tenant-picker {{ max-width: 640px; margin: 48px auto; padding: 0 24px; }}
   .gg-tenant-picker-lead {{ text-align: center; color: var(--muted); font-size: 15px; margin-bottom: 14px; }}
   .gg-tenant-picker-list {{ list-style: none; padding: 0; margin: 0; border: 1px solid var(--line); border-radius: 8px; }}
@@ -12038,7 +12138,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
 <body>
 {nav}
 <div class="wrap">
-  <h1>My Deals</h1>
+  {head_html}
   {feature_box_html}
   {summary_html}
   {subtle_html}
@@ -14143,7 +14243,7 @@ SELL_ORDER_MAILTO_URL = (
 )
 
 
-def _message_page(title, message, show_signin=False, show_sell_cta=False, show_signout=False):
+def _message_page(title, message, show_signin=False, show_sell_cta=False, show_signout=False, primary_cta=None):
     """Standalone pre-auth / not-enabled page. Reuses the board's own dark
     palette (not the nav's) since there's no tab shell to sit under here.
 
@@ -14178,6 +14278,9 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
                                f'companies with completed purchases.</p>'
                                if stats["companies_count"] else "")
             raised_html = f'<p class="raised-headline">{_esc(headline_text)} closed for sellers through this desk</p>{companies_html}'
+    if primary_cta:
+        cta_href, cta_label = primary_cta
+        signin_html += f'<p><a class="gg-btn" href="{_esc(cta_href)}">{_esc(cta_label)}</a></p>'
     if show_signout:
         signin_html += f'<p><a class="gg-link" href="{_esc(_signout_url())}">Sign out</a></p>'
     sell_cta_html = ""
@@ -14216,6 +14319,9 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
   .gg-card h1 {{ font-size: 18px; margin: 0 0 12px; }}
   .gg-card p {{ color: #6b7280; font-size: 14px; line-height: 1.5; margin: 0 0 8px; }}
   .gg-link {{ color: #3d5a73; text-decoration: none; font-weight: 600; }}
+  .gg-btn {{ display: inline-block; background: #3d5a73; color: #ffffff; text-decoration: none; font-weight: 600;
+            padding: 10px 18px; border-radius: 6px; margin: 8px 0 4px; }}
+  .gg-btn:hover {{ opacity: 0.9; }}
   .raised-headline {{ font-size: 15px; font-weight: 700; color: #1f7a4d; }}
   .raised-companies {{ font-size: 13px; }}
 </style>
@@ -16453,6 +16559,12 @@ def _handle_update_buyer_note(event):
 
 
 NOT_ENABLED_MESSAGE = "This dashboard is for sellers."
+# First-time seller arriving with ?welcome=1 before their first deal lands.
+WELCOME_TITLE = "Welcome to Blockbook"
+WELCOME_MESSAGE = ("Your first deal is being set up and will appear here within the hour. "
+                   "We'll keep you posted by email.")
+WELCOME_CTA_URL = "https://trades.graciagroup.com/"
+WELCOME_CTA_LABEL = "While you wait, explore what's trading now →"
 
 
 def _perf_infer_page(query):
@@ -16704,13 +16816,23 @@ def _lambda_handler_impl(event, context):
         email = _verify_sso_handoff(sso_token)
         if email:
             location = f"{PUBLIC_BASE_URL}/" if via_public else (event.get("rawPath") or "/")
+            params = []
             tab = query.get("tab")
             if tab:
-                location += f"?tab={urllib.parse.quote(tab, safe='')}"
+                params.append(f"tab={urllib.parse.quote(tab, safe='')}")
+            if query.get("welcome") == "1":
+                params.append("welcome=1")
+            if params:
+                location += "?" + "&".join(params)
+            # Public arrival: the same HttpOnly .graciagroup.com cookie login
+            # links set, so trades recognises the person too. Raw Function
+            # URL stays host-only (a .graciagroup.com cookie can't stick there).
+            cookie = (_make_identity_cookie(email, domain=PUBLIC_COOKIE_DOMAIN) if via_public
+                      else _make_identity_cookie(email))
             return {
                 "statusCode": 302,
                 "headers": {"Location": location},
-                "cookies": [_make_identity_cookie(email)],
+                "cookies": [cookie],
                 "body": "",
             }
 
@@ -16751,6 +16873,9 @@ def _lambda_handler_impl(event, context):
             return _html_response(_signin_page(_request_base_url(event.get("rawPath"))), 403)
         tenant = _resolve_tenant(identity_email)
         if not tenant:
+            if query.get("welcome") == "1":
+                return _html_response(_message_page(WELCOME_TITLE, WELCOME_MESSAGE, show_signout=True,
+                                                    primary_cta=(WELCOME_CTA_URL, WELCOME_CTA_LABEL)))
             return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True,
                                                 show_signout=True))
         viewer_name = tenant["name"]
