@@ -6078,7 +6078,7 @@ DEAL_STAGE_EMAIL_TO = "cgracia@rainmakersecurities.com"
 DEAL_STAGE_EMAIL_FROM = "agent@agent.graciagroup.com"
 
 
-def _send_deal_stage_email(deal, deal_id, tenant_name, target):
+def _send_deal_stage_email(deal, deal_id, tenant_name, target, note=""):
     """Best-effort SES notification — failure here must never roll back
     the Pipeline write or the Dynamo overlay (see _handle_deal_stage),
     only get flagged in the audit item. Returns True/False, never
@@ -6094,6 +6094,8 @@ def _send_deal_stage_email(deal, deal_id, tenant_name, target):
         f"Tenant: {tenant_name}\n"
         f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n"
     )
+    if note:
+        body += f"Note: {note}\n"
     try:
         ses = boto3.client("ses", region_name="us-east-1")
         ses.send_email(
@@ -6148,6 +6150,14 @@ def _tenant_can_act_on_deal(identity_email, deal):
     if owner == str(identity_email).strip().lower():
         return True
     return (_resolve_tenant(owner) or {}).get("person_id") in scope
+
+
+ANTHROPIC_HOLD_NOTE = "Anthropic sell: kept on Hold"
+ANTHROPIC_HOLD_TENANT_MSG = "Received — we'll review and confirm before listing."
+
+
+def _is_anthropic_deal(deal):
+    return "anthropic" in (_deal_company_name(deal) or "").lower()
 
 
 def _handle_deal_stage(event):
@@ -6215,18 +6225,27 @@ def _handle_deal_stage(event):
         if not _is_closed_down_stage(old_stage_id):
             return _json_response({"error": "deal is not closed down"}, 409)
 
+    # Anthropic sell deals are never set live from here: a Re-Open lands on
+    # Hold for Chad to review (same Pipeline-first write + audit).
+    anthropic_hold = target == "reopen" and _is_anthropic_deal(deal)
+    if anthropic_hold:
+        target_stage_id = HOLD_STAGE_ID
+
     ok, err = _pipeline_update_deal_stage(deal_id, target_stage_id)
     if not ok:
         return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
     tenant_name = (_resolve_tenant(tenant_email) or {}).get("name", tenant_email)
-    email_ok = _send_deal_stage_email(deal, deal_id, tenant_name, target)
+    email_ok = _send_deal_stage_email(deal, deal_id, tenant_name, target,
+                                      note=ANTHROPIC_HOLD_NOTE if anthropic_hold else "")
 
     ok, err = _dynamo_write_deal_stage_override(tenant_email, deal_id, target_stage_id, actor, old_stage_id,
                                                  not email_ok)
     if not ok:
         return _json_response({"error": f"Pipeline updated but save failed: {err}"}, 502)
 
+    if anthropic_hold:
+        return _json_response({"ok": True, "message": ANTHROPIC_HOLD_TENANT_MSG})
     return _json_response({"ok": True})
 
 
@@ -9816,7 +9835,7 @@ def _reopen_deal_script_html():
       }).then(function(r) {
         return r.json().then(function(data) { return { ok: r.ok, data: data }; });
       }).then(function(res) {
-        if (res.ok) { window.location.reload(); }
+        if (res.ok) { if (res.data && res.data.message) alert(res.data.message); window.location.reload(); }
         else { btn.disabled = false; alert((res.data && res.data.error) || 'Error'); }
       }).catch(function(err) { btn.disabled = false; alert('Error: ' + err); });
     });
@@ -14215,7 +14234,7 @@ SELL_ORDER_MAILTO_URL = (
 )
 
 
-def _message_page(title, message, show_signin=False, show_sell_cta=False, show_signout=False):
+def _message_page(title, message, show_signin=False, show_sell_cta=False, show_signout=False, primary_cta=None):
     """Standalone pre-auth / not-enabled page. Reuses the board's own dark
     palette (not the nav's) since there's no tab shell to sit under here.
 
@@ -14250,6 +14269,9 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
                                f'companies with completed purchases.</p>'
                                if stats["companies_count"] else "")
             raised_html = f'<p class="raised-headline">{_esc(headline_text)} closed for sellers through this desk</p>{companies_html}'
+    if primary_cta:
+        cta_href, cta_label = primary_cta
+        signin_html += f'<p><a class="gg-btn" href="{_esc(cta_href)}">{_esc(cta_label)}</a></p>'
     if show_signout:
         signin_html += f'<p><a class="gg-link" href="{_esc(_signout_url())}">Sign out</a></p>'
     sell_cta_html = ""
@@ -14288,6 +14310,9 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
   .gg-card h1 {{ font-size: 18px; margin: 0 0 12px; }}
   .gg-card p {{ color: #6b7280; font-size: 14px; line-height: 1.5; margin: 0 0 8px; }}
   .gg-link {{ color: #3d5a73; text-decoration: none; font-weight: 600; }}
+  .gg-btn {{ display: inline-block; background: #3d5a73; color: #ffffff; text-decoration: none; font-weight: 600;
+            padding: 10px 18px; border-radius: 6px; margin: 8px 0 4px; }}
+  .gg-btn:hover {{ opacity: 0.9; }}
   .raised-headline {{ font-size: 15px; font-weight: 700; color: #1f7a4d; }}
   .raised-companies {{ font-size: 13px; }}
 </style>
@@ -16511,6 +16536,12 @@ def _handle_update_buyer_note(event):
 
 
 NOT_ENABLED_MESSAGE = "This dashboard is for sellers."
+# First-time seller arriving with ?welcome=1 before their first deal lands.
+WELCOME_TITLE = "Welcome to Blockbook"
+WELCOME_MESSAGE = ("Your first deal is being set up and will appear here within the hour. "
+                   "We'll keep you posted by email.")
+WELCOME_CTA_URL = "https://trades.graciagroup.com/"
+WELCOME_CTA_LABEL = "While you wait, explore what's trading now →"
 
 
 def _perf_infer_page(query):
@@ -16762,13 +16793,23 @@ def _lambda_handler_impl(event, context):
         email = _verify_sso_handoff(sso_token)
         if email:
             location = f"{PUBLIC_BASE_URL}/" if via_public else (event.get("rawPath") or "/")
+            params = []
             tab = query.get("tab")
             if tab:
-                location += f"?tab={urllib.parse.quote(tab, safe='')}"
+                params.append(f"tab={urllib.parse.quote(tab, safe='')}")
+            if query.get("welcome") == "1":
+                params.append("welcome=1")
+            if params:
+                location += "?" + "&".join(params)
+            # Public arrival: the same HttpOnly .graciagroup.com cookie login
+            # links set, so trades recognises the person too. Raw Function
+            # URL stays host-only (a .graciagroup.com cookie can't stick there).
+            cookie = (_make_identity_cookie(email, domain=PUBLIC_COOKIE_DOMAIN) if via_public
+                      else _make_identity_cookie(email))
             return {
                 "statusCode": 302,
                 "headers": {"Location": location},
-                "cookies": [_make_identity_cookie(email)],
+                "cookies": [cookie],
                 "body": "",
             }
 
@@ -16809,6 +16850,9 @@ def _lambda_handler_impl(event, context):
             return _html_response(_signin_page(_request_base_url(event.get("rawPath"))), 403)
         tenant = _resolve_tenant(identity_email)
         if not tenant:
+            if query.get("welcome") == "1":
+                return _html_response(_message_page(WELCOME_TITLE, WELCOME_MESSAGE, show_signout=True,
+                                                    primary_cta=(WELCOME_CTA_URL, WELCOME_CTA_LABEL)))
             return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True,
                                                 show_signout=True))
         viewer_name = tenant["name"]

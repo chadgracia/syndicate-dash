@@ -8837,6 +8837,63 @@ check("Add deal: no IDENTITY_SECRET -> no token, no link",
       and "+ Add deal" not in lf.render_my_deals_page("Adam Add", deals=[], account_email=_ad_email))
 lf.IDENTITY_SECRET = _ad_saved
 
+
+# ======================================================================
+# SECTION: SSO arrival cookie domain, welcome page, Anthropic Re-Open -> Hold
+# ======================================================================
+use_fixture({"people.json": {"people": [{"id": 5601, "full_name": "Adam Add", "email": _ad_email,
+                                         "company_name": "AddCo", "custom_fields": {}}]},
+             "interest_people.json": {"buy": {}},
+             "deals.json": {"deals": [{"id": 56010, "name": "AddCo sell", "company": {"name": "AddCo"},
+                                       "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(),
+                                       "people": [{"id": 5601}], "updated_at": "2026-08-01T00:00:00Z"}]}})
+_wl_new = "newseller@freshco.com"
+_wl_r = _tl_path("/blockbook/", {"sso": lf._make_handoff_token(_wl_new), "welcome": "1", "tab": "overview"})
+check("sso arrival via public: 302, Domain=.graciagroup.com HttpOnly cookie, welcome=1 kept",
+      _wl_r["statusCode"] == 302 and len(_wl_r["cookies"]) == 1
+      and "Domain=.graciagroup.com" in _wl_r["cookies"][0] and "HttpOnly" in _wl_r["cookies"][0]
+      and _wl_r["headers"]["Location"] == f"{lf.PUBLIC_BASE_URL}/?tab=overview&welcome=1")
+_wl_raw = _tl_get({"sso": lf._make_handoff_token(_wl_new), "welcome": "1"})
+check("sso arrival via raw Function URL: host-only cookie, welcome=1 kept",
+      _wl_raw["statusCode"] == 302 and "Domain=" not in _wl_raw["cookies"][0]
+      and _wl_raw["headers"]["Location"] == "/?welcome=1")
+_wl_page = _tl_get({"welcome": "1"}, cookies=[tenant_cookie(_wl_new)])["body"]
+check("non-tenant with welcome=1: welcome page, trades button, Sign out",
+      "Welcome to Blockbook" in _wl_page
+      and "Your first deal is being set up and will appear here within the hour. We&#x27;ll keep you posted by email."
+      in _wl_page.replace("We'll", "We&#x27;ll")
+      and '<a class="gg-btn" href="https://trades.graciagroup.com/">While you wait, explore what&#x27;s trading now →</a>'
+      in _wl_page.replace("what's", "what&#x27;s")
+      and ">Sign out</a>" in _wl_page and lf.NOT_ENABLED_MESSAGE not in _wl_page)
+_wl_old = _tl_get({}, cookies=[tenant_cookie(_wl_new)])["body"]
+check("non-tenant without welcome=1: old not-enabled message unchanged",
+      lf.NOT_ENABLED_MESSAGE in _wl_old and "Welcome to Blockbook" not in _wl_old and 'class="gg-btn"' not in _wl_old)
+check("tenant with welcome=1 still gets the dashboard",
+      "Welcome to Blockbook" not in _tl_get({"welcome": "1"}, cookies=[tenant_cookie(_ad_email)])["body"])
+
+_an_s3, _an_table = _ro_fixture(_ro_deals + [_ro_sell(960061, "Anthropic", lf.OBSOLETE_STAGE_ID)])
+_an_calls = []
+_an_saved = lf._pipeline_update_deal_stage, lf._read_identity_email
+lf._pipeline_update_deal_stage = lambda deal_id, stage_id: (_an_calls.append((deal_id, stage_id, len(_an_table.puts)))
+                                                           or (True, None))
+lf._read_identity_email = lambda event: RO_EMAIL
+ses_calls.clear()
+_an_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960061", "target": "reopen"})})
+_an_audit = [it for it in _an_table.puts if str(it.get("sk", "")).startswith("audit#960061#")]
+check("Anthropic Re-Open: Pipeline PUT to Hold (not Inquiry) before any Dynamo write",
+      _an_resp["statusCode"] == 200 and _an_calls == [("960061", lf.HOLD_STAGE_ID, 0)])
+check("Anthropic Re-Open: Hold override + audit, tenant message, Chad's email notes it",
+      any(u["Key"]["sk"] == "intro#960061" and u["ExpressionAttributeValues"][":s"] == lf.HOLD_STAGE_ID
+          for u in _an_table.updates)
+      and len(_an_audit) == 1 and _an_audit[0]["new"] == {"stage": lf.HOLD_STAGE_ID}
+      and json.loads(_an_resp["body"]) == {"ok": True, "message": "Received — we'll review and confirm before listing."}
+      and len(ses_calls) == 1 and "Anthropic sell: kept on Hold" in ses_calls[0]["Message"]["Body"]["Text"]["Data"])
+_an_calls.clear()
+_an_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen"})})
+check("non-Anthropic Re-Open still goes to Inquiry with a plain ok",
+      [c[:2] for c in _an_calls] == [("960001", lf.STAGE_INQUIRY)] and json.loads(_an_resp["body"]) == {"ok": True})
+lf._pipeline_update_deal_stage, lf._read_identity_email = _an_saved
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)
