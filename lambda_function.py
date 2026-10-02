@@ -12251,7 +12251,7 @@ def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None
         code = _anon_buyer_code(anon_key_email, buyer["person_id"])
         return f"""<div class="buyer-tile">
       <span class="{dot_cls}" title="{dot_title}"></span>
-      <div class="buyer-code">Buyer {_esc(code)}{_standing_ticks_for(buyer["person_id"])}</div>
+      <div class="buyer-code">Buyer {_esc(code)}</div>
       {tier_html}
       {range_html}
     </div>"""
@@ -14696,7 +14696,8 @@ STANDING_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _standing_default_client():
-    return {"visible": False, "respond_repair": 0, "terms_repair": 0, "payments_repair": 0, "tier_floor": None,
+    return {"visible": False, "share_with_sellers": False, "respond_repair": 0, "terms_repair": 0,
+            "payments_repair": 0, "tier_floor": None,
             "referrals": [], "trade_edits": {}, "manual_trades": [], "notes": "", "history": []}
 
 
@@ -14756,6 +14757,9 @@ def _standing_client_record(raw):
     if not isinstance(raw, dict):
         return rec
     rec["visible"] = raw.get("visible") is True
+    # Client consent to show standing to sellers. Set only by the client via
+    # the desk (?action=standing_share); missing on old records = False.
+    rec["share_with_sellers"] = raw.get("share_with_sellers") is True
     for f in STANDING_REPAIR_FIELDS:
         rec[f] = _standing_int(raw.get(f), 0, STANDING_REPAIR_MAX) or 0
     rec["tier_floor"] = raw.get("tier_floor") if raw.get("tier_floor") in STANDING_TIERS else None
@@ -14766,6 +14770,7 @@ def _standing_client_record(raw):
             # longer means anything: every referral reads as True.
             refs.append({"person_id": str(r["person_id"]).strip(),
                          "confirmed_unrelated": True,
+                         "household_override": r.get("household_override") is True,
                          "added_at": r.get("added_at")})
     rec["referrals"] = refs
     rec["trade_edits"] = _standing_trade_edits(raw.get("trade_edits"))
@@ -14987,12 +14992,25 @@ def _standing_related(client_rec, other_rec):
     return any(_is_corporate_domain(d) for d in doms_a & doms_b)
 
 
+def _standing_last_name(rec):
+    return ((rec or {}).get("last_name") or "").strip().lower()
+
+
+def _standing_household(client_rec, other_rec):
+    """True when two people share a last name (case-insensitive, both
+    non-blank): a possible household member, which never counts unless
+    Chad sets household_override on that referral."""
+    a, b = _standing_last_name(client_rec), _standing_last_name(other_rec)
+    return bool(a and b and a == b)
+
+
 def _standing_referral_detail(client_pid, client_rec, ref_pid, by_id):
     """Onboarding facts for one referred person. onboarded = exists, not
     the client, and has completed the form(s) their role requires (seller:
     engagement form Yes/N/A; buyer: IQF Yes/Unnecessary; both: both);
     "missing" lists what is still needed. A referral is Confirmed when
-    onboarded and not same-firm (no relationship checkbox)."""
+    onboarded, not same-firm and not a possible household (same last name)
+    unless household_override is set. No relationship checkbox."""
     ref_pid = str(ref_pid)
     rec = by_id.get(ref_pid)
     cf = (rec or {}).get("custom_fields") or {}
@@ -15013,6 +15031,7 @@ def _standing_referral_detail(client_pid, client_rec, ref_pid, by_id):
         "onboarded": rec is not None and not is_self and not missing,
         "missing": missing,
         "related": (not is_self) and _standing_related(client_rec, rec),
+        "household": (not is_self) and _standing_household(client_rec, rec),
     }
 
 
@@ -15068,9 +15087,13 @@ def compute_client_standing(person_id, state=None):
     for r in client["referrals"]:
         detail = _standing_referral_detail(pid, rec, r["person_id"], by_id)
         detail["confirmed_unrelated"] = r["confirmed_unrelated"]
+        detail["household_override"] = r.get("household_override") is True
         detail["added_at"] = r.get("added_at")
-        # Same-firm referrals (shared company_id / corporate domain) never count.
-        detail["confirmed"] = detail["onboarded"] and not detail["related"]
+        # Same-firm referrals (shared company_id / corporate domain) never count;
+        # a possible household (same last name) counts only with the override.
+        detail["excluded"] = detail["self"] or detail["related"] or (
+            detail["household"] and not detail["household_override"])
+        detail["confirmed"] = detail["onboarded"] and not detail["excluded"]
         referrals.append(detail)
     confirmed = sum(1 for r in referrals if r["confirmed"])
     computed = _standing_computed_tier(good_standing, tr["volume"], tr["trades_250k"], tr["trades_1m"], confirmed)
@@ -15078,12 +15101,14 @@ def compute_client_standing(person_id, state=None):
     tier = floor if _standing_tier_rank(floor) > _standing_tier_rank(computed) else computed
     return {
         "person_id": pid, "has_record": stored is not None, "record": client, "visible": client["visible"],
+        "share_with_sellers": client["share_with_sellers"],
+        "seller_visible": client["visible"] and client["share_with_sellers"],
         "roles": roles,
         "id_forms_done": flags["id_forms_done"], "qualification_done": flags["qualification_done"],
         "won_deals": won_deals, "trades": tr["trades"], "volume": tr["volume"],
         "trades_250k": tr["trades_250k"], "trades_1m": tr["trades_1m"], "unknown_size": tr["unknown_size"],
         "items": items, "done_count": sum(1 for i in items if i["done"]), "good_standing": good_standing,
-        "referrals": referrals, "confirmed_referrals": confirmed, "pending_referrals": sum(1 for r in referrals if not (r["confirmed"] or r["related"] or r["self"])),
+        "referrals": referrals, "confirmed_referrals": confirmed, "pending_referrals": sum(1 for r in referrals if not (r["confirmed"] or r["excluded"])),
         "computed_tier": computed, "tier": tier, "discount_pct": STANDING_DISCOUNT_PCT.get(tier, 0),
     }
 
@@ -15103,14 +15128,15 @@ def _next_n(n, word):
 
 # ── Seller-facing surfaces ───────────────────────────────────────────────
 def _standing_seller_items(person_id):
-    """The five items for a seller surface, or None when hidden (client not
-    marked visible, unknown person, or any error)."""
+    """The five items for a seller surface, or None when hidden: shown ONLY
+    when Chad marked the client visible AND the client consented
+    (share_with_sellers); unknown person or any error = hidden."""
     try:
         state = _load_client_standing()
         if state is None:
             return None
         cs = compute_client_standing(person_id, state=state)
-        if cs is None or not cs["visible"]:
+        if cs is None or not cs["seller_visible"]:
             return None
         return cs["items"]
     except Exception as e:
@@ -15170,7 +15196,12 @@ def _standing_buyer_page_card_html(person_id, admin):
         return ('<div class="card standing-card" style="margin-top:12px">'
                 '<div class="buyer-section-heading">Client standing (hidden from sellers)</div>'
                 '<div class="buyer-page-note">Standing file could not be loaded.</div></div>')
-    heading = "Client standing (sellers see this)" if cs["visible"] else "Client standing (hidden from sellers)"
+    if cs["seller_visible"]:
+        heading = "Client standing (sellers see this)"
+    elif cs["visible"]:
+        heading = "Client standing (hidden from sellers — client has not agreed to share)"
+    else:
+        heading = "Client standing (hidden from sellers)"
     return _standing_card_html(cs["items"], heading)
 
 
@@ -15224,7 +15255,8 @@ def standing_json_payload(pid):
         items.append({"label": "Completed trades", "done": cs["trades"] >= 1,
                       "note": f"{_plural(cs['trades'], 'trade')} · {_fmt_standing_musd(cs['volume'])}"})
         tier = cs["tier"]
-        return {"visible": True, "tier": tier, "tier_label": STANDING_TIER_LABELS.get(tier),
+        return {"visible": True, "share_with_sellers": cs["share_with_sellers"],
+                "tier": tier, "tier_label": STANDING_TIER_LABELS.get(tier),
                 "discount_pct": STANDING_DISCOUNT_PCT.get(tier, 0), "good_standing": cs["good_standing"],
                 "items": items, "tiers_url": STANDING_TIERS_URL}
     except Exception as e:
@@ -15234,7 +15266,16 @@ def standing_json_payload(pid):
 
 # ── Admin scoreboard: ?key=ADMIN_KEY&view=standing ───────────────────────
 STANDING_ROW_REF_KEYS = ("person_id", "name", "firm", "role", "cef_label", "iqf_label", "onboarded", "missing",
-                         "related", "self", "exists", "confirmed_unrelated", "added_at")
+                         "related", "self", "exists", "confirmed_unrelated", "added_at", "household",
+                         "household_override")
+
+
+def _standing_share_at(client):
+    """When share_with_sellers last changed (the consent record), or None."""
+    for h in reversed(client.get("history") or []):
+        if h.get("field") == "share_with_sellers":
+            return h.get("at")
+    return None
 
 
 def _standing_row(pid, rec, state):
@@ -15247,6 +15288,9 @@ def _standing_row(pid, rec, state):
         "id_forms": cs["id_forms_done"], "qual": cs["qualification_done"], "roles": cs["roles"],
         "won": cs["won_deals"], "has_record": cs["has_record"],
         "rec": {k: client[k] for k in STANDING_EDIT_FIELDS if k != "referrals"},
+        # Read-only on the scoreboard: consent comes only from the client.
+        "share": client["share_with_sellers"], "share_at": _standing_share_at(client),
+        "last": _standing_last_name(rec),
         "refs": [{k: r[k] for k in STANDING_ROW_REF_KEYS} for r in cs["referrals"]],
         "history": client["history"],
     }
@@ -15360,7 +15404,10 @@ def _validate_standing_client(pid, raw, now, old_refs):
             return None, (f"{pid}: referral #{rp} shares a company or corporate email domain with the client; "
                           "same-firm referrals never count")
         seen.add(rp)
-        refs.append({"person_id": rp, "confirmed_unrelated": True,
+        hh = r.get("household_override", False)
+        if not isinstance(hh, bool):
+            return None, f"{pid}: referral #{rp} household override must be true/false"
+        refs.append({"person_id": rp, "confirmed_unrelated": True, "household_override": hh,
                      "added_at": old_added.get(rp) or now})
     rec["referrals"] = refs
     edits_in = raw.get("trade_edits", {})
@@ -15407,7 +15454,8 @@ def _validate_standing_client(pid, raw, now, old_refs):
 
 def _standing_hist_value(field, v):
     if field == "referrals":
-        return [{"person_id": r["person_id"], "confirmed_unrelated": r["confirmed_unrelated"]} for r in v]
+        return [{"person_id": r["person_id"], "confirmed_unrelated": r["confirmed_unrelated"],
+                 "household_override": r.get("household_override") is True} for r in v]
     return v
 
 
@@ -15546,6 +15594,49 @@ def _handle_save_standing(event):
                            "clients": len(clients_in)})
 
 
+def _handle_standing_share(event):
+    """POST ?action=standing_share -- admin key (the desk calls it server-side
+    on the client's behalf). Body {pid, share: bool}. Toggles ONLY
+    share_with_sellers; refuses an unknown pid (404) or a client not marked
+    visible (409). Every change appends history {field share_with_sellers,
+    from, to, reason "set by client on desk"} -- the consent record. An
+    unchanged value writes nothing. Returns the new standing_json payload."""
+    body = _parse_json_body(event)
+    if not _admin_key_ok(event, body):
+        return _json_response({"error": "forbidden"}, 403)
+    pid = str(body.get("pid") or "").strip()
+    share = body.get("share")
+    if not (pid.isdigit() and pid.isascii()):
+        return _json_response({"error": "pid must be numeric"}, 400)
+    if not isinstance(share, bool):
+        return _json_response({"error": "share must be true/false"}, 400)
+    if pid not in _people_data()["by_id"]:
+        return _json_response({"error": "unknown pid"}, 404)
+    s3 = _s3_client()
+    try:
+        current_raw = _s3_read_json_fresh(s3, STANDING_KEY)
+    except Exception as e:
+        print(f"standing_share read failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not read the standing file. Nothing was saved."}, 502)
+    current = _normalize_standing_state(current_raw) if current_raw is not None else _standing_empty_state()
+    old = current["clients"].get(pid)
+    if old is None or not old["visible"]:
+        return _json_response({"error": "client standing is not visible"}, 409)
+    if old["share_with_sellers"] != share:
+        now = _iso_utc()
+        new_state = copy.deepcopy(current)
+        _standing_migrate_legacy(new_state, now)
+        rec = new_state["clients"][pid]
+        rec["history"].append({"at": now, "field": "share_with_sellers", "from": old["share_with_sellers"],
+                               "to": share, "reason": "set by client on desk"})
+        rec["share_with_sellers"] = share
+        try:
+            _standing_finish_write(s3, current_raw, current, new_state, now, "standing_share")
+        except _S3WriteError as e:
+            return _json_response({"error": e.message}, 502)
+    return _json_response(standing_json_payload(pid))
+
+
 def _handle_standing_view(query):
     """GET ?key=ADMIN_KEY&view=standing (caller verified the key). With
     &search=<q> (optional &for=<client pid>) returns JSON search results."""
@@ -15656,7 +15747,7 @@ __BANNER__
 <table>
 <thead><tr><th class="st-selcol"><label><input type="checkbox" id="st-all"> Select</label></th><th>Name</th><th>Firm</th><th>ID forms</th><th>Qualification</th>
 <th>Terms</th><th>Payments</th><th>Responds</th><th>Trades</th><th>Referrals</th>
-<th>Tier floor</th><th>Visible</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
+<th>Tier floor</th><th>Visible</th><th>Shared with sellers</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
 </table>
 </div>
@@ -15672,7 +15763,7 @@ STANDING_PAGE_JS = r"""
 (function() {
   var D = STANDING, rows = D.rows, byId = {}, orig = {}, edits = {}, forceSave = {};
   var selected = {}, openRefs = null, openTrades = {}, openHist = {}, page = 0;
-  var COLS = 15;
+  var COLS = 16;
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
     return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
@@ -15693,7 +15784,7 @@ STANDING_PAGE_JS = r"""
   function cur(r) { return edits[r.id] || orig[r.id]; }
   function edit(r) { if (!edits[r.id]) edits[r.id] = clone(orig[r.id]); return edits[r.id]; }
   function sig(s) { return JSON.stringify([s.rec, s.refs.map(function(x) {
-    return [x.person_id, !!x.confirmed_unrelated]; })]); }
+    return [x.person_id, !!x.household_override]; })]); }
   function changed(r) { return !!forceSave[r.id] || (!!edits[r.id] && sig(edits[r.id]) !== sig(orig[r.id])); }
   function rank(t) { return D.tiers.indexOf(t); }
   function tradeStats(r) {
@@ -15706,7 +15797,8 @@ STANDING_PAGE_JS = r"""
       t250: known.filter(function(v) { return v >= D.size_250k; }).length,
       t1m: known.filter(function(v) { return v >= D.size_1m; }).length, unknown: list.length - known.length};
   }
-  function refConfirmed(x) { return !!(x.onboarded && !x.related && !x.self); }
+  function refExcluded(x) { return !!(x.self || x.related || (x.household && !x.household_override)); }
+  function refConfirmed(x) { return !!(x.onboarded && !refExcluded(x)); }
   function standing(r) {
     var s = cur(r), rec = s.rec, ts = tradeStats(r);
     var roles = r.roles || {seller: false, buyer: true};
@@ -15716,7 +15808,8 @@ STANDING_PAGE_JS = r"""
     if (good) { comp = (ts.vol >= D.plat_vol || ts.t1m >= D.plat_1m) ? 'platinum' :
       ((ts.vol >= D.gold_vol || ts.t250 >= D.gold_250k) ? 'gold' : (conf >= 1 ? 'preferred' : null)); }
     var tier = rank(rec.tier_floor) > rank(comp) ? rec.tier_floor : comp;
-    return {good: good, tier: tier, conf: conf, pend: s.refs.length - conf, ts: ts};
+    var pend = s.refs.filter(function(x) { return !refConfirmed(x) && !refExcluded(x); }).length;
+    return {good: good, tier: tier, conf: conf, pend: pend, ts: ts};
   }
   function filtered() {
     var q = document.getElementById('st-q').value.trim().toLowerCase();
@@ -15755,7 +15848,7 @@ STANDING_PAGE_JS = r"""
   function fmtVal(v) {
     if (v == null || v === '') return '—';
     if (Array.isArray(v)) return v.length ? v.map(function(x) { return x && x.person_id ? '#' + x.person_id +
-      (x.confirmed_unrelated ? ' ✓' : '') : (x && x.label ? x.label + ' ' + (x.size_usd != null ? money(x.size_usd) : '?') : JSON.stringify(x)); }).join(', ') : '(none)';
+      (x.household_override ? ' (counts — invests separately)' : '') : (x && x.label ? x.label + ' ' + (x.size_usd != null ? money(x.size_usd) : '?') : JSON.stringify(x)); }).join(', ') : '(none)';
     if (typeof v === 'object') return JSON.stringify(v);
     return String(v);
   }
@@ -15785,6 +15878,9 @@ STANDING_PAGE_JS = r"""
       '<td data-role="refs">' + refsCell(r) + '</td>' +
       '<td><select data-act="floor">' + floorOpts + '</select></td>' +
       '<td><input type="checkbox" data-act="visible"' + (rec.visible ? ' checked' : '') + '></td>' +
+      '<td title="' + esc(r.share ? (r.share_at ? 'Client agreed on ' + String(r.share_at).slice(0, 10) : 'Client agreed') :
+        (r.share_at ? 'Client stopped sharing on ' + String(r.share_at).slice(0, 10) : 'Client has not agreed')) + '">' +
+        (r.share ? '<span class="st-yes">✓</span>' : '<span class="st-muted">—</span>') + '</td>' +
       '<td class="st-tier" data-role="tier">' + tierHtml(r) + '</td>' +
       '<td><textarea class="st-notes" data-act="notes" maxlength="' + D.notes_max + '" rows="1">' + esc(rec.notes) + '</textarea></td>' +
       '<td>' + (hist.length ? '<a href="#" data-act="hist">History (' + hist.length + ')</a>' : '<span class="st-muted">History (0)</span>') + '</td></tr>' +
@@ -15825,6 +15921,7 @@ STANDING_PAGE_JS = r"""
   function refStatus(x) {
     if (x.self) return '<span class="st-warn">this is the client</span>';
     if (x.related) return '<span class="st-warn">Same firm — never counts</span>';
+    if (x.household && !x.household_override) return '<span class="st-warn">Possible household — doesn\'t count</span>';
     if (!x.onboarded) return '<span class="st-amber">Pending onboarding — needs ' + esc((x.missing || []).join(' and ')) + '</span>';
     return '<span class="st-yes">Confirmed</span>';
   }
@@ -15837,6 +15934,8 @@ STANDING_PAGE_JS = r"""
     var s = cur(r);
     var list = s.refs.map(function(x, i) {
       return '<div style="padding:6px 0;border-bottom:1px solid #ececea">' + refLine(x) +
+        (x.household && !x.related && !x.self ? '<label><input type="checkbox" data-act="hhok" data-i="' + i + '"' +
+          (x.household_override ? ' checked' : '') + '> Counts — they invest separately</label> ' : '') +
         '<button type="button" data-act="refdel" data-i="' + i + '">Remove</button></div>';
     }).join('') || '<div class="st-muted">No referrals yet.</div>';
     return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><h2>Referrals for ' + esc(r.name) + '</h2>' + list +
@@ -15911,10 +16010,10 @@ STANDING_PAGE_JS = r"""
       edit(r).rec.manual_trades.push({label: label, size_usd: size, date: date || ''}); render();
     }
     else if (act === 'refadd') { var x = JSON.parse(el.getAttribute('data-ref')); var s2 = edit(r);
-      if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = true; s2.refs.push(x); }
+      if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = true; x.household_override = false; s2.refs.push(x); }
       render(); }
   });
-  var CHANGE_ACTS = {sel: 1, visible: 1, floor: 1, tinc: 1};
+  var CHANGE_ACTS = {sel: 1, visible: 1, floor: 1, hhok: 1, tinc: 1};
   body.addEventListener('change', function(e) {
     var el = e.target, act = el.getAttribute('data-act');
     if (!act || !CHANGE_ACTS[act]) return;
@@ -15923,6 +16022,7 @@ STANDING_PAGE_JS = r"""
     var s = edit(r);
     if (act === 'visible') s.rec.visible = el.checked;
     else if (act === 'floor') s.rec.tier_floor = el.value || null;
+    else if (act === 'hhok') s.refs[+el.getAttribute('data-i')].household_override = el.checked;
     else if (act === 'tinc') { var did = el.closest('tr[data-deal]').getAttribute('data-deal');
       var te = s.rec.trade_edits[did] || (s.rec.trade_edits[did] = {size_usd: null, excluded: false});
       te.excluded = !el.checked; cleanEdit(s.rec, did); }
@@ -15979,7 +16079,8 @@ STANDING_PAGE_JS = r"""
     var b = e.target.closest('[data-addclient]'); if (!b) return;
     var p = JSON.parse(b.getAttribute('data-addclient'));
     addRow({id: p.id, name: p.name, firm: p.firm, email: p.email, id_forms: p.id_forms, qual: p.qual,
-      won: p.won || [], roles: p.roles, has_record: true, rec: p.rec, refs: p.refs, history: p.history || []});
+      won: p.won || [], roles: p.roles, has_record: true, rec: p.rec, refs: p.refs, history: p.history || [],
+      share: !!p.share, share_at: p.share_at || null});
     if (!p.has_record) forceSave[p.id] = 1;
     page = 0; render(); searchMore();
   });
@@ -16016,7 +16117,7 @@ STANDING_PAGE_JS = r"""
       clients[r.id] = {visible: !!s.rec.visible, terms_repair: s.rec.terms_repair, payments_repair: s.rec.payments_repair,
         respond_repair: s.rec.respond_repair, tier_floor: s.rec.tier_floor || null, notes: s.rec.notes || '',
         trade_edits: s.rec.trade_edits, manual_trades: s.rec.manual_trades,
-        referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: true}; })};
+        referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: true, household_override: !!x.household_override}; })};
     });
     if (!Object.keys(clients).length) { msg('st-ok', 'Nothing to save.'); return; }
     saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
@@ -16189,7 +16290,7 @@ def _referral_person_brief(pid):
     if rec is None:
         return None
     return {"id": str(pid), "name": _person_display_name(rec) or f"#{pid}", "firm": rec.get("company_name") or "",
-            "email": (_person_all_emails(rec) or [""])[0]}
+            "email": (_person_all_emails(rec) or [""])[0], "last": _standing_last_name(rec)}
 
 
 def _suggestion_view(sug):
@@ -16216,6 +16317,9 @@ def _suggestion_view(sug):
         "referred_name": (_person_display_name(referred_rec) if referred_rec else "") or sug.get("referred_name") or "",
         "referred_company": (referred_rec or {}).get("company_name") or sug.get("referred_company") or "",
         "referred_exists": referred_rec is not None,
+        # Same last name as the referrer: listed (never dropped) and flagged
+        # "Possible household"; the client-side check re-runs on a pick.
+        "referred_last": _standing_last_name(referred_rec),
         "referrer_name": sug.get("referrer_name") or "", "referrer_email": sug.get("referrer_email") or "",
         "state": state, "via": res["via"], "referrer": referrer, "candidates": candidates,
         "evidence": sug.get("evidence") or "",
@@ -16532,8 +16636,13 @@ STANDING_IMPORT_PAGE_JS = r"""
     if (r.referrer_email && r.status !== 'approved') h += '<div class="st-muted">' + esc(r.referrer_email) + '</div>';
     return h;
   }
+  // Same last name as the referrer: listed, never dropped. An approved one
+  // does not count until Chad ticks "Counts — they invest separately" on the scoreboard.
+  function household(r) { var ref = r.status === 'approved' ? r.referrer : referrerOf(r);
+    return !!(ref && ref.last && r.referred_last && ref.last === r.referred_last); }
   function kindCell(r) { return esc(D.kind_labels[r.kind] || r.kind) +
     (r.kind === 'cc' ? '<span class="st-cc">CC\'ed — check</span>' : '') +
+    (household(r) ? '<span class="st-cc">Possible household — doesn\'t count</span>' : '') +
     (picks[r.key] && picks[r.key].related == null ? '<div class="st-muted">same-firm check on save</div>' : ''); }
   function evCell(r) { var e = r.evidence || '';
     if (e.length <= 160 || openEv[r.key]) return esc(e) + (e.length > 160 ? ' <a href="#" data-act="ev">less</a>' : '');
@@ -16613,7 +16722,7 @@ STANDING_IMPORT_PAGE_JS = r"""
         .then(function(x) { return x.json(); }).then(function(d) {
           var res = ((d && d.results) || []).filter(function(p) { return p.id !== r.referred_id; });
           box.innerHTML = res.map(function(p) {
-            var person = {id: p.id, name: p.name, firm: p.firm, email: p.email, related: null};
+            var person = {id: p.id, name: p.name, firm: p.firm, email: p.email, last: p.last || '', related: null};
             return '<div>' + esc(p.name) + (p.firm ? ' · ' + esc(p.firm) : '') + ' <button type="button" data-act="use" data-person="' +
               esc(JSON.stringify(person)) + '">Use</button></div>'; }).join('') || '<div class="st-muted">No matches</div>';
         }).catch(function(err) { box.innerHTML = '<div class="st-flag">Search failed: ' + esc(err) + '</div>'; });
@@ -17706,6 +17815,11 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_save_standing(event)
+
+    if query.get("action") == "standing_share":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_standing_share(event)
 
     if query.get("action") == "standing_import_load":
         if method != "POST":

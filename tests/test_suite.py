@@ -8396,6 +8396,10 @@ _st_people = {"people": [
     {"id": 18, "full_name": "Bertan İlbak", "email": "bertan@ilbak.com.tr", "custom_fields": {}},
     {"id": 19, "full_name": "Sam Same", "email": "sam1@firmone.com", "company_name": "Firm One", "custom_fields": {}},
     {"id": 20, "full_name": "Sam Same", "email": "sam2@firmtwo.com", "company_name": "Firm Two", "custom_fields": {}},
+    {"id": 21, "first_name": "Hal", "last_name": "Harlow", "email": "hal@halco.com", "custom_fields": dict(_ST_GOOD)},
+    {"id": 22, "first_name": "Hana", "last_name": "HARLOW ", "email": "hana@hanaco.com",
+     "custom_fields": {lf.IQF_FIELD: 6596073}},
+    {"id": 23, "first_name": "Wes", "last_name": "", "email": "wes@wesco.com", "custom_fields": {lf.IQF_FIELD: 6596073}},
 ]}
 _ST_WON, _ST_WON2 = 111802, 2379321
 _st_deals = [
@@ -8563,6 +8567,37 @@ check("referral: only confirmed count toward Preferred",
       _st_cs(13, {"13": {"referrals": [{"person_id": "14", "confirmed_unrelated": True},
                                        {"person_id": "15", "confirmed_unrelated": True}]}})["tier"] is None)
 
+# --- Household rule: same last name (case-insensitive, both non-blank) never counts without the override
+_c = _st_cs(21, {"21": {"referrals": [{"person_id": "22"}]}})
+check("household: same last name (case/space-insensitive) flagged, onboarded but not confirmed, not pending",
+      _c["referrals"][0]["household"] and _c["referrals"][0]["onboarded"] and not _c["referrals"][0]["confirmed"]
+      and _c["confirmed_referrals"] == 0 and _c["pending_referrals"] == 0 and _c["tier"] is None)
+_c = _st_cs(21, {"21": {"referrals": [{"person_id": "22", "household_override": True}]}})
+check("household: override 'Counts — they invest separately' -> Confirmed, Preferred",
+      _c["referrals"][0]["confirmed"] and _c["confirmed_referrals"] == 1 and _c["tier"] == "preferred"
+      and _c["record"]["referrals"][0]["household_override"] is True)
+check("household: blank last name never matches",
+      not _st_cs(21, {"21": {"referrals": [{"person_id": "23"}]}})["referrals"][0]["household"]
+      and not lf._standing_household({"last_name": ""}, {"last_name": ""}))
+check("household: different last names not flagged", not _st_ref(5)[0]["household"])
+_st_put({}, rev=0)
+check("household: referral editor search flags the referred person for that client",
+      (lambda res: res and res[0]["ref"]["household"] is True)(
+          [x for x in lf.standing_search("hana", for_pid="21") if x["id"] == "22"]))
+check("household: import rows carry both last names (listed, not dropped) and the page flags them",
+      lf._referral_person_brief(21)["last"] == "harlow"
+      and lf._suggestion_view({"key": "22|21", "referred_person_id": "22", "referrer_person_id": "21",
+                               "referrer_name": "Hal Harlow", "status": "pending", "kind": "reference"})
+      ["referred_last"] == "harlow"
+      and "Possible household — doesn\\'t count" in lf.STANDING_IMPORT_PAGE_JS)
+check("household: scoreboard panel has the flag and the override toggle",
+      "Possible household — doesn\\'t count" in lf.STANDING_PAGE_JS
+      and "Counts — they invest separately" in lf.STANDING_PAGE_JS and "hhok: 1" in lf.STANDING_PAGE_JS
+      and "relationship" not in lf.STANDING_PAGE_JS)
+check("household: stored non-true override reads as false",
+      _st_cs(21, {"21": {"referrals": [{"person_id": "22", "household_override": "yes"}]}})["record"]["referrals"][0]
+      ["household_override"] is False)
+
 # --- Admin gating
 def _st_get(q, cookies=None):
     return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
@@ -8713,6 +8748,30 @@ check("referral flip: adding Rita (CEF Yes + Accredited, box ticked) -> Preferre
       _r["statusCode"] == 200 and _st_tia["trades"] == 0 and _st_tia["confirmed_referrals"] == 1
       and _st_tia["tier"] == "preferred" and _st_tia["discount_pct"] == 10)
 
+# Household override via save_standing: validated, stored, logged in history.
+_st_put({"21": {"visible": True, "share_with_sellers": True, "referrals": [{"person_id": "22"}]}}, rev=30)
+_r = _st_post({"key": ADMIN_KEY, "rev": 30, "clients": {"21": _st_row(
+    visible=True, referrals=[{"person_id": "22", "household_override": "yes"}])}})
+check("household save: non-bool override rejected 400", _r["statusCode"] == 400
+      and _st_s3.objs[lf.STANDING_KEY]["rev"] == 30)
+_r = _st_post({"key": ADMIN_KEY, "rev": 30, "clients": {"21": _st_row(
+    visible=True, share_with_sellers=False, referrals=[{"person_id": "22", "household_override": True}])}})
+_st_c21 = _st_s3.objs[lf.STANDING_KEY]["clients"]["21"]
+_st_h21 = [h for h in _st_c21["history"] if h["field"] == "referrals"]
+check("household save: override stored + one referrals history entry showing it",
+      _r["statusCode"] == 200 and _st_c21["referrals"][0]["household_override"] is True
+      and len(_st_h21) == 1 and _st_h21[0]["from"][0]["household_override"] is False
+      and _st_h21[0]["to"][0]["household_override"] is True)
+check("save_standing cannot change share_with_sellers (consent only from the client)",
+      _st_c21["share_with_sellers"] is True and not any(h["field"] == "share_with_sellers" for h in _st_c21["history"]))
+lf._req_cache_reset()
+check("household save: Hal now Preferred via the overridden referral", lf.compute_client_standing(21)["tier"] == "preferred")
+_st_put({"2": {"terms_repair": 1}}, rev=31)
+_r = _st_post({"key": ADMIN_KEY, "rev": 31, "clients": {"13": _st_row(notes="z")}})
+check("migration: records without share_with_sellers read and store as false",
+      _r["statusCode"] == 200 and _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["share_with_sellers"] is False
+      and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["share_with_sellers"] is False)
+
 # Migration: old overrides, "private" and global settings stop counting; first save logs the overrides.
 _st_put({"2": {"private": False, "trades_override": 7, "volume_override_usd": 7654321, "tier_floor": None},
          "3": {"trades_override": None, "volume_override_usd": 20000000}},
@@ -8738,16 +8797,16 @@ check("migration: not repeated on the next save",
 
 # --- Seller surfaces (per-person Visible)
 _ST_SECRET_CLIENTS = {
-    "2": {"visible": True, "terms_repair": 3, "payments_repair": 0, "respond_repair": 0, "tier_floor": "platinum",
+    "2": {"visible": True, "share_with_sellers": True, "terms_repair": 3, "payments_repair": 0, "respond_repair": 0, "tier_floor": "platinum",
           "referrals": [{"person_id": "5", "confirmed_unrelated": True, "added_at": "2026-09-01T00:00:00Z"}],
           "trade_edits": {"953": {"size_usd": 7654321, "excluded": False}},
           "manual_trades": [{"label": "ZZMANUALTRADE", "size_usd": 1234567, "date": "2020-01-01"}],
           "notes": "ZZINTERNALNOTE",
           "history": [{"at": "2026-09-01T00:00:00Z", "field": "terms_repair", "from": 0, "to": 3,
                        "reason": "ZZSECRETREASON"}]},
-    "3": {"visible": True, "respond_repair": 2, "tier_floor": "gold",
+    "3": {"visible": True, "share_with_sellers": True, "respond_repair": 2, "tier_floor": "gold",
           "referrals": [{"person_id": "5", "confirmed_unrelated": True}]},
-    "10": {"visible": True},
+    "10": {"visible": True, "share_with_sellers": True},
 }
 
 
@@ -8779,9 +8838,14 @@ check("anonymous buyer page: ticks count only applicable items ('Good standing: 
 check("pending cell: ticks next to the Buyer code",
       re.search(r'Buyer [A-Z0-9]{4}</span><span class="gs-ticks"[^>]*title="Good standing: 2 of 4"',
                 _st_pages["active intros (pending cell)"]) is not None)
-check("demand tile: ticks on Buyer tiles (Bob 2/4, Ivy 3/4 -- engagement form n/a for buyers)",
-      'title="Good standing: 2 of 4"' in _st_pages["company page (demand tiles)"]
-      and 'title="Good standing: 3 of 4"' in _st_pages["company page (demand tiles)"])
+_st_tiles = _st_pages["company page (demand tiles)"]
+_st_tile_divs = re.findall(r'<div class="buyer-tile">(.*?)</div>\s*</div>', _st_tiles, re.S)
+check("demand tiles: never carry standing, even for visible + shared clients (Bob, Ivy)",
+      len(_st_tile_divs) >= 2 and all("gs-ticks" not in d and "Good standing" not in d for d in _st_tile_divs))
+check("demand tiles: the tile helper itself never renders standing",
+      "gs-ticks" not in lf._buyer_tile_html({"person_id": 3, "ticket_range": (None, None), "updated_at": None,
+                                             "custom_fields": {}, "tier": None, "iqf_pending": False},
+                                            TENANT_EMAIL, datetime.now(timezone.utc)))
 _st_tick = lf._standing_ticks_html(lf.compute_client_standing(3)["items"])
 check("anonymous ticks carry only the count: no name, id or firm",
       "Bob" not in _st_tick and "Beta" not in _st_tick
@@ -8797,6 +8861,24 @@ for _name, _html in _st_pages.items():
           and "platinum" not in _low and "repair" not in _low and "override" not in _low and "tier_floor" not in _low
           and "trade_edits" not in _low and "referral" not in _low and "discount" not in _low and "CEF" not in _html
           and "to go" not in _low)
+
+_st_noshare = json.loads(json.dumps(_ST_SECRET_CLIENTS))
+for _c in _st_noshare.values():
+    _c["share_with_sellers"] = False
+_st_put(_st_noshare)
+for _name, _html in _st_tenant_pages().items():
+    check(f"share_with_sellers=false (visible=true): {_name} renders no standing at all",
+          "Client standing" not in _html and "gs-ticks" not in _html and "Good standing" not in _html)
+check("share_with_sellers=false: admin buyer page says the client has not agreed",
+      "Client standing (hidden from sellers — client has not agreed to share)"
+      in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
+check("share_with_sellers=false: standing_json still visible, reports share false",
+      (lambda d: d["visible"] is True and d["share_with_sellers"] is False)(
+          json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"])))
+_st_put({"2": {"share_with_sellers": True, "visible": False}})
+for _name, _html in _st_tenant_pages().items():
+    check(f"share=true but visible=false: {_name} renders no standing",
+          "Client standing" not in _html and "gs-ticks" not in _html)
 
 _st_hidden = json.loads(json.dumps(_ST_SECRET_CLIENTS))
 for _c in _st_hidden.values():
@@ -8833,6 +8915,59 @@ check("admin buyer page (edit mode): labeled 'sellers see this' when visible",
 check("admin anonymized preview: full card shown too",
       "Client standing (sellers see this)" in _st_get({"buyer": "3", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
 
+
+# --- Client consent: POST ?action=standing_share (admin key; desk calls it for the client)
+def _st_share(body, method="POST"):
+    return lf.lambda_handler({"requestContext": {"http": {"method": method}}, "rawPath": "/",
+                              "queryStringParameters": {"action": "standing_share"},
+                              "body": json.dumps(body), "cookies": []}, None)
+
+_st_put({"2": {"visible": True, "notes": "keep", "terms_repair": 3}, "3": {"visible": False}}, rev=40)
+check("standing_share: no key -> 403", _st_share({"pid": "2", "share": True})["statusCode"] == 403)
+check("standing_share: wrong key -> 403", _st_share({"key": "nope", "pid": "2", "share": True})["statusCode"] == 403)
+check("standing_share: tenant cookie is not enough -> 403",
+      lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                         "queryStringParameters": {"action": "standing_share"},
+                         "body": json.dumps({"pid": "2", "share": True}),
+                         "cookies": [tenant_cookie(TENANT_EMAIL)]}, None)["statusCode"] == 403)
+check("standing_share: GET -> 405", _st_share({"key": ADMIN_KEY, "pid": "2", "share": True}, "GET")["statusCode"] == 405)
+check("standing_share: non-numeric pid -> 400", _st_share({"key": ADMIN_KEY, "pid": "x2", "share": True})["statusCode"] == 400)
+check("standing_share: share not bool -> 400", _st_share({"key": ADMIN_KEY, "pid": "2", "share": "yes"})["statusCode"] == 400)
+check("standing_share: unknown pid -> 404", _st_share({"key": ADMIN_KEY, "pid": "424242", "share": True})["statusCode"] == 404)
+check("standing_share: client not visible -> 409", _st_share({"key": ADMIN_KEY, "pid": "3", "share": True})["statusCode"] == 409)
+check("standing_share: no record -> 409", _st_share({"key": ADMIN_KEY, "pid": "13", "share": True})["statusCode"] == 409)
+check("standing_share: refusals write nothing", _st_s3.objs[lf.STANDING_KEY]["rev"] == 40)
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": True})
+_st_obj = _st_s3.objs[lf.STANDING_KEY]
+_st_c = _st_obj["clients"]["2"]
+_st_sh = [h for h in _st_c["history"] if h["field"] == "share_with_sellers"]
+check("standing_share: on -> 200, returns standing_json with share true",
+      _r["statusCode"] == 200 and (lambda d: d["visible"] is True and d["share_with_sellers"] is True
+                                   and "items" in d)(json.loads(_r["body"])))
+check("standing_share: consent history entry with timestamp and reason",
+      len(_st_sh) == 1 and _st_sh[0]["from"] is False and _st_sh[0]["to"] is True
+      and _st_sh[0]["reason"] == "set by client on desk" and re.match(r"^\d{4}-\d{2}-\d{2}T", _st_sh[0]["at"]))
+check("standing_share: toggles only that field, rev+1",
+      _st_c["share_with_sellers"] is True and _st_c["visible"] is True and _st_c["notes"] == "keep"
+      and _st_c["terms_repair"] == 3 and _st_obj["rev"] == 41 and _st_obj["clients"]["3"]["share_with_sellers"] is False)
+_st_s3.put_calls.clear()
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": True})
+check("standing_share: unchanged value writes nothing", _r["statusCode"] == 200 and not _st_s3.put_calls
+      and _st_s3.objs[lf.STANDING_KEY]["rev"] == 41)
+check("standing_share: seller surfaces now show standing for Alice",
+      ">Client standing<" in _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"])
+_st_sd = _st_page_data(_st_get({"view": "standing", "key": ADMIN_KEY})["body"])
+_st_row2 = [x for x in _st_sd["rows"] if x["id"] == "2"][0]
+check("scoreboard: read-only 'Shared with sellers' column with the consent date",
+      ">Shared with sellers</th>" in _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
+      and _st_row2["share"] is True and _st_row2["share_at"] == _st_sh[0]["at"]
+      and "share_with_sellers" not in _st_row2["rec"])
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": False})
+_st_c = _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]
+check("standing_share: off -> second history entry, seller surfaces hide again",
+      _r["statusCode"] == 200 and json.loads(_r["body"])["share_with_sellers"] is False
+      and [h["to"] for h in _st_c["history"] if h["field"] == "share_with_sellers"] == [True, False]
+      and ">Client standing<" not in _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"])
 
 # --- Desk JSON
 def _st_json(pid):
@@ -8917,7 +9052,7 @@ check("roles: nothing found -> buyer (default)", lf._standing_roles(13) == {"sel
 check("roles: Sell + Buy deals -> both", lf._standing_roles(1) == {"seller": True, "buyer": True}
       and lf._standing_roles(12) == {"seller": True, "buyer": True})
 check("slim: Sell Interest field kept in the slim index", lf.SELL_INTEREST_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
-_st_put({"16": {"visible": True}, "17": {"visible": True}})
+_st_put({"16": {"visible": True, "share_with_sellers": True}, "17": {"visible": True, "share_with_sellers": True}})
 _cs = lf.compute_client_standing(16)
 check("not applicable: seller with engagement form only is in good standing (IQF not required)",
       _cs["good_standing"] and [i["key"] for i in _cs["items"]] == ["id_forms", "terms", "payments", "respond"])
