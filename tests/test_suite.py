@@ -8518,7 +8518,7 @@ check("admin scoreboard: rows = interest buy ids + buy-deal people (unknown ids 
       _st_ids == ["1", "10", "2", "3"])
 check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 4") == 1)
 check("admin scoreboard: rows embedded as JSON, not one server-rendered <tr> each",
-      _st_page["body"].count("<tr") < 5 and "Show standing to sellers" in _st_page["body"]
+      _st_page["body"].split("<script>")[0].count("<tr") == 1 and "Show standing to sellers" in _st_page["body"]
       and "Show status to buyers" in _st_page["body"])
 check("admin scoreboard: missing file = both settings off, rev 0",
       _st_data["settings"] == {"sellers_visible": False, "buyers_visible": False} and _st_data["rev"] == 0)
@@ -8539,7 +8539,7 @@ check("save: repair 6 rejected 400, nothing written", _r["statusCode"] == 400 an
 
 def _st_row(**kw):
     row = {"private": False, "terms_repair": 0, "payments_repair": 0, "respond_repair": 0, "trades_override": None,
-           "volume_override_usd": None, "tier_floor": None, "referrals": []}
+           "volume_override_usd": None, "tier_floor": None, "referrals": [], "notes": ""}
     row.update(kw)
     return row
 _r = _st_post({"key": ADMIN_KEY, "rev": 0, "clients": {"2": _st_row(referrals=[{"person_id": "2"}])}})
@@ -8548,15 +8548,15 @@ _st_s3.put_calls.clear()
 _r = _st_post({"key": ADMIN_KEY, "rev": 0, "settings": {"sellers_visible": True},
                "clients": {"2": _st_row(terms_repair=2, tier_floor="gold",
                                         referrals=[{"person_id": "5", "confirmed_unrelated": True}])},
-               "reasons": {"2": "Late wire on Old Co"}})
+               "reasons": {"2": "ignored"}})
 _st_saved = _st_s3.objs.get(lf.STANDING_KEY) or {}
 check("save: first save on a missing file -> 200, rev 1", _r["statusCode"] == 200 and _st_saved.get("rev") == 1)
 check("save: no backup when there was no file to copy",
       [c["Key"] for c in _st_s3.put_calls] == [lf.STANDING_KEY])
 _st_h = _st_saved["clients"]["2"]["history"]
-check("save: one history entry per changed field, with reason",
+check("save: one history entry per changed field, reason left blank",
       sorted(h["field"] for h in _st_h) == ["referrals", "terms_repair", "tier_floor"]
-      and all(h["reason"] == "Late wire on Old Co" for h in _st_h)
+      and all(h["reason"] == "" for h in _st_h)
       and next(h for h in _st_h if h["field"] == "terms_repair")["from"] == 0
       and next(h for h in _st_h if h["field"] == "terms_repair")["to"] == 2)
 check("save: settings stored, referral added_at set",
@@ -8576,8 +8576,14 @@ check("save: day's first write copies the current object to the dated backup fir
 check("save: unchanged fields add no history (only private changed)",
       [h["field"] for h in _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"]][-1:] == ["private"]
       and len(_st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"]) == 4)
+_r = _st_post({"key": ADMIN_KEY, "rev": 2, "clients": {"2": _st_row(notes="x" * 2001)}})
+check("save: notes over 2000 chars rejected 400", _r["statusCode"] == 400)
 _st_s3.put_calls.clear()
-_r = _st_post({"key": ADMIN_KEY, "rev": 2, "clients": {"2": _st_row(private=False)}})
+_r = _st_post({"key": ADMIN_KEY, "rev": 2, "clients": {"2": _st_row(private=False, notes="Prefers calls")}})
+check("save: notes stored and logged to history like any field",
+      _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["notes"] == "Prefers calls"
+      and {"field": "notes", "from": "", "to": "Prefers calls"}.items()
+      <= _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"][-1].items())
 check("save: later writes the same day never rewrite the backup",
       _r["statusCode"] == 200 and [c["Key"] for c in _st_s3.put_calls] == [lf.STANDING_KEY]
       and _st_s3.objs[_st_bkey]["rev"] == 1)
@@ -8604,6 +8610,7 @@ _ST_SECRET_CLIENTS = {
     "2": {"private": False, "terms_repair": 3, "payments_repair": 0, "respond_repair": 0, "trades_override": 7,
           "volume_override_usd": 7654321, "tier_floor": "platinum",
           "referrals": [{"person_id": "5", "confirmed_unrelated": True, "added_at": "2026-09-01T00:00:00Z"}],
+          "notes": "ZZINTERNALNOTE",
           "history": [{"at": "2026-09-01T00:00:00Z", "field": "terms_repair", "from": 0, "to": 3,
                        "reason": "ZZSECRETREASON"}]},
     "3": {"respond_repair": 2, "trades_override": 7, "volume_override_usd": 7654321, "tier_floor": "gold",
@@ -8651,7 +8658,8 @@ check("anonymous surfaces: no buyer names leak with standing on",
 for _name, _html in _st_pages.items():
     _low = _html.lower()
     check(f"tenant HTML ({_name}): no repair/override/floor/referral/history values, no tier/discount, no 'CEF'",
-          "7654321" not in _html and "7.7M" not in _html and "ZZSECRETREASON" not in _html and "Rita" not in _html
+          "7654321" not in _html and "7.7M" not in _html and "ZZSECRETREASON" not in _html
+          and "ZZINTERNALNOTE" not in _html and "Rita" not in _html
           and "platinum" not in _low and "repair" not in _low and "override" not in _low and "tier_floor" not in _low
           and "referral" not in _low and "discount" not in _low and "CEF" not in _html)
 
@@ -8725,7 +8733,7 @@ check("standing_json: referral item", _d["items"][5] == {"label": "Introduced a 
 check("standing_json: trades item uses override trades/volume",
       _d["items"][6] == {"label": "Completed trades", "done": True, "note": "7 trades · $7.7M"})
 check("standing_json: no internal fields (history/reason/floor/repairs)",
-      "ZZSECRETREASON" not in _r["body"] and "repair" not in _r["body"] and "history" not in _r["body"])
+      "ZZSECRETREASON" not in _r["body"] and "ZZINTERNALNOTE" not in _r["body"] and "repair" not in _r["body"] and "history" not in _r["body"])
 _r, _d = _st_json(3)
 check("standing_json: ID forms open -> engagement-form note + form_url",
       _d["items"][0] == {"label": "Identity and compliance forms complete", "done": False,
@@ -8735,12 +8743,17 @@ check("standing_json: qualification open note",
 check("standing_json: respond note singular/plural",
       _d["items"][4]["note"] == "Reply within 3 business days on your next 2 introductions.")
 check("standing_json: Bob's floor gold applies without good standing", _d["tier"] == "gold" and _d["discount_pct"] == 15)
-_st_put({"2": {"payments_repair": 1}}, buyers=True)
+_st_put({"2": {"payments_repair": 1, "terms_repair": 1, "respond_repair": 1}}, buyers=True)
 _d = _st_json(2)[1]
-check("standing_json: payments note singular; auto trades/volume note",
-      _d["items"][3]["note"] == "Meet the payment deadlines on your next 1 trade."
+check("standing_json: count 1 drops the number; auto trades/volume note",
+      _d["items"][3]["note"] == "Meet the payment deadlines on your next trade."
       and _d["items"][6]["note"] == "2 trades · $4.0M" and _d["items"][5]["done"] is False
-      and _d["items"][5]["note"] == "0 completed onboarding with Rainmaker" and _d["tier"] is None)
+      and _d["items"][5]["note"] == "0 completed onboarding with Rainmaker" and _d["tier"] is None
+      and _d["items"][2]["note"] == "Complete your next trade on the agreed terms."
+      and _d["items"][4]["note"] == "Reply within 3 business days on your next introduction.")
+check("admin scoreboard: notes and history embedded for the admin page only",
+      "notes_max" in _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
+      and lf._standing_default_client()["notes"] == "" and "notes" in lf.STANDING_EDIT_FIELDS)
 _st_s3.objs.pop(lf.STANDING_KEY, None)
 lf._data_cache.pop(lf.STANDING_KEY, None)
 check("standing_json: missing file -> visible false", _st_json(2)[1] == {"visible": False})

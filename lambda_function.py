@@ -14543,11 +14543,11 @@ STANDING_REPAIR_FIELDS = ("respond_repair", "terms_repair", "payments_repair")
 STANDING_REPAIR_MAX = 5
 STANDING_REFERRAL_LEVEL_IDS = {ACCREDITED_ID, QC_ID, QP_ID}
 STANDING_MAX_REFERRALS = 50
-STANDING_REASON_MAX_LEN = 500
+STANDING_NOTES_MAX_LEN = 2000
 STANDING_PAGE_ROWS = 100
 STANDING_SEARCH_LIMIT = 25
 STANDING_EDIT_FIELDS = ("private", "respond_repair", "terms_repair", "payments_repair", "trades_override",
-                        "volume_override_usd", "tier_floor", "referrals")
+                        "volume_override_usd", "tier_floor", "referrals", "notes")
 # (key, tenant-safe label) in display order -- the wording sellers and the
 # desk see. Never "CEF".
 STANDING_ITEMS = (
@@ -14565,7 +14565,7 @@ PIPELINE_PERSON_URL = "https://app.pipelinecrm.com/people/{}"
 def _standing_default_client():
     return {"private": False, "respond_repair": 0, "terms_repair": 0, "payments_repair": 0,
             "trades_override": None, "volume_override_usd": None, "tier_floor": None,
-            "referrals": [], "history": []}
+            "referrals": [], "notes": "", "history": []}
 
 
 def _standing_empty_state():
@@ -14610,6 +14610,7 @@ def _standing_client_record(raw):
                          "confirmed_unrelated": r.get("confirmed_unrelated") is True,
                          "added_at": r.get("added_at")})
     rec["referrals"] = refs
+    rec["notes"] = raw.get("notes")[:STANDING_NOTES_MAX_LEN] if isinstance(raw.get("notes"), str) else ""
     rec["history"] = [h for h in (raw.get("history") or []) if isinstance(h, dict)]
     return rec
 
@@ -14815,6 +14816,11 @@ def _plural(n, word):
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
+def _next_n(n, word):
+    """"introduction" for 1, "2 introductions" for 2+ (desk notes)."""
+    return word if n == 1 else f"{n} {word}s"
+
+
 # ── Seller-facing surfaces ───────────────────────────────────────────────
 def _standing_seller_items(person_id):
     """The five items for a seller surface, or None when hidden (sellers
@@ -14912,12 +14918,12 @@ def standing_json_payload(pid):
                 k = i["key"]
                 if k == "respond":
                     item["note"] = (f"Reply within 3 business days on your next "
-                                    f"{_plural(rec['respond_repair'], 'introduction')}.")
+                                    f"{_next_n(rec['respond_repair'], 'introduction')}.")
                 elif k == "terms":
-                    item["note"] = f"Complete your next {_plural(rec['terms_repair'], 'trade')} on the agreed terms."
+                    item["note"] = f"Complete your next {_next_n(rec['terms_repair'], 'trade')} on the agreed terms."
                 elif k == "payments":
                     item["note"] = (f"Meet the payment deadlines on your next "
-                                    f"{_plural(rec['payments_repair'], 'trade')}.")
+                                    f"{_next_n(rec['payments_repair'], 'trade')}.")
                 else:
                     item["note"] = STANDING_ITEM_OPEN_NOTES[k]
                 if k == "id_forms":
@@ -14952,7 +14958,7 @@ def _standing_row(pid, rec, state):
         "refs": [{k: r[k] for k in ("person_id", "name", "firm", "cef_label", "level_label", "base_ok",
                                     "related", "self", "exists", "confirmed_unrelated", "added_at")}
                  for r in cs["referrals"]],
-        "history_count": len(client["history"]),
+        "history": client["history"],
     }
 
 
@@ -14974,7 +14980,7 @@ def standing_admin_rows(state):
 
 def standing_search(query, for_pid=None):
     """Admin-only people-slim search (name/email/company, case-insensitive)
-    for the Add client box and the referral editor."""
+    for the "Not on the scoreboard yet" list and the referral editor."""
     q = (query or "").strip().lower()
     if len(q) < 2:
         return []
@@ -15011,7 +15017,7 @@ def render_standing_page(key):
     data = {
         "key": key or "", "rev": 0 if load_error else state["rev"], "load_error": load_error,
         "settings": (state or _standing_empty_state())["settings"], "rows": rows,
-        "page_rows": STANDING_PAGE_ROWS, "repair_max": STANDING_REPAIR_MAX,
+        "page_rows": STANDING_PAGE_ROWS, "repair_max": STANDING_REPAIR_MAX, "notes_max": STANDING_NOTES_MAX_LEN,
         "tiers": list(STANDING_TIERS), "tier_labels": STANDING_TIER_LABELS, "discounts": STANDING_DISCOUNT_PCT,
         "plat_vol": STANDING_PLATINUM_VOLUME_USD, "plat_trades": STANDING_PLATINUM_TRADES,
         "gold_vol": STANDING_GOLD_VOLUME_USD, "person_url": PIPELINE_PERSON_URL,
@@ -15067,6 +15073,10 @@ def _validate_standing_client(pid, raw, now, old_refs):
         refs.append({"person_id": rp, "confirmed_unrelated": r.get("confirmed_unrelated") is True,
                      "added_at": old_added.get(rp) or now})
     rec["referrals"] = refs
+    notes = raw.get("notes", "")
+    if not isinstance(notes, str) or len(notes) > STANDING_NOTES_MAX_LEN:
+        return None, f"{pid}: notes must be text of at most {STANDING_NOTES_MAX_LEN} characters"
+    rec["notes"] = notes
     return rec, None
 
 
@@ -15078,9 +15088,9 @@ def _standing_hist_value(field, v):
 
 def _handle_save_standing(event):
     """POST ?action=save_standing -- admin only. Body {key, rev, settings?,
-    clients: {pid: {every editable field}}, reasons: {pid: text}}. Rejected
-    whole on any invalid row; 409 when the stored rev moved; daily backup
-    before the day's first write; one history entry per changed field."""
+    clients: {pid: {every editable field}}}. Rejected whole on any invalid
+    row; 409 when the stored rev moved; daily backup before the day's
+    first write; one history entry (reason blank) per changed field."""
     body = _parse_json_body(event)
     query = event.get("queryStringParameters") or {}
     admin_key = os.environ.get("ADMIN_KEY")
@@ -15090,10 +15100,9 @@ def _handle_save_standing(event):
     if rev is None:
         return _json_response({"error": "rev must be a whole number"}, 400)
     clients_in = body.get("clients") or {}
-    reasons = body.get("reasons") or {}
     settings_in = body.get("settings")
-    if not isinstance(clients_in, dict) or not isinstance(reasons, dict):
-        return _json_response({"error": "clients/reasons must be objects"}, 400)
+    if not isinstance(clients_in, dict):
+        return _json_response({"error": "clients must be an object"}, 400)
     if settings_in is not None and not (isinstance(settings_in, dict) and all(
             k in ("sellers_visible", "buyers_visible") and isinstance(v, bool) for k, v in settings_in.items())):
         return _json_response({"error": "settings must be sellers_visible/buyers_visible true/false"}, 400)
@@ -15130,13 +15139,12 @@ def _handle_save_standing(event):
         new_vals, err = _validate_standing_client(pid, raw, now, old["referrals"])
         if err:
             return _json_response({"error": err}, 400)
-        reason = str(reasons.get(pid) or "").strip()[:STANDING_REASON_MAX_LEN]
         rec = copy.deepcopy(old)
         for field in STANDING_EDIT_FIELDS:
             before = _standing_hist_value(field, old[field])
             after = _standing_hist_value(field, new_vals[field])
             if before != after:
-                rec["history"].append({"at": now, "field": field, "from": before, "to": after, "reason": reason})
+                rec["history"].append({"at": now, "field": field, "from": before, "to": after, "reason": ""})
                 changed_fields += 1
             rec[field] = new_vals[field]
         new_state["clients"][pid] = rec
@@ -15198,7 +15206,10 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
   th { font-size: 11px; color: #374151; text-transform: uppercase; letter-spacing: .03em; white-space: nowrap; }
   input[type=search], input[type=text], input[type=number] { padding: 5px 7px; font-size: 13px;
          border: 1px solid #d1d5db; border-radius: 5px; box-sizing: border-box; }
-  input[type=number] { width: 84px; }
+  input[type=number] { width: 110px; }
+  textarea.st-notes { width: 180px; min-height: 28px; font: 12px/1.35 inherit; resize: vertical; overflow: hidden;
+         border: 1px solid #d1d5db; border-radius: 5px; padding: 4px 6px; box-sizing: border-box; }
+  .st-hint { font-size: 11px; color: #6b7280; margin-top: 2px; white-space: nowrap; }
   .st-banner { padding: 10px 12px; border-radius: 6px; margin: 8px 0; font-weight: 600; }
   .st-err { background: #fde8e8; color: #b91c1c; }
   .st-ok { background: #e7f5ec; color: #1f7a4d; }
@@ -15231,11 +15242,7 @@ __BANNER__
   <label><input type="checkbox" id="st-buyers"> Show status to buyers — <span id="st-buyers-state"></span></label>
 </div>
 <div class="st-bar">
-  <input type="search" id="st-add" placeholder="Add client: search name, email or company…" style="min-width:320px">
-</div>
-<div id="st-add-results" class="st-results"></div>
-<div class="st-bar">
-  <input type="search" id="st-q" placeholder="Search name, firm or id…" style="min-width:260px">
+  <input type="search" id="st-q" placeholder="Search name, firm, email or id…" style="min-width:300px">
   <select id="st-tier"><option value="">Any tier</option><option value="none">No tier</option>
     <option value="preferred">Preferred</option><option value="gold">Gold</option><option value="platinum">Platinum</option></select>
   <label><input type="checkbox" id="st-bad"> Not in good standing</label>
@@ -15253,11 +15260,13 @@ __BANNER__
 <table>
 <thead><tr><th><input type="checkbox" id="st-all"></th><th>Name</th><th>Firm</th><th>ID forms</th><th>Qualification</th>
 <th>Terms repair</th><th>Payments repair</th><th>Responds repair</th><th>Trades</th><th>Volume</th><th>Referrals</th>
-<th>Tier floor</th><th>Private</th><th>Tier</th><th>Reason</th></tr></thead>
+<th>Tier floor</th><th>Private</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
 </table>
 <div class="st-bar"><button type="button" id="st-prev">Prev</button><span id="st-page" class="st-muted"></span>
 <button type="button" id="st-next">Next</button></div>
+<div id="st-more" hidden><h2 style="font-size:14px;margin:18px 0 6px">Not on the scoreboard yet</h2>
+<div id="st-add-results" class="st-results"></div></div>
 </div>
 <div class="st-save"><span id="st-dirty">No unsaved changes</span><button type="button" id="st-savebtn">Save changes</button></div>
 <script>var STANDING = __DATA__;</script>
@@ -15267,16 +15276,18 @@ __BANNER__
 
 STANDING_PAGE_JS = r"""
 (function() {
-  var D = STANDING, rows = D.rows, byId = {}, orig = {}, edits = {}, reasons = {}, forceSave = {};
-  var selected = {}, openPanel = null, page = 0, settings = {sellers_visible: !!D.settings.sellers_visible,
+  var D = STANDING, rows = D.rows, byId = {}, orig = {}, edits = {}, forceSave = {};
+  var selected = {}, openPanel = null, openHist = {}, page = 0, settings = {sellers_visible: !!D.settings.sellers_visible,
     buyers_visible: !!D.settings.buyers_visible};
+  var COLS = 16;
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
     return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
   function musd(v) { return '$' + ((v || 0) / 1e6).toFixed(1) + 'M'; }
-  function addRow(r) { if (byId[r.id]) return; rows.push(r); byId[r.id] = r;
+  function track(r) { byId[r.id] = r; if (r.rec.notes == null) r.rec.notes = '';
     orig[r.id] = {rec: clone(r.rec), refs: clone(r.refs)}; }
-  rows.slice().forEach(function(r) { byId[r.id] = r; orig[r.id] = {rec: clone(r.rec), refs: clone(r.refs)}; });
+  function addRow(r) { if (byId[r.id]) return; rows.push(r); track(r); }
+  rows.slice().forEach(track);
   function cur(r) { return edits[r.id] || orig[r.id]; }
   function edit(r) { if (!edits[r.id]) edits[r.id] = clone(orig[r.id]); return edits[r.id]; }
   function sig(s) { return JSON.stringify([s.rec, s.refs.map(function(x) {
@@ -15319,13 +15330,27 @@ STANDING_PAGE_JS = r"""
   function rep(r, f) { var v = cur(r).rec[f];
     return '<span class="st-rep"><button type="button" data-act="dec" data-f="' + f + '">−</button><span>' + v +
       '</span><button type="button" data-act="inc" data-f="' + f + '">+</button></span>'; }
+  function tierHtml(r) { var st = standing(r);
+    return esc(st.tier ? (D.tier_labels[st.tier] + ' · ' + D.discounts[st.tier] + '%') : '—') +
+      (st.good ? '' : '<div class="st-muted">not in good standing</div>'); }
+  function tradesHint(r) { var o = cur(r).rec.trades_override;
+    return o == null ? '' : 'Pipeline: ' + r.auto_trades + ' · <a href="#" data-act="reset" data-f="trades_override">reset</a>'; }
+  function volHint(r) { var o = cur(r).rec.volume_override_usd;
+    return o == null ? '' : 'Pipeline: ' + musd(r.auto_volume) + ' · <a href="#" data-act="reset" data-f="volume_override_usd">reset</a>'; }
+  function fmtVal(v) {
+    if (v == null || v === '') return '—';
+    if (Array.isArray(v)) return v.length ? v.map(function(x) { return x && x.person_id ? '#' + x.person_id +
+      (x.confirmed_unrelated ? ' ✓' : '') : JSON.stringify(x); }).join(', ') : '(none)';
+    if (typeof v === 'object') return JSON.stringify(v);
+    return String(v);
+  }
   function rowHtml(r) {
     var s = cur(r), rec = s.rec, st = standing(r);
     var personUrl = D.person_url.replace('{}', encodeURIComponent(r.id));
-    var tierTxt = st.tier ? (D.tier_labels[st.tier] + ' · ' + D.discounts[st.tier] + '%') : '—';
     var floorOpts = ['', 'preferred', 'gold', 'platinum'].map(function(t) {
       return '<option value="' + t + '"' + ((rec.tier_floor || '') === t ? ' selected' : '') + '>' +
         (t ? D.tier_labels[t] : '—') + '</option>'; }).join('');
+    var hist = r.history || [];
     return '<tr data-id="' + esc(r.id) + '"' + (changed(r) ? ' class="st-changed"' : '') + '>' +
       '<td><input type="checkbox" data-act="sel"' + (selected[r.id] ? ' checked' : '') + '></td>' +
       '<td><a href="?buyer=' + encodeURIComponent(r.id) + '&key=' + encodeURIComponent(D.key) + '">' + esc(r.name) +
@@ -15334,16 +15359,24 @@ STANDING_PAGE_JS = r"""
       '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' + (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a></td>' +
       '<td><span class="' + (r.qual ? 'st-yes">✓' : 'st-no">○') + '</span></td>' +
       '<td>' + rep(r, 'terms_repair') + '</td><td>' + rep(r, 'payments_repair') + '</td><td>' + rep(r, 'respond_repair') + '</td>' +
-      '<td><span class="st-muted">auto ' + r.auto_trades + '</span><br><input type="number" min="0" step="1" data-act="trades" placeholder="override" value="' +
-        (rec.trades_override == null ? '' : rec.trades_override) + '"></td>' +
-      '<td><span class="st-muted">auto ' + musd(r.auto_volume) + '</span><br><input type="number" min="0" step="1" data-act="volume" placeholder="override $" value="' +
-        (rec.volume_override_usd == null ? '' : rec.volume_override_usd) + '"></td>' +
+      '<td><input type="number" min="0" step="1" data-act="trades" value="' + st.trades + '">' +
+        '<div class="st-hint" data-role="thint">' + tradesHint(r) + '</div></td>' +
+      '<td><input type="number" min="0" step="1" data-act="volume" value="' + st.vol + '"> <span class="st-muted" data-role="vfmt">' +
+        musd(st.vol) + '</span><div class="st-hint" data-role="vhint">' + volHint(r) + '</div></td>' +
       '<td><a href="#" data-act="refs">' + st.q + ' / ' + s.refs.length + '</a></td>' +
       '<td><select data-act="floor">' + floorOpts + '</select></td>' +
       '<td><input type="checkbox" data-act="private"' + (rec.private ? ' checked' : '') + '></td>' +
-      '<td class="st-tier">' + esc(tierTxt) + (st.good ? '' : '<div class="st-muted">not in good standing</div>') + '</td>' +
-      '<td><input type="text" data-act="reason" placeholder="reason" value="' + esc(reasons[r.id] || '') + '"></td></tr>' +
-      (openPanel === r.id ? panelHtml(r) : '');
+      '<td class="st-tier" data-role="tier">' + tierHtml(r) + '</td>' +
+      '<td><textarea class="st-notes" data-act="notes" maxlength="' + D.notes_max + '" rows="1">' + esc(rec.notes) + '</textarea></td>' +
+      '<td>' + (hist.length ? '<a href="#" data-act="hist">History (' + hist.length + ')</a>' : '<span class="st-muted">History (0)</span>') + '</td></tr>' +
+      (openPanel === r.id ? panelHtml(r) : '') + (openHist[r.id] ? histHtml(r) : '');
+  }
+  function histHtml(r) {
+    var items = (r.history || []).slice().reverse().map(function(h) {
+      return '<div>' + esc(String(h.at || '').slice(0, 10)) + ' · ' + esc(h.field) + ' · ' + esc(fmtVal(h.from)) +
+        ' → ' + esc(fmtVal(h.to)) + '</div>'; }).join('');
+    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><strong>History for ' + esc(r.name) +
+      '</strong><div class="st-results">' + items + '</div></td></tr>';
   }
   function refLine(x) {
     return '<div>' + esc(x.name || ('#' + x.person_id)) + (x.firm ? ' · ' + esc(x.firm) : '') +
@@ -15359,20 +15392,33 @@ STANDING_PAGE_JS = r"""
         '<label><input type="checkbox" data-act="refok" data-i="' + i + '"' + (x.confirmed_unrelated ? ' checked' : '') +
         '> Confirmed new and unrelated</label> <button type="button" data-act="refdel" data-i="' + i + '">Remove</button></div>';
     }).join('') || '<div class="st-muted">No referrals yet.</div>';
-    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="15"><strong>Referrals for ' + esc(r.name) + '</strong>' + list +
-      '<div style="margin-top:8px"><input type="search" data-act="refsearch" placeholder="Search people to add a referral…" style="min-width:300px">' +
+    return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><strong>Referrals for ' + esc(r.name) + '</strong>' + list +
+      '<div style="margin-top:8px"><input type="search" data-act="refsearch" placeholder="Search people to add as a referral" style="min-width:300px">' +
       '<div class="st-results" data-role="refresults"></div></div></td></tr>';
   }
+  function grow(ta) { ta.style.height = 'auto'; ta.style.height = (ta.scrollHeight + 2) + 'px'; }
   function render() {
     var list = filtered(), pages = Math.max(1, Math.ceil(list.length / D.page_rows));
     if (page >= pages) page = pages - 1;
     var slice = list.slice(page * D.page_rows, (page + 1) * D.page_rows);
     document.getElementById('st-body').innerHTML = slice.map(rowHtml).join('') ||
-      '<tr><td colspan="15" class="st-muted">No matches</td></tr>';
+      '<tr><td colspan="' + COLS + '" class="st-muted">No matches</td></tr>';
+    document.querySelectorAll('#st-body textarea.st-notes').forEach(grow);
     document.getElementById('st-page').textContent = 'Page ' + (page + 1) + ' of ' + pages;
     document.getElementById('st-count').textContent = list.length + ' of ' + rows.length + ' people';
     document.getElementById('st-selcount').textContent = Object.keys(selected).length + ' selected';
     document.getElementById('st-all').checked = slice.length > 0 && slice.every(function(r) { return selected[r.id]; });
+    renderDirty();
+  }
+  // In-place refresh of one row's derived bits while its inputs keep focus.
+  function refreshRow(tr, r) {
+    tr.className = changed(r) ? 'st-changed' : '';
+    var q = function(role) { return tr.querySelector('[data-role=' + role + ']'); };
+    var st = standing(r);
+    q('tier').innerHTML = tierHtml(r);
+    q('thint').innerHTML = tradesHint(r);
+    q('vhint').innerHTML = volHint(r);
+    q('vfmt').textContent = musd(st.vol);
     renderDirty();
   }
   function renderDirty() {
@@ -15387,68 +15433,85 @@ STANDING_PAGE_JS = r"""
   }
   function rowOf(el) { var tr = el.closest('tr[data-id]'); return tr ? byId[tr.getAttribute('data-id')] : null; }
   var body = document.getElementById('st-body');
+  // Buttons/links never take focus, so a focused input never blurs (and
+  // never re-renders) between mousedown and click: the click always lands.
+  body.addEventListener('mousedown', function(e) {
+    if (e.target.closest('button, a[data-act]')) e.preventDefault();
+  });
   body.addEventListener('click', function(e) {
     var el = e.target.closest('[data-act]'); if (!el) return; var r = rowOf(el); if (!r) return;
     var act = el.getAttribute('data-act');
     if (act === 'inc' || act === 'dec') { var f = el.getAttribute('data-f'), s = edit(r);
       s.rec[f] = Math.max(0, Math.min(D.repair_max, s.rec[f] + (act === 'inc' ? 1 : -1))); render(); }
     else if (act === 'refs') { e.preventDefault(); openPanel = openPanel === r.id ? null : r.id; render(); }
+    else if (act === 'hist') { e.preventDefault(); if (openHist[r.id]) delete openHist[r.id]; else openHist[r.id] = 1; render(); }
+    else if (act === 'reset') { e.preventDefault(); edit(r).rec[el.getAttribute('data-f')] = null; render(); }
     else if (act === 'refdel') { edit(r).refs.splice(+el.getAttribute('data-i'), 1); render(); }
     else if (act === 'refadd') { var x = JSON.parse(el.getAttribute('data-ref')); var s2 = edit(r);
       if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = false; s2.refs.push(x); }
       render(); }
   });
+  var CHANGE_ACTS = {sel: 1, private: 1, floor: 1, refok: 1};
   body.addEventListener('change', function(e) {
-    var el = e.target, act = el.getAttribute('data-act'), r = rowOf(el); if (!r || !act) return;
+    var el = e.target, act = el.getAttribute('data-act');
+    if (!act || !CHANGE_ACTS[act]) return;
+    var r = rowOf(el); if (!r) return;
     if (act === 'sel') { if (el.checked) selected[r.id] = 1; else delete selected[r.id]; render(); return; }
-    if (act === 'reason') { reasons[r.id] = el.value; return; }
     var s = edit(r);
     if (act === 'private') s.rec.private = el.checked;
     else if (act === 'floor') s.rec.tier_floor = el.value || null;
     else if (act === 'refok') s.refs[+el.getAttribute('data-i')].confirmed_unrelated = el.checked;
-    else if (act === 'trades' || act === 'volume') {
-      var v = el.value.trim(), n = v === '' ? null : Number(v);
-      if (n !== null && (!isFinite(n) || n < 0 || (act === 'trades' && Math.floor(n) !== n))) { el.value = ''; n = null; }
-      s.rec[act === 'trades' ? 'trades_override' : 'volume_override_usd'] = n;
-    }
     render();
   });
   body.addEventListener('input', function(e) {
     var el = e.target, act = el.getAttribute('data-act'), r = rowOf(el); if (!r) return;
-    if (act === 'reason') { reasons[r.id] = el.value; return; }
-    if (act === 'refsearch') { search(el.value, r.id, el.parentNode.querySelector('[data-role=refresults]')); }
+    if (act === 'refsearch') { search(el.value, r.id, el.parentNode.querySelector('[data-role=refresults]')); return; }
+    if (act === 'notes') { edit(r).rec.notes = el.value.slice(0, D.notes_max); grow(el); refreshRow(el.closest('tr'), r); return; }
+    if (act === 'trades' || act === 'volume') {
+      var v = el.value.trim(), n = v === '' ? null : Number(v);
+      var field = act === 'trades' ? 'trades_override' : 'volume_override_usd';
+      var auto = act === 'trades' ? r.auto_trades : r.auto_volume;
+      if (n !== null && (!isFinite(n) || n < 0 || (act === 'trades' && Math.floor(n) !== n))) return;
+      edit(r).rec[field] = (n === null || n === auto) ? null : n;
+      refreshRow(el.closest('tr'), r);
+    }
   });
   var timers = {};
-  function search(q, forId, box) {
+  function search(q, forId, box, after) {
     clearTimeout(timers[forId || '_']);
     timers[forId || '_'] = setTimeout(function() {
-      if (q.trim().length < 2) { box.innerHTML = ''; return; }
+      if (q.trim().length < 2) { box.innerHTML = ''; if (after) after(0); return; }
       fetch('?key=' + encodeURIComponent(D.key) + '&view=standing&search=' + encodeURIComponent(q) +
         (forId ? '&for=' + encodeURIComponent(forId) : '')).then(function(r) { return r.json(); }).then(function(d) {
         var res = (d && d.results) || [];
+        if (!forId) res = res.filter(function(p) { return !byId[p.id]; });
         box.innerHTML = res.map(function(p) {
           if (forId) { return '<div>' + refLine(p.ref) + ' <button type="button" data-act="refadd" data-ref="' +
             esc(JSON.stringify(p.ref)) + '"' + (p.ref.self ? ' disabled' : '') + '>Add</button></div>'; }
           return '<div>' + esc(p.name) + (p.firm ? ' · ' + esc(p.firm) : '') + (p.email ? ' · ' + esc(p.email) : '') +
-            (byId[p.id] ? ' <span class="st-muted">(already listed)</span>' :
-              ' <button type="button" data-addclient="' + esc(JSON.stringify(p)) + '">Add client</button>') + '</div>';
-        }).join('') || '<div class="st-muted">No matches</div>';
-      }).catch(function(err) { box.innerHTML = '<div class="st-warn">Search failed: ' + esc(err) + '</div>'; });
+            ' <button type="button" data-addclient="' + esc(JSON.stringify(p)) + '">Add client</button></div>';
+        }).join('') || (forId ? '<div class="st-muted">No matches</div>' : '');
+        if (after) after(res.length);
+      }).catch(function(err) { box.innerHTML = '<div class="st-warn">Search failed: ' + esc(err) + '</div>'; if (after) after(1); });
     }, 250);
   }
-  var addBox = document.getElementById('st-add-results');
-  document.getElementById('st-add').addEventListener('input', function(e) { search(e.target.value, null, addBox); });
+  var addBox = document.getElementById('st-add-results'), more = document.getElementById('st-more');
+  function searchMore() {
+    search(document.getElementById('st-q').value, null, addBox, function(n) { more.hidden = !n; });
+  }
+  addBox.addEventListener('mousedown', function(e) { if (e.target.closest('button')) e.preventDefault(); });
   addBox.addEventListener('click', function(e) {
     var b = e.target.closest('[data-addclient]'); if (!b) return;
     var p = JSON.parse(b.getAttribute('data-addclient'));
     addRow({id: p.id, name: p.name, firm: p.firm, email: p.email, id_forms: p.id_forms, qual: p.qual,
-      auto_trades: p.auto_trades, auto_volume: p.auto_volume, has_record: true, rec: p.rec, refs: p.refs, history_count: 0});
+      auto_trades: p.auto_trades, auto_volume: p.auto_volume, has_record: true, rec: p.rec, refs: p.refs,
+      history: p.history || []});
     if (!p.has_record) forceSave[p.id] = 1;
-    document.getElementById('st-q').value = p.name; page = 0; addBox.innerHTML = ''; render();
+    page = 0; render(); searchMore();
   });
-  ['st-q', 'st-tier', 'st-bad', 'st-priv', 'st-sort'].forEach(function(id) {
-    var el = document.getElementById(id);
-    el.addEventListener(el.tagName === 'INPUT' && el.type === 'search' ? 'input' : 'change', function() { page = 0; render(); });
+  document.getElementById('st-q').addEventListener('input', function() { page = 0; render(); searchMore(); });
+  ['st-tier', 'st-bad', 'st-priv', 'st-sort'].forEach(function(id) {
+    document.getElementById(id).addEventListener('change', function() { page = 0; render(); });
   });
   document.getElementById('st-prev').addEventListener('click', function() { if (page > 0) { page--; render(); } });
   document.getElementById('st-next').addEventListener('click', function() { page++; render(); });
@@ -15473,15 +15536,14 @@ STANDING_PAGE_JS = r"""
   var saveBtn = document.getElementById('st-savebtn');
   if (D.load_error) saveBtn.disabled = true;
   saveBtn.addEventListener('click', function() {
-    var clients = {}, rs = {};
+    var clients = {};
     rows.filter(changed).forEach(function(r) { var s = cur(r);
       clients[r.id] = {private: !!s.rec.private, terms_repair: s.rec.terms_repair, payments_repair: s.rec.payments_repair,
         respond_repair: s.rec.respond_repair, trades_override: s.rec.trades_override,
-        volume_override_usd: s.rec.volume_override_usd, tier_floor: s.rec.tier_floor || null,
+        volume_override_usd: s.rec.volume_override_usd, tier_floor: s.rec.tier_floor || null, notes: s.rec.notes || '',
         referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: !!x.confirmed_unrelated}; })};
-      if (reasons[r.id]) rs[r.id] = reasons[r.id];
     });
-    var payload = {key: D.key, rev: D.rev, clients: clients, reasons: rs};
+    var payload = {key: D.key, rev: D.rev, clients: clients};
     if (settingsChanged()) payload.settings = {sellers_visible: settings.sellers_visible, buyers_visible: settings.buyers_visible};
     if (!Object.keys(clients).length && !payload.settings) { msg('st-ok', 'Nothing to save.'); return; }
     saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
