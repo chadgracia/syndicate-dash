@@ -8389,6 +8389,7 @@ _st_people = {"people": [
     {"id": 12, "full_name": "Julio Pekarovic", "email": "julio@jpcap.com", "custom_fields": dict(_ST_GOOD)},
     {"id": 13, "full_name": "Tia Tiers", "email": "tia@tiaco.com", "custom_fields": dict(_ST_GOOD)},
     {"id": 14, "full_name": "Nora Nolevel", "email": "nora@noraco.com", "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID}},
+    {"id": 15, "full_name": "Sid Seller", "email": "sid@sidco.com", "custom_fields": {}},
 ]}
 _ST_WON, _ST_WON2 = 111802, 2379321
 _st_deals = [
@@ -8414,6 +8415,7 @@ _st_deals = [
      "person_ids": [12]},
     {"id": 964, "name": "Mystery Sell", "deal_stage": {"id": _ST_WON}, "value": 123456,
      "custom_fields": {}, "person_ids": [12]},
+    {"id": 965, "name": "Sid Co: $2M Sell", "deal_stage": {"id": _ST_WON}, "custom_fields": cf_sell(), "person_ids": [15]},
 ]
 _st_s3, _ = use_fixture({lf.PEOPLE_KEY: _st_people, lf.INTEREST_KEY: {"buy": {"Gamma Co": [3, 10], "Other": [999]}},
                          lf.DEALS_KEY: {"deals": _st_deals}})
@@ -8577,9 +8579,11 @@ del lf.print
 check("admin scoreboard: 200, private no-store", _st_page["statusCode"] == 200
       and _st_page["headers"]["Cache-Control"] == "private, no-store")
 _st_data = _st_page_data(_st_page["body"])
-check("admin scoreboard: rows = interest buy ids + buy-deal people (unknown ids skipped)",
-      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "2", "3"])
-check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 5") == 1)
+check("admin scoreboard: rows = interest buy ids + buy-deal people + won-deal people (unknown ids skipped)",
+      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "15", "2", "3"])
+check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 6") == 1)
+check("admin scoreboard: Select column header separate from Visible; bulk buttons start disabled",
+      "Select</label></th>" in _st_page["body"] and 'data-bulk="visible_on" disabled' in _st_page["body"])
 _st_html = _st_page["body"].split("<script>")[0]
 check("admin scoreboard: rows embedded as JSON, not one server-rendered <tr> each", _st_html.count("<tr") == 1)
 check("admin scoreboard: no global toggles; Visible column, filters and bulk buttons",
@@ -8864,8 +8868,9 @@ check("standing_json: referral note '1 pending onboarding' only",
                                       "note": "1 pending onboarding"})
 check("standing_json: Julio gets credit for all 4 won deals",
       _st_json(12)[1]["items"][6]["note"] == "4 trades · $8.6M")
-check("standing_json: no referrals, no trades",
-      _st_json(13)[1]["items"][5]["note"] == "0 confirmed" and _st_json(13)[1]["items"][6]["note"] == "0 trades · $0.0M")
+check("standing_json: no referrals -> done false and no note; no trades",
+      _st_json(13)[1]["items"][5] == {"label": "Introduced a new accredited investor", "done": False}
+      and _st_json(13)[1]["items"][6]["note"] == "0 trades · $0.0M")
 _st_s3.objs.pop(lf.STANDING_KEY, None)
 lf._data_cache.pop(lf.STANDING_KEY, None)
 check("standing_json: missing file -> visible false", _st_json(2)[1] == {"visible": False})

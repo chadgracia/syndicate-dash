@@ -15120,7 +15120,7 @@ def _standing_referral_note(confirmed, pending):
         parts.append(f"{confirmed} confirmed")
     if pending:
         parts.append(f"{pending} pending onboarding")
-    return ", ".join(parts) or "0 confirmed"
+    return ", ".join(parts)
 
 
 def standing_json_payload(pid):
@@ -15150,8 +15150,10 @@ def standing_json_payload(pid):
                 if k == "id_forms":
                     item["form_url"] = CEF_FORM_URL
             items.append(item)
-        items.append({"label": "Introduced a new accredited investor", "done": cs["confirmed_referrals"] >= 1,
-                      "note": _standing_referral_note(cs["confirmed_referrals"], cs["pending_referrals"])})
+        ref_item = {"label": "Introduced a new accredited investor", "done": cs["confirmed_referrals"] >= 1}
+        if cs["referrals"]:
+            ref_item["note"] = _standing_referral_note(cs["confirmed_referrals"], cs["pending_referrals"])
+        items.append(ref_item)
         items.append({"label": "Completed trades", "done": cs["trades"] >= 1,
                       "note": f"{_plural(cs['trades'], 'trade')} · {_fmt_standing_musd(cs['volume'])}"})
         tier = cs["tier"]
@@ -15185,14 +15187,16 @@ def _standing_row(pid, rec, state):
 
 def standing_admin_rows(state):
     """Union of interest_people.json "buy" ids, people on >= 1 Buy-tagged
-    deal (any stage) and anyone with a client record; people not in
-    people-slim are skipped (nothing to show)."""
+    deal (any stage), people on >= 1 Won deal (any side) and anyone with a
+    client record; people not in people-slim are skipped (nothing to show)."""
     by_id = _people_data()["by_id"]
     ids = set()
     for pids in (_interest_buy_map() or {}).values():
         for p in pids or []:
             ids.add(str(p))
-    ids |= _standing_deal_index()["buy_any"]
+    deal_index = _standing_deal_index()
+    ids |= deal_index["buy_any"]
+    ids |= set(deal_index["won"].keys())
     ids |= set(state["clients"].keys())
     rows = [_standing_row(pid, by_id[pid], state) for pid in ids if pid in by_id]
     print(f"standing rows: {len(rows)}")
@@ -15509,6 +15513,8 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
   textarea.st-notes { width: 190px; min-height: 30px; font: 12px/1.4 "IBM Plex Sans", sans-serif; resize: vertical;
          overflow: hidden; border: 1px solid #d6d6d2; border-radius: 6px; padding: 5px 7px; box-sizing: border-box; }
   input.st-size { width: 130px; text-align: right; }
+  th.st-selcol, td.st-selcol { background: #f4f4f1; border-right: 2px solid #d6d6d2; text-align: center; width: 56px; }
+  th.st-selcol label { display: flex; flex-direction: column; align-items: center; gap: 2px; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -15529,15 +15535,16 @@ __BANNER__
 <div id="st-add-results" class="st-results"></div></div>
 <div class="st-bar" id="st-bulk">
   <span class="st-muted" id="st-selcount">0 selected</span>
-  <button type="button" data-bulk="visible_on">Make visible</button>
-  <button type="button" data-bulk="visible_off">Hide</button>
-  <button type="button" data-bulk="reset_repairs">Reset repairs to 0</button>
+  <button type="button" data-bulk="visible_on" disabled>Make visible</button>
+  <button type="button" data-bulk="visible_off" disabled>Hide</button>
+  <button type="button" data-bulk="reset_repairs" disabled>Reset repairs</button>
+  <span class="st-muted">Tick rows in the Select column to use these.</span>
 </div>
 <div class="st-tablewrap">
 <div class="st-save"><span id="st-dirty">No unsaved changes</span>
   <button type="button" id="st-savebtn">Save changes</button><div id="st-msg"></div></div>
 <table>
-<thead><tr><th><input type="checkbox" id="st-all"></th><th>Name</th><th>Firm</th><th>ID forms</th><th>Qualification</th>
+<thead><tr><th class="st-selcol"><label><input type="checkbox" id="st-all"> Select</label></th><th>Name</th><th>Firm</th><th>ID forms</th><th>Qualification</th>
 <th>Terms</th><th>Payments</th><th>Responds</th><th>Trades</th><th>Referrals</th>
 <th>Tier floor</th><th>Visible</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
@@ -15560,6 +15567,12 @@ STANDING_PAGE_JS = r"""
     return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
   function usd(v) { return '$' + Math.round(v || 0).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  // Compact display amount used everywhere on the scoreboard: $950, $152K, $8.6M, $1.2B.
+  function money(v) { v = v || 0;
+    if (v >= 1e9) return '$' + (v / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+    if (v >= 1e6) return '$' + (v / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (v >= 1e3) return '$' + Math.round(v / 1e3) + 'K';
+    return '$' + Math.round(v); }
   function parseUsd(v) { v = String(v || '').replace(/[$,\s]/g, '').replace(/\.\d*$/, '');
     if (v === '') return null; var n = Number(v); return (isFinite(n) && n >= 0) ? n : NaN; }
   function track(r) { byId[r.id] = r;
@@ -15623,15 +15636,15 @@ STANDING_PAGE_JS = r"""
     return esc(st.tier ? (D.tier_labels[st.tier] + ' · ' + D.discounts[st.tier] + '%') : '—') +
       (st.good ? '' : '<div class="st-muted" style="font-weight:400">not in good standing</div>'); }
   function tradesCell(r) { var ts = standing(r).ts;
-    return '<a href="#" data-act="trades">Trades (' + ts.trades + ')</a><div class="num">' + usd(ts.vol) + '</div>' +
-      '<div class="st-muted num">≥$250K: ' + ts.t250 + ' · ≥$1M: ' + ts.t1m + '</div>' +
+    return '<a href="#" data-act="trades" class="num">' + ts.trades + ' trade' + (ts.trades === 1 ? '' : 's') + ' · ' +
+      money(ts.vol) + '</a><div class="st-muted num">' + ts.t250 + ' of $250K+ · ' + ts.t1m + ' of $1M+</div>' +
       (ts.unknown ? '<div class="st-amber">' + ts.unknown + ' size unknown</div>' : ''); }
   function refsCell(r) { var st = standing(r);
     return '<a href="#" data-act="refs">' + st.conf + ' confirmed · ' + st.pend + ' pending</a>'; }
   function fmtVal(v) {
     if (v == null || v === '') return '—';
     if (Array.isArray(v)) return v.length ? v.map(function(x) { return x && x.person_id ? '#' + x.person_id +
-      (x.confirmed_unrelated ? ' ✓' : '') : (x && x.label ? x.label + ' ' + (x.size_usd != null ? usd(x.size_usd) : '?') : JSON.stringify(x)); }).join(', ') : '(none)';
+      (x.confirmed_unrelated ? ' ✓' : '') : (x && x.label ? x.label + ' ' + (x.size_usd != null ? money(x.size_usd) : '?') : JSON.stringify(x)); }).join(', ') : '(none)';
     if (typeof v === 'object') return JSON.stringify(v);
     return String(v);
   }
@@ -15643,7 +15656,8 @@ STANDING_PAGE_JS = r"""
         (t ? D.tier_labels[t] : '—') + '</option>'; }).join('');
     var hist = r.history || [];
     return '<tr data-id="' + esc(r.id) + '"' + (changed(r) ? ' class="st-changed"' : '') + '>' +
-      '<td><input type="checkbox" data-act="sel"' + (selected[r.id] ? ' checked' : '') + '></td>' +
+      '<td class="st-selcol"><input type="checkbox" data-act="sel" aria-label="Select ' + esc(r.name) + '"' +
+        (selected[r.id] ? ' checked' : '') + '></td>' +
       '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) + '</a>' +
         (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') + '</td>' +
       '<td>' + esc(r.firm) + '</td>' +
@@ -15668,12 +15682,12 @@ STANDING_PAGE_JS = r"""
         '</td><td class="num">' + esc(d.date || '—') + '</td><td><input type="text" inputmode="numeric" class="st-size num" data-act="tsize" value="' +
         (size == null ? '' : usd(size)) + '" placeholder="size">' +
         (size == null ? ' <span class="st-amber">size unknown</span>' : '') +
-        (e.size_usd != null && d.auto_size !== e.size_usd ? ' <span class="st-muted">Pipeline: ' + (d.auto_size == null ? 'unknown' : usd(d.auto_size)) + '</span>' : '') +
+        (e.size_usd != null && d.auto_size !== e.size_usd ? ' <span class="st-muted">Pipeline: ' + (d.auto_size == null ? 'unknown' : money(d.auto_size)) + '</span>' : '') +
         '</td><td><label><input type="checkbox" data-act="tinc"' + (e.excluded ? '' : ' checked') + '> Include</label></td></tr>';
     }).join('') || '<tr><td colspan="5" class="st-muted">No won deals in Pipeline.</td></tr>';
     var manual = rec.manual_trades.map(function(t, i) {
       return '<tr><td>' + esc(t.label) + ' <span class="st-muted">(not in Pipeline)</span></td><td>—</td><td class="num">' + esc(t.date || '—') +
-        '</td><td class="num">' + (t.size_usd == null ? '<span class="st-amber">size unknown</span>' : usd(t.size_usd)) +
+        '</td><td class="num">' + (t.size_usd == null ? '<span class="st-amber">size unknown</span>' : money(t.size_usd)) +
         '</td><td><button type="button" data-act="mdel" data-i="' + i + '">Remove</button></td></tr>';
     }).join('');
     return '<tr class="st-panel" data-id="' + esc(r.id) + '"><td colspan="' + COLS + '"><h2>Trades for ' + esc(r.name) + '</h2>' +
@@ -15727,7 +15741,7 @@ STANDING_PAGE_JS = r"""
     document.getElementById('st-prev').disabled = page === 0;
     document.getElementById('st-next').disabled = page >= pages - 1;
     document.getElementById('st-count').textContent = list.length + ' of ' + rows.length + ' people';
-    document.getElementById('st-selcount').textContent = Object.keys(selected).length + ' selected';
+    updateBulk();
     document.getElementById('st-all').checked = slice.length > 0 && slice.every(function(r) { return selected[r.id]; });
     renderDirty();
   }
@@ -15739,6 +15753,16 @@ STANDING_PAGE_JS = r"""
     tr.querySelector('[data-role=tier]').innerHTML = tierHtml(r);
     tr.querySelector('[data-role=trades]').innerHTML = tradesCell(r);
     renderDirty();
+  }
+  var BULK_LABELS = {visible_on: ['Make visible', 'Make {n} visible'], visible_off: ['Hide', 'Hide {n}'],
+    reset_repairs: ['Reset repairs', 'Reset repairs on {n}']};
+  function updateBulk() {
+    var n = Object.keys(selected).length;
+    document.getElementById('st-selcount').textContent = n + ' selected';
+    document.querySelectorAll('#st-bulk [data-bulk]').forEach(function(b) {
+      var l = BULK_LABELS[b.getAttribute('data-bulk')];
+      b.disabled = n === 0; b.textContent = n ? l[1].replace('{n}', n) : l[0];
+    });
   }
   function renderDirty() {
     var n = rows.filter(changed).length;
@@ -15856,12 +15880,17 @@ STANDING_PAGE_JS = r"""
   });
   document.getElementById('st-bulk').addEventListener('click', function(e) {
     var op = e.target.getAttribute('data-bulk'); if (!op) return;
-    Object.keys(selected).forEach(function(id) { var r = byId[id]; if (!r) return; var s = edit(r);
+    var ids = Object.keys(selected).filter(function(id) { return byId[id]; });
+    if (!ids.length) return;
+    ids.forEach(function(id) { var s = edit(byId[id]);
       if (op === 'visible_on') s.rec.visible = true;
       else if (op === 'visible_off') s.rec.visible = false;
       else if (op === 'reset_repairs') { s.rec.terms_repair = 0; s.rec.payments_repair = 0; s.rec.respond_repair = 0; }
     });
     render();
+    var who = ids.length + (ids.length === 1 ? ' person' : ' people');
+    msg('st-ok', (op === 'visible_on' ? 'Visible set on ' : op === 'visible_off' ? 'Hidden on ' : 'Repairs reset on ') +
+      who + ' — Save to apply');
   });
   function msg(cls, text) { document.getElementById('st-msg').innerHTML = '<div class="st-banner ' + cls + '">' + esc(text) + '</div>'; }
   var saveBtn = document.getElementById('st-savebtn');
