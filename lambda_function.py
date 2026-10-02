@@ -9784,6 +9784,7 @@ def _company_intros_paused(person_id, company, intro_details=None):
 
 
 REOPEN_DEAL_LABEL = "Re-Open Deal"
+REOPEN_CONFIRM_ANTHROPIC = "This sends the deal to Gracia Group for review before it's listed again."
 PAUSED_INTRO_TEXT = "Paused — deal closed"
 
 
@@ -9796,7 +9797,16 @@ def _reopen_deal_button_html(deal, stage, key=None):
         return ""
     key_attr = f' data-key="{_esc(key)}"' if key else ""
     return (f'<button type="button" class="reopen-deal-btn" data-deal-id="{_esc(str(deal.get("id")))}" '
-            f'data-deal-name="{_esc(_deal_title(deal))}"{key_attr}>{REOPEN_DEAL_LABEL}</button>')
+            f'data-deal-name="{_esc(_deal_title(deal))}" data-confirm="{_esc(_reopen_confirm_text(deal))}"'
+            f'{key_attr}>{REOPEN_DEAL_LABEL}</button>')
+
+
+def _reopen_confirm_text(deal):
+    """Re-Open confirmation wording; Anthropic deals go to Hold for review
+    (see _handle_deal_stage), so they never promise Inquiry."""
+    tail = (REOPEN_CONFIRM_ANTHROPIC if _is_anthropic_deal(deal) else
+            "This sets the deal back to Inquiry and returns it to your active pipeline.")
+    return f"Re-open {_deal_title(deal)}? {tail}"
 
 
 def _paused_intro_chip_html():
@@ -9824,8 +9834,7 @@ def _reopen_deal_script_html():
 (function() {
   document.querySelectorAll('.reopen-deal-btn').forEach(function(btn) {
     btn.addEventListener('click', function() {
-      var name = btn.getAttribute('data-deal-name');
-      if (!window.confirm('Re-open ' + name + '? This sets the deal back to Inquiry and returns it to your active pipeline.')) return;
+      if (!window.confirm(btn.getAttribute('data-confirm'))) return;
       btn.disabled = true;
       fetch('?action=deal_stage', {
         method: 'POST',

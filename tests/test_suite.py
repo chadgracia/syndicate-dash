@@ -8894,6 +8894,21 @@ check("non-Anthropic Re-Open still goes to Inquiry with a plain ok",
       [c[:2] for c in _an_calls] == [("960001", lf.STAGE_INQUIRY)] and json.loads(_an_resp["body"]) == {"ok": True})
 lf._pipeline_update_deal_stage, lf._read_identity_email = _an_saved
 
+
+# ======================================================================
+# SECTION: Re-Open confirmation wording (Anthropic -> review, others -> Inquiry)
+# ======================================================================
+_rc_an = lf._reopen_deal_button_html(_ro_sell(960071, "Anthropic PBC", lf.OBSOLETE_STAGE_ID), lf.OBSOLETE_STAGE_ID)
+_rc_other = lf._reopen_deal_button_html(_ro_sell(960072, "Paused Co", lf.OBSOLETE_STAGE_ID), lf.OBSOLETE_STAGE_ID)
+check("Re-Open confirm: Anthropic deal says it goes to Gracia Group for review, never Inquiry",
+      'data-confirm="Re-open Anthropic PBC block? This sends the deal to Gracia Group for review before it&#x27;s '
+      'listed again."' in _rc_an.replace("it's", "it&#x27;s") and "Inquiry" not in _rc_an)
+check("Re-Open confirm: other deals keep the Inquiry wording",
+      'data-confirm="Re-open Paused Co block? This sets the deal back to Inquiry and returns it to your active '
+      'pipeline."' in _rc_other)
+check("Re-Open confirm: script reads the server-built wording",
+      "window.confirm(btn.getAttribute('data-confirm'))" in lf._reopen_deal_script_html())
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)
