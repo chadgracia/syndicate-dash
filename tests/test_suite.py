@@ -8759,6 +8759,27 @@ lf._data_cache.pop(lf.STANDING_KEY, None)
 check("standing_json: missing file -> visible false", _st_json(2)[1] == {"visible": False})
 
 
+# --- A save in one Lambda container must show on reload in another: admin
+# reads ignore the 60s HEAD reuse; tenant surfaces may lag up to 60s.
+_st_put({}, rev=10)
+_st_s3.last_modified[lf.STANDING_KEY] = datetime(2026, 10, 1, tzinfo=timezone.utc)
+lf.S3_VERSION_TTL_SECONDS = 60
+try:
+    lf._req_cache_reset()
+    lf._load_client_standing()  # this container now holds rev 10 + a fresh HEAD
+    _st_s3.objs[lf.STANDING_KEY]["rev"] = 11  # another container saved
+    _st_s3.last_modified[lf.STANDING_KEY] = datetime(2026, 10, 2, tzinfo=timezone.utc)
+    lf._req_cache_reset()
+    check("stale container: tenant read may reuse the cached copy within 60s", lf._load_client_standing()["rev"] == 10)
+    _st_body = _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
+    check("stale container: admin scoreboard re-checks S3 and shows the saved rev",
+          json.loads(re.search(r"var STANDING = (\{.*?\});</script>", _st_body).group(1))["rev"] == 11)
+    check("scoreboard: name links to the Pipeline person record, not the buyer page",
+          "D.person_url.replace" in _st_body and "'?buyer='" not in _st_body)
+finally:
+    lf.S3_VERSION_TTL_SECONDS = 0
+    _st_s3.last_modified.pop(lf.STANDING_KEY, None)
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)

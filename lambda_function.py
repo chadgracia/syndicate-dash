@@ -14637,14 +14637,19 @@ def _s3_is_missing(e):
 _standing_missing_at = {"t": None}
 
 
-def _load_client_standing():
+def _load_client_standing(fresh=False):
     """The standing state for this request (cached across requests by S3
     version, like the other S3 JSON). Missing file = empty state (both
     settings off); any other failure = None, which every tenant surface
-    treats as hidden."""
+    treats as hidden. fresh=True (admin scoreboard, desk JSON) skips the
+    container's 60s HEAD reuse: a save lands in one Lambda container, and
+    a reload served by another must not show its stale copy."""
     memo = _req_cache.get("standing")
     if memo is not None:
         return memo[0]
+    if fresh:
+        _s3_version_cache.pop(STANDING_KEY, None)
+        _standing_missing_at["t"] = None
     missing_at = _standing_missing_at["t"]
     if missing_at is not None and time.monotonic() - missing_at < S3_VERSION_TTL_SECONDS:
         state = _standing_empty_state()
@@ -14904,7 +14909,7 @@ STANDING_ITEM_OPEN_NOTES = {
 
 def standing_json_payload(pid):
     try:
-        state = _load_client_standing()
+        state = _load_client_standing(fresh=True)
         if state is None or not state["settings"]["buyers_visible"]:
             return {"visible": False}
         cs = compute_client_standing(pid, state=state)
@@ -14984,7 +14989,7 @@ def standing_search(query, for_pid=None):
     q = (query or "").strip().lower()
     if len(q) < 2:
         return []
-    state = _load_client_standing() or _standing_empty_state()
+    state = _load_client_standing(fresh=True) or _standing_empty_state()
     by_id = _people_data()["by_id"]
     client_rec = by_id.get(str(for_pid)) if for_pid else None
     out = []
@@ -15011,7 +15016,7 @@ def _standing_json_for_script(data):
 
 
 def render_standing_page(key):
-    state = _load_client_standing()
+    state = _load_client_standing(fresh=True)
     load_error = state is None
     rows = [] if load_error else standing_admin_rows(state)
     data = {
@@ -15207,6 +15212,7 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
   input[type=search], input[type=text], input[type=number] { padding: 5px 7px; font-size: 13px;
          border: 1px solid #d1d5db; border-radius: 5px; box-sizing: border-box; }
   input[type=number] { width: 110px; }
+  input.st-vol { width: 130px; text-align: right; }
   textarea.st-notes { width: 180px; min-height: 28px; font: 12px/1.35 inherit; resize: vertical; overflow: hidden;
          border: 1px solid #d1d5db; border-radius: 5px; padding: 4px 6px; box-sizing: border-box; }
   .st-hint { font-size: 11px; color: #6b7280; margin-top: 2px; white-space: nowrap; }
@@ -15263,8 +15269,8 @@ __BANNER__
 <th>Tier floor</th><th>Private</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
 </table>
-<div class="st-bar"><button type="button" id="st-prev">Prev</button><span id="st-page" class="st-muted"></span>
-<button type="button" id="st-next">Next</button></div>
+<div class="st-bar" id="st-pager"><button type="button" id="st-prev">← Previous 100</button><span id="st-page" class="st-muted"></span>
+<button type="button" id="st-next">Next 100 →</button></div>
 <div id="st-more" hidden><h2 style="font-size:14px;margin:18px 0 6px">Not on the scoreboard yet</h2>
 <div id="st-add-results" class="st-results"></div></div>
 </div>
@@ -15283,7 +15289,7 @@ STANDING_PAGE_JS = r"""
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
     return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
-  function musd(v) { return '$' + ((v || 0) / 1e6).toFixed(1) + 'M'; }
+  function usd(v) { return '$' + Math.round(v || 0).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
   function track(r) { byId[r.id] = r; if (r.rec.notes == null) r.rec.notes = '';
     orig[r.id] = {rec: clone(r.rec), refs: clone(r.refs)}; }
   function addRow(r) { if (byId[r.id]) return; rows.push(r); track(r); }
@@ -15336,7 +15342,7 @@ STANDING_PAGE_JS = r"""
   function tradesHint(r) { var o = cur(r).rec.trades_override;
     return o == null ? '' : 'Pipeline: ' + r.auto_trades + ' · <a href="#" data-act="reset" data-f="trades_override">reset</a>'; }
   function volHint(r) { var o = cur(r).rec.volume_override_usd;
-    return o == null ? '' : 'Pipeline: ' + musd(r.auto_volume) + ' · <a href="#" data-act="reset" data-f="volume_override_usd">reset</a>'; }
+    return o == null ? '' : 'Pipeline: ' + usd(r.auto_volume) + ' · <a href="#" data-act="reset" data-f="volume_override_usd">reset</a>'; }
   function fmtVal(v) {
     if (v == null || v === '') return '—';
     if (Array.isArray(v)) return v.length ? v.map(function(x) { return x && x.person_id ? '#' + x.person_id +
@@ -15353,7 +15359,7 @@ STANDING_PAGE_JS = r"""
     var hist = r.history || [];
     return '<tr data-id="' + esc(r.id) + '"' + (changed(r) ? ' class="st-changed"' : '') + '>' +
       '<td><input type="checkbox" data-act="sel"' + (selected[r.id] ? ' checked' : '') + '></td>' +
-      '<td><a href="?buyer=' + encodeURIComponent(r.id) + '&key=' + encodeURIComponent(D.key) + '">' + esc(r.name) +
+      '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) +
         '</a>' + (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') + '</td>' +
       '<td>' + esc(r.firm) + '</td>' +
       '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' + (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a></td>' +
@@ -15361,8 +15367,8 @@ STANDING_PAGE_JS = r"""
       '<td>' + rep(r, 'terms_repair') + '</td><td>' + rep(r, 'payments_repair') + '</td><td>' + rep(r, 'respond_repair') + '</td>' +
       '<td><input type="number" min="0" step="1" data-act="trades" value="' + st.trades + '">' +
         '<div class="st-hint" data-role="thint">' + tradesHint(r) + '</div></td>' +
-      '<td><input type="number" min="0" step="1" data-act="volume" value="' + st.vol + '"> <span class="st-muted" data-role="vfmt">' +
-        musd(st.vol) + '</span><div class="st-hint" data-role="vhint">' + volHint(r) + '</div></td>' +
+      '<td><input type="text" inputmode="numeric" class="st-vol" data-act="volume" value="' + usd(st.vol) + '">' +
+        '<div class="st-hint" data-role="vhint">' + volHint(r) + '</div></td>' +
       '<td><a href="#" data-act="refs">' + st.q + ' / ' + s.refs.length + '</a></td>' +
       '<td><select data-act="floor">' + floorOpts + '</select></td>' +
       '<td><input type="checkbox" data-act="private"' + (rec.private ? ' checked' : '') + '></td>' +
@@ -15405,6 +15411,9 @@ STANDING_PAGE_JS = r"""
       '<tr><td colspan="' + COLS + '" class="st-muted">No matches</td></tr>';
     document.querySelectorAll('#st-body textarea.st-notes').forEach(grow);
     document.getElementById('st-page').textContent = 'Page ' + (page + 1) + ' of ' + pages;
+    document.getElementById('st-pager').hidden = pages < 2;
+    document.getElementById('st-prev').disabled = page === 0;
+    document.getElementById('st-next').disabled = page >= pages - 1;
     document.getElementById('st-count').textContent = list.length + ' of ' + rows.length + ' people';
     document.getElementById('st-selcount').textContent = Object.keys(selected).length + ' selected';
     document.getElementById('st-all').checked = slice.length > 0 && slice.every(function(r) { return selected[r.id]; });
@@ -15418,7 +15427,6 @@ STANDING_PAGE_JS = r"""
     q('tier').innerHTML = tierHtml(r);
     q('thint').innerHTML = tradesHint(r);
     q('vhint').innerHTML = volHint(r);
-    q('vfmt').textContent = musd(st.vol);
     renderDirty();
   }
   function renderDirty() {
@@ -15452,6 +15460,11 @@ STANDING_PAGE_JS = r"""
       render(); }
   });
   var CHANGE_ACTS = {sel: 1, private: 1, floor: 1, refok: 1};
+  // Volume box: re-show the effective amount as $12,345,678 when it loses focus.
+  body.addEventListener('focusout', function(e) {
+    var el = e.target, r = el.getAttribute('data-act') === 'volume' ? rowOf(el) : null;
+    if (r) el.value = usd(standing(r).vol);
+  });
   body.addEventListener('change', function(e) {
     var el = e.target, act = el.getAttribute('data-act');
     if (!act || !CHANGE_ACTS[act]) return;
@@ -15468,7 +15481,8 @@ STANDING_PAGE_JS = r"""
     if (act === 'refsearch') { search(el.value, r.id, el.parentNode.querySelector('[data-role=refresults]')); return; }
     if (act === 'notes') { edit(r).rec.notes = el.value.slice(0, D.notes_max); grow(el); refreshRow(el.closest('tr'), r); return; }
     if (act === 'trades' || act === 'volume') {
-      var v = el.value.trim(), n = v === '' ? null : Number(v);
+      var v = act === 'volume' ? el.value.replace(/[$,\s]/g, '').replace(/\.\d*$/, '') : el.value.trim();
+      var n = v === '' ? null : Number(v);
       var field = act === 'trades' ? 'trades_override' : 'volume_override_usd';
       var auto = act === 'trades' ? r.auto_trades : r.auto_volume;
       if (n !== null && (!isFinite(n) || n < 0 || (act === 'trades' && Math.floor(n) !== n))) return;
@@ -15514,7 +15528,7 @@ STANDING_PAGE_JS = r"""
     document.getElementById(id).addEventListener('change', function() { page = 0; render(); });
   });
   document.getElementById('st-prev').addEventListener('click', function() { if (page > 0) { page--; render(); } });
-  document.getElementById('st-next').addEventListener('click', function() { page++; render(); });
+  document.getElementById('st-next').addEventListener('click', function() { page++; render(); window.scrollTo(0, 0); });
   document.getElementById('st-all').addEventListener('change', function(e) {
     var list = filtered().slice(page * D.page_rows, (page + 1) * D.page_rows);
     list.forEach(function(r) { if (e.target.checked) selected[r.id] = 1; else delete selected[r.id]; }); render();
