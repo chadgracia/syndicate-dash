@@ -8811,9 +8811,12 @@ check("household save: override stored + one referrals history entry showing it"
       _r["statusCode"] == 200 and _st_c21["referrals"][0]["household_override"] is True
       and len(_st_h21) == 1 and _st_h21[0]["from"][0]["household_override"] is False
       and _st_h21[0]["to"][0]["household_override"] is True)
-check("save_standing cannot change share_with_sellers (consent only from the client)",
-      _st_c21["share_with_sellers"] is True
-      and [h for h in _st_c21["history"] if h["field"] == "share_with_sellers"] == _ST_OPTIN)
+_st_sh21 = [h for h in _st_c21["history"] if h["field"] == "share_with_sellers"]
+check("save_standing share change (Client Standing checkbox) is recorded as an admin change",
+      _st_c21["share_with_sellers"] is False and _st_sh21[:len(_ST_OPTIN)] == _ST_OPTIN and len(_st_sh21) == len(_ST_OPTIN) + 1
+      and _st_sh21[-1]["from"] is True and _st_sh21[-1]["to"] is False
+      and _st_sh21[-1]["actor"] == "admin (client permission)"
+      and _st_sh21[-1]["reason"] == "set by admin with client permission")
 lf._req_cache_reset()
 check("household save: Hal now Preferred via the overridden referral", lf.compute_client_standing(21)["tier"] == "preferred")
 _st_put({"2": {"terms_repair": 1}}, rev=31)
@@ -9121,6 +9124,52 @@ check("standing_share: no record (not hidden) -> record created with the opt-in"
       _r["statusCode"] == 200 and json.loads(_r["body"])["share_with_sellers"] is True
       and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["share_with_sellers"] is True
       and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["hidden"] is False)
+
+# --- Admin share changes (with client permission): latest change wins, actor recorded
+_st_put({"2": {}, "3": {"hidden": True}}, rev=50)
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": True, "actor": "nobody"})
+check("standing_share: unknown actor -> 400, nothing written", _r["statusCode"] == 400
+      and _st_s3.objs[lf.STANDING_KEY]["rev"] == 50)
+check("standing_share: hidden blocks an admin change too (409)",
+      _st_share({"key": ADMIN_KEY, "pid": "3", "share": True, "actor": "admin"})["statusCode"] == 409)
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": True, "actor": "admin"})
+lf._req_cache_reset()
+_st_sh = [h for h in _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"] if h["field"] == "share_with_sellers"]
+check("admin share change takes effect (seller card shows) and records the actor",
+      _r["statusCode"] == 200 and json.loads(_r["body"])["share_with_sellers"] is True
+      and lf.compute_client_standing(2)["share_with_sellers"] is True
+      and _st_sh[-1]["actor"] == "admin (client permission)" and _st_sh[-1]["reason"] == "set by admin with client permission"
+      and ">Client standing<" in _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"])
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": False})
+lf._req_cache_reset()
+_st_sh = [h for h in _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"] if h["field"] == "share_with_sellers"]
+check("client change after an admin change wins; client actor recorded",
+      lf.compute_client_standing(2)["share_with_sellers"] is False
+      and [h["actor"] for h in _st_sh] == ["admin (client permission)", "client"])
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": True, "actor": "admin"})
+lf._req_cache_reset()
+check("admin change after a client change wins", lf.compute_client_standing(2)["share_with_sellers"] is True)
+check("latest change wins from stored history regardless of actor",
+      _st_cs(2, {"2": {"history": [
+          {"at": "2026-09-01T00:00:00Z", "field": "share_with_sellers", "from": False, "to": True,
+           "reason": "set by client on desk", "actor": "client"},
+          {"at": "2026-09-02T00:00:00Z", "field": "share_with_sellers", "from": True, "to": False,
+           "reason": "set by admin with client permission", "actor": "admin (client permission)"}]}})
+      ["share_with_sellers"] is False)
+_st_rev = _st_s3.objs[lf.STANDING_KEY]["rev"]
+_r = _st_post({"key": ADMIN_KEY, "rev": _st_rev, "clients": {"3": _st_row(hidden=True, share_with_sellers=True)}})
+check("save_standing: share change on a hidden client -> 409, nothing written",
+      _r["statusCode"] == 409 and _st_s3.objs[lf.STANDING_KEY]["rev"] == _st_rev)
+_r = _st_post({"key": ADMIN_KEY, "rev": _st_rev, "clients": {"2": _st_row(share_with_sellers="yes")}})
+check("save_standing: non-bool share -> 400", _r["statusCode"] == 400)
+_r = _st_post({"key": ADMIN_KEY, "rev": _st_rev, "clients": {"2": _st_row(share_with_sellers=False)}})
+lf._req_cache_reset()
+check("save_standing: admin share change saved through the same path (actor admin, takes effect)",
+      _r["statusCode"] == 200 and lf.compute_client_standing(2)["share_with_sellers"] is False
+      and _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"][-1]["actor"] == "admin (client permission)")
+check("scoreboard: share is an editable checkbox posted with Save",
+      'data-act="share"' in lf.STANDING_PAGE_JS and "share: 1" in lf.STANDING_PAGE_JS
+      and "clients[r.id].share_with_sellers" in lf.STANDING_PAGE_JS)
 
 # --- Desk JSON
 def _st_json(pid):

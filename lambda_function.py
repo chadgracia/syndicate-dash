@@ -14758,17 +14758,37 @@ def _standing_manual_trades(raw):
 
 
 STANDING_SHARE_REASON = "set by client on desk"
+STANDING_SHARE_ADMIN_REASON = "set by admin with client permission"
+# History "actor" on every share_with_sellers change; the effective value is
+# the latest change of EITHER kind.
+STANDING_SHARE_ACTORS = {"client": ("client", STANDING_SHARE_REASON),
+                         "admin": ("admin (client permission)", STANDING_SHARE_ADMIN_REASON)}
+STANDING_SHARE_REASONS = (STANDING_SHARE_REASON, STANDING_SHARE_ADMIN_REASON)
 # Sharing named standing with matched/introduced sellers is OPT-IN: this is
 # the value until the client's own desk change says otherwise.
 STANDING_SHARE_DEFAULT = False
 
 
 def _standing_client_share_entry(history):
-    """The client's latest share_with_sellers change (made on the desk), or None."""
+    """The latest share_with_sellers change -- the client's own desk change or
+    an admin change made with the client's permission -- or None."""
     for h in reversed(history or []):
-        if h.get("field") == "share_with_sellers" and h.get("reason") == STANDING_SHARE_REASON:
+        if h.get("field") == "share_with_sellers" and h.get("reason") in STANDING_SHARE_REASONS:
             return h
     return None
+
+
+def _standing_apply_share(rec, share, actor, now):
+    """Record one share_with_sellers change on rec (history + value). actor is
+    "client" or "admin". No-op (False) when the value is unchanged."""
+    old = rec["share_with_sellers"]
+    if old == share:
+        return False
+    label, reason = STANDING_SHARE_ACTORS[actor]
+    rec["history"].append({"at": now, "field": "share_with_sellers", "from": old, "to": share,
+                           "reason": reason, "actor": label})
+    rec["share_with_sellers"] = share
+    return True
 
 
 def _standing_client_share(history):
@@ -14790,8 +14810,8 @@ def _standing_client_record(raw):
     rec["hidden"] = raw.get("hidden") is True
     rec["history"] = [h for h in (raw.get("history") or []) if isinstance(h, dict)]
     # Sharing with sellers is opt-in: STANDING_SHARE_DEFAULT unless the
-    # client's own latest change (?action=standing_share, reason
-    # STANDING_SHARE_REASON) set it. The stored flag is ignored -- the
+    # latest change -- the client's own (STANDING_SHARE_REASON) or an admin's
+    # with client permission (STANDING_SHARE_ADMIN_REASON) -- set it. The stored flag is ignored -- the
     # history entry is the record.
     rec["share_with_sellers"] = _standing_client_share(rec["history"])
     for f in STANDING_REPAIR_FIELDS:
@@ -15365,8 +15385,7 @@ STANDING_ROW_REF_KEYS = ("person_id", "name", "firm", "role", "cef_label", "iqf_
 
 
 def _standing_share_at(client):
-    """When the client last changed share_with_sellers on the desk (the
-    opt-out record), or None."""
+    """When share_with_sellers last changed (client or admin), or None."""
     h = _standing_client_share_entry(client.get("history"))
     return h.get("at") if h else None
 
@@ -15678,6 +15697,17 @@ def _handle_save_standing(event):
                 rec["history"].append({"at": now, "field": field, "from": before, "to": after, "reason": ""})
                 changed_fields += 1
             rec[field] = new_vals[field]
+        # Optional admin share change (Client Standing page checkbox): same
+        # rule as ?action=standing_share -- hidden blocks it (409).
+        if "share_with_sellers" in raw:
+            share = raw["share_with_sellers"]
+            if not isinstance(share, bool):
+                return _json_response({"error": f"{pid}: shared with sellers must be true/false"}, 400)
+            if share != rec["share_with_sellers"]:
+                if rec["hidden"]:
+                    return _json_response({"error": f"{pid}: client standing is hidden; sharing can't change"}, 409)
+                _standing_apply_share(rec, share, "admin", now)
+                changed_fields += 1
         new_state["clients"][pid] = rec
     try:
         _standing_finish_write(s3, current_raw, current, new_state, now, "save_standing")
@@ -15689,7 +15719,9 @@ def _handle_save_standing(event):
 
 def _handle_standing_share(event):
     """POST ?action=standing_share -- admin key (the desk calls it server-side
-    on the client's behalf). Body {pid, share: bool}. Toggles ONLY
+    on the client's behalf, or for an admin acting with the client's
+    permission). Body {pid, share: bool, actor?: "client" (default) |
+    "admin"}. Toggles ONLY
     share_with_sellers; refuses an unknown pid (404) or a hidden client
     (409); a client with no record gets one (defaults). Every change appends history {field share_with_sellers,
     from, to, reason "set by client on desk"} -- the consent record. An
@@ -15699,10 +15731,13 @@ def _handle_standing_share(event):
         return _json_response({"error": "forbidden"}, 403)
     pid = str(body.get("pid") or "").strip()
     share = body.get("share")
+    actor = body.get("actor", "client")
     if not (pid.isdigit() and pid.isascii()):
         return _json_response({"error": "pid must be numeric"}, 400)
     if not isinstance(share, bool):
         return _json_response({"error": "share must be true/false"}, 400)
+    if actor not in STANDING_SHARE_ACTORS:
+        return _json_response({"error": "actor must be client or admin"}, 400)
     if pid not in _people_data()["by_id"]:
         return _json_response({"error": "unknown pid"}, 404)
     s3 = _s3_client()
@@ -15720,9 +15755,7 @@ def _handle_standing_share(event):
         new_state = copy.deepcopy(current)
         _standing_migrate_legacy(new_state, now)
         rec = new_state["clients"].setdefault(pid, _standing_default_client())
-        rec["history"].append({"at": now, "field": "share_with_sellers", "from": old["share_with_sellers"],
-                               "to": share, "reason": STANDING_SHARE_REASON})
-        rec["share_with_sellers"] = share
+        _standing_apply_share(rec, share, actor, now)
         try:
             _standing_finish_write(s3, current_raw, current, new_state, now, "standing_share")
         except _S3WriteError as e:
@@ -15869,13 +15902,13 @@ STANDING_PAGE_JS = r"""
     if (v === '') return null; var n = Number(v); return (isFinite(n) && n >= 0) ? n : NaN; }
   function track(r) { byId[r.id] = r;
     r.rec.notes = r.rec.notes || ''; r.rec.trade_edits = r.rec.trade_edits || {}; r.rec.manual_trades = r.rec.manual_trades || [];
-    orig[r.id] = {rec: clone(r.rec), refs: clone(r.refs)}; }
+    orig[r.id] = {rec: clone(r.rec), refs: clone(r.refs), share: !!r.share}; }
   function addRow(r) { if (byId[r.id]) return; rows.push(r); track(r); }
   rows.slice().forEach(track);
   function cur(r) { return edits[r.id] || orig[r.id]; }
   function edit(r) { if (!edits[r.id]) edits[r.id] = clone(orig[r.id]); return edits[r.id]; }
   function sig(s) { return JSON.stringify([s.rec, s.refs.map(function(x) {
-    return [x.person_id, !!x.household_override]; })]); }
+    return [x.person_id, !!x.household_override]; }), !!s.share]); }
   function changed(r) { return !!forceSave[r.id] || (!!edits[r.id] && sig(edits[r.id]) !== sig(orig[r.id])); }
   function rank(t) { return D.tiers.indexOf(t); }
   function tradeStats(r) {
@@ -15970,10 +16003,10 @@ STANDING_PAGE_JS = r"""
       '<td><select data-act="floor">' + floorOpts + '</select></td>' +
       '<td><label title="Sensitive client — standing shown nowhere, not even to the client"><input type="checkbox" data-act="hidden"' +
         (rec.hidden ? ' checked' : '') + '> Hidden</label></td>' +
-      '<td>' + (r.share ? '<span class="st-yes">✓</span>' + (r.share_at ? ' <span class="st-muted">Opted in ' +
-          esc(String(r.share_at).slice(0, 10)) + '</span>' : '') :
-        '<span class="st-muted">' + (r.share_at ? 'Opted out ' + esc(String(r.share_at).slice(0, 10)) : 'Not shared') +
-          '</span>') + '</td>' +
+      '<td><label title="Change only with the client\'s permission"><input type="checkbox" data-act="share"' +
+        (s.share ? ' checked' : '') + (rec.hidden ? ' disabled' : '') + '> Shared</label>' +
+        (r.share_at ? '<div class="st-muted">' + (r.share ? 'Opted in ' : 'Opted out ') +
+          esc(String(r.share_at).slice(0, 10)) + '</div>' : (r.share ? '' : '<div class="st-muted">Not shared</div>')) + '</td>' +
       '<td class="st-tier" data-role="tier">' + tierHtml(r) + '</td>' +
       '<td><textarea class="st-notes" data-act="notes" maxlength="' + D.notes_max + '" rows="1">' + esc(rec.notes) + '</textarea></td>' +
       '<td>' + (hist.length ? '<a href="#" data-act="hist">History (' + hist.length + ')</a>' : '<span class="st-muted">History (0)</span>') + '</td></tr>' +
@@ -16107,7 +16140,7 @@ STANDING_PAGE_JS = r"""
       if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = true; x.household_override = false; s2.refs.push(x); }
       render(); }
   });
-  var CHANGE_ACTS = {sel: 1, hidden: 1, floor: 1, hhok: 1, tinc: 1};
+  var CHANGE_ACTS = {sel: 1, hidden: 1, share: 1, floor: 1, hhok: 1, tinc: 1};
   body.addEventListener('change', function(e) {
     var el = e.target, act = el.getAttribute('data-act');
     if (!act || !CHANGE_ACTS[act]) return;
@@ -16115,6 +16148,7 @@ STANDING_PAGE_JS = r"""
     if (act === 'sel') { if (el.checked) selected[r.id] = 1; else delete selected[r.id]; render(); return; }
     var s = edit(r);
     if (act === 'hidden') s.rec.hidden = el.checked;
+    else if (act === 'share') s.share = el.checked;
     else if (act === 'floor') s.rec.tier_floor = el.value || null;
     else if (act === 'hhok') s.refs[+el.getAttribute('data-i')].household_override = el.checked;
     else if (act === 'tinc') { var did = el.closest('tr[data-deal]').getAttribute('data-deal');
@@ -16209,6 +16243,7 @@ STANDING_PAGE_JS = r"""
         respond_repair: s.rec.respond_repair, tier_floor: s.rec.tier_floor || null, notes: s.rec.notes || '',
         trade_edits: s.rec.trade_edits, manual_trades: s.rec.manual_trades,
         referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: true, household_override: !!x.household_override}; })};
+      if (s.share !== orig[r.id].share) clients[r.id].share_with_sellers = !!s.share;
     });
     if (!Object.keys(clients).length) { msg('st-ok', 'Nothing to save.'); return; }
     saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
