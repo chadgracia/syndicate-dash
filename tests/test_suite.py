@@ -8451,6 +8451,9 @@ def _st_cs(pid, clients=None):
 
 _ST_OPTOUT = [{"at": "2026-09-15T00:00:00Z", "field": "share_with_sellers", "from": True, "to": False,
                "reason": "set by client on desk"}]
+# The client's own opt-in (sharing named standing with sellers is opt-in).
+_ST_OPTIN = [{"at": "2026-09-16T00:00:00Z", "field": "share_with_sellers", "from": False, "to": True,
+              "reason": "set by client on desk"}]
 
 
 def _st_manual(*sizes):
@@ -8644,14 +8647,20 @@ check("admin scoreboard: rows carry roles (Sella both, Bob buyer, Sid seller)",
       _st_roles["1"] == {"seller": True, "buyer": True} and _st_roles["3"] == {"seller": False, "buyer": True}
       and _st_roles["15"] == {"seller": True, "buyer": False}
       and "Buyer + seller" in lf.STANDING_PAGE_JS and "n/a</span>" in lf.STANDING_PAGE_JS)
-check("admin scoreboard: Select column header separate from Visible; bulk buttons start disabled",
-      "Select</label></th>" in _st_page["body"] and 'data-bulk="visible_on" disabled' in _st_page["body"])
+check("admin scoreboard: Select column header separate from Hidden; bulk buttons start disabled",
+      "Select</label></th>" in _st_page["body"] and 'data-bulk="reset_repairs" disabled' in _st_page["body"])
 _st_html = _st_page["body"].split("<script>")[0]
 check("admin scoreboard: rows embedded as JSON, not one server-rendered <tr> each", _st_html.count("<tr") == 1)
-check("admin scoreboard: no global toggles; Visible column, filters and bulk buttons",
+check("admin scoreboard: no global toggles; Hidden everywhere column + filter, no Visible control",
       "Show standing to sellers" not in _st_html and "Show status to buyers" not in _st_html
-      and "<th>Visible</th>" in _st_html and ">Visible only<" in _st_html and ">Hidden only<" in _st_html
-      and ">Make visible<" in _st_html and ">Hide<" in _st_html and "Set Private" not in _st_html)
+      and ">Hidden everywhere</th>" in _st_html and ">Hidden everywhere only<" in _st_html
+      and ">Not hidden only<" in _st_html and "Visible" not in _st_html and "visible_on" not in _st_html
+      and "Make visible" not in lf.STANDING_PAGE_JS and "Set Private" not in _st_html)
+check("admin scoreboard: per-row Hidden checkbox with the tooltip, saved as hidden, count of hidden",
+      'data-act="hidden"' in lf.STANDING_PAGE_JS
+      and 'title="Sensitive client — standing shown nowhere, not even to the client"' in lf.STANDING_PAGE_JS
+      and "clients[r.id] = {hidden: !!s.rec.hidden" in lf.STANDING_PAGE_JS
+      and "hidden everywhere'" in lf.STANDING_PAGE_JS and "rec.visible" not in lf.STANDING_PAGE_JS)
 check("admin scoreboard: repair columns renamed Terms / Payments / Responds",
       "<th>Terms</th><th>Payments</th><th>Responds</th>" in _st_html and "repair</th>" not in _st_html)
 check("admin scoreboard: sticky save bar above the table, none at the bottom",
@@ -8676,12 +8685,12 @@ check("admin search: case-insensitive email/company match with referral detail",
 
 # --- Save: validation, history, rev conflict, backups, migration
 def _st_row(**kw):
-    row = {"visible": False, "terms_repair": 0, "payments_repair": 0, "respond_repair": 0, "tier_floor": None,
+    row = {"hidden": False, "terms_repair": 0, "payments_repair": 0, "respond_repair": 0, "tier_floor": None,
            "referrals": [], "trade_edits": {}, "manual_trades": [], "notes": ""}
     row.update(kw)
     return row
 for _lbl, _row in (("repair 7", _st_row(terms_repair=7)), ("self-referral", _st_row(referrals=[{"person_id": "2"}])),
-                   ("visible not bool", _st_row(visible="yes")), ("notes over 2000", _st_row(notes="x" * 2001)),
+                   ("hidden not bool", _st_row(hidden="yes")), ("notes over 2000", _st_row(notes="x" * 2001)),
                    ("bad trade edit key", _st_row(trade_edits={"abc": {"size_usd": 1}})),
                    ("negative trade size", _st_row(trade_edits={"953": {"size_usd": -1}})),
                    ("manual trade without label", _st_row(manual_trades=[{"label": " ", "size_usd": 1, "date": ""}])),
@@ -8707,7 +8716,7 @@ check("save: stale rev -> 409 with the reload message, nothing changed",
       and _st_s3.objs[lf.STANDING_KEY]["rev"] == 1)
 _st_s3.put_calls.clear()
 _r = _st_post({"key": ADMIN_KEY, "rev": 1, "clients": {"2": _st_row(
-    terms_repair=6, tier_floor="gold", referrals=[{"person_id": "5", "confirmed_unrelated": True}], visible=True,
+    terms_repair=6, tier_floor="gold", referrals=[{"person_id": "5", "confirmed_unrelated": True}], hidden=True,
     trade_edits={"955": {"excluded": True, "size_usd": None}, "953": {"size_usd": None, "excluded": False}},
     manual_trades=[{"label": "Old SPV", "size_usd": 500000, "date": "2019-05-01"}], notes="Prefers calls")}})
 _st_bkey = f"{lf.STANDING_BACKUP_PREFIX}{lf._iso_utc()[:10]}.json"
@@ -8715,13 +8724,13 @@ _st_c2 = _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]
 check("save: day's first write copies the current object to the dated backup first",
       _r["statusCode"] == 200 and [c["Key"] for c in _st_s3.put_calls] == [_st_bkey, lf.STANDING_KEY]
       and _st_s3.objs[_st_bkey]["rev"] == 1)
-check("save: visible, trade edits (no-op edit dropped), manual trades and notes stored + logged",
-      _st_c2["visible"] is True and _st_c2["trade_edits"] == {"955": {"size_usd": None, "excluded": True}}
+check("save: hidden, trade edits (no-op edit dropped), manual trades and notes stored + logged",
+      _st_c2["hidden"] is True and "visible" not in _st_c2 and _st_c2["trade_edits"] == {"955": {"size_usd": None, "excluded": True}}
       and _st_c2["manual_trades"] == [{"label": "Old SPV", "size_usd": 500000, "date": "2019-05-01"}]
       and _st_c2["notes"] == "Prefers calls"
-      and [h["field"] for h in _st_c2["history"]][-4:] == ["visible", "trade_edits", "manual_trades", "notes"])
+      and [h["field"] for h in _st_c2["history"]][-4:] == ["hidden", "trade_edits", "manual_trades", "notes"])
 _st_s3.put_calls.clear()
-_r = _st_post({"key": ADMIN_KEY, "rev": 2, "clients": {"2": _st_row(visible=False)}})
+_r = _st_post({"key": ADMIN_KEY, "rev": 2, "clients": {"2": _st_row(hidden=False)}})
 check("save: later writes the same day never rewrite the backup",
       _r["statusCode"] == 200 and [c["Key"] for c in _st_s3.put_calls] == [lf.STANDING_KEY]
       and _st_s3.objs[_st_bkey]["rev"] == 1)
@@ -8734,7 +8743,7 @@ def _st_failing_put(Bucket, Key, Body, ContentType=None):
         raise RuntimeError("boom")
     return _st_orig_put(Bucket=Bucket, Key=Key, Body=Body, ContentType=ContentType)
 _st_s3.put_object = _st_failing_put
-_r = _st_post({"key": ADMIN_KEY, "rev": 3, "clients": {"2": _st_row(visible=True)}})
+_r = _st_post({"key": ADMIN_KEY, "rev": 3, "clients": {"2": _st_row(hidden=True)}})
 _st_s3.put_object = _st_orig_put
 check("save: write failure -> error, stored file untouched",
       _r["statusCode"] == 502 and "error" in json.loads(_r["body"])
@@ -8753,36 +8762,45 @@ check("referral flip: adding Rita (CEF Yes + Accredited, box ticked) -> Preferre
       and _st_tia["tier"] == "preferred" and _st_tia["discount_pct"] == 10)
 
 # --- Seller-facing star (standing_star)
-def _st_star(pid, rec):
+def _st_star(pid, rec, named=False):
     lf._req_cache_reset()
-    return lf._standing_star_from_cs(lf.compute_client_standing(pid, state=_st_state({str(pid): rec})))
-check("star: not visible -> None", _st_star(2, {"visible": False}) is None)
-check("star: no record -> None", _st_star(13, None) is None and
-      lf._standing_star_from_cs(lf.compute_client_standing(13, state=_st_state({}))) is None)
-check("star: visible but opted out -> hidden", _st_star(2, {"visible": True, "history": _ST_OPTOUT}) == "hidden")
-check("star: closed a trade + onboarded + clean -> gold", _st_star(2, {"visible": True}) == "gold")
-check("star: payments repair does not affect the star", _st_star(2, {"visible": True, "payments_repair": 3}) == "gold")
+    clients = {str(pid): rec} if rec is not None else {}
+    return lf._standing_star_from_cs(lf.compute_client_standing(pid, state=_st_state(clients)), named=named)
+check("star: hidden -> None (anonymous and named)", _st_star(2, {"hidden": True}) is None
+      and _st_star(2, {"hidden": True, "history": _ST_OPTIN}, named=True) is None)
+check("star: no record -> anonymous star by default (not hidden)", _st_star(13, None) == "green")
+check("star: legacy visible=false record behaves as not hidden",
+      _st_star(2, {"visible": False}) == "gold" and _st_cs(2, {"2": {"visible": False}})["hidden"] is False)
+check("star: anonymous star ignores the share switch",
+      _st_star(2, {"history": _ST_OPTOUT}) == "gold" and _st_star(2, {}) == "gold")
+check("star: named needs the client's opt-in (default and opted out -> noshare)",
+      _st_star(2, {}, named=True) == "noshare" and _st_star(2, {"history": _ST_OPTOUT}, named=True) == "noshare"
+      and _st_star(2, {"history": _ST_OPTIN}, named=True) == "gold")
+check("star: closed a trade + onboarded + clean -> gold", _st_star(2, {}) == "gold")
+check("star: payments repair does not affect the star", _st_star(2, {"payments_repair": 3}) == "gold")
 check("star: closed a trade but not onboarded (seller without engagement form) -> green",
-      _st_star(15, {"visible": True}) == "green" and lf.compute_client_standing(15)["trades"] >= 1)
-check("star: onboarded and clean, no trade -> green", _st_star(13, {"visible": True}) == "green")
-check("star: not onboarded but clean, no trade -> green", _st_star(14, {"visible": True}) == "green")
-check("star: terms repair -> yellow (even with trades + onboarded)", _st_star(2, {"visible": True, "terms_repair": 1}) == "yellow")
-check("star: respond repair -> yellow", _st_star(13, {"visible": True, "respond_repair": 2}) == "yellow")
-check("star: opted out wins over yellow", _st_star(13, {"visible": True, "respond_repair": 2, "history": _ST_OPTOUT}) == "hidden")
-_st_put({"2": {"visible": True}})
+      _st_star(15, {}) == "green" and lf.compute_client_standing(15)["trades"] >= 1)
+check("star: onboarded and clean, no trade -> green", _st_star(13, {}) == "green")
+check("star: not onboarded but clean, no trade -> green", _st_star(14, {}) == "green")
+check("star: terms repair -> yellow (even with trades + onboarded)", _st_star(2, {"terms_repair": 1}) == "yellow")
+check("star: respond repair -> yellow", _st_star(13, {"respond_repair": 2}) == "yellow")
+check("star: named, not opted in wins over yellow",
+      _st_star(13, {"respond_repair": 2, "history": _ST_OPTOUT}, named=True) == "noshare")
+_st_put({"2": {}, "3": {"hidden": True}})
 check("standing_star(pid): the public helper reads the stored file", lf.standing_star(2) == "gold"
+      and lf.standing_star(2, named=True) == "noshare" and lf.standing_star(3) is None
       and lf.standing_star(424242) is None)
 _st_s3.objs[lf.STANDING_KEY] = "not a dict"
 lf._data_cache.pop(lf.STANDING_KEY, None)
 
 # Household override via save_standing: validated, stored, logged in history.
-_st_put({"21": {"visible": True, "share_with_sellers": True, "referrals": [{"person_id": "22"}]}}, rev=30)
+_st_put({"21": {"share_with_sellers": True, "history": list(_ST_OPTIN), "referrals": [{"person_id": "22"}]}}, rev=30)
 _r = _st_post({"key": ADMIN_KEY, "rev": 30, "clients": {"21": _st_row(
-    visible=True, referrals=[{"person_id": "22", "household_override": "yes"}])}})
+    referrals=[{"person_id": "22", "household_override": "yes"}])}})
 check("household save: non-bool override rejected 400", _r["statusCode"] == 400
       and _st_s3.objs[lf.STANDING_KEY]["rev"] == 30)
 _r = _st_post({"key": ADMIN_KEY, "rev": 30, "clients": {"21": _st_row(
-    visible=True, share_with_sellers=False, referrals=[{"person_id": "22", "household_override": True}])}})
+    share_with_sellers=False, referrals=[{"person_id": "22", "household_override": True}])}})
 _st_c21 = _st_s3.objs[lf.STANDING_KEY]["clients"]["21"]
 _st_h21 = [h for h in _st_c21["history"] if h["field"] == "referrals"]
 check("household save: override stored + one referrals history entry showing it",
@@ -8790,23 +8808,31 @@ check("household save: override stored + one referrals history entry showing it"
       and len(_st_h21) == 1 and _st_h21[0]["from"][0]["household_override"] is False
       and _st_h21[0]["to"][0]["household_override"] is True)
 check("save_standing cannot change share_with_sellers (consent only from the client)",
-      _st_c21["share_with_sellers"] is True and not any(h["field"] == "share_with_sellers" for h in _st_c21["history"]))
+      _st_c21["share_with_sellers"] is True
+      and [h for h in _st_c21["history"] if h["field"] == "share_with_sellers"] == _ST_OPTIN)
 lf._req_cache_reset()
 check("household save: Hal now Preferred via the overridden referral", lf.compute_client_standing(21)["tier"] == "preferred")
 _st_put({"2": {"terms_repair": 1}}, rev=31)
 _r = _st_post({"key": ADMIN_KEY, "rev": 31, "clients": {"13": _st_row(notes="z")}})
-check("migration (opt-out): records without a client opt-out read and store share_with_sellers true",
-      _r["statusCode"] == 200 and _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["share_with_sellers"] is True
-      and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["share_with_sellers"] is True)
-check("migration (opt-out): a stored false without a client history entry reads as true",
-      _st_cs(2, {"2": {"visible": True, "share_with_sellers": False}})["share_with_sellers"] is True)
-check("migration (opt-out): a client-made change to false keeps it false",
-      _st_cs(2, {"2": {"visible": True, "share_with_sellers": True, "history": _ST_OPTOUT}})["share_with_sellers"] is False)
-check("migration (opt-out): a later client opt-in wins over an earlier opt-out",
+check("share default: STANDING_SHARE_DEFAULT is False (opt-in)", lf.STANDING_SHARE_DEFAULT is False
+      and lf._standing_default_client()["share_with_sellers"] is False)
+check("migration (opt-in): records without a client opt-in read and store share_with_sellers false",
+      _r["statusCode"] == 200 and _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["share_with_sellers"] is False
+      and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["share_with_sellers"] is False)
+check("migration (opt-in): a stored true without a client history entry reads as false",
+      _st_cs(2, {"2": {"share_with_sellers": True}})["share_with_sellers"] is False)
+check("migration (opt-in): a client-made change to true keeps it true",
+      _st_cs(2, {"2": {"history": _ST_OPTIN}})["share_with_sellers"] is True)
+check("migration (opt-in): a client-made change to false keeps it false",
+      _st_cs(2, {"2": {"share_with_sellers": True, "history": _ST_OPTOUT}})["share_with_sellers"] is False)
+check("migration (opt-in): a later client opt-in wins over an earlier opt-out",
       _st_cs(2, {"2": {"history": _ST_OPTOUT + [dict(_ST_OPTOUT[0], at="2026-09-20T00:00:00Z", **{"from": False, "to": True})]}})
       ["share_with_sellers"] is True)
-check("migration (opt-out): a non-client entry (other reason) is not an opt-out",
-      _st_cs(2, {"2": {"history": [dict(_ST_OPTOUT[0], reason="")]}})["share_with_sellers"] is True)
+check("migration (opt-in): a non-client entry (other reason) is not an opt-in",
+      _st_cs(2, {"2": {"history": [dict(_ST_OPTIN[0], reason="")]}})["share_with_sellers"] is False)
+check("migration: legacy visible flag ignored either way (not hidden), dropped from the record",
+      _st_cs(2, {"2": {"visible": False}})["hidden"] is False and _st_cs(2, {"2": {"visible": True}})["hidden"] is False
+      and "visible" not in _st_cs(2, {"2": {"visible": False}})["record"])
 
 # Migration: old overrides, "private" and global settings stop counting; first save logs the overrides.
 _st_put({"2": {"private": False, "trades_override": 7, "volume_override_usd": 7654321, "tier_floor": None},
@@ -8815,7 +8841,8 @@ _st_put({"2": {"private": False, "trades_override": 7, "volume_override_usd": 76
 _cs = lf.compute_client_standing(2)
 check("migration: overrides ignored (Alice back to 3 Pipeline trades, $4.25M)",
       _cs["trades"] == 3 and _cs["volume"] == 4250000)
-check("migration: old global settings + private=false do not make anyone visible", _cs["visible"] is False)
+check("migration: old global settings + private=false do not hide anyone or opt anyone in",
+      _cs["hidden"] is False and _cs["share_with_sellers"] is False and _cs["seller_visible"] is False)
 _r = _st_post({"key": ADMIN_KEY, "rev": 20, "clients": {"13": _st_row(notes="x")}})
 _st_mig = _st_s3.objs[lf.STANDING_KEY]["clients"]
 _st_h2 = [h for h in _st_mig["2"]["history"] if h["field"] == "override removed"]
@@ -8831,18 +8858,18 @@ _r = _st_post({"key": ADMIN_KEY, "rev": 21, "clients": {"13": _st_row(notes="y")
 check("migration: not repeated on the next save",
       len([h for h in _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]["history"] if h["field"] == "override removed"]) == 1)
 
-# --- Seller surfaces (per-person Visible)
+# --- Seller surfaces (not hidden; named badges need the client's opt-in)
 _ST_SECRET_CLIENTS = {
-    "2": {"visible": True, "share_with_sellers": True, "terms_repair": 3, "payments_repair": 0, "respond_repair": 0, "tier_floor": "platinum",
+    "2": {"share_with_sellers": True, "terms_repair": 3, "payments_repair": 0, "respond_repair": 0, "tier_floor": "platinum",
           "referrals": [{"person_id": "5", "confirmed_unrelated": True, "added_at": "2026-09-01T00:00:00Z"}],
           "trade_edits": {"953": {"size_usd": 7654321, "excluded": False}},
           "manual_trades": [{"label": "ZZMANUALTRADE", "size_usd": 1234567, "date": "2020-01-01"}],
           "notes": "ZZINTERNALNOTE",
           "history": [{"at": "2026-09-01T00:00:00Z", "field": "terms_repair", "from": 0, "to": 3,
-                       "reason": "ZZSECRETREASON"}]},
-    "3": {"visible": True, "share_with_sellers": True, "respond_repair": 2, "tier_floor": "gold",
-          "referrals": [{"person_id": "5", "confirmed_unrelated": True}]},
-    "10": {"visible": True, "share_with_sellers": True},
+                       "reason": "ZZSECRETREASON"}] + _ST_OPTIN},
+    "3": {"share_with_sellers": True, "respond_repair": 2, "tier_floor": "gold",
+          "referrals": [{"person_id": "5", "confirmed_unrelated": True}], "history": list(_ST_OPTIN)},
+    "10": {"share_with_sellers": True, "history": list(_ST_OPTIN)},
 }
 
 
@@ -8859,7 +8886,7 @@ def _st_tenant_pages():
 _st_put(_ST_SECRET_CLIENTS)
 _st_pages = _st_tenant_pages()
 _st_disc = _st_pages["disclosed buyer page"]
-check("seller card: visible client's disclosed buyer page shows 'Client standing' with the five items",
+check("seller card: opted-in client's disclosed buyer page shows 'Client standing' with the five items",
       ">Client standing<" in _st_disc and all(lbl in _st_disc for _, lbl in lf.STANDING_ITEMS))
 check("seller card: sits under the header card",
       _st_disc.find('class="card buyer-header"') < _st_disc.find(">Client standing<") < _st_disc.find('class="buyer-col-right"'))
@@ -8885,7 +8912,7 @@ check("demand tiles: star next to the tier pill (Bob yellow, Ivy green)",
       and any('title="Ready to transact"' in d for d in _st_tile_divs))
 check("anonymous surfaces: no check-mark ticks anywhere (the star replaced them)",
       all("gs-ticks" not in h and "Good standing" not in h for h in (_st_anon, _st_pend, _st_tiles)))
-for _star in ("gold", "green", "yellow", "hidden"):
+for _star in ("gold", "green", "yellow", "noshare"):
     _h = lf._standing_star_html(_star)
     check(f"star html ({_star}): no digits beyond colours/sizes, no item text, no name/id",
           not re.search(r"\d", re.sub(r"#[0-9A-Fa-f]{6}|viewBox=\"[^\"]*\"|width=\"\d+\"|height=\"\d+\"|"
@@ -8915,50 +8942,81 @@ for _name, _html in _st_pages.items():
           and "trade_edits" not in _low and "referral" not in _low and "discount" not in _low and "CEF" not in _html
           and "to go" not in _low)
 
+def _st_noshare_checks(label, pages):
+    _tiles = pages["company page (demand tiles)"]
+    _tile_divs = [seg.split("</div>\n    </div>")[0] for seg in _tiles.split('<div class="buyer-tile">')[1:]]
+    check(f"{label}: named surfaces render no star, ticks or card",
+          all("Client standing" not in pages[k] and "gs-star" not in pages[k] and "gs-ticks" not in pages[k]
+              and "Good standing" not in pages[k] and "In progress" not in pages[k]
+              for k in ("disclosed buyer page", "anonymous buyer page", "active intros (pending cell)")))
+    check(f"{label}: matched/introduced surfaces show 'Prefers not to share' instead of a star",
+          all("Prefers not to share" in pages[k] for k in ("anonymous buyer page", "active intros (pending cell)")))
+    check(f"{label}: company page Introduced row shows 'Prefers not to share', no star",
+          (lambda r: "Prefers not to share" in r and "gs-star" not in r)(_st_intro_row(_tiles)))
+    check(f"{label}: Buyer Demand tiles still show the anonymous star (share switch ignored)",
+          any('title="In progress"' in d for d in _tile_divs) and any('title="Ready to transact"' in d for d in _tile_divs)
+          and not any("Prefers not" in d for d in _tile_divs))
+    check(f"{label}: disclosed buyer page shows the muted line instead of the card",
+          "Client prefers not to share this information." in pages["disclosed buyer page"]
+          and ">Client standing<" not in pages["disclosed buyer page"])
+
+
 _st_noshare = json.loads(json.dumps(_ST_SECRET_CLIENTS))
 for _c in _st_noshare.values():
     _c["history"] = list(_c.get("history") or []) + _ST_OPTOUT
 _st_put(_st_noshare)
-for _name, _html in _st_tenant_pages().items():
-    check(f"opted out (visible=true): {_name} renders no star, ticks or card",
-          "Client standing" not in _html and "gs-star" not in _html and "gs-ticks" not in _html
-          and "Good standing" not in _html and "In progress" not in _html)
-_st_np = _st_tenant_pages()
-check("opted out: anonymous surfaces show 'Prefers not to share' instead of a star",
-      all("Prefers not to share" in _st_np[k] for k in ("anonymous buyer page", "active intros (pending cell)",
-                                                       "company page (demand tiles)")))
-check("opted out: company page Introduced row shows 'Prefers not to share', no star",
-      (lambda r: "Prefers not to share" in r and "gs-star" not in r)(_st_intro_row(_st_np["company page (demand tiles)"])))
-check("opted out: disclosed buyer page shows the muted line instead of the card",
-      "Client prefers not to share this information." in _st_np["disclosed buyer page"]
-      and ">Client standing<" not in _st_np["disclosed buyer page"])
-check("opted out: admin buyer page says the client opted out",
-      "Client standing (hidden from sellers — client opted out of sharing)"
+_st_noshare_checks("opted out", _st_tenant_pages())
+check("opted out: admin buyer page says the client has not opted in",
+      "Client standing (hidden from sellers — client has not opted in to sharing)"
       in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
-check("share_with_sellers=false: standing_json still visible, reports share false",
+check("share_with_sellers=false: standing_json still visible (own desk card), reports share false",
       (lambda d: d["visible"] is True and d["share_with_sellers"] is False)(
           json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"])))
-_st_put({"2": {"share_with_sellers": True, "visible": False}, "3": {"visible": False, "history": _ST_OPTOUT}})
-for _name, _html in _st_tenant_pages().items():
-    check(f"visible=false (shared or opted out): {_name} renders nothing (not even the opt-out text)",
-          "Client standing" not in _html and "gs-star" not in _html and "Prefers not to share" not in _html
-          and "prefers not to share" not in _html)
 
+# Default (not hidden, never opted in): own desk card + anonymous star; named surfaces get the opt-out text.
+_st_default = json.loads(json.dumps(_ST_SECRET_CLIENTS))
+for _c in _st_default.values():
+    _c["history"] = [h for h in (_c.get("history") or []) if h["field"] != "share_with_sellers"]
+_st_put(_st_default)
+_st_noshare_checks("default (no opt-in)", _st_tenant_pages())
+check("default (no opt-in): own desk card shows",
+      (lambda d: d["visible"] is True and d["share_with_sellers"] is False and d["items"])(
+          json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"])))
+
+# Legacy visible=false records behave as not hidden (default rules).
+_st_legacy = json.loads(json.dumps(_st_default))
+for _c in _st_legacy.values():
+    _c["visible"] = False
+_st_put(_st_legacy)
+_st_noshare_checks("legacy visible=false", _st_tenant_pages())
+check("legacy visible=false: own desk card shows",
+      json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"])["visible"] is True)
+
+# hidden=True removes all three surfaces (own card, named badges, anonymous star), opted in or not.
 _st_hidden = json.loads(json.dumps(_ST_SECRET_CLIENTS))
 for _c in _st_hidden.values():
-    _c["visible"] = False
+    _c["hidden"] = True
 _st_put(_st_hidden)
-check("visible=false: company page Introduced row unchanged (no star, no opt-out text)",
+check("hidden: company page Introduced row unchanged (no star, no opt-out text)",
       (lambda r: r and "gs-star" not in r and "Prefers not" not in r)(
           _st_intro_row(_st_get({"company": "Gamma Co"}, [tenant_cookie(TENANT_EMAIL)])["body"])))
 for _name, _html in _st_tenant_pages().items():
-    check(f"visible=false: {_name} renders no standing at all",
+    check(f"hidden (opted in): {_name} renders no standing at all (incl. demand-tile star)",
           "Client standing" not in _html and "gs-star" not in _html and "Good standing" not in _html
-          and "Prefers not to share" not in _html)
-_st_put({}, extra={"settings": {"sellers_visible": True, "buyers_visible": True}})
+          and "Prefers not to share" not in _html and "prefers not to share" not in _html)
+check("hidden: no desk card for the client",
+      json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"]) == {"visible": False})
+_st_put({"2": {"hidden": True}, "3": {"hidden": True, "history": _ST_OPTOUT}, "10": {"hidden": True}})
 for _name, _html in _st_tenant_pages().items():
-    check(f"no record (default hidden, old global setting ignored): {_name} renders no standing",
-          "gs-star" not in _html and "Client standing" not in _html)
+    check(f"hidden (default or opted out): {_name} renders nothing (not even the opt-out text)",
+          "Client standing" not in _html and "gs-star" not in _html and "Prefers not to share" not in _html
+          and "prefers not to share" not in _html)
+_st_put({}, extra={"settings": {"sellers_visible": True, "buyers_visible": True}})
+_st_nr = _st_tenant_pages()
+check("no record (not hidden, not opted in, old global setting ignored): no named card or star, tiles keep the anonymous star",
+      all("Client standing" not in h for h in _st_nr.values())
+      and "gs-star" not in _st_nr["disclosed buyer page"] and "gs-star" not in _st_nr["anonymous buyer page"]
+      and "gs-star" in _st_nr["company page (demand tiles)"])
 _st_s3.objs[lf.STANDING_KEY] = "not a dict"
 lf._data_cache.pop(lf.STANDING_KEY, None)
 _st_real_get = _st_s3.get_object
@@ -8975,10 +9033,10 @@ _st_s3.get_object = _st_real_get
 
 # --- Admin preview on buyer pages
 _st_put(_st_hidden)
-check("admin buyer page: full card labeled hidden when the client is not visible",
-      "Client standing (hidden from sellers)" in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
+check("admin buyer page: full card labeled hidden everywhere when the client is hidden",
+      "Client standing (hidden everywhere)" in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
 _st_put(_ST_SECRET_CLIENTS)
-check("admin buyer page (edit mode): labeled 'sellers see this' when visible",
+check("admin buyer page (edit mode): labeled 'sellers see this' when not hidden and opted in",
       "Client standing (sellers see this)" in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL,
                                                        "edit": "1"})["body"])
 check("admin anonymized preview: full card shown too",
@@ -8991,7 +9049,7 @@ def _st_share(body, method="POST"):
                               "queryStringParameters": {"action": "standing_share"},
                               "body": json.dumps(body), "cookies": []}, None)
 
-_st_put({"2": {"visible": True, "notes": "keep", "terms_repair": 3}, "3": {"visible": False}}, rev=40)
+_st_put({"2": {"notes": "keep", "terms_repair": 3, "visible": False}, "3": {"hidden": True}}, rev=40)
 check("standing_share: no key -> 403", _st_share({"pid": "2", "share": True})["statusCode"] == 403)
 check("standing_share: wrong key -> 403", _st_share({"key": "nope", "pid": "2", "share": True})["statusCode"] == 403)
 check("standing_share: tenant cookie is not enough -> 403",
@@ -9003,43 +9061,53 @@ check("standing_share: GET -> 405", _st_share({"key": ADMIN_KEY, "pid": "2", "sh
 check("standing_share: non-numeric pid -> 400", _st_share({"key": ADMIN_KEY, "pid": "x2", "share": True})["statusCode"] == 400)
 check("standing_share: share not bool -> 400", _st_share({"key": ADMIN_KEY, "pid": "2", "share": "yes"})["statusCode"] == 400)
 check("standing_share: unknown pid -> 404", _st_share({"key": ADMIN_KEY, "pid": "424242", "share": True})["statusCode"] == 404)
-check("standing_share: client not visible -> 409", _st_share({"key": ADMIN_KEY, "pid": "3", "share": True})["statusCode"] == 409)
-check("standing_share: no record -> 409", _st_share({"key": ADMIN_KEY, "pid": "13", "share": True})["statusCode"] == 409)
+check("standing_share: hidden client -> 409", _st_share({"key": ADMIN_KEY, "pid": "3", "share": True})["statusCode"] == 409
+      and _st_share({"key": ADMIN_KEY, "pid": "3", "share": False})["statusCode"] == 409)
 check("standing_share: refusals write nothing", _st_s3.objs[lf.STANDING_KEY]["rev"] == 40)
-check("standing_share: sharing is on by default (opt-out), seller card shows",
-      ">Client standing<" in _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"])
+check("standing_share: sharing is off by default (opt-in, legacy visible=false = not hidden), muted line shows",
+      (lambda b: ">Client standing<" not in b and "Client prefers not to share this information." in b)(
+          _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"]))
 _st_s3.put_calls.clear()
-_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": True})
-check("standing_share: unchanged value (already sharing) writes nothing", _r["statusCode"] == 200
-      and not _st_s3.put_calls and _st_s3.objs[lf.STANDING_KEY]["rev"] == 40)
 _r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": False})
+check("standing_share: unchanged value (default not sharing) writes nothing", _r["statusCode"] == 200
+      and not _st_s3.put_calls and _st_s3.objs[lf.STANDING_KEY]["rev"] == 40)
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": True})
 _st_obj = _st_s3.objs[lf.STANDING_KEY]
 _st_c = _st_obj["clients"]["2"]
 _st_sh = [h for h in _st_c["history"] if h["field"] == "share_with_sellers"]
-check("standing_share: opt out -> 200, returns standing_json with share false",
-      _r["statusCode"] == 200 and (lambda d: d["visible"] is True and d["share_with_sellers"] is False
+check("standing_share: opt in -> 200, returns standing_json with share true",
+      _r["statusCode"] == 200 and (lambda d: d["visible"] is True and d["share_with_sellers"] is True
                                    and "items" in d)(json.loads(_r["body"])))
-check("standing_share: opt-out history entry with timestamp and reason",
-      len(_st_sh) == 1 and _st_sh[0]["from"] is True and _st_sh[0]["to"] is False
+check("standing_share: opt-in history entry with timestamp and reason",
+      len(_st_sh) == 1 and _st_sh[0]["from"] is False and _st_sh[0]["to"] is True
       and _st_sh[0]["reason"] == "set by client on desk" and re.match(r"^\d{4}-\d{2}-\d{2}T", _st_sh[0]["at"]))
-check("standing_share: toggles only that field, rev+1",
-      _st_c["share_with_sellers"] is False and _st_c["visible"] is True and _st_c["notes"] == "keep"
-      and _st_c["terms_repair"] == 3 and _st_obj["rev"] == 41 and _st_obj["clients"]["3"]["share_with_sellers"] is True)
+check("standing_share: toggles only that field, rev+1, legacy visible key dropped",
+      _st_c["share_with_sellers"] is True and _st_c["hidden"] is False and "visible" not in _st_c
+      and _st_c["notes"] == "keep" and _st_c["terms_repair"] == 3 and _st_obj["rev"] == 41
+      and _st_obj["clients"]["3"]["share_with_sellers"] is False and _st_obj["clients"]["3"]["hidden"] is True)
 lf._req_cache_reset()
-check("standing_share: opt-out survives a reload (history is the record)",
-      lf.compute_client_standing(2)["share_with_sellers"] is False
+check("standing_share: opt-in survives a reload (history is the record), seller card shows",
+      lf.compute_client_standing(2)["share_with_sellers"] is True
+      and ">Client standing<" in _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"])
+_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": False})
+_st_c = _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]
+_st_sh = [h for h in _st_c["history"] if h["field"] == "share_with_sellers"]
+check("standing_share: opt back out -> second history entry, muted line shows again",
+      _r["statusCode"] == 200 and json.loads(_r["body"])["share_with_sellers"] is False
+      and [h["to"] for h in _st_sh] == [True, False]
       and "Client prefers not to share this information." in _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"])
 _st_sb = _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
 _st_row2 = [x for x in _st_page_data(_st_sb)["rows"] if x["id"] == "2"][0]
 check("scoreboard: read-only 'Shared with sellers' column shows the opt-out date",
-      ">Shared with sellers</th>" in _st_sb and _st_row2["share"] is False and _st_row2["share_at"] == _st_sh[0]["at"]
-      and "'Opted out'" not in _st_sb and "Opted out" in lf.STANDING_PAGE_JS and "share_with_sellers" not in _st_row2["rec"])
-_r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": True})
-_st_c = _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]
-check("standing_share: opt back in -> second history entry, seller card shows again",
+      ">Shared with sellers</th>" in _st_sb and _st_row2["share"] is False and _st_row2["share_at"] == _st_sh[-1]["at"]
+      and "'Opted out'" not in _st_sb and "Opted out" in lf.STANDING_PAGE_JS and "Not shared" in lf.STANDING_PAGE_JS
+      and "share_with_sellers" not in _st_row2["rec"] and _st_row2["rec"]["hidden"] is False)
+_st_s3.put_calls.clear()
+_r = _st_share({"key": ADMIN_KEY, "pid": "13", "share": True})
+check("standing_share: no record (not hidden) -> record created with the opt-in",
       _r["statusCode"] == 200 and json.loads(_r["body"])["share_with_sellers"] is True
-      and [h["to"] for h in _st_c["history"] if h["field"] == "share_with_sellers"] == [False, True]
-      and ">Client standing<" in _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"])
+      and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["share_with_sellers"] is True
+      and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["hidden"] is False)
 
 # --- Desk JSON
 def _st_json(pid):
@@ -9048,12 +9116,13 @@ def _st_json(pid):
 
 _st_put(_st_hidden)
 _r, _d = _st_json(2)
-check("standing_json: not visible -> visible false only",
+check("standing_json: hidden -> visible false only",
       _d == {"visible": False} and _r["headers"]["Cache-Control"] == "private, no-store")
 _st_put(_ST_SECRET_CLIENTS)
 check("standing_json: unknown pid -> visible false", _st_json(424242)[1] == {"visible": False})
 check("standing_json: blank pid -> visible false", _st_json("")[1] == {"visible": False})
-check("standing_json: record-less person -> visible false", _st_json(13)[1] == {"visible": False})
+check("standing_json: record-less person -> own card (not hidden), share false",
+      (lambda d: d["visible"] is True and d["share_with_sellers"] is False)(_st_json(13)[1]))
 _r, _d = _st_json(2)
 check("standing_json: floor platinum without good standing", _d["visible"] and _d["tier"] == "platinum"
       and _d["tier_label"] == "Platinum" and _d["discount_pct"] == 20 and _d["good_standing"] is False
@@ -9081,7 +9150,7 @@ check("standing_json: qualification open note",
 check("standing_json: respond note plural",
       _st_lbl["Responds promptly after an introduction"]["note"]
       == "Reply within 3 business days on your next 2 introductions.")
-_st_put(dict(_ST_SECRET_CLIENTS, **{"15": {"visible": True}}))
+_st_put(dict(_ST_SECRET_CLIENTS, **{"15": {}}))
 _st_sid = _st_json(15)[1]
 check("standing_json: seller -> ID forms open note + form_url; qualification omitted",
       _st_sid["items"][0] == {"label": "Identity and compliance forms complete", "done": False,
@@ -9089,10 +9158,10 @@ check("standing_json: seller -> ID forms open note + form_url; qualification omi
       and "Investor qualification on file" not in [i["label"] for i in _st_sid["items"]])
 _st_put(_ST_SECRET_CLIENTS)
 check("standing_json: Bob's floor gold applies without good standing", _d["tier"] == "gold" and _d["discount_pct"] == 15)
-_st_put({"2": {"visible": True, "payments_repair": 1, "terms_repair": 1, "respond_repair": 1,
+_st_put({"2": {"payments_repair": 1, "terms_repair": 1, "respond_repair": 1,
                "referrals": [{"person_id": "5", "confirmed_unrelated": True}, {"person_id": "7", "confirmed_unrelated": True}]},
-         "12": {"visible": True, "referrals": [{"person_id": "7", "confirmed_unrelated": True}]},
-         "13": {"visible": True}})
+         "12": {"referrals": [{"person_id": "7", "confirmed_unrelated": True}]},
+         "13": {}})
 _d = _st_json(2)[1]
 check("standing_json: count 1 drops the number; Pipeline trades/volume note",
       _d["items"][3]["note"] == "Meet the payment deadlines on your next trade."
@@ -9112,7 +9181,8 @@ check("standing_json: no referrals -> done false and no note; no trades",
       and _st_json(13)[1]["items"][5]["note"] == "0 trades · $0.0M")
 _st_s3.objs.pop(lf.STANDING_KEY, None)
 lf._data_cache.pop(lf.STANDING_KEY, None)
-check("standing_json: missing file -> visible false", _st_json(2)[1] == {"visible": False})
+check("standing_json: missing file -> defaults (own card shows, not shared)",
+      (lambda d: d["visible"] is True and d["share_with_sellers"] is False)(_st_json(2)[1]))
 
 # --- Roles: which onboarding forms apply
 lf._req_cache_reset()
@@ -9124,7 +9194,7 @@ check("roles: nothing found -> buyer (default)", lf._standing_roles(13) == {"sel
 check("roles: Sell + Buy deals -> both", lf._standing_roles(1) == {"seller": True, "buyer": True}
       and lf._standing_roles(12) == {"seller": True, "buyer": True})
 check("slim: Sell Interest field kept in the slim index", lf.SELL_INTEREST_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
-_st_put({"16": {"visible": True, "share_with_sellers": True}, "17": {"visible": True, "share_with_sellers": True}})
+_st_put({"16": {"history": list(_ST_OPTIN)}, "17": {"history": list(_ST_OPTIN)}})
 _cs = lf.compute_client_standing(16)
 check("not applicable: seller with engagement form only is in good standing (IQF not required)",
       _cs["good_standing"] and [i["key"] for i in _cs["items"]] == ["id_forms", "terms", "payments", "respond"])
@@ -9268,9 +9338,9 @@ _r = _imp_post("standing_import_save", {"key": ADMIN_KEY, "standing_rev": _imp_s
     {"key": _imp_key["14"], "action": "approve", "referrer_id": "19"},
     {"key": _imp_key["11"], "action": "skip"}]})
 _st_c13 = _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]
-check("import save: approve adds a ticked referral to the referrer's record (created, hidden) + history",
+check("import save: approve adds a ticked referral to the referrer's record (created, not hidden) + history",
       _r["statusCode"] == 200 and _st_c13["referrals"][0]["person_id"] == "5" and _st_c13["referrals"][0]["confirmed_unrelated"] is True
-      and _st_c13["visible"] is False and _st_c13["history"][-1]["reason"] == "referral imported from summary")
+      and _st_c13["hidden"] is False and "visible" not in _st_c13 and _st_c13["history"][-1]["reason"] == "referral imported from summary")
 check("import save: ambiguous row approved with the picked candidate",
       _st_s3.objs[lf.STANDING_KEY]["clients"]["19"]["referrals"][0]["person_id"] == "14")
 _imp_status = {s["referred_person_id"]: s["status"] for s in _st_s3.objs[lf.REFERRAL_SUGGESTIONS_KEY]["suggestions"]}

@@ -7809,7 +7809,7 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
         blocks.append(
             f'<div class="pending-buyer">'
             f'<span class="buyer-code">Buyer {_esc(code)}</span> '
-            f'{tier_html}{_standing_star_for(pid)}'
+            f'{tier_html}{_standing_star_for(pid, named=True)}'
             f'{range_html}</div>'
         )
     return "".join(blocks)
@@ -7959,11 +7959,11 @@ def _buy_deal_row_cols_html(deal, resolved_or_disclosed, people_by_id, tenant_pe
         extra_cls = ""
         if disclosed:
             primary, secondary, more_count = _select_display_buyers(deal, buyer_recs)
-            # Standing star (or "Prefers not to share") for the primary buyer
-            # -- same standing_star rules as the anonymous surfaces; never ticks.
+            # Named standing star (or "Prefers not to share") for the primary
+            # buyer -- needs the client's opt-in; never ticks.
             col1_html = _buyer_name_cell_html(primary, secondary, more_count, show_contact=True, link=True,
                                                key=key, view_as=view_as,
-                                               after_name_html=_standing_star_for(primary.get("id")) if primary else "")
+                                               after_name_html=_standing_star_for(primary.get("id"), named=True) if primary else "")
             col1_html += _buyer_contact_detail_html(primary)
             _unused_it, company_text = _investor_type_and_company(buyer_recs, disclosed=True)
             col2_html = _esc(company_text)
@@ -13895,7 +13895,7 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
     min_v, max_v = get_person_ticket_range(cf)
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<div class="buyer-page-row">{_esc(range_text)}</div>' if range_text else ""
-    star_html = _standing_star_for(buyer_id)
+    star_html = _standing_star_for(buyer_id, named=True)
     tier_row = f'<div class="buyer-page-row">{tier_html}{star_html}</div>' if (tier_html or star_html) else ""
     return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}</div>'
             f'{tier_row}{range_html}'
@@ -14642,8 +14642,9 @@ def _esc(s):
 
 # ── Client Standing ──────────────────────────────────────────────────────
 # Chad's private scoreboard per buyer (admin ?view=standing), a five-item
-# good-standing display for sellers (only for clients marked visible), and
-# the desk's per-buyer JSON (?view=standing_json, visible clients only).
+# good-standing display for sellers (not hidden AND the client opted in to
+# sharing), an anonymous star on Buyer Demand tiles (not hidden), and the
+# desk's per-buyer JSON (?view=standing_json, not hidden).
 # Stored ONLY in STANDING_KEY (never Pipeline or Dynamo).
 # compute_client_standing is the one helper every surface reads. Repairs,
 # trade edits, tier floor, referrals, notes, history, trades and volume are
@@ -14676,7 +14677,7 @@ STANDING_LABEL_MAX_LEN = 200
 STANDING_NOTES_MAX_LEN = 2000
 STANDING_PAGE_ROWS = 100
 STANDING_SEARCH_LIMIT = 25
-STANDING_EDIT_FIELDS = ("visible", "respond_repair", "terms_repair", "payments_repair", "tier_floor",
+STANDING_EDIT_FIELDS = ("hidden", "respond_repair", "terms_repair", "payments_repair", "tier_floor",
                         "referrals", "trade_edits", "manual_trades", "notes")
 # (key, tenant-safe label) in display order -- the wording sellers and the
 # desk see. Never "CEF".
@@ -14701,7 +14702,7 @@ STANDING_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _standing_default_client():
-    return {"visible": False, "share_with_sellers": True, "respond_repair": 0, "terms_repair": 0,
+    return {"hidden": False, "share_with_sellers": STANDING_SHARE_DEFAULT, "respond_repair": 0, "terms_repair": 0,
             "payments_repair": 0, "tier_floor": None,
             "referrals": [], "trade_edits": {}, "manual_trades": [], "notes": "", "history": []}
 
@@ -14752,6 +14753,9 @@ def _standing_manual_trades(raw):
 
 
 STANDING_SHARE_REASON = "set by client on desk"
+# Sharing named standing with matched/introduced sellers is OPT-IN: this is
+# the value until the client's own desk change says otherwise.
+STANDING_SHARE_DEFAULT = False
 
 
 def _standing_client_share_entry(history):
@@ -14764,24 +14768,26 @@ def _standing_client_share_entry(history):
 
 def _standing_client_share(history):
     h = _standing_client_share_entry(history)
-    return not (h is not None and h.get("to") is False)
+    return STANDING_SHARE_DEFAULT if h is None else h.get("to") is True
 
 
 def _standing_client_record(raw):
     """A stored client record with every field defaulted/validated (a bad
     stored value reads as its default, never crashes a render). Legacy
-    fields: "private" and the global settings are ignored (everyone starts
-    hidden; visible defaults False); trades_override / volume_override_usd
+    fields: "private", the global settings and the old "visible" flag are
+    ignored ("visible" was a default, not a decision; it survives only in
+    history; hidden defaults False); trades_override / volume_override_usd
     are no longer computed and are kept only in "legacy_overrides" until
     the next save moves them into history."""
     rec = _standing_default_client()
     if not isinstance(raw, dict):
         return rec
-    rec["visible"] = raw.get("visible") is True
+    rec["hidden"] = raw.get("hidden") is True
     rec["history"] = [h for h in (raw.get("history") or []) if isinstance(h, dict)]
-    # Sharing with sellers is opt-out: True unless the client's own latest
-    # change (?action=standing_share, reason STANDING_SHARE_REASON) set it
-    # False. The stored flag is ignored -- the history entry is the record.
+    # Sharing with sellers is opt-in: STANDING_SHARE_DEFAULT unless the
+    # client's own latest change (?action=standing_share, reason
+    # STANDING_SHARE_REASON) set it. The stored flag is ignored -- the
+    # history entry is the record.
     rec["share_with_sellers"] = _standing_client_share(rec["history"])
     for f in STANDING_REPAIR_FIELDS:
         rec[f] = _standing_int(raw.get(f), 0, STANDING_REPAIR_MAX) or 0
@@ -15077,7 +15083,7 @@ def compute_client_standing(person_id, state=None):
     """THE Client Standing helper. None when the person is not in
     people-slim or the standing file could not be read; otherwise every
     derived value (items, good_standing, trades/volume, referrals, tier,
-    discount) plus the stored record and its visible flag."""
+    discount) plus the stored record and its hidden/share flags."""
     if state is None:
         state = _load_client_standing()
     if state is None:
@@ -15122,9 +15128,9 @@ def compute_client_standing(person_id, state=None):
     floor = client["tier_floor"]
     tier = floor if _standing_tier_rank(floor) > _standing_tier_rank(computed) else computed
     return {
-        "person_id": pid, "has_record": stored is not None, "record": client, "visible": client["visible"],
+        "person_id": pid, "has_record": stored is not None, "record": client, "hidden": client["hidden"],
         "share_with_sellers": client["share_with_sellers"],
-        "seller_visible": client["visible"] and client["share_with_sellers"],
+        "seller_visible": not client["hidden"] and client["share_with_sellers"],
         "roles": roles,
         "id_forms_done": flags["id_forms_done"], "qualification_done": flags["qualification_done"],
         "won_deals": won_deals, "trades": tr["trades"], "volume": tr["volume"],
@@ -15150,9 +15156,9 @@ def _next_n(n, word):
 
 # ── Seller-facing surfaces ───────────────────────────────────────────────
 def _standing_seller_items(person_id):
-    """The five items for a seller surface, or None when hidden: shown ONLY
-    when Chad marked the client visible AND the client consented
-    (share_with_sellers); unknown person or any error = hidden."""
+    """The five items for a seller surface, or None: shown ONLY when Chad
+    has not hidden the client AND the client opted in (share_with_sellers);
+    unknown person or any error = nothing."""
     try:
         state = _load_client_standing()
         if state is None:
@@ -15194,11 +15200,11 @@ STANDING_NOT_SHARED_TEXT = "Prefers not to share"
 STANDING_NOT_SHARED_CARD_TEXT = "Client prefers not to share this information."
 
 
-def _standing_star_from_cs(cs):
-    if cs is None or not cs["visible"]:
+def _standing_star_from_cs(cs, named=False):
+    if cs is None or cs["hidden"]:
         return None
-    if not cs["share_with_sellers"]:
-        return "hidden"
+    if named and not cs["share_with_sellers"]:
+        return "noshare"
     rec = cs["record"]
     clean = rec["terms_repair"] == 0 and rec["respond_repair"] == 0
     if not clean:
@@ -15207,17 +15213,19 @@ def _standing_star_from_cs(cs):
     return "gold" if cs["trades"] >= 1 and onboarded else "green"
 
 
-def standing_star(pid):
-    """THE seller-facing star: None (render nothing) when the client is not
-    visible, unknown, or on any error; "hidden" when visible but opted out of
-    sharing; else "gold" (closed a trade, onboarded for their role, terms and
+def standing_star(pid, named=False):
+    """THE seller-facing star: None (render nothing) when the client is
+    hidden, unknown, or on any error. named=False (anonymous Buyer Demand
+    tiles): a colour regardless of the client's share switch. named=True
+    (matched/introduced seller surfaces): "noshare" unless the client opted
+    in to sharing. Colours: "gold" (closed a trade, onboarded for their role, terms and
     respond clean), "green" (terms and respond clean; onboarding not
     required), "yellow" (any terms/respond repair). Payments never count."""
     try:
         state = _load_client_standing()
         if state is None:
             return None
-        return _standing_star_from_cs(compute_client_standing(pid, state=state))
+        return _standing_star_from_cs(compute_client_standing(pid, state=state), named=named)
     except Exception as e:
         print(f"client-standing star failed: {type(e).__name__}: {e}")
         return None
@@ -15226,7 +15234,7 @@ def standing_star(pid):
 def _standing_star_html(star):
     """A small filled star (title/aria-label only) or the muted opt-out text.
     No item detail, count, tier, id or name."""
-    if star == "hidden":
+    if star == "noshare":
         return (f'<span class="gs-noshare" style="margin-left:6px;font-size:11px;color:#8a8f98">'
                 f'{STANDING_NOT_SHARED_TEXT}</span>')
     if star not in STANDING_STAR_STYLE:
@@ -15238,8 +15246,8 @@ def _standing_star_html(star):
             f'<path fill="{fill}" d="{STANDING_STAR_PATH}"/></svg></span>')
 
 
-def _standing_star_for(pid):
-    return _standing_star_html(standing_star(pid))
+def _standing_star_for(pid, named=False):
+    return _standing_star_html(standing_star(pid, named=named))
 
 
 def _standing_buyer_page_card_html(person_id, admin):
@@ -15249,7 +15257,7 @@ def _standing_buyer_page_card_html(person_id, admin):
         items = _standing_seller_items(person_id)
         if items:
             return _standing_card_html(items)
-        if standing_star(person_id) == "hidden":
+        if standing_star(person_id, named=True) == "noshare":
             return ('<div class="card standing-card" style="margin-top:12px">'
                     f'<div class="buyer-page-note" style="color:#8a8f98">{STANDING_NOT_SHARED_CARD_TEXT}</div></div>')
         return ""
@@ -15265,10 +15273,10 @@ def _standing_buyer_page_card_html(person_id, admin):
                 '<div class="buyer-page-note">Standing file could not be loaded.</div></div>')
     if cs["seller_visible"]:
         heading = "Client standing (sellers see this)"
-    elif cs["visible"]:
-        heading = "Client standing (hidden from sellers — client opted out of sharing)"
+    elif not cs["hidden"]:
+        heading = "Client standing (hidden from sellers — client has not opted in to sharing)"
     else:
-        heading = "Client standing (hidden from sellers)"
+        heading = "Client standing (hidden everywhere)"
     return _standing_card_html(cs["items"], heading)
 
 
@@ -15294,7 +15302,7 @@ def standing_json_payload(pid):
         if state is None:
             return {"visible": False}
         cs = compute_client_standing(pid, state=state)
-        if cs is None or not cs["visible"]:
+        if cs is None or cs["hidden"]:
             return {"visible": False}
         rec = cs["record"]
         items = []
@@ -15441,9 +15449,9 @@ def _validate_standing_client(pid, raw, now, old_refs):
     if not isinstance(raw, dict):
         return None, f"{pid}: row must be an object"
     rec = {}
-    if not isinstance(raw.get("visible"), bool):
-        return None, f"{pid}: visible must be true/false"
-    rec["visible"] = raw["visible"]
+    if not isinstance(raw.get("hidden"), bool):
+        return None, f"{pid}: hidden must be true/false"
+    rec["hidden"] = raw["hidden"]
     for f in STANDING_REPAIR_FIELDS:
         v = _standing_int(raw.get(f), 0, STANDING_REPAIR_MAX)
         if v is None:
@@ -15663,8 +15671,8 @@ def _handle_save_standing(event):
 def _handle_standing_share(event):
     """POST ?action=standing_share -- admin key (the desk calls it server-side
     on the client's behalf). Body {pid, share: bool}. Toggles ONLY
-    share_with_sellers; refuses an unknown pid (404) or a client not marked
-    visible (409). Every change appends history {field share_with_sellers,
+    share_with_sellers; refuses an unknown pid (404) or a hidden client
+    (409); a client with no record gets one (defaults). Every change appends history {field share_with_sellers,
     from, to, reason "set by client on desk"} -- the consent record. An
     unchanged value writes nothing. Returns the new standing_json payload."""
     body = _parse_json_body(event)
@@ -15685,14 +15693,14 @@ def _handle_standing_share(event):
         print(f"standing_share read failed: {type(e).__name__}: {e}")
         return _json_response({"error": "Could not read the standing file. Nothing was saved."}, 502)
     current = _normalize_standing_state(current_raw) if current_raw is not None else _standing_empty_state()
-    old = current["clients"].get(pid)
-    if old is None or not old["visible"]:
-        return _json_response({"error": "client standing is not visible"}, 409)
+    old = current["clients"].get(pid) or _standing_default_client()
+    if old["hidden"]:
+        return _json_response({"error": "client standing is hidden"}, 409)
     if old["share_with_sellers"] != share:
         now = _iso_utc()
         new_state = copy.deepcopy(current)
         _standing_migrate_legacy(new_state, now)
-        rec = new_state["clients"][pid]
+        rec = new_state["clients"].setdefault(pid, _standing_default_client())
         rec["history"].append({"at": now, "field": "share_with_sellers", "from": old["share_with_sellers"],
                                "to": share, "reason": STANDING_SHARE_REASON})
         rec["share_with_sellers"] = share
@@ -15792,8 +15800,8 @@ __BANNER__
   <input type="search" id="st-q" placeholder="Search name, firm, email or id…" style="min-width:320px">
   <select id="st-tier"><option value="">Any tier</option><option value="none">No tier</option>
     <option value="preferred">Preferred</option><option value="gold">Gold</option><option value="platinum">Platinum</option></select>
-  <select id="st-vis"><option value="">Visible and hidden</option><option value="visible">Visible only</option>
-    <option value="hidden">Hidden only</option></select>
+  <select id="st-vis"><option value="">Hidden and not hidden</option><option value="hidden">Hidden everywhere only</option>
+    <option value="shown">Not hidden only</option></select>
   <label><input type="checkbox" id="st-bad"> Not in good standing</label>
   <select id="st-sort"><option value="clients">Clients first, then name</option><option value="name">Name</option></select>
   <span id="st-count" class="st-muted"></span>
@@ -15802,8 +15810,6 @@ __BANNER__
 <div id="st-add-results" class="st-results"></div></div>
 <div class="st-bar" id="st-bulk">
   <span class="st-muted" id="st-selcount">0 selected</span>
-  <button type="button" data-bulk="visible_on" disabled>Make visible</button>
-  <button type="button" data-bulk="visible_off" disabled>Hide</button>
   <button type="button" data-bulk="reset_repairs" disabled>Reset repairs</button>
   <span class="st-muted">Tick rows in the Select column to use these.</span>
 </div>
@@ -15813,7 +15819,7 @@ __BANNER__
 <table>
 <thead><tr><th class="st-selcol"><label><input type="checkbox" id="st-all"> Select</label></th><th>Name</th><th>Firm</th><th>ID forms</th><th>Qualification</th>
 <th>Terms</th><th>Payments</th><th>Responds</th><th>Trades</th><th>Referrals</th>
-<th>Tier floor</th><th>Visible</th><th>Shared with sellers</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
+<th>Tier floor</th><th title="Sensitive client — standing shown nowhere, not even to the client">Hidden everywhere</th><th>Shared with sellers</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
 </table>
 </div>
@@ -15887,8 +15893,8 @@ STANDING_PAGE_JS = r"""
       if (tf === 'none' && st.tier) return false;
       if (tf && tf !== 'none' && st.tier !== tf) return false;
       if (bad && st.good) return false;
-      if (vis === 'visible' && !cur(r).rec.visible) return false;
-      if (vis === 'hidden' && cur(r).rec.visible) return false;
+      if (vis === 'hidden' && !cur(r).rec.hidden) return false;
+      if (vis === 'shown' && cur(r).rec.hidden) return false;
       return true;
     });
     out.sort(function(a, b) {
@@ -15943,10 +15949,12 @@ STANDING_PAGE_JS = r"""
       '<td data-role="trades">' + tradesCell(r) + '</td>' +
       '<td data-role="refs">' + refsCell(r) + '</td>' +
       '<td><select data-act="floor">' + floorOpts + '</select></td>' +
-      '<td><input type="checkbox" data-act="visible"' + (rec.visible ? ' checked' : '') + '></td>' +
-      '<td' + (r.share && r.share_at ? ' title="Opted back in ' + esc(String(r.share_at).slice(0, 10)) + '"' : '') + '>' +
-        (r.share ? '<span class="st-yes">✓</span>' : '<span class="st-muted">Opted out' +
-          (r.share_at ? ' ' + esc(String(r.share_at).slice(0, 10)) : '') + '</span>') + '</td>' +
+      '<td><label title="Sensitive client — standing shown nowhere, not even to the client"><input type="checkbox" data-act="hidden"' +
+        (rec.hidden ? ' checked' : '') + '> Hidden</label></td>' +
+      '<td>' + (r.share ? '<span class="st-yes">✓</span>' + (r.share_at ? ' <span class="st-muted">Opted in ' +
+          esc(String(r.share_at).slice(0, 10)) + '</span>' : '') :
+        '<span class="st-muted">' + (r.share_at ? 'Opted out ' + esc(String(r.share_at).slice(0, 10)) : 'Not shared') +
+          '</span>') + '</td>' +
       '<td class="st-tier" data-role="tier">' + tierHtml(r) + '</td>' +
       '<td><textarea class="st-notes" data-act="notes" maxlength="' + D.notes_max + '" rows="1">' + esc(rec.notes) + '</textarea></td>' +
       '<td>' + (hist.length ? '<a href="#" data-act="hist">History (' + hist.length + ')</a>' : '<span class="st-muted">History (0)</span>') + '</td></tr>' +
@@ -16020,7 +16028,9 @@ STANDING_PAGE_JS = r"""
     document.getElementById('st-pager').hidden = pages < 2;
     document.getElementById('st-prev').disabled = page === 0;
     document.getElementById('st-next').disabled = page >= pages - 1;
-    document.getElementById('st-count').textContent = list.length + ' of ' + rows.length + ' people';
+    var nHidden = rows.filter(function(r) { return cur(r).rec.hidden; }).length;
+    document.getElementById('st-count').textContent = list.length + ' of ' + rows.length + ' people · ' +
+      nHidden + ' hidden everywhere';
     updateBulk();
     document.getElementById('st-all').checked = slice.length > 0 && slice.every(function(r) { return selected[r.id]; });
     renderDirty();
@@ -16034,8 +16044,7 @@ STANDING_PAGE_JS = r"""
     tr.querySelector('[data-role=trades]').innerHTML = tradesCell(r);
     renderDirty();
   }
-  var BULK_LABELS = {visible_on: ['Make visible', 'Make {n} visible'], visible_off: ['Hide', 'Hide {n}'],
-    reset_repairs: ['Reset repairs', 'Reset repairs on {n}']};
+  var BULK_LABELS = {reset_repairs: ['Reset repairs', 'Reset repairs on {n}']};
   function updateBulk() {
     var n = Object.keys(selected).length;
     document.getElementById('st-selcount').textContent = n + ' selected';
@@ -16079,14 +16088,14 @@ STANDING_PAGE_JS = r"""
       if (!s2.refs.some(function(y) { return y.person_id === x.person_id; })) { x.confirmed_unrelated = true; x.household_override = false; s2.refs.push(x); }
       render(); }
   });
-  var CHANGE_ACTS = {sel: 1, visible: 1, floor: 1, hhok: 1, tinc: 1};
+  var CHANGE_ACTS = {sel: 1, hidden: 1, floor: 1, hhok: 1, tinc: 1};
   body.addEventListener('change', function(e) {
     var el = e.target, act = el.getAttribute('data-act');
     if (!act || !CHANGE_ACTS[act]) return;
     var r = rowOf(el); if (!r) return;
     if (act === 'sel') { if (el.checked) selected[r.id] = 1; else delete selected[r.id]; render(); return; }
     var s = edit(r);
-    if (act === 'visible') s.rec.visible = el.checked;
+    if (act === 'hidden') s.rec.hidden = el.checked;
     else if (act === 'floor') s.rec.tier_floor = el.value || null;
     else if (act === 'hhok') s.refs[+el.getAttribute('data-i')].household_override = el.checked;
     else if (act === 'tinc') { var did = el.closest('tr[data-deal]').getAttribute('data-deal');
@@ -16165,14 +16174,11 @@ STANDING_PAGE_JS = r"""
     var ids = Object.keys(selected).filter(function(id) { return byId[id]; });
     if (!ids.length) return;
     ids.forEach(function(id) { var s = edit(byId[id]);
-      if (op === 'visible_on') s.rec.visible = true;
-      else if (op === 'visible_off') s.rec.visible = false;
-      else if (op === 'reset_repairs') { s.rec.terms_repair = 0; s.rec.payments_repair = 0; s.rec.respond_repair = 0; }
+      if (op === 'reset_repairs') { s.rec.terms_repair = 0; s.rec.payments_repair = 0; s.rec.respond_repair = 0; }
     });
     render();
     var who = ids.length + (ids.length === 1 ? ' person' : ' people');
-    msg('st-ok', (op === 'visible_on' ? 'Visible set on ' : op === 'visible_off' ? 'Hidden on ' : 'Repairs reset on ') +
-      who + ' — Save to apply');
+    msg('st-ok', 'Repairs reset on ' + who + ' — Save to apply');
   });
   function msg(cls, text) { document.getElementById('st-msg').innerHTML = '<div class="st-banner ' + cls + '">' + esc(text) + '</div>'; }
   var saveBtn = document.getElementById('st-savebtn');
@@ -16180,7 +16186,7 @@ STANDING_PAGE_JS = r"""
   saveBtn.addEventListener('click', function() {
     var clients = {};
     rows.filter(changed).forEach(function(r) { var s = cur(r);
-      clients[r.id] = {visible: !!s.rec.visible, terms_repair: s.rec.terms_repair, payments_repair: s.rec.payments_repair,
+      clients[r.id] = {hidden: !!s.rec.hidden, terms_repair: s.rec.terms_repair, payments_repair: s.rec.payments_repair,
         respond_repair: s.rec.respond_repair, tier_floor: s.rec.tier_floor || null, notes: s.rec.notes || '',
         trade_edits: s.rec.trade_edits, manual_trades: s.rec.manual_trades,
         referrals: s.refs.map(function(x) { return {person_id: x.person_id, confirmed_unrelated: true, household_override: !!x.household_override}; })};
