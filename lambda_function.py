@@ -14692,9 +14692,10 @@ STANDING_ITEMS = (
     ("payments", "Meets all payment deadlines"),
     ("respond", "Responds promptly after an introduction"),
 )
-STANDING_QUALIFICATION_LABEL = dict(STANDING_ITEMS)["qualification"]
-# Desk JSON only: seller-only clients see qualification as done with this note.
-STANDING_SELLER_QUALIFICATION_NOTE = "Unnecessary for sellers"
+# Desk JSON only: seller-only clients see qualification as done with this
+# label and note (buyer / buyer+seller keep the STANDING_ITEMS wording).
+STANDING_SELLER_QUALIFICATION_LABEL = "Investor qualification"
+STANDING_SELLER_QUALIFICATION_NOTE = "Not needed for sellers"
 STANDING_REFERRAL_LABEL = "Introduced a new client who completed onboarding with Rainmaker"
 IQF_LABELS = {6496840: "Yes", 6596073: "Unnecessary"}
 PIPELINE_PERSON_URL = "https://app.pipelinecrm.com/people/{}"
@@ -15321,7 +15322,7 @@ def standing_json_payload(pid):
         items = []
         seller_only = cs["roles"]["seller"] and not cs["roles"]["buyer"]
         for i in cs["items"]:
-            item = {"label": i["label"], "done": i["done"], "note": ""}
+            item = {"key": i["key"], "label": i["label"], "done": i["done"], "note": ""}
             if not i["done"]:
                 k = i["key"]
                 if k == "respond":
@@ -15338,13 +15339,13 @@ def standing_json_payload(pid):
                     item["form_url"] = CEF_FORM_URL
             items.append(item)
             if i["key"] == "id_forms" and seller_only:
-                items.append({"label": STANDING_QUALIFICATION_LABEL, "done": True,
+                items.append({"key": "qualification", "label": STANDING_SELLER_QUALIFICATION_LABEL, "done": True,
                               "note": STANDING_SELLER_QUALIFICATION_NOTE})
-        ref_item = {"label": STANDING_REFERRAL_LABEL, "done": cs["confirmed_referrals"] >= 1}
+        ref_item = {"key": "referral", "label": STANDING_REFERRAL_LABEL, "done": cs["confirmed_referrals"] >= 1}
         if cs["referrals"]:
             ref_item["note"] = _standing_referral_note(cs["confirmed_referrals"], cs["pending_referrals"])
         items.append(ref_item)
-        items.append({"label": "Completed trades", "done": cs["trades"] >= 1,
+        items.append({"key": "trades", "label": "Completed trades", "done": cs["trades"] >= 1,
                       "note": f"{_plural(cs['trades'], 'trade')} · {_fmt_standing_musd(cs['volume'])}"})
         tier = cs["tier"]
         return {"visible": True, "share_with_sellers": cs["share_with_sellers"],

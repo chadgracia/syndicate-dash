@@ -9144,12 +9144,14 @@ check("standing_json: buyer + seller -> all five items, then referral + trades",
       [i["label"] for i in _d["items"]] == [lbl for _, lbl in lf.STANDING_ITEMS]
       + ["Introduced a new client who completed onboarding with Rainmaker", "Completed trades"])
 check("standing_json: terms note keyed to the number",
-      _d["items"][2] == {"label": "Honors agreed terms through closing", "done": False,
+      _d["items"][2] == {"key": "terms", "label": "Honors agreed terms through closing", "done": False,
                          "note": "Complete your next 3 trades on the agreed terms."})
 check("standing_json: referral note '1 confirmed'",
-      _d["items"][5] == {"label": lf.STANDING_REFERRAL_LABEL, "done": True, "note": "1 confirmed"})
+      _d["items"][5] == {"key": "referral", "label": lf.STANDING_REFERRAL_LABEL, "done": True, "note": "1 confirmed"})
+check("standing_json: every item carries its key, in order",
+      [i["key"] for i in _d["items"]] == ["id_forms", "qualification", "terms", "payments", "respond", "referral", "trades"])
 check("standing_json: trades include edited size and manual trade (4 trades)",
-      _d["items"][6] == {"label": "Completed trades", "done": True, "note": "4 trades · $10.1M"})
+      _d["items"][6] == {"key": "trades", "label": "Completed trades", "done": True, "note": "4 trades · $10.1M"})
 check("standing_json: no internal fields (history/notes/manual labels/repairs)",
       "ZZSECRETREASON" not in _r["body"] and "ZZINTERNALNOTE" not in _r["body"] and "ZZMANUALTRADE" not in _r["body"]
       and "repair" not in _r["body"] and "history" not in _r["body"] and "Rita" not in _r["body"])
@@ -9158,18 +9160,20 @@ _st_lbl = {i["label"]: i for i in _d["items"]}
 check("standing_json: buyer -> engagement form item omitted (not applicable)",
       "Identity and compliance forms complete" not in _st_lbl and len(_d["items"]) == 6)
 check("standing_json: qualification open note",
-      _st_lbl["Investor qualification on file"] == {"label": "Investor qualification on file", "done": False,
+      _st_lbl["Investor qualification on file"] == {"key": "qualification", "label": "Investor qualification on file", "done": False,
                                                      "note": "Rainmaker's qualification form is still needed."})
 check("standing_json: respond note plural",
       _st_lbl["Responds promptly after an introduction"]["note"]
       == "Reply within 3 business days on your next 2 introductions.")
 _st_put(dict(_ST_SECRET_CLIENTS, **{"15": {}}))
 _st_sid = _st_json(15)[1]
-check("standing_json: seller -> ID forms open note + form_url; qualification done 'Unnecessary for sellers'",
-      _st_sid["items"][0] == {"label": "Identity and compliance forms complete", "done": False,
+check("standing_json: seller -> ID forms open note + form_url; 'Investor qualification' done 'Not needed for sellers'",
+      _st_sid["items"][0] == {"key": "id_forms", "label": "Identity and compliance forms complete", "done": False,
                               "note": "Rainmaker's engagement form is still needed.", "form_url": lf.CEF_FORM_URL}
-      and _st_sid["items"][1] == {"label": "Investor qualification on file", "done": True,
-                                  "note": "Unnecessary for sellers"})
+      and _st_sid["items"][1] == {"key": "qualification", "label": "Investor qualification", "done": True,
+                                  "note": "Not needed for sellers"}
+      and [i["key"] for i in _st_sid["items"]] == ["id_forms", "qualification", "terms", "payments", "respond",
+                                                   "referral", "trades"])
 _st_put(_ST_SECRET_CLIENTS)
 check("standing_json: Bob's floor gold applies without good standing", _d["tier"] == "gold" and _d["discount_pct"] == 15)
 _st_put({"2": {"payments_repair": 1, "terms_repair": 1, "respond_repair": 1,
@@ -9183,15 +9187,15 @@ check("standing_json: count 1 drops the number; Pipeline trades/volume note",
       and _d["items"][4]["note"] == "Reply within 3 business days on your next introduction."
       and _d["items"][6]["note"] == "3 trades · $4.2M" and _d["tier"] is None)
 check("standing_json: referral note '1 confirmed, 1 pending onboarding'",
-      _d["items"][5] == {"label": lf.STANDING_REFERRAL_LABEL, "done": True,
+      _d["items"][5] == {"key": "referral", "label": lf.STANDING_REFERRAL_LABEL, "done": True,
                          "note": "1 confirmed, 1 pending onboarding"})
 check("standing_json: referral note '1 pending onboarding' only",
-      _st_json(12)[1]["items"][5] == {"label": lf.STANDING_REFERRAL_LABEL, "done": False,
+      _st_json(12)[1]["items"][5] == {"key": "referral", "label": lf.STANDING_REFERRAL_LABEL, "done": False,
                                       "note": "1 pending onboarding"})
 check("standing_json: Julio gets credit for all 4 won deals",
       _st_json(12)[1]["items"][6]["note"] == "4 trades · $8.6M")
 check("standing_json: no referrals -> done false and no note; no trades",
-      _st_json(13)[1]["items"][4] == {"label": lf.STANDING_REFERRAL_LABEL, "done": False}
+      _st_json(13)[1]["items"][4] == {"key": "referral", "label": lf.STANDING_REFERRAL_LABEL, "done": False}
       and _st_json(13)[1]["items"][5]["note"] == "0 trades · $0.0M")
 _st_s3.objs.pop(lf.STANDING_KEY, None)
 lf._data_cache.pop(lf.STANDING_KEY, None)
@@ -9224,20 +9228,25 @@ check("not applicable: seller with engagement form only, clean, no trade -> gree
 _st_card = lf._standing_card_html(lf._standing_seller_items(16))
 check("not applicable: seller card omits the qualification item",
       "Identity and compliance forms complete" in _st_card and "Investor qualification on file" not in _st_card)
-check("standing_json: seller-only -> qualification shown done with 'Unnecessary for sellers', after ID forms",
-      (lambda it: [i["label"] for i in it][:2] == ["Identity and compliance forms complete", "Investor qualification on file"]
-       and it[1] == {"label": "Investor qualification on file", "done": True, "note": "Unnecessary for sellers"})(
-          _st_json(16)[1]["items"]))
-check("standing_json: buyer-only -> engagement form item still omitted",
+check("standing_json: seller-only -> 'Investor qualification' done 'Not needed for sellers', after ID forms",
+      (lambda it: [i["label"] for i in it][:2] == ["Identity and compliance forms complete", "Investor qualification"]
+       and it[1] == {"key": "qualification", "label": "Investor qualification", "done": True,
+                     "note": "Not needed for sellers"})(_st_json(16)[1]["items"]))
+check("standing_json: buyer-only -> engagement form omitted, qualification wording unchanged",
       "Identity and compliance forms complete" not in [i["label"] for i in _st_json(17)[1]["items"]]
-      and "Unnecessary for sellers" not in json.dumps(_st_json(17)[1]))
+      and "Investor qualification on file" in [i["label"] for i in _st_json(17)[1]["items"]]
+      and "Not needed for sellers" not in json.dumps(_st_json(17)[1]))
+check("standing_json: buyer + seller keeps 'Investor qualification on file' (no seller note)",
+      (lambda d: "Investor qualification on file" in [i["label"] for i in d["items"]]
+       and "Not needed for sellers" not in json.dumps(d))(_st_json(12)[1]))
 check("standing_json: carries roles",
       _st_json(16)[1]["roles"] == {"seller": True, "buyer": False}
       and _st_json(17)[1]["roles"] == {"seller": False, "buyer": True}
       and _st_json(24)[1]["roles"] == {"seller": True, "buyer": False})
-check("standing_json: IQF Unnecessary + Buy Interest -> seller items, qualification 'Unnecessary for sellers'",
+check("standing_json: IQF Unnecessary + Buy Interest -> seller items, qualification 'Not needed for sellers'",
       (lambda it: it[0]["label"] == "Identity and compliance forms complete" and it[0]["done"]
-       and it[1]["note"] == "Unnecessary for sellers")(_st_json(24)[1]["items"]))
+       and it[1]["label"] == "Investor qualification" and it[1]["note"] == "Not needed for sellers")(
+          _st_json(24)[1]["items"]))
 _st_s3.put_calls.clear()
 _r = _st_share({"key": ADMIN_KEY, "pid": "24", "share": True})
 check("standing_share: a seller-only client's choice is stored with the same mechanism",
