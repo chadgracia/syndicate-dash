@@ -9171,6 +9171,141 @@ check("scoreboard: share is an editable checkbox posted with Save",
       'data-act="share"' in lf.STANDING_PAGE_JS and "share: 1" in lf.STANDING_PAGE_JS
       and "clients[r.id].share_with_sellers" in lf.STANDING_PAGE_JS)
 
+# --- Admin form overrides + desk admin editor (?view/action=standing_client)
+def _st_client_get(pid, key=ADMIN_KEY, cookies=None):
+    q = {"view": "standing_client", "pid": str(pid)}
+    if key is not None:
+        q["key"] = key
+    return _st_get(q, cookies)
+
+
+def _st_client_post(body, method="POST"):
+    return lf.lambda_handler({"requestContext": {"http": {"method": method}}, "rawPath": "/",
+                              "queryStringParameters": {"action": "standing_client"},
+                              "body": json.dumps(body), "cookies": []}, None)
+
+_st_put({"2": {"notes": "keep"}}, rev=60)
+check("standing_client: GET without key -> 403", _st_client_get(2, key=None)["statusCode"] == 403)
+check("standing_client: GET wrong key -> 403", _st_client_get(2, key="nope")["statusCode"] == 403)
+check("standing_client: tenant cookie is not enough -> 403",
+      _st_client_get(2, key=None, cookies=[tenant_cookie(TENANT_EMAIL)])["statusCode"] == 403)
+check("standing_client: POST without key -> 403", _st_client_post({"pid": "2", "rev": 60, "fields": {"notes": "x"}})["statusCode"] == 403)
+check("standing_client: GET on the action -> 405", _st_get({"action": "standing_client", "key": ADMIN_KEY})["statusCode"] == 405)
+check("standing_client: bad / unknown pid -> 400 / 404",
+      _st_client_get("x2")["statusCode"] == 400 and _st_client_get(424242)["statusCode"] == 404)
+_r = _st_client_get(2)
+_d = json.loads(_r["body"])
+check("standing_client: GET returns desk JSON + admin-only fields incl. rev and override defaults",
+      _r["statusCode"] == 200 and _d["standing"]["visible"] is True and _d["admin"]["rev"] == 60
+      and _d["admin"]["notes"] == "keep" and _d["admin"]["qualification_override"] is None
+      and _d["admin"]["id_forms_override_note"] == "Please resubmit \u2014 an update is needed"
+      and _d["admin"]["id_forms_override_reason"] == "" and _d["admin"]["pipeline_qualification_done"] is True)
+lf._req_cache_reset()
+_st_alice = lf.compute_client_standing(2)
+check("override fixture: Alice is Pipeline-done on both forms, gold star",
+      _st_alice["qualification_done"] and _st_alice["id_forms_done"] and lf.standing_star(2) == "gold")
+
+for _lbl, _fields in (("repair 7", {"terms_repair": 7}), ("hidden not bool", {"hidden": "yes"}),
+                      ("bad tier floor", {"tier_floor": "diamond"}), ("notes too long", {"notes": "x" * 2001}),
+                      ("bad override value", {"qualification_override": "maybe"}),
+                      ("reason too long", {"id_forms_override_reason": "x" * 501}),
+                      ("note not text", {"id_forms_override_note": 5}),
+                      ("share not bool", {"share_with_sellers": "yes"}), ("unknown field", {"referrals": []}),
+                      ("empty fields", {})):
+    _r = _st_client_post({"key": ADMIN_KEY, "pid": "2", "rev": 60, "fields": _fields})
+    check(f"standing_client: {_lbl} -> 400, nothing written",
+          _r["statusCode"] == 400 and _st_s3.objs[lf.STANDING_KEY]["rev"] == 60)
+check("standing_client: stale rev -> 409 with the reload message",
+      (lambda r: r["statusCode"] == 409 and json.loads(r["body"])["error"] == lf.STANDING_CONFLICT_MSG)(
+          _st_client_post({"key": ADMIN_KEY, "pid": "2", "rev": 59, "fields": {"notes": "x"}})))
+
+_st_fields = {"hidden": False, "respond_repair": 1, "terms_repair": 2, "payments_repair": 3, "tier_floor": "gold",
+              "notes": "Desk note", "share_with_sellers": True}
+_r = _st_client_post({"key": ADMIN_KEY, "pid": "2", "rev": 60, "fields": _st_fields})
+_d = json.loads(_r["body"])
+_st_c2 = _st_s3.objs[lf.STANDING_KEY]["clients"]["2"]
+_st_hist = {h["field"]: h for h in _st_c2["history"]}
+check("standing_client: each field saves through the shared path (rev+1, values stored)",
+      _r["statusCode"] == 200 and _st_s3.objs[lf.STANDING_KEY]["rev"] == 61 and _d["admin"]["rev"] == 61
+      and all(_st_c2[k] == v for k, v in _st_fields.items()))
+check("standing_client: one history entry per changed field, actor admin",
+      all(_st_hist[k]["actor"] in ("admin", "admin (client permission)") for k in _st_fields if k != "hidden")
+      and _st_hist["notes"]["from"] == "keep" and _st_hist["notes"]["to"] == "Desk note"
+      and _st_hist["notes"]["actor"] == "admin" and _st_hist["share_with_sellers"]["actor"] == "admin (client permission)"
+      and "hidden" not in _st_hist)
+check("standing_client: response carries the recomputed desk JSON (yellow, gold floor)",
+      _d["standing"]["tier"] == "gold" and _d["standing"]["good_standing"] is False)
+check("standing_client: untouched stored fields kept (referrals/trade edits)",
+      _st_c2["referrals"] == [] and _st_c2["trade_edits"] == {})
+
+# Overrides flip Pipeline-done forms to not done and recompute everything
+_st_put({"2": {}, "13": {}}, rev=70)
+lf._req_cache_reset()
+check("override fixture: Tia good standing, green star before the override",
+      lf.compute_client_standing(13)["good_standing"] and lf.standing_star(13) == "green")
+_r = _st_client_post({"key": ADMIN_KEY, "pid": "13", "rev": 70, "fields": {
+    "qualification_override": "needs_update", "qualification_override_note": "Please re-sign the IQF",
+    "qualification_override_reason": "ZZPRIVATEREASON expired accreditation"}})
+_d = json.loads(_r["body"])
+lf._req_cache_reset()
+_cs13 = lf.compute_client_standing(13)
+_q13 = [i for i in _d["standing"]["items"] if i["key"] == "qualification"][0]
+check("override: Pipeline-done IQF becomes not done, good standing drops",
+      _r["statusCode"] == 200 and _cs13["qualification_done"] is False and _cs13["pipeline_qualification_done"] is True
+      and _cs13["good_standing"] is False and _d["standing"]["good_standing"] is False)
+check("override: desk item shows the client-facing note, flagged as an override",
+      _q13["done"] is False and _q13["note"] == "Please re-sign the IQF" and _q13.get("override") is True)
+check("override: history records the override fields with actor admin",
+      {h["field"] for h in _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["history"] if h.get("actor") == "admin"}
+      >= {"qualification_override", "qualification_override_note", "qualification_override_reason"})
+_st_put({"2": {}, "13": {"referrals": [{"person_id": "5"}], "qualification_override": "needs_update"}}, rev=71)
+lf._req_cache_reset()
+check("override: a confirmed referral no longer earns Preferred (not in good standing)",
+      lf.compute_client_standing(13)["tier"] is None
+      and _st_cs(13, {"13": {"referrals": [{"person_id": "5"}]}})["tier"] == "preferred")
+_st_put({"2": {"id_forms_override": "needs_update", "share_with_sellers": True,
+               "id_forms_override_reason": "ZZPRIVATEREASON",
+               "history": [dict(_ST_OPTIN[0])] if _ST_OPTIN else []}}, rev=72)
+lf._req_cache_reset()
+check("override: CEF override turns Alice's gold star green (onboarding no longer complete)",
+      lf.standing_star(2) == "green" and lf.compute_client_standing(2)["id_forms_done"] is False)
+_st_idf = [i for i in json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"])["items"]
+           if i["key"] == "id_forms"][0]
+check("override: CEF item carries the default note and the engagement form link",
+      _st_idf["done"] is False and _st_idf["note"] == "Please resubmit \u2014 an update is needed"
+      and _st_idf["form_url"] == lf.CEF_FORM_URL)
+_st_np2 = _st_tenant_pages()
+check("override: seller-facing card ticks recompute (ID forms item open)",
+      ">Client standing<" in _st_np2["disclosed buyer page"] and
+      _st_np2["disclosed buyer page"].split(">Client standing<")[1].split("</ul>")[0].count("border:2px solid #b8bcc4") == 1)
+_st_all = (json.dumps(json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"]))
+           + json.dumps(json.loads(_st_get({"view": "standing_json", "pid": "13", "key": ADMIN_KEY})["body"]))
+           + "".join(_st_np2.values()))
+check("override reason never appears in desk JSON or seller output", "ZZPRIVATEREASON" not in _st_all)
+_st_put({"2": {}, "13": {"qualification_override": "needs_update", "qualification_override_reason": "r"}}, rev=73)
+_r = _st_client_post({"key": ADMIN_KEY, "pid": "13", "rev": 73, "fields": {"qualification_override": None}})
+lf._req_cache_reset()
+check("clearing the override restores Pipeline (done again, good standing back)",
+      _r["statusCode"] == 200 and lf.compute_client_standing(13)["qualification_done"] is True
+      and lf.compute_client_standing(13)["good_standing"] is True
+      and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["qualification_override"] is None)
+_st_rev = _st_s3.objs[lf.STANDING_KEY]["rev"]
+_r = _st_post({"key": ADMIN_KEY, "rev": _st_rev, "clients": {"13": _st_row(notes="scoreboard save")}})
+check("scoreboard save without override keys keeps the stored override values",
+      _r["statusCode"] == 200 and _st_s3.objs[lf.STANDING_KEY]["clients"]["13"]["qualification_override_reason"] == "r")
+_st_put({"3": {"hidden": True}}, rev=80)
+check("standing_client: hidden blocks a share change (409)",
+      _st_client_post({"key": ADMIN_KEY, "pid": "3", "rev": 80, "fields": {"share_with_sellers": True}})["statusCode"] == 409)
+_st_put({"13": {"id_forms_override": "needs_update"}}, rev=81)
+_st_sb = _st_get({"view": "standing", "key": ADMIN_KEY, "pid": "13"})["body"]
+_st_r13 = [x for x in _st_page_data(_st_sb)["rows"] if x["id"] == "13"][0]
+check("scoreboard: deep link pid passed to the page, row shows the override state",
+      _st_page_data(_st_sb)["focus_pid"] == "13" and _st_r13["overrides"]["id_forms"] == "needs_update"
+      and "Needs update (override)" in lf.STANDING_PAGE_JS and "st-focus" in lf.STANDING_PAGE_JS
+      and "id_forms_override_reason" not in json.dumps(_st_r13))
+check("scoreboard: non-numeric pid ignored", _st_page_data(_st_get({"view": "standing", "key": ADMIN_KEY,
+                                                                   "pid": "<x>"})["body"])["focus_pid"] == "")
+
 # --- Desk JSON
 def _st_json(pid):
     r = _st_get({"view": "standing_json", "pid": str(pid), "key": ADMIN_KEY})

@@ -14680,6 +14680,17 @@ STANDING_PAGE_ROWS = 100
 STANDING_SEARCH_LIMIT = 25
 STANDING_EDIT_FIELDS = ("hidden", "respond_repair", "terms_repair", "payments_repair", "tier_floor",
                         "referrals", "trade_edits", "manual_trades", "notes")
+# Admin form overrides: None = use Pipeline (IQF custom_label_3763008 / CEF);
+# "needs_update" = the item is NOT done whatever Pipeline says. Pipeline is
+# never written. *_note is client-facing (desk card); *_reason is admin-only
+# and never reaches the desk JSON or any seller surface. Optional on
+# save_standing (a row that omits them keeps the stored values).
+STANDING_OVERRIDE_ITEMS = ("qualification", "id_forms")
+STANDING_OVERRIDE_VALUES = (None, "needs_update")
+STANDING_OVERRIDE_NOTE_DEFAULT = "Please resubmit \u2014 an update is needed"
+STANDING_OVERRIDE_TEXT_MAX_LEN = 500
+STANDING_OVERRIDE_FIELDS = tuple(f"{k}{suffix}" for k in STANDING_OVERRIDE_ITEMS
+                                 for suffix in ("_override", "_override_note", "_override_reason"))
 # (key, tenant-safe label) in display order -- the wording sellers and the
 # desk see. Never "CEF".
 # id_forms applies only to sellers, qualification only to buyers
@@ -14707,9 +14718,14 @@ STANDING_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _standing_default_client():
-    return {"hidden": False, "share_with_sellers": STANDING_SHARE_DEFAULT, "respond_repair": 0, "terms_repair": 0,
-            "payments_repair": 0, "tier_floor": None,
-            "referrals": [], "trade_edits": {}, "manual_trades": [], "notes": "", "history": []}
+    rec = {"hidden": False, "share_with_sellers": STANDING_SHARE_DEFAULT, "respond_repair": 0, "terms_repair": 0,
+           "payments_repair": 0, "tier_floor": None,
+           "referrals": [], "trade_edits": {}, "manual_trades": [], "notes": "", "history": []}
+    for k in STANDING_OVERRIDE_ITEMS:
+        rec[f"{k}_override"] = None
+        rec[f"{k}_override_note"] = STANDING_OVERRIDE_NOTE_DEFAULT
+        rec[f"{k}_override_reason"] = ""
+    return rec
 
 
 def _standing_empty_state():
@@ -14830,6 +14846,14 @@ def _standing_client_record(raw):
     rec["trade_edits"] = _standing_trade_edits(raw.get("trade_edits"))
     rec["manual_trades"] = _standing_manual_trades(raw.get("manual_trades"))
     rec["notes"] = raw.get("notes")[:STANDING_NOTES_MAX_LEN] if isinstance(raw.get("notes"), str) else ""
+    for k in STANDING_OVERRIDE_ITEMS:
+        ov = raw.get(f"{k}_override")
+        rec[f"{k}_override"] = ov if ov in STANDING_OVERRIDE_VALUES else None
+        note = raw.get(f"{k}_override_note")
+        rec[f"{k}_override_note"] = (note.strip()[:STANDING_OVERRIDE_TEXT_MAX_LEN]
+                                     if isinstance(note, str) and note.strip() else STANDING_OVERRIDE_NOTE_DEFAULT)
+        reason = raw.get(f"{k}_override_reason")
+        rec[f"{k}_override_reason"] = reason[:STANDING_OVERRIDE_TEXT_MAX_LEN] if isinstance(reason, str) else ""
     legacy = {"trades": raw.get("trades_override"), "volume_usd": raw.get("volume_override_usd")}
     if any(v is not None for v in legacy.values()):
         rec["legacy_overrides"] = legacy
@@ -15124,7 +15148,11 @@ def compute_client_standing(person_id, state=None):
         return None
     stored = state["clients"].get(pid)
     client = stored if stored is not None else _standing_default_client()
-    flags = _standing_person_flags(rec)
+    pipeline_flags = _standing_person_flags(rec)
+    # Admin overrides: "needs_update" makes the form item not done whatever
+    # Pipeline says (Pipeline is never written).
+    flags = {"id_forms_done": pipeline_flags["id_forms_done"] and client["id_forms_override"] is None,
+             "qualification_done": pipeline_flags["qualification_done"] and client["qualification_override"] is None}
     roles = _standing_roles(pid, rec)
     won_deals = _standing_deal_index()["won"].get(pid, [])
     tr = _standing_trades(won_deals, client)
@@ -15165,6 +15193,8 @@ def compute_client_standing(person_id, state=None):
         "seller_visible": not client["hidden"] and client["share_with_sellers"],
         "roles": roles,
         "id_forms_done": flags["id_forms_done"], "qualification_done": flags["qualification_done"],
+        "pipeline_id_forms_done": pipeline_flags["id_forms_done"],
+        "pipeline_qualification_done": pipeline_flags["qualification_done"],
         "won_deals": won_deals, "trades": tr["trades"], "volume": tr["volume"],
         "trades_250k": tr["trades_250k"], "trades_1m": tr["trades_1m"], "unknown_size": tr["unknown_size"],
         "items": items, "done_count": sum(1 for i in items if i["done"]), "good_standing": good_standing,
@@ -15353,6 +15383,10 @@ def standing_json_payload(pid):
                 elif k == "payments":
                     item["note"] = (f"Meet the payment deadlines on your next "
                                     f"{_next_n(rec['payments_repair'], 'trade')}.")
+                elif rec.get(f"{k}_override") == "needs_update":
+                    # Client-facing override note (never the admin-only reason).
+                    item["note"] = rec[f"{k}_override_note"]
+                    item["override"] = True
                 else:
                     item["note"] = STANDING_ITEM_OPEN_NOTES[k]
                 if k == "id_forms":
@@ -15400,6 +15434,7 @@ def _standing_row(pid, rec, state):
         "id_forms": cs["id_forms_done"], "qual": cs["qualification_done"], "roles": cs["roles"],
         "won": cs["won_deals"], "has_record": cs["has_record"],
         "rec": {k: client[k] for k in STANDING_EDIT_FIELDS if k != "referrals"},
+        "overrides": {k: client[f"{k}_override"] for k in STANDING_OVERRIDE_ITEMS},
         # Read-only on the scoreboard: consent comes only from the client.
         "share": client["share_with_sellers"], "share_at": _standing_share_at(client),
         "last": _standing_last_name(rec),
@@ -15458,7 +15493,7 @@ def _standing_json_for_script(data):
         "&", "\\u0026")
 
 
-def render_standing_page(key):
+def render_standing_page(key, focus_pid=None):
     state = _load_client_standing(fresh=True)
     load_error = state is None
     rows = [] if load_error else standing_admin_rows(state)
@@ -15472,6 +15507,8 @@ def render_standing_page(key):
         "size_250k": STANDING_SIZE_250K, "size_1m": STANDING_SIZE_1M,
         "person_url": PIPELINE_PERSON_URL, "deal_url": PIPELINE_DEAL_URL,
         "conflict_msg": STANDING_CONFLICT_MSG,
+        # ?view=standing&pid=<id>: scroll to + highlight that client's row.
+        "focus_pid": focus_pid if (focus_pid or "").isdigit() else "",
     }
     banner = ('<div class="st-banner st-err">The standing file could not be loaded. Nothing can be saved '
               'until it loads; reload to try again.</div>') if load_error else ""
@@ -15562,6 +15599,28 @@ def _validate_standing_client(pid, raw, now, old_refs):
         return None, f"{pid}: notes must be text of at most {STANDING_NOTES_MAX_LEN} characters"
     rec["notes"] = notes
     return rec, None
+
+
+def _validate_standing_overrides(pid, raw, old):
+    """(values, error): the override fields present in raw, validated; a
+    field raw omits keeps old's value."""
+    vals = {}
+    for k in STANDING_OVERRIDE_ITEMS:
+        f = f"{k}_override"
+        v = raw.get(f, old[f])
+        if v not in STANDING_OVERRIDE_VALUES:
+            return None, f"{pid}: {f} must be blank or needs_update"
+        vals[f] = v
+        for f in (f"{k}_override_note", f"{k}_override_reason"):
+            v = raw.get(f, old[f])
+            if v is None:
+                v = ""
+            if not isinstance(v, str) or len(v) > STANDING_OVERRIDE_TEXT_MAX_LEN:
+                return None, f"{pid}: {f} must be text of at most {STANDING_OVERRIDE_TEXT_MAX_LEN} characters"
+            vals[f] = v.strip() if f.endswith("_note") else v
+        if not vals[f"{k}_override_note"]:
+            vals[f"{k}_override_note"] = STANDING_OVERRIDE_NOTE_DEFAULT
+    return vals, None
 
 
 def _standing_hist_value(field, v):
@@ -15675,9 +15734,18 @@ def _handle_save_standing(event):
     except Exception as e:
         print(f"save_standing read failed: {type(e).__name__}: {e}")
         return _json_response({"error": "Could not read the standing file. Nothing was saved."}, 502)
+    status, payload = _standing_save_clients(s3, current_raw, rev, clients_in)
+    return _json_response(payload, status)
+
+
+def _standing_save_clients(s3, current_raw, rev, clients_in):
+    """THE standing save path (save_standing and the desk's standing_client
+    both call it): rev check (409), whole-batch validation (400), one history
+    entry per changed field (actor "admin"), admin share changes, daily
+    backup + write. Returns (status, payload)."""
     current = _normalize_standing_state(current_raw) if current_raw is not None else _standing_empty_state()
     if current["rev"] != rev:
-        return _json_response({"error": STANDING_CONFLICT_MSG}, 409)
+        return 409, {"error": STANDING_CONFLICT_MSG}
 
     now = _iso_utc()
     new_state = copy.deepcopy(current)
@@ -15688,13 +15756,18 @@ def _handle_save_standing(event):
         old = new_state["clients"].get(pid) or _standing_default_client()
         new_vals, err = _validate_standing_client(pid, raw, now, old["referrals"])
         if err:
-            return _json_response({"error": err}, 400)
+            return 400, {"error": err}
+        ov_vals, err = _validate_standing_overrides(pid, raw, old)
+        if err:
+            return 400, {"error": err}
+        new_vals.update(ov_vals)
         rec = copy.deepcopy(old)
-        for field in STANDING_EDIT_FIELDS:
+        for field in STANDING_EDIT_FIELDS + STANDING_OVERRIDE_FIELDS:
             before = _standing_hist_value(field, old[field])
             after = _standing_hist_value(field, new_vals[field])
             if before != after:
-                rec["history"].append({"at": now, "field": field, "from": before, "to": after, "reason": ""})
+                rec["history"].append({"at": now, "field": field, "from": before, "to": after, "reason": "",
+                                       "actor": "admin"})
                 changed_fields += 1
             rec[field] = new_vals[field]
         # Optional admin share change (Client Standing page checkbox): same
@@ -15702,19 +15775,99 @@ def _handle_save_standing(event):
         if "share_with_sellers" in raw:
             share = raw["share_with_sellers"]
             if not isinstance(share, bool):
-                return _json_response({"error": f"{pid}: shared with sellers must be true/false"}, 400)
+                return 400, {"error": f"{pid}: shared with sellers must be true/false"}
             if share != rec["share_with_sellers"]:
                 if rec["hidden"]:
-                    return _json_response({"error": f"{pid}: client standing is hidden; sharing can't change"}, 409)
+                    return 409, {"error": f"{pid}: client standing is hidden; sharing can't change"}
                 _standing_apply_share(rec, share, "admin", now)
                 changed_fields += 1
         new_state["clients"][pid] = rec
     try:
         _standing_finish_write(s3, current_raw, current, new_state, now, "save_standing")
     except _S3WriteError as e:
-        return _json_response({"error": e.message}, 502)
-    return _json_response({"ok": True, "rev": new_state["rev"], "changed_fields": changed_fields,
-                           "clients": len(clients_in)})
+        return 502, {"error": e.message}
+    return 200, {"ok": True, "rev": new_state["rev"], "changed_fields": changed_fields,
+                 "clients": len(clients_in)}
+
+
+# ── Desk admin editor: one client's editable standing (admin key only) ──
+STANDING_CLIENT_FIELDS = ("hidden", "respond_repair", "terms_repair", "payments_repair", "tier_floor", "notes",
+                          "share_with_sellers") + STANDING_OVERRIDE_FIELDS
+
+
+def _standing_client_admin_fields(state, pid):
+    """The admin-only block for the desk editor: every editable field incl.
+    the override reasons, the file rev for conflict checks, and the
+    Pipeline form values. Never sent to a client or seller surface."""
+    client = state["clients"].get(pid) or _standing_default_client()
+    out = {k: client[k] for k in STANDING_CLIENT_FIELDS}
+    out.update({"rev": state["rev"], "repair_max": STANDING_REPAIR_MAX, "tiers": list(STANDING_TIERS),
+                "has_record": pid in state["clients"]})
+    try:
+        cs = compute_client_standing(pid, state=state)
+        if cs is not None:
+            out["pipeline_id_forms_done"] = cs["pipeline_id_forms_done"]
+            out["pipeline_qualification_done"] = cs["pipeline_qualification_done"]
+            out["roles"] = {"seller": bool(cs["roles"]["seller"]), "buyer": bool(cs["roles"]["buyer"])}
+    except Exception as e:
+        print(f"standing_client admin fields failed: {type(e).__name__}: {e}")
+    return out
+
+
+def _standing_client_response(pid):
+    state = _load_client_standing(fresh=True)
+    if state is None:
+        return _json_response({"error": "Could not read the standing file."}, 502)
+    return _json_response({"standing": standing_json_payload(pid), "admin": _standing_client_admin_fields(state, pid)})
+
+
+def _handle_standing_client(event):
+    """GET ?view=standing_client&pid=<id> / POST ?action=standing_client
+    {key, pid, rev, fields{...}} -- admin key only. POST merges the posted
+    fields (any of STANDING_CLIENT_FIELDS) over the stored record and saves
+    through _standing_save_clients: same validation (400), rev conflict
+    (409), history with actor "admin", hidden blocks a share change (409).
+    Returns {standing: desk JSON, admin: admin-only fields}."""
+    method = (event.get("requestContext", {}).get("http", {}).get("method") or "GET").upper()
+    query = event.get("queryStringParameters") or {}
+    body = _parse_json_body(event) if method == "POST" else {}
+    if not _admin_key_ok(event, body):
+        return _json_response({"error": "forbidden"}, 403)
+    pid = str((body.get("pid") if method == "POST" else query.get("pid")) or "").strip()
+    if not (pid.isdigit() and pid.isascii()):
+        return _json_response({"error": "pid must be numeric"}, 400)
+    if pid not in _people_data()["by_id"]:
+        return _json_response({"error": "unknown pid"}, 404)
+    if method != "POST":
+        return _standing_client_response(pid)
+    rev = _standing_int(body.get("rev"), 0)
+    if rev is None:
+        return _json_response({"error": "rev must be a whole number"}, 400)
+    fields = body.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        return _json_response({"error": "fields must be a non-empty object"}, 400)
+    unknown = sorted(k for k in fields if k not in STANDING_CLIENT_FIELDS)
+    if unknown:
+        return _json_response({"error": f"unknown field(s): {', '.join(unknown)}"}, 400)
+    s3 = _s3_client()
+    try:
+        current_raw = _s3_read_json_fresh(s3, STANDING_KEY)
+    except Exception as e:
+        print(f"standing_client read failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not read the standing file. Nothing was saved."}, 502)
+    current = _normalize_standing_state(current_raw) if current_raw is not None else _standing_empty_state()
+    old = current["clients"].get(pid) or _standing_default_client()
+    # The full save_standing row for this client: stored values, posted fields on top.
+    row = {k: old[k] for k in STANDING_EDIT_FIELDS if k != "referrals"}
+    row["referrals"] = [{"person_id": r["person_id"], "household_override": r.get("household_override") is True}
+                        for r in old["referrals"]]
+    for k in STANDING_OVERRIDE_FIELDS:
+        row[k] = old[k]
+    row.update(fields)
+    status, payload = _standing_save_clients(s3, current_raw, rev, {pid: row})
+    if status != 200:
+        return _json_response(payload, status)
+    return _standing_client_response(pid)
 
 
 def _handle_standing_share(event):
@@ -15772,7 +15925,7 @@ def _handle_standing_view(query):
         except Exception as e:
             print(f"standing search failed: {type(e).__name__}: {e}")
             return _json_response({"error": "Search failed"}, 502)
-    return _html_response(render_standing_page(query.get("key")))
+    return _html_response(render_standing_page(query.get("key"), (query.get("pid") or "").strip()))
 
 
 STANDING_PAGE_HTML = """<!DOCTYPE html>
@@ -15829,6 +15982,7 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
   .st-yes { color: var(--green); font-weight: 600; text-decoration: none; }
   .st-no { color: #9ca3af; text-decoration: none; }
   tr.st-changed td { background: #fffbeb; }
+  tr.st-focus td { background: #eef4fb; box-shadow: inset 0 1px 0 #3d5a73, inset 0 -1px 0 #3d5a73; }
   .st-tier { font-weight: 600; white-space: nowrap; } .st-muted { color: var(--muted); font-size: 12px; }
   .st-warn { color: var(--red); font-weight: 500; }
   .st-amber { color: var(--amber); font-weight: 500; }
@@ -15888,6 +16042,9 @@ STANDING_PAGE_JS = r"""
   var D = STANDING, rows = D.rows, byId = {}, orig = {}, edits = {}, forceSave = {};
   var selected = {}, openRefs = null, openTrades = {}, openHist = {}, page = 0;
   var COLS = 16;
+  // Deep link ?view=standing&pid=<id>: highlight that row; when it is not on
+  // the first page, show only that row until the search box is used.
+  var focusPid = D.focus_pid || '', focusOnly = false;
   function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
     return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]; }); }
   function clone(o) { return JSON.parse(JSON.stringify(o)); }
@@ -15940,6 +16097,7 @@ STANDING_PAGE_JS = r"""
     var tf = document.getElementById('st-tier').value, bad = document.getElementById('st-bad').checked;
     var vis = document.getElementById('st-vis').value, sort = document.getElementById('st-sort').value;
     var out = rows.filter(function(r) {
+      if (focusOnly) return r.id === focusPid;
       if (q && (r.name + ' ' + r.firm + ' ' + r.id + ' ' + r.email).toLowerCase().indexOf(q) === -1) return false;
       var st = standing(r);
       if (tf === 'none' && st.tier) return false;
@@ -15979,6 +16137,8 @@ STANDING_PAGE_JS = r"""
   function roleOf(r) { return r.roles || {seller: false, buyer: true}; }
   function roleLabel(r) { var o = roleOf(r);
     return o.seller && o.buyer ? 'Buyer + seller' : (o.seller ? 'Seller' : 'Buyer'); }
+  function ovNote(r, k) { return (r.overrides && r.overrides[k] === 'needs_update') ?
+    '<div class="st-amber" title="Admin override: not done regardless of Pipeline">Needs update (override)</div>' : ''; }
   function rowHtml(r) {
     var s = cur(r), rec = s.rec;
     var personUrl = D.person_url.replace('{}', encodeURIComponent(r.id));
@@ -15986,7 +16146,8 @@ STANDING_PAGE_JS = r"""
       return '<option value="' + t + '"' + ((rec.tier_floor || '') === t ? ' selected' : '') + '>' +
         (t ? D.tier_labels[t] : '—') + '</option>'; }).join('');
     var hist = r.history || [];
-    return '<tr data-id="' + esc(r.id) + '"' + (changed(r) ? ' class="st-changed"' : '') + '>' +
+    var cls = (changed(r) ? 'st-changed' : '') + (r.id === focusPid ? ' st-focus' : '');
+    return '<tr data-id="' + esc(r.id) + '"' + (cls.trim() ? ' class="' + cls.trim() + '"' : '') + '>' +
       '<td class="st-selcol"><input type="checkbox" data-act="sel" aria-label="Select ' + esc(r.name) + '"' +
         (selected[r.id] ? ' checked' : '') + '></td>' +
       '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) + '</a>' +
@@ -15994,9 +16155,9 @@ STANDING_PAGE_JS = r"""
         '<div class="st-muted">' + roleLabel(r) + '</div></td>' +
       '<td>' + esc(r.firm) + '</td>' +
       '<td>' + (roleOf(r).seller ? '<a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' +
-        (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a>' : '<span class="st-muted">n/a</span>') + '</td>' +
+        (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a>' : '<span class="st-muted">n/a</span>') + ovNote(r, 'id_forms') + '</td>' +
       '<td>' + (roleOf(r).buyer ? '<span class="' + (r.qual ? 'st-yes">✓' : 'st-no">○') + '</span>' :
-        '<span class="st-muted">n/a</span>') + '</td>' +
+        '<span class="st-muted">n/a</span>') + ovNote(r, 'qualification') + '</td>' +
       '<td>' + rep(r, 'terms_repair') + '</td><td>' + rep(r, 'payments_repair') + '</td><td>' + rep(r, 'respond_repair') + '</td>' +
       '<td data-role="trades">' + tradesCell(r) + '</td>' +
       '<td data-role="refs">' + refsCell(r) + '</td>' +
@@ -16091,7 +16252,7 @@ STANDING_PAGE_JS = r"""
   function refreshRow(r) {
     var tr = document.querySelector('#st-body tr[data-id="' + r.id + '"]:not(.st-panel)');
     if (!tr) return;
-    tr.className = changed(r) ? 'st-changed' : '';
+    tr.className = ((changed(r) ? 'st-changed' : '') + (r.id === focusPid ? ' st-focus' : '')).trim();
     tr.querySelector('[data-role=tier]').innerHTML = tierHtml(r);
     tr.querySelector('[data-role=trades]').innerHTML = tradesCell(r);
     renderDirty();
@@ -16260,7 +16421,24 @@ STANDING_PAGE_JS = r"""
   window.addEventListener('beforeunload', function(e) {
     if (saveBtn.textContent !== 'Saving…' && rows.some(changed)) { e.preventDefault(); e.returnValue = ''; }
   });
+  if (focusPid && byId[focusPid]) {
+    var idx = filtered().indexOf(byId[focusPid]);
+    if (idx === -1 || idx >= D.page_rows) {
+      focusOnly = true;
+      var note = document.createElement('div');
+      note.className = 'st-muted'; note.id = 'st-focusnote';
+      note.innerHTML = 'Showing one client from a link. <a href="#" id="st-showall">Show all clients</a>';
+      document.getElementById('st-count').insertAdjacentElement('afterend', note);
+      var clearFocus = function() { if (!focusOnly) return; focusOnly = false; note.remove(); page = 0; render(); };
+      document.getElementById('st-showall').addEventListener('click', function(e) { e.preventDefault(); clearFocus(); });
+      document.getElementById('st-q').addEventListener('input', clearFocus);
+    }
+  }
   render();
+  if (focusPid) {
+    var ftr = document.querySelector('#st-body tr[data-id="' + focusPid + '"]');
+    if (ftr && ftr.scrollIntoView) ftr.scrollIntoView({block: 'center'});
+  }
 })();
 """
 
@@ -17941,6 +18119,14 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_save_standing(event)
+
+    if query.get("action") == "standing_client":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_standing_client(event)
+
+    if query.get("view") == "standing_client":
+        return _handle_standing_client(event)
 
     if query.get("action") == "standing_share":
         if method != "POST":
