@@ -8392,14 +8392,17 @@ _st_people = {"people": [
     {"id": 15, "full_name": "Sid Seller", "email": "sid@sidco.com", "custom_fields": {}},
     {"id": 16, "full_name": "Sue Sellint", "email": "sue@sueco.com",
      "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, lf.SELL_INTEREST_FIELD: [7300001]}},
-    {"id": 17, "full_name": "Bea Buyint", "email": "bea@beaco.com", "custom_fields": {lf.IQF_FIELD: 6596073}},
+    {"id": 17, "full_name": "Bea Buyint", "email": "bea@beaco.com", "custom_fields": {lf.IQF_FIELD: 6496840}},
     {"id": 18, "full_name": "Bertan İlbak", "email": "bertan@ilbak.com.tr", "custom_fields": {}},
     {"id": 19, "full_name": "Sam Same", "email": "sam1@firmone.com", "company_name": "Firm One", "custom_fields": {}},
     {"id": 20, "full_name": "Sam Same", "email": "sam2@firmtwo.com", "company_name": "Firm Two", "custom_fields": {}},
     {"id": 21, "first_name": "Hal", "last_name": "Harlow", "email": "hal@halco.com", "custom_fields": dict(_ST_GOOD)},
     {"id": 22, "first_name": "Hana", "last_name": "HARLOW ", "email": "hana@hanaco.com",
-     "custom_fields": {lf.IQF_FIELD: 6596073}},
-    {"id": 23, "first_name": "Wes", "last_name": "", "email": "wes@wesco.com", "custom_fields": {lf.IQF_FIELD: 6596073}},
+     "custom_fields": {lf.IQF_FIELD: 6496840}},
+    {"id": 23, "first_name": "Wes", "last_name": "", "email": "wes@wesco.com", "custom_fields": {lf.IQF_FIELD: 6496840}},
+    # Buy Interest (Delta Co) but IQF Unnecessary -> seller-only.
+    {"id": 24, "full_name": "Una Unneeded", "email": "una@unaco.com",
+     "custom_fields": {lf.CEF_FIELD: lf.CEF_YES_ID, lf.IQF_FIELD: 6596073}},
 ]}
 _ST_WON, _ST_WON2 = 111802, 2379321
 _st_deals = [
@@ -8427,7 +8430,7 @@ _st_deals = [
      "custom_fields": {}, "person_ids": [12]},
     {"id": 965, "name": "Sid Co: $2M Sell", "deal_stage": {"id": _ST_WON}, "custom_fields": cf_sell(), "person_ids": [15]},
 ]
-_st_s3, _ = use_fixture({lf.PEOPLE_KEY: _st_people, lf.INTEREST_KEY: {"buy": {"Gamma Co": [3, 10], "Other": [999], "Delta Co": [17]}},
+_st_s3, _ = use_fixture({lf.PEOPLE_KEY: _st_people, lf.INTEREST_KEY: {"buy": {"Gamma Co": [3, 10], "Other": [999], "Delta Co": [17, 24]}},
                          lf.DEALS_KEY: {"deals": _st_deals}})
 
 
@@ -8537,7 +8540,7 @@ def _st_ref(pid, ticked=True, client="13"):
     c = _st_cs(int(client), {client: {"referrals": [{"person_id": str(pid), "confirmed_unrelated": ticked}]}})
     return c["referrals"][0], c
 _r, _c = _st_ref(5)
-check("referral: buyer with IQF Unnecessary -> Confirmed",
+check("referral: IQF Unnecessary (seller-only) with the engagement form -> Confirmed",
       _r["confirmed"] and _c["confirmed_referrals"] == 1 and _c["pending_referrals"] == 0)
 _r, _c = _st_ref(5, False)
 check("referral: stored confirmed_unrelated=false is ignored -> Confirmed",
@@ -8553,7 +8556,7 @@ check("referral: buyer + seller with neither form -> both missing",
       _st_ref(1)[0]["missing"] == ["engagement form", "IQF"] and _st_ref(1)[0]["role"] == "Buyer + seller")
 check("referral: seller (Sell Interest) with the engagement form only -> Confirmed",
       (lambda r: r["confirmed"] and r["role"] == "Seller")(_st_ref(16)[0]))
-check("referral: buyer (Buy Interest) with IQF Unnecessary and no Investor Level -> Confirmed",
+check("referral: buyer (Buy Interest) with IQF Yes and no Investor Level -> Confirmed",
       (lambda r: r["confirmed"] and r["role"] == "Buyer")(_st_ref(17)[0]))
 check("referral: same-firm referral never counts even when onboarded",
       (lambda r: r[0]["related"] and r[0]["onboarded"] and not r[0]["confirmed"] and r[1]["confirmed_referrals"] == 0)(
@@ -8640,8 +8643,8 @@ check("admin scoreboard: 200, private no-store", _st_page["statusCode"] == 200
       and _st_page["headers"]["Cache-Control"] == "private, no-store")
 _st_data = _st_page_data(_st_page["body"])
 check("admin scoreboard: rows = interest buy ids + buy-deal people + won-deal people (unknown ids skipped)",
-      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "15", "17", "2", "3"])
-check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 7") == 1)
+      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "15", "17", "2", "24", "3"])
+check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 8") == 1)
 _st_roles = {r["id"]: r["roles"] for r in _st_data["rows"]}
 check("admin scoreboard: rows carry roles (Sella both, Bob buyer, Sid seller)",
       _st_roles["1"] == {"seller": True, "buyer": True} and _st_roles["3"] == {"seller": False, "buyer": True}
@@ -8773,9 +8776,10 @@ check("star: legacy visible=false record behaves as not hidden",
       _st_star(2, {"visible": False}) == "gold" and _st_cs(2, {"2": {"visible": False}})["hidden"] is False)
 check("star: anonymous star ignores the share switch",
       _st_star(2, {"history": _ST_OPTOUT}) == "gold" and _st_star(2, {}) == "gold")
-check("star: named needs the client's opt-in (default and opted out -> noshare)",
-      _st_star(2, {}, named=True) == "noshare" and _st_star(2, {"history": _ST_OPTOUT}, named=True) == "noshare"
-      and _st_star(2, {"history": _ST_OPTIN}, named=True) == "gold")
+check("star: named needs the client's opt-in (never chose -> None, opted out -> noshare)",
+      _st_star(2, {}, named=True) is None and _st_star(2, {"history": _ST_OPTOUT}, named=True) == "noshare"
+      and _st_star(2, {"history": _ST_OPTIN}, named=True) == "gold"
+      and _st_star(2, {"history": _ST_OPTIN + [dict(_ST_OPTOUT[0], at="2026-09-20T00:00:00Z")]}, named=True) == "noshare")
 check("star: closed a trade + onboarded + clean -> gold", _st_star(2, {}) == "gold")
 check("star: payments repair does not affect the star", _st_star(2, {"payments_repair": 3}) == "gold")
 check("star: closed a trade but not onboarded (seller without engagement form) -> green",
@@ -8788,7 +8792,7 @@ check("star: named, not opted in wins over yellow",
       _st_star(13, {"respond_repair": 2, "history": _ST_OPTOUT}, named=True) == "noshare")
 _st_put({"2": {}, "3": {"hidden": True}})
 check("standing_star(pid): the public helper reads the stored file", lf.standing_star(2) == "gold"
-      and lf.standing_star(2, named=True) == "noshare" and lf.standing_star(3) is None
+      and lf.standing_star(2, named=True) is None and lf.standing_star(3) is None
       and lf.standing_star(424242) is None)
 _st_s3.objs[lf.STANDING_KEY] = "not a dict"
 lf._data_cache.pop(lf.STANDING_KEY, None)
@@ -8942,30 +8946,39 @@ for _name, _html in _st_pages.items():
           and "trade_edits" not in _low and "referral" not in _low and "discount" not in _low and "CEF" not in _html
           and "to go" not in _low)
 
-def _st_noshare_checks(label, pages):
+def _st_noshare_checks(label, pages, explicit):
+    """Not hidden, not sharing. Anonymous surfaces keep the star; named
+    surfaces show the opt-out text only after an explicit opt-out."""
     _tiles = pages["company page (demand tiles)"]
     _tile_divs = [seg.split("</div>\n    </div>")[0] for seg in _tiles.split('<div class="buyer-tile">')[1:]]
-    check(f"{label}: named surfaces render no star, ticks or card",
-          all("Client standing" not in pages[k] and "gs-star" not in pages[k] and "gs-ticks" not in pages[k]
-              and "Good standing" not in pages[k] and "In progress" not in pages[k]
-              for k in ("disclosed buyer page", "anonymous buyer page", "active intros (pending cell)")))
-    check(f"{label}: matched/introduced surfaces show 'Prefers not to share' instead of a star",
-          all("Prefers not to share" in pages[k] for k in ("anonymous buyer page", "active intros (pending cell)")))
-    check(f"{label}: company page Introduced row shows 'Prefers not to share', no star",
-          (lambda r: "Prefers not to share" in r and "gs-star" not in r)(_st_intro_row(_tiles)))
+    check(f"{label}: anonymous buyer page + Pending-introduction cell keep the star (share switch ignored)",
+          'title="In progress"' in pages["anonymous buyer page"]
+          and 'title="In progress"' in pages["active intros (pending cell)"]
+          and "Prefers not" not in pages["anonymous buyer page"] and "Prefers not" not in pages["active intros (pending cell)"])
     check(f"{label}: Buyer Demand tiles still show the anonymous star (share switch ignored)",
           any('title="In progress"' in d for d in _tile_divs) and any('title="Ready to transact"' in d for d in _tile_divs)
           and not any("Prefers not" in d for d in _tile_divs))
-    check(f"{label}: disclosed buyer page shows the muted line instead of the card",
-          "Client prefers not to share this information." in pages["disclosed buyer page"]
-          and ">Client standing<" not in pages["disclosed buyer page"])
+    check(f"{label}: disclosed buyer page has no card or star",
+          ">Client standing<" not in pages["disclosed buyer page"] and "gs-star" not in pages["disclosed buyer page"]
+          and "gs-ticks" not in pages["disclosed buyer page"])
+    _ir = _st_intro_row(_tiles)
+    if explicit:
+        check(f"{label}: company page Introduced row shows 'Prefers not to share', no star",
+              "Prefers not to share" in _ir and "gs-star" not in _ir)
+        check(f"{label}: disclosed buyer page shows the muted line instead of the card",
+              "Client prefers not to share this information." in pages["disclosed buyer page"])
+    else:
+        check(f"{label}: company page Introduced row shows nothing (no star, no text)",
+              _ir and "Prefers not" not in _ir and "gs-star" not in _ir)
+        check(f"{label}: disclosed buyer page shows nothing (no card, no text)",
+              "prefers not to share" not in pages["disclosed buyer page"].lower())
 
 
 _st_noshare = json.loads(json.dumps(_ST_SECRET_CLIENTS))
 for _c in _st_noshare.values():
     _c["history"] = list(_c.get("history") or []) + _ST_OPTOUT
 _st_put(_st_noshare)
-_st_noshare_checks("opted out", _st_tenant_pages())
+_st_noshare_checks("opted out", _st_tenant_pages(), explicit=True)
 check("opted out: admin buyer page says the client has not opted in",
       "Client standing (hidden from sellers — client has not opted in to sharing)"
       in _st_get({"buyer": "2", "key": ADMIN_KEY, "view_as": TENANT_EMAIL})["body"])
@@ -8978,8 +8991,8 @@ _st_default = json.loads(json.dumps(_ST_SECRET_CLIENTS))
 for _c in _st_default.values():
     _c["history"] = [h for h in (_c.get("history") or []) if h["field"] != "share_with_sellers"]
 _st_put(_st_default)
-_st_noshare_checks("default (no opt-in)", _st_tenant_pages())
-check("default (no opt-in): own desk card shows",
+_st_noshare_checks("never chose", _st_tenant_pages(), explicit=False)
+check("never chose: own desk card shows",
       (lambda d: d["visible"] is True and d["share_with_sellers"] is False and d["items"])(
           json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"])))
 
@@ -8988,7 +9001,7 @@ _st_legacy = json.loads(json.dumps(_st_default))
 for _c in _st_legacy.values():
     _c["visible"] = False
 _st_put(_st_legacy)
-_st_noshare_checks("legacy visible=false", _st_tenant_pages())
+_st_noshare_checks("legacy visible=false", _st_tenant_pages(), explicit=False)
 check("legacy visible=false: own desk card shows",
       json.loads(_st_get({"view": "standing_json", "pid": "2", "key": ADMIN_KEY})["body"])["visible"] is True)
 
@@ -9013,10 +9026,10 @@ for _name, _html in _st_tenant_pages().items():
           and "prefers not to share" not in _html)
 _st_put({}, extra={"settings": {"sellers_visible": True, "buyers_visible": True}})
 _st_nr = _st_tenant_pages()
-check("no record (not hidden, not opted in, old global setting ignored): no named card or star, tiles keep the anonymous star",
-      all("Client standing" not in h for h in _st_nr.values())
-      and "gs-star" not in _st_nr["disclosed buyer page"] and "gs-star" not in _st_nr["anonymous buyer page"]
-      and "gs-star" in _st_nr["company page (demand tiles)"])
+check("no record (not hidden, never chose, old global setting ignored): no named card/star/text, anonymous surfaces keep the star",
+      all("Client standing" not in h and "Prefers not" not in h and "prefers not" not in h for h in _st_nr.values())
+      and "gs-star" not in _st_nr["disclosed buyer page"] and "gs-star" in _st_nr["anonymous buyer page"]
+      and "gs-star" in _st_nr["active intros (pending cell)"] and "gs-star" in _st_nr["company page (demand tiles)"])
 _st_s3.objs[lf.STANDING_KEY] = "not a dict"
 lf._data_cache.pop(lf.STANDING_KEY, None)
 _st_real_get = _st_s3.get_object
@@ -9064,8 +9077,8 @@ check("standing_share: unknown pid -> 404", _st_share({"key": ADMIN_KEY, "pid": 
 check("standing_share: hidden client -> 409", _st_share({"key": ADMIN_KEY, "pid": "3", "share": True})["statusCode"] == 409
       and _st_share({"key": ADMIN_KEY, "pid": "3", "share": False})["statusCode"] == 409)
 check("standing_share: refusals write nothing", _st_s3.objs[lf.STANDING_KEY]["rev"] == 40)
-check("standing_share: sharing is off by default (opt-in, legacy visible=false = not hidden), muted line shows",
-      (lambda b: ">Client standing<" not in b and "Client prefers not to share this information." in b)(
+check("standing_share: sharing is off by default (opt-in, legacy visible=false = not hidden), never chose = no text",
+      (lambda b: ">Client standing<" not in b and "prefers not to share" not in b.lower())(
           _st_get({"buyer": "2"}, [tenant_cookie(TENANT_EMAIL)])["body"]))
 _st_s3.put_calls.clear()
 _r = _st_share({"key": ADMIN_KEY, "pid": "2", "share": False})
@@ -9152,10 +9165,11 @@ check("standing_json: respond note plural",
       == "Reply within 3 business days on your next 2 introductions.")
 _st_put(dict(_ST_SECRET_CLIENTS, **{"15": {}}))
 _st_sid = _st_json(15)[1]
-check("standing_json: seller -> ID forms open note + form_url; qualification omitted",
+check("standing_json: seller -> ID forms open note + form_url; qualification done 'Unnecessary for sellers'",
       _st_sid["items"][0] == {"label": "Identity and compliance forms complete", "done": False,
                               "note": "Rainmaker's engagement form is still needed.", "form_url": lf.CEF_FORM_URL}
-      and "Investor qualification on file" not in [i["label"] for i in _st_sid["items"]])
+      and _st_sid["items"][1] == {"label": "Investor qualification on file", "done": True,
+                                  "note": "Unnecessary for sellers"})
 _st_put(_ST_SECRET_CLIENTS)
 check("standing_json: Bob's floor gold applies without good standing", _d["tier"] == "gold" and _d["discount_pct"] == 15)
 _st_put({"2": {"payments_repair": 1, "terms_repair": 1, "respond_repair": 1,
@@ -9190,6 +9204,11 @@ check("roles: Sell deal only -> seller", lf._standing_roles(15) == {"seller": Tr
 check("roles: Sell Interest (custom_label_3759156) only -> seller", lf._standing_roles(16) == {"seller": True, "buyer": False})
 check("roles: Buy Interest only -> buyer", lf._standing_roles(17) == {"seller": False, "buyer": True})
 check("roles: Buy deal only -> buyer", lf._standing_roles(3) == {"seller": False, "buyer": True})
+check("roles: IQF Unnecessary -> seller-only even with a Buy Interest",
+      lf._standing_roles(24) == {"seller": True, "buyer": False} and 24 in [int(x) for x in lf._standing_interest_buy_ids()])
+check("roles: IQF Unnecessary -> seller-only even on Buy deals",
+      lf._standing_roles(3, dict(_st_people["people"][2], custom_fields={lf.IQF_FIELD: [6596073]}))
+      == {"seller": True, "buyer": False})
 check("roles: nothing found -> buyer (default)", lf._standing_roles(13) == {"seller": False, "buyer": True})
 check("roles: Sell + Buy deals -> both", lf._standing_roles(1) == {"seller": True, "buyer": True}
       and lf._standing_roles(12) == {"seller": True, "buyer": True})
@@ -9205,9 +9224,26 @@ check("not applicable: seller with engagement form only, clean, no trade -> gree
 _st_card = lf._standing_card_html(lf._standing_seller_items(16))
 check("not applicable: seller card omits the qualification item",
       "Identity and compliance forms complete" in _st_card and "Investor qualification on file" not in _st_card)
-check("not applicable: standing_json omits it too",
-      "Investor qualification on file" not in [i["label"] for i in _st_json(16)[1]["items"]]
-      and "Identity and compliance forms complete" not in [i["label"] for i in _st_json(17)[1]["items"]])
+check("standing_json: seller-only -> qualification shown done with 'Unnecessary for sellers', after ID forms",
+      (lambda it: [i["label"] for i in it][:2] == ["Identity and compliance forms complete", "Investor qualification on file"]
+       and it[1] == {"label": "Investor qualification on file", "done": True, "note": "Unnecessary for sellers"})(
+          _st_json(16)[1]["items"]))
+check("standing_json: buyer-only -> engagement form item still omitted",
+      "Identity and compliance forms complete" not in [i["label"] for i in _st_json(17)[1]["items"]]
+      and "Unnecessary for sellers" not in json.dumps(_st_json(17)[1]))
+check("standing_json: carries roles",
+      _st_json(16)[1]["roles"] == {"seller": True, "buyer": False}
+      and _st_json(17)[1]["roles"] == {"seller": False, "buyer": True}
+      and _st_json(24)[1]["roles"] == {"seller": True, "buyer": False})
+check("standing_json: IQF Unnecessary + Buy Interest -> seller items, qualification 'Unnecessary for sellers'",
+      (lambda it: it[0]["label"] == "Identity and compliance forms complete" and it[0]["done"]
+       and it[1]["note"] == "Unnecessary for sellers")(_st_json(24)[1]["items"]))
+_st_s3.put_calls.clear()
+_r = _st_share({"key": ADMIN_KEY, "pid": "24", "share": True})
+check("standing_share: a seller-only client's choice is stored with the same mechanism",
+      _r["statusCode"] == 200 and json.loads(_r["body"])["share_with_sellers"] is True
+      and [h["to"] for h in _st_s3.objs[lf.STANDING_KEY]["clients"]["24"]["history"]
+           if h["field"] == "share_with_sellers"] == [True])
 
 # --- Slim index rebuilds when its field set changes (new custom_label)
 _st_s3.last_modified[lf.PEOPLE_KEY] = datetime(2026, 9, 30, tzinfo=timezone.utc)
@@ -9347,7 +9383,7 @@ _imp_status = {s["referred_person_id"]: s["status"] for s in _st_s3.objs[lf.REFE
 check("import save: statuses stored (approved / skipped / pending)",
       _imp_status["5"] == "approved" and _imp_status["14"] == "approved" and _imp_status["11"] == "skipped" and _imp_status["7"] == "pending")
 lf._req_cache_reset()
-check("import: approved referral counts under the role rule (Rita: buyer, IQF Unnecessary -> Tia Preferred)",
+check("import: approved referral counts under the role rule (Rita: seller-only, engagement form -> Tia Preferred)",
       lf.compute_client_standing(13)["confirmed_referrals"] == 1 and lf.compute_client_standing(13)["tier"] == "preferred")
 check("import: Nora (needs IQF) approved but still Pending onboarding for Sam",
       lf.compute_client_standing(19)["confirmed_referrals"] == 0 and lf.compute_client_standing(19)["pending_referrals"] == 1)

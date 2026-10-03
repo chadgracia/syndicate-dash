@@ -325,6 +325,7 @@ QC_ID = 7209227          # Qualified Client ($2.2M net worth) — option added 2
 ACCREDITED_ID = 6950563  # Accredited Investor ($1M in assets)
 IQF_FIELD = "custom_label_3763008"
 IQF_OK_IDS = {6496840, 6596073}
+IQF_UNNECESSARY_ID = 6596073
 
 # "Substantive" (Investor LEVEL option, added 2026/02/26) — verified via a
 # one-time person_custom_field_labels fetch against field 3923758. It is
@@ -7809,7 +7810,7 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
         blocks.append(
             f'<div class="pending-buyer">'
             f'<span class="buyer-code">Buyer {_esc(code)}</span> '
-            f'{tier_html}{_standing_star_for(pid, named=True)}'
+            f'{tier_html}{_standing_star_for(pid)}'
             f'{range_html}</div>'
         )
     return "".join(blocks)
@@ -13895,7 +13896,7 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
     min_v, max_v = get_person_ticket_range(cf)
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<div class="buyer-page-row">{_esc(range_text)}</div>' if range_text else ""
-    star_html = _standing_star_for(buyer_id, named=True)
+    star_html = _standing_star_for(buyer_id)
     tier_row = f'<div class="buyer-page-row">{tier_html}{star_html}</div>' if (tier_html or star_html) else ""
     return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}</div>'
             f'{tier_row}{range_html}'
@@ -14691,6 +14692,9 @@ STANDING_ITEMS = (
     ("payments", "Meets all payment deadlines"),
     ("respond", "Responds promptly after an introduction"),
 )
+STANDING_QUALIFICATION_LABEL = dict(STANDING_ITEMS)["qualification"]
+# Desk JSON only: seller-only clients see qualification as done with this note.
+STANDING_SELLER_QUALIFICATION_NOTE = "Unnecessary for sellers"
 STANDING_REFERRAL_LABEL = "Introduced a new client who completed onboarding with Rainmaker"
 IQF_LABELS = {6496840: "Yes", 6596073: "Unnecessary"}
 PIPELINE_PERSON_URL = "https://app.pipelinecrm.com/people/{}"
@@ -14977,10 +14981,14 @@ def _standing_roles(pid, rec=None):
     """{"seller": bool, "buyer": bool} -- which onboarding forms apply.
     seller = on >= 1 Sell-tagged deal (any stage) or a non-empty Sell
     Interest; buyer = on >= 1 Buy-tagged deal or a Buy Interest, and also
-    the default when neither role is found."""
+    the default when neither role is found. IQF Status Unnecessary means
+    seller-only, whatever deals or interests say (a buyer's IQF is never
+    Unnecessary)."""
     pid = str(pid)
     if rec is None:
         rec = _people_data()["by_id"].get(pid)
+    if IQF_UNNECESSARY_ID in cf_list((rec or {}).get("custom_fields") or {}, IQF_FIELD):
+        return {"seller": True, "buyer": False}
     idx = _standing_deal_index()
     seller = pid in idx["sell_any"] or _cf_nonempty((rec or {}).get("custom_fields"), SELL_INTEREST_FIELD)
     buyer = pid in idx["buy_any"] or pid in _standing_interest_buy_ids()
@@ -15130,6 +15138,9 @@ def compute_client_standing(person_id, state=None):
     return {
         "person_id": pid, "has_record": stored is not None, "record": client, "hidden": client["hidden"],
         "share_with_sellers": client["share_with_sellers"],
+        # True/False = the client's latest explicit desk choice; None = never chose.
+        "share_choice": (lambda h: None if h is None else h.get("to") is True)(
+            _standing_client_share_entry(client["history"])),
         "seller_visible": not client["hidden"] and client["share_with_sellers"],
         "roles": roles,
         "id_forms_done": flags["id_forms_done"], "qualification_done": flags["qualification_done"],
@@ -15204,7 +15215,8 @@ def _standing_star_from_cs(cs, named=False):
     if cs is None or cs["hidden"]:
         return None
     if named and not cs["share_with_sellers"]:
-        return "noshare"
+        # Only an explicit opt-out shows the text; never chose = nothing.
+        return "noshare" if cs["share_choice"] is False else None
     rec = cs["record"]
     clean = rec["terms_repair"] == 0 and rec["respond_repair"] == 0
     if not clean:
@@ -15215,10 +15227,11 @@ def _standing_star_from_cs(cs, named=False):
 
 def standing_star(pid, named=False):
     """THE seller-facing star: None (render nothing) when the client is
-    hidden, unknown, or on any error. named=False (anonymous Buyer Demand
-    tiles): a colour regardless of the client's share switch. named=True
-    (matched/introduced seller surfaces): "noshare" unless the client opted
-    in to sharing. Colours: "gold" (closed a trade, onboarded for their role, terms and
+    hidden, unknown, or on any error. named=False (anonymous surfaces:
+    Buyer Demand tiles, Pending-introduction rows, anonymized buyer page): a
+    colour regardless of the client's share switch. named=True (Introduced
+    rows): needs the client's opt-in; "noshare" only after an explicit
+    opt-out, None when the client never chose. Colours: "gold" (closed a trade, onboarded for their role, terms and
     respond clean), "green" (terms and respond clean; onboarding not
     required), "yellow" (any terms/respond repair). Payments never count."""
     try:
@@ -15306,6 +15319,7 @@ def standing_json_payload(pid):
             return {"visible": False}
         rec = cs["record"]
         items = []
+        seller_only = cs["roles"]["seller"] and not cs["roles"]["buyer"]
         for i in cs["items"]:
             item = {"label": i["label"], "done": i["done"], "note": ""}
             if not i["done"]:
@@ -15323,6 +15337,9 @@ def standing_json_payload(pid):
                 if k == "id_forms":
                     item["form_url"] = CEF_FORM_URL
             items.append(item)
+            if i["key"] == "id_forms" and seller_only:
+                items.append({"label": STANDING_QUALIFICATION_LABEL, "done": True,
+                              "note": STANDING_SELLER_QUALIFICATION_NOTE})
         ref_item = {"label": STANDING_REFERRAL_LABEL, "done": cs["confirmed_referrals"] >= 1}
         if cs["referrals"]:
             ref_item["note"] = _standing_referral_note(cs["confirmed_referrals"], cs["pending_referrals"])
@@ -15331,6 +15348,7 @@ def standing_json_payload(pid):
                       "note": f"{_plural(cs['trades'], 'trade')} · {_fmt_standing_musd(cs['volume'])}"})
         tier = cs["tier"]
         return {"visible": True, "share_with_sellers": cs["share_with_sellers"],
+                "roles": {"seller": bool(cs["roles"]["seller"]), "buyer": bool(cs["roles"]["buyer"])},
                 "tier": tier, "tier_label": STANDING_TIER_LABELS.get(tier),
                 "discount_pct": STANDING_DISCOUNT_PCT.get(tier, 0), "good_standing": cs["good_standing"],
                 "items": items, "tiers_url": STANDING_TIERS_URL}
