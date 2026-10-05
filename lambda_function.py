@@ -128,11 +128,13 @@ _req_cache = {
     "tenant_index": None, "id_status": {},
     "intro_details": {}, "manual_intros": {}, "models": {}, "memo_dynamo": False,
     "feature_requests": {}, "manual_intro_calls": {}, "aggregate_scan": None, "standing": None,
+    "deal_source_at": None,
 }
 
 
 def _req_cache_reset():
     _req_cache["deals"] = None
+    _req_cache["deal_source_at"] = None
     _req_cache["closed_deals"] = None
     _req_cache["people"] = None
     _req_cache["interest"] = None
@@ -2244,7 +2246,10 @@ def _get_live_deals_list():
 # problem falls back to the best already-known list (possibly []),
 # never raises, so a Pipeline or S3 hiccup degrades this Lambda to
 # live-only behavior (deals.json alone) rather than erroring the page.
-_closed_deals_cache = {"fetched_at": None, "deals": None}
+# source_at: epoch when Pipeline produced the cached closed list (its
+# last_updated), used by _override_is_current -- NOT fetched_at, which
+# is when this container loaded it.
+_closed_deals_cache = {"fetched_at": None, "deals": None, "source_at": None}
 
 
 def _closed_deals_cache_token():
@@ -2536,6 +2541,7 @@ def _refresh_closed_deals_cache(s3, s3_cached, now):
 
     _closed_deals_cache["fetched_at"] = now
     _closed_deals_cache["deals"] = merged
+    _closed_deals_cache["source_at"] = _parse_dt(last_updated).timestamp()
     return merged, mode, None
 
 
@@ -2576,6 +2582,7 @@ def get_closed_deals_list():
         if last_updated_dt is not None and now - last_updated_dt.timestamp() < CLOSED_DEALS_TTL_SECONDS:
             _closed_deals_cache["fetched_at"] = now
             _closed_deals_cache["deals"] = s3_cached["deals"]
+            _closed_deals_cache["source_at"] = last_updated_dt.timestamp()
             _req_cache["closed_deals"] = s3_cached["deals"]
             return s3_cached["deals"]
 
@@ -2635,7 +2642,55 @@ def get_deals_list():
     closed = get_closed_deals_list()
     merged = _merge_deal_lists(live, closed)
     _req_cache["deals"] = merged
+    _req_cache["deal_source_at"] = _deal_source_times(live, closed)
     return merged
+
+
+def _deal_source_times(live, closed):
+    """{deal id: epoch when its record left Pipeline}: deals.json's
+    LastModified for live deals, the closed list's last_updated for
+    closed ones (live wins, as in _merge_deal_lists). Unknown -> absent."""
+    out = {}
+    closed_at = _closed_deals_cache.get("source_at")
+    if closed_at is not None:
+        for d in closed:
+            if isinstance(d, dict) and d.get("id") is not None:
+                out[str(d["id"])] = closed_at
+    live_lm = _s3_last_modified.get(DEALS_KEY)
+    if live_lm is not None:
+        live_at = live_lm.timestamp()
+        for d in live:
+            if isinstance(d, dict) and d.get("id") is not None:
+                out[str(d["id"])] = live_at
+    return out
+
+
+# A card save writes Pipeline FIRST, then a Dynamo override that bridges
+# the gap until the next data refresh. Pipeline is the source of truth:
+# the override stops counting once (1) Pipeline's own updated_at for the
+# deal is at/after the save, or (2) a refresh of the deal's source
+# (deals.json / closed list) landed more than OVERRIDE_REFRESH_GRACE_SECONDS
+# after the save -- the grace covers an export that read Pipeline just
+# before the save but finished uploading just after it.
+OVERRIDE_REFRESH_GRACE_SECONDS = 15 * 60
+
+
+def _override_is_current(deal, override_at):
+    """True while a Dynamo override (epoch seconds override_at) should
+    still win over the deal's Pipeline value -- see the rule above.
+    Shared by the deadline, exemption, deal-stage and intro-status
+    overlays."""
+    try:
+        override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return False
+    pipeline_dt = _parse_pipeline_ts(deal.get("updated_at"))
+    if pipeline_dt is not None and pipeline_dt >= override_dt:
+        return False
+    source_at = (_req_cache.get("deal_source_at") or {}).get(str(deal.get("id")))
+    if source_at is not None and source_at > override_dt.timestamp() + OVERRIDE_REFRESH_GRACE_SECONDS:
+        return False
+    return True
 
 
 _raised_cache = {"version": None, "total": None, "closed_count": None,
@@ -6034,14 +6089,8 @@ def _resolve_deal_stage(deal, override_entry=None):
     if override_entry:
         override_val = override_entry.get("stage_override")
         override_at = override_entry.get("stage_override_at")
-        if override_val and override_at:
-            pipeline_dt = _parse_dt(deal.get("updated_at"))
-            try:
-                override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
-            except (TypeError, ValueError, OSError):
-                override_dt = None
-            if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
-                stage_id = override_val
+        if override_val and override_at and _override_is_current(deal, override_at):
+            stage_id = override_val
     return stage_id
 
 
@@ -6483,14 +6532,8 @@ def _resolve_intro_status(deal, override_entry=None):
     if override_entry:
         override_id = override_entry.get("status_override")
         override_at = override_entry.get("override_at")
-        if override_id in INTRO_STATUS_LABELS and override_at:
-            pipeline_dt = _parse_dt(deal.get("updated_at"))
-            try:
-                override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
-            except (TypeError, ValueError, OSError):
-                override_dt = None
-            if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
-                status_id = override_id
+        if override_id in INTRO_STATUS_LABELS and override_at and _override_is_current(deal, override_at):
+            status_id = override_id
 
     name = INTRO_STATUS_LABELS[status_id] if status_id is not None else _default_intro_status(deal)
     if status_id in EXIT_STATUS_IDS:
@@ -7463,14 +7506,8 @@ def _resolve_deal_deadline(deal, override_entry=None):
     if override_entry:
         override_val = override_entry.get("deadline_override")
         override_at = override_entry.get("deadline_override_at")
-        if override_val and override_at:
-            pipeline_dt = _parse_dt(deal.get("updated_at"))
-            try:
-                override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
-            except (TypeError, ValueError, OSError):
-                override_dt = None
-            if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
-                deadline = override_val
+        if override_val and override_at and _override_is_current(deal, override_at):
+            deadline = override_val
     return deadline
 
 
@@ -7483,17 +7520,11 @@ def _resolve_deal_exemption(deal, override_entry=None):
     if override_entry:
         override_val = override_entry.get("exemption_override")
         override_at = override_entry.get("exemption_override_at")
-        if override_val is not None and override_at:
-            pipeline_dt = _parse_dt(deal.get("updated_at"))
+        if override_val is not None and override_at and _override_is_current(deal, override_at):
             try:
-                override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
-            except (TypeError, ValueError, OSError):
-                override_dt = None
-            if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
-                try:
-                    exemption_id = int(override_val)
-                except (TypeError, ValueError):
-                    pass
+                exemption_id = int(override_val)
+            except (TypeError, ValueError):
+                pass
     return exemption_id if exemption_id in EXEMPTION_SHORT_LABELS else None
 
 

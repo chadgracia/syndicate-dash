@@ -1230,6 +1230,98 @@ check("impersonating a tenant who doesn't own the deal -> 403, no Pipeline call"
 
 
 # ======================================================================
+# SECTION: Pipeline is the source of truth — card overrides yield to
+# Pipeline (deadline, exemption, deal stage, intro status)
+# ======================================================================
+# (1) Pipeline's real updated_at format must parse, so a later Pipeline
+# edit beats an older override; (2) an override stops counting once the
+# deal's source refreshed more than OVERRIDE_REFRESH_GRACE_SECONDS after it.
+
+def _pl_ts(dt):
+    """A datetime in Pipeline's real updated_at format, e.g. "2026/10/05 14:03:22 -0400"."""
+    return dt.astimezone(timezone(timedelta(hours=-4))).strftime("%Y/%m/%d %H:%M:%S %z")
+
+check("Pipeline's real timestamp format parses: '2026/10/05 14:03:22 -0400'",
+      lf._parse_pipeline_ts("2026/10/05 14:03:22 -0400")
+      == datetime(2026, 10, 5, 18, 3, 22, tzinfo=timezone.utc)
+      and _pl_ts(datetime(2026, 10, 5, 18, 3, 22, tzinfo=timezone.utc)) == "2026/10/05 14:03:22 -0400")
+
+SOT_PID = 31
+SOT_EMAIL = "sot-seller@example.com"
+_now_dt = datetime.now(timezone.utc)
+_ov_at = (_now_dt - timedelta(hours=3)).timestamp()          # card save 3h ago
+_pl_after = _pl_ts(_now_dt - timedelta(hours=1))             # Pipeline edited 1h ago (after the save)
+_pl_before = _pl_ts(_now_dt - timedelta(hours=5))            # Pipeline last touched before the save
+_sot_dl_pipeline = iso_dash(40)
+_sot_override = {"deadline_override": iso_dash(10), "deadline_override_at": _ov_at,
+                 "exemption_override": 7200028, "exemption_override_at": _ov_at,
+                 "stage_override": lf.HOLD_STAGE_ID, "stage_override_at": _ov_at,
+                 "status_override": 7207580, "override_at": _ov_at}
+
+def _sot_deal(updated_at, deal_id=7701):
+    return {"id": deal_id, "name": "SOT Deal", "company": {"name": "SOT Co"}, "deal_stage": {"id": lf.STAGE_FIRM},
+            "custom_fields": cf_sell({lf.DEADLINE_FIELD: _sot_dl_pipeline.replace("-", "/"),
+                                      lf.EXEMPTION_FIELD: 7200027, lf.INTRO_STATUS_FIELD: [7207579]}),
+            "people": [{"id": SOT_PID}], "updated_at": updated_at}
+
+def _sot_resolved(deal, entry):
+    return (lf._resolve_deal_deadline(deal, entry), lf._resolve_deal_exemption(deal, entry),
+            lf._resolve_deal_stage(deal, entry), lf._resolve_intro_status(deal, entry)["id"])
+
+_sot_pipeline_vals = (_sot_dl_pipeline, 7200027, lf.STAGE_FIRM, 7207579)
+_sot_override_vals = (iso_dash(10), 7200028, lf.HOLD_STAGE_ID, 7207580)
+lf._req_cache_reset()
+check("override_is_current: Pipeline edited AFTER the save (real format) -> Pipeline wins",
+      not lf._override_is_current(_sot_deal(_pl_after), _ov_at))
+check("override_is_current: Pipeline last touched BEFORE the save, no refresh known -> override wins",
+      lf._override_is_current(_sot_deal(_pl_before), _ov_at))
+check("all four overlays show Pipeline's value when Pipeline was edited after the card save (real format)",
+      _sot_resolved(_sot_deal(_pl_after), _sot_override) == _sot_pipeline_vals)
+check("all four overlays still show the override before any later Pipeline edit or refresh",
+      _sot_resolved(_sot_deal(_pl_before), _sot_override) == _sot_override_vals)
+
+def _sot_fixture(deals_lm):
+    _people = {"people": [{"id": SOT_PID, "full_name": "Sot Seller", "email": SOT_EMAIL, "custom_fields": {}}]}
+    use_fixture({"people.json": _people, "interest_people.json": {"buy": {}},
+                 "deals.json": {"deals": [_sot_deal(_pl_before)]}},
+                last_modified={lf.DEALS_KEY: deals_lm})
+    lf._req_cache_reset()
+    return lf.get_deals_list()[0]
+
+_d = _sot_fixture(_now_dt - timedelta(minutes=30))   # refreshed 2.5h after the save
+check("deals.json refreshed well after the save -> all four overlays yield to Pipeline (even with an old updated_at)",
+      _sot_resolved(_d, _sot_override) == _sot_pipeline_vals)
+_d = _sot_fixture(datetime.fromtimestamp(_ov_at + 5 * 60, tz=timezone.utc))   # within the grace window
+check("deals.json refreshed within the grace window after the save -> override still wins",
+      _sot_resolved(_d, _sot_override) == _sot_override_vals)
+_d = _sot_fixture(datetime.fromtimestamp(_ov_at - 60, tz=timezone.utc))      # snapshot older than the save
+check("deals.json older than the save -> override wins",
+      _sot_resolved(_d, _sot_override) == _sot_override_vals)
+
+# Closed deals use the closed list's own last_updated
+lf._req_cache_reset()
+lf._closed_deals_cache["source_at"] = (_now_dt - timedelta(minutes=20)).timestamp()
+_closed_times = lf._deal_source_times([], [{"id": 7702}])
+check("closed deals take their refresh time from the closed list's last_updated",
+      _closed_times.get("7702") == lf._closed_deals_cache["source_at"])
+lf._req_cache["deal_source_at"] = _closed_times
+check("closed deal refreshed after the grace -> Pipeline wins",
+      not lf._override_is_current(_sot_deal(_pl_before, deal_id=7702), _ov_at))
+lf._closed_deals_cache["source_at"] = None
+
+# End to end: the Deal Details card shows Pipeline's deadline + exemption
+_d = _sot_fixture(_now_dt - timedelta(minutes=30))
+_card = lf._deal_card_html(_d, "SOT Co", _sot_override)
+_pipe_dl = lf._parse_dt(_sot_dl_pipeline)
+check("Deal Details card shows Pipeline's deadline and exemption once refreshed, not the stale override",
+      f"{_pipe_dl.strftime('%b')} {_pipe_dl.day}, {_pipe_dl.year}" in _card
+      and 'dc-label">Exemption</span><span class="dc-value">3(c)(1)</span>' in _card)
+lf._req_cache_reset()
+_card2 = lf._deal_card_html(_sot_deal(_pl_after), "SOT Co", _sot_override)
+check("Deal Details card shows Pipeline's values when Pipeline's real-format updated_at is after the save",
+      f"{_pipe_dl.strftime('%b')} {_pipe_dl.day}, {_pipe_dl.year}" in _card2 and "3(c)(1)</span>" in _card2)
+
+# ======================================================================
 # SECTION: Active Intros — layout, status restrictions, sort/grouping,
 # pending note, empty state
 # ======================================================================
