@@ -6122,6 +6122,51 @@ def _send_deal_stage_email(deal, deal_id, tenant_name, target, note=""):
         return False
 
 
+def _fmt_deadline_for_email(iso_date):
+    """'Oct 31, 2026' for the tenant-deadline email, 'Not set' when empty."""
+    dt = _parse_dt(iso_date) if iso_date else None
+    if dt is None:
+        return str(iso_date) if iso_date else "Not set"
+    return f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+
+
+def _send_tenant_deadline_email(tenant_email, deal, deal_id, old_deadline, new_deadline):
+    """Best-effort SES note to Chad when a tenant changes their own deal's
+    deadline from the Deal Details card. Same sender/recipient as
+    _send_deal_stage_email; failure never rolls back the write. Returns
+    True/False, never raises."""
+    line = (f"{tenant_email} changed {_deal_title(deal)} deadline: "
+            f"{_fmt_deadline_for_email(old_deadline)} \u2192 {_fmt_deadline_for_email(new_deadline)}")
+    body = (f"{line}\n"
+            f"Deal ID: {deal_id}\n"
+            f"Company: {_deal_company_name(deal) or '—'}\n"
+            f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n")
+    try:
+        ses = boto3.client("ses", region_name="us-east-1")
+        ses.send_email(
+            Source=DEAL_STAGE_EMAIL_FROM,
+            Destination={"ToAddresses": [DEAL_STAGE_EMAIL_TO]},
+            Message={"Subject": {"Data": f"[Dashboard] Deadline changed: {_deal_title(deal)}"},
+                     "Body": {"Text": {"Data": body}}},
+        )
+        return True
+    except Exception as e:
+        print(f"tenant deadline email failed (non-fatal): {type(e).__name__}: {e}")
+        return False
+
+
+# Tenant deadline self-edit (Deal Details card): the request may carry ONLY
+# these keys; the date must be on or after "today" anywhere in the US
+# (UTC minus TENANT_DEADLINE_TZ_SLACK_HOURS), so an evening edit in
+# Pacific time isn't refused for being "yesterday" in UTC.
+TENANT_DEADLINE_ALLOWED_KEYS = {"deal_id", "deadline"}
+TENANT_DEADLINE_TZ_SLACK_HOURS = 12
+
+
+def _tenant_deadline_min_date(now=None):
+    return ((now or datetime.now(timezone.utc)) - timedelta(hours=TENANT_DEADLINE_TZ_SLACK_HOURS)).date()
+
+
 def _dynamo_write_deal_stage_override(tenant_email, deal_id, stage_id, actor, old_stage_id, email_failed):
     now = time.time()
     try:
@@ -7670,7 +7715,61 @@ def _deal_deadline_display_html(deadline, is_closed=False):
     return f'{_esc(text)} <span class="dc-hint">{hint}</span>'
 
 
-def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None, reopen_html=""):
+def _tenant_deadline_editor_html(deal_id, deadline, display_html):
+    """Tenant self-edit for a live deal's DEADLINE cell: the date with a
+    small "Edit" link under it; Edit swaps in a date picker + Save/Cancel
+    (TENANT_DEADLINE_SCRIPT posts ?action=update_intro {deal_id, deadline})."""
+    min_date = _tenant_deadline_min_date().isoformat()
+    return (f'<span class="dc-dl" data-deal-id="{_esc(deal_id)}">'
+            f'<span class="dc-dl-view"><span class="dc-dl-value">{display_html}</span>'
+            f'<a href="#" class="dc-dl-edit">Edit</a></span>'
+            f'<span class="dc-dl-form" hidden><input type="date" class="dc-dl-input" value="{_esc(deadline or "")}" '
+            f'min="{min_date}"><button type="button" class="dc-dl-save">Save</button>'
+            f'<button type="button" class="dc-dl-cancel">Cancel</button></span>'
+            f'<span class="dc-dl-msg" role="status"></span></span>')
+
+
+TENANT_DEADLINE_SCRIPT = """<script>
+(function() {
+  document.querySelectorAll('.dc-dl').forEach(function(box) {
+    var view = box.querySelector('.dc-dl-view'), form = box.querySelector('.dc-dl-form');
+    var input = box.querySelector('.dc-dl-input'), msg = box.querySelector('.dc-dl-msg');
+    var val = box.querySelector('.dc-dl-value'), saveBtn = box.querySelector('.dc-dl-save');
+    var orig = input.value;
+    function setMsg(t, cls) { msg.textContent = t; msg.className = 'dc-dl-msg' + (cls ? ' ' + cls : ''); }
+    box.querySelector('.dc-dl-edit').addEventListener('click', function(e) {
+      e.preventDefault(); input.value = orig; view.hidden = true; form.hidden = false; setMsg(''); input.focus();
+    });
+    box.querySelector('.dc-dl-cancel').addEventListener('click', function() {
+      form.hidden = true; view.hidden = false; setMsg('');
+    });
+    saveBtn.addEventListener('click', function() {
+      if (!input.value) { setMsg('Please pick a date.', 'error'); return; }
+      saveBtn.disabled = true; setMsg('Saving\u2026');
+      fetch('?action=update_intro', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deal_id: box.getAttribute('data-deal-id'), deadline: input.value })
+      }).then(function(r) {
+        return r.json().then(function(d) { return { ok: r.ok, d: d }; }, function() { return { ok: false, d: {} }; });
+      }).then(function(res) {
+        saveBtn.disabled = false;
+        if (res.ok) {
+          orig = input.value; val.innerHTML = res.d.display || input.value;
+          form.hidden = true; view.hidden = false; setMsg('Saved \u2713', 'saved');
+          setTimeout(function() { setMsg(''); }, 2500);
+        } else {
+          setMsg((res.d && res.d.error) || 'Could not save. Please try again.', 'error');
+        }
+      }).catch(function() { saveBtn.disabled = false; setMsg('Could not save. Please try again.', 'error'); });
+    });
+  });
+})();
+</script>"""
+
+
+def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None, reopen_html="",
+                    tenant_deadline_edit=False):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
     render_company_page), used to resolve any deadline_override. edit_mode
@@ -7709,6 +7808,8 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         deadline_value_html = _ei_date_field_html(deal_id, deadline or "", css_class="ei-deadline", field="deadline")
     else:
         deadline_value_html = _deal_deadline_display_html(deadline, is_closed=is_closed)
+        if tenant_deadline_edit and not is_closed and not _deal_is_public(deal):
+            deadline_value_html = _tenant_deadline_editor_html(deal_id, deadline, deadline_value_html)
     is_overdue = False
     if deadline and not is_closed:
         deadline_dt = _parse_dt(deadline)
@@ -12539,8 +12640,11 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                                                       reopen_html=reopen_html))
                 else:
                     live_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode,
-                                                      paperwork=deal_paperwork_status(d, anon_key_email, person_id)))
+                                                      paperwork=deal_paperwork_status(d, anon_key_email, person_id),
+                                                      tenant_deadline_edit=(key is None)))
             deals_body = "".join(live_cards)
+            if 'class="dc-dl-edit"' in deals_body:
+                deals_body += TENANT_DEADLINE_SCRIPT
             if won_cards:
                 deals_body += ('<div class="cd-won-deals"><h3 class="cd-deals-subhead">Won</h3>'
                                + "".join(won_cards) + '</div>')
@@ -13143,6 +13247,19 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
   .dc-not-set {{ color: var(--accredited); font-weight: 500; }}
   .dc-hint {{ font-size: 12px; font-weight: 500; color: var(--accredited); margin-left: 4px; }}
+  .dc-dl-edit {{ display: block; font-size: 11px; font-weight: 500; color: var(--accent); text-decoration: none;
+                 margin-top: 2px; }}
+  .dc-dl-edit:hover {{ text-decoration: underline; }}
+  .dc-dl-form {{ display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }}
+  .dc-dl-view[hidden], .dc-dl-form[hidden] {{ display: none !important; }}
+  .dc-dl-input {{ font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }}
+  .dc-dl-form button {{ font: inherit; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+                        cursor: pointer; border: 1px solid var(--line); background: var(--card); color: var(--ink); }}
+  .dc-dl-form .dc-dl-save {{ background: var(--qp); border-color: var(--qp); color: #fff; }}
+  .dc-dl-form button:disabled {{ opacity: 0.6; cursor: default; }}
+  .dc-dl-msg {{ display: block; font-size: 11px; font-weight: 500; margin-top: 2px; }}
+  .dc-dl-msg.saved {{ color: var(--qp); }}
+  .dc-dl-msg.error {{ color: #b23b3b; }}
   .dc-footer {{ display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
                gap: 10px 16px; margin-top: 16px; }}
   .dc-verify {{ font-size: 13px; color: var(--muted); flex: 1 1 240px; }}
@@ -17294,13 +17411,18 @@ def _handle_update_intro(event):
     is_admin = bool(admin_key) and body.get("key") == admin_key
 
     tenant_identity_email = None
+    tenant_deadline_edit = False
     if not is_admin:
         identity_email = _read_identity_email(event)
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
         if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
-        if body.get("deadline") not in (None, ""):
-            return _json_response({"error": "forbidden"}, 403)
+        if "deadline" in body:
+            # Tenant deadline self-edit: deadline is the ONLY field allowed
+            # in the request; anything alongside it is refused outright.
+            if set(body.keys()) - TENANT_DEADLINE_ALLOWED_KEYS:
+                return _json_response({"error": "forbidden"}, 403)
+            tenant_deadline_edit = True
         if body.get("exemption") not in (None, ""):
             return _json_response({"error": "forbidden"}, 403)
         if "share_loss_reason" in body:
@@ -17379,14 +17501,18 @@ def _handle_update_intro(event):
             except ValueError:
                 return _json_response({"error": "invalid follow_up date"}, 400)
 
-    deadline = body.get("deadline") if is_admin else None
+    deadline = body.get("deadline") if (is_admin or tenant_deadline_edit) else None
     if deadline is not None:
         deadline = str(deadline).strip()
         if deadline:
             try:
-                datetime.strptime(deadline, "%Y-%m-%d")
+                deadline_d = datetime.strptime(deadline, "%Y-%m-%d").date()
             except ValueError:
                 return _json_response({"error": "invalid deadline date"}, 400)
+            if tenant_deadline_edit and deadline_d < _tenant_deadline_min_date():
+                return _json_response({"error": "The deadline can't be in the past."}, 400)
+        elif tenant_deadline_edit:
+            return _json_response({"error": "Please pick a date."}, 400)
 
     # Admin-only Fund Exemption (Deal Details EXEMPTION selector).
     exemption = None
@@ -17434,6 +17560,16 @@ def _handle_update_intro(event):
     intro_details, _ = get_intro_details(tenant_email, expand_team=False)
     old_entry = intro_details.get(deal_id) or {}
     old_resolved = _resolve_intro_status(deal, old_entry)
+
+    if tenant_deadline_edit:
+        # Only the tenant's own live Sell deal (what the card's Edit link
+        # is shown on): never a buy deal, a public company, or a closed one.
+        if DEAL_SIDE_SELL_ID not in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
+            return _json_response({"error": "forbidden"}, 403)
+        tenant_rsid = _resolve_deal_stage(deal, old_entry)
+        if (_deal_is_public(deal) or _is_won_stage(tenant_rsid)
+                or _is_closed_down_stage(tenant_rsid)):
+            return _json_response({"error": "This deal is closed — its deadline can't be changed."}, 409)
 
     if has_status_intent and not is_admin:
         if not old_resolved["disclosed"]:
@@ -17553,6 +17689,10 @@ def _handle_update_intro(event):
 
     if history_entry is not None:
         return _json_response({"ok": True, "entry": _note_entry_payload(history_entry)})
+    if tenant_deadline_edit:
+        _send_tenant_deadline_email(tenant_identity_email, deal, deal_id, old_values["deadline"], deadline)
+        return _json_response({"ok": True, "deadline": deadline,
+                               "display": _deal_deadline_display_html(deadline)})
     return _json_response({"ok": True})
 
 
