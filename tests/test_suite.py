@@ -1131,9 +1131,8 @@ check("impersonated deadline save -> 200, Pipeline PUT, audit actor 'cgracia@…
       resp_imp["statusCode"] == 200 and len(pipeline_calls) == 1
       and fake_table.puts and fake_table.puts[-1].get("actor") == _imp_actor
       and fake_table.puts[-1]["new"].get("deadline") == _imp_dl)
-check("impersonated deadline save still emails Chad, naming the admin-as-tenant actor",
-      len(ses_calls) == 1 and f"{_imp_actor} changed Sell Deal Overdue deadline:"
-      in ses_calls[-1]["Message"]["Body"]["Text"]["Data"])
+check("impersonated deadline save sends NO email (only real seller sessions notify Chad)",
+      len(ses_calls) == 0)
 pipeline_calls.clear()
 resp_imp_past = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": TENANT_EMAIL, "deal_id": "900",
                                               "deadline": iso_dash(-3)}), None)
