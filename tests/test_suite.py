@@ -1042,10 +1042,68 @@ check("Pipeline 502 on deadline write -> 502", resp_fail["statusCode"] == 502)
 check("no Dynamo write happens when the Pipeline PUT fails", len(fake_table.updates) == 0)
 lf.urllib.request.urlopen = fake_urlopen
 
-# Tenant still can never write a deadline (unchanged, dedicated 403 path)
-resp_tenant = lf.lambda_handler(post_event({"deal_id": "900", "deadline": "2026-12-01"},
+# --- Tenant deadline self-edit (Deal Details card)
+check("tenant live card: DEADLINE cell carries the Edit link + hidden picker, page includes the script",
+      'class="dc-dl-edit">Edit</a>' in page_company and '<span class="dc-dl-form" hidden>' in page_company
+      and 'data-deal-id="900"' in page_company and "dc-dl-save" in lf.TENANT_DEADLINE_SCRIPT
+      and lf.TENANT_DEADLINE_SCRIPT in page_company)
+check("admin view (edit mode) has no tenant Edit link", 'class="dc-dl-edit"' not in page_company_edit)
+_closed_card = lf._deal_card_html(dict(deal_future, deal_stage={"id": lf.OBSOLETE_STAGE_ID}), "Delta Co",
+                                  tenant_deadline_edit=True)
+_won_card = lf._deal_card_html(dict(deal_future, deal_stage={"id": next(iter(lf.WON_STAGE_IDS))}), "Delta Co",
+                               tenant_deadline_edit=True)
+check("closed deals: no Edit link", "dc-dl-edit" not in _closed_card and "dc-dl-edit" not in _won_card)
+
+FakeBoto3.SES = FakeSES()
+ses_calls.clear(); pipeline_calls.clear(); fake_table.updates.clear(); fake_table.puts.clear()
+_new_dl = iso_dash(45)
+_old_dl = lf._resolve_deal_deadline(deal_overdue, lf.get_intro_details(TENANT_EMAIL, expand_team=False)[0].get("900"))
+check("fixture: deal 900's current resolved deadline is known before the tenant edit", bool(_old_dl))
+resp_tenant = lf.lambda_handler(post_event({"deal_id": "900", "deadline": _new_dl},
                                             cookies=[tenant_cookie(TENANT_EMAIL)]), None)
-check("tenant deadline write is rejected with 403", resp_tenant["statusCode"] == 403)
+_tbody = json.loads(resp_tenant["body"])
+check("tenant can change their own live deal's deadline -> 200 with the new display",
+      resp_tenant["statusCode"] == 200 and _tbody.get("deadline") == _new_dl and "dc-hint" not in _tbody.get("display", "x"))
+check("tenant deadline write: ONE Pipeline PUT of only the deadline field, slash format",
+      len(pipeline_calls) == 1
+      and pipeline_calls[0]["data"]["deal"]["custom_fields"] == {lf.DEADLINE_FIELD: _new_dl.replace("-", "/")})
+check("tenant deadline write: Dynamo override + audit with tenant email, old and new dates",
+      fake_table.updates and fake_table.updates[-1]["ExpressionAttributeValues"].get(":do") == _new_dl
+      and fake_table.puts and fake_table.puts[-1].get("actor") == TENANT_EMAIL
+      and fake_table.puts[-1]["old"].get("deadline") == _old_dl
+      and fake_table.puts[-1]["new"].get("deadline") == _new_dl)
+_dl_mail = ses_calls[-1] if ses_calls else {}
+_fmt = lambda iso: f"{lf._parse_dt(iso).strftime('%b')} {lf._parse_dt(iso).day}, {lf._parse_dt(iso).year}"
+check("Chad is emailed '<tenant> changed <deal> deadline: <old> → <new>' (only cgracia@)",
+      len(ses_calls) == 1 and _dl_mail["Destination"]["ToAddresses"] == ["cgracia@rainmakersecurities.com"]
+      and f"{TENANT_EMAIL} changed Sell Deal Overdue deadline: {_fmt(_old_dl)} \u2192 {_fmt(_new_dl)}"
+          in _dl_mail["Message"]["Body"]["Text"]["Data"])
+
+pipeline_calls.clear(); ses_calls.clear()
+resp_t_past = lf.lambda_handler(post_event({"deal_id": "900", "deadline": iso_dash(-3)},
+                                           cookies=[tenant_cookie(TENANT_EMAIL)]), None)
+check("tenant deadline in the past -> 400, no Pipeline call, no email",
+      resp_t_past["statusCode"] == 400 and not pipeline_calls and not ses_calls)
+check("tenant deadline of today is allowed by the min-date rule",
+      lf._tenant_deadline_min_date() <= lf.datetime.now(lf.timezone.utc).date())
+for _extra in ({"next_steps": "x"}, {"notes": "x"}, {"exemption": "7200027"}, {"flag": "stalled"},
+               {"status": "7207579"}, {"follow_up": iso_dash(5)}, {"share_loss_reason": True}, {"key": "nope"}):
+    _r = lf.lambda_handler(post_event(dict({"deal_id": "900", "deadline": iso_dash(20)}, **_extra),
+                                      cookies=[tenant_cookie(TENANT_EMAIL)]), None)
+    check(f"tenant deadline request carrying {sorted(_extra)[0]!r} too -> 403, nothing written",
+          _r["statusCode"] == 403 and not pipeline_calls)
+resp_t_ex = lf.lambda_handler(post_event({"deal_id": "900", "exemption": "7200027"},
+                                         cookies=[tenant_cookie(TENANT_EMAIL)]), None)
+check("tenant still can't write any other admin field (exemption) -> 403", resp_t_ex["statusCode"] == 403)
+
+lf.urllib.request.urlopen = fake_urlopen_fail
+fake_table.updates.clear(); fake_table.puts.clear(); ses_calls.clear()
+resp_t_fail = lf.lambda_handler(post_event({"deal_id": "900", "deadline": iso_dash(50)},
+                                           cookies=[tenant_cookie(TENANT_EMAIL)]), None)
+check("Pipeline failure on a tenant deadline write -> 502, no Dynamo write, no audit, no email",
+      resp_t_fail["statusCode"] == 502 and not fake_table.updates and not fake_table.puts and not ses_calls)
+lf.urllib.request.urlopen = fake_urlopen
+FakeBoto3.SES = None
 
 # --- Deal Details EXEMPTION column (Fund Exemption 4006089) + admin selector
 check("tenant card: EXEMPTION column right of DEADLINE, amber 'Not set' when empty, no old 'Exemption:' line",
@@ -1104,6 +1162,11 @@ use_fixture({"people.json": other_people, "interest_people.json": {"buy": {}},
 resp_foreign = lf.lambda_handler(post_event({"deal_id": "900", "next_steps": "hack"},
                                              cookies=[tenant_cookie("other@example.com")]), None)
 check("a tenant writing on a deal linked to a DIFFERENT tenant is rejected", resp_foreign["statusCode"] == 403)
+pipeline_calls.clear()
+resp_foreign_dl = lf.lambda_handler(post_event({"deal_id": "900", "deadline": iso_dash(20)},
+                                                cookies=[tenant_cookie("other@example.com")]), None)
+check("a tenant can't change ANOTHER tenant's deal deadline -> 403, no Pipeline call",
+      resp_foreign_dl["statusCode"] == 403 and not pipeline_calls)
 
 
 # ======================================================================
