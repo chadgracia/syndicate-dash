@@ -106,6 +106,7 @@ Stages: Inquiry 2109142, Firm 111800, Matched 2381534, LOI 2517909, Transfer Not
 - "Help shape this dashboard" feature box: Overview and My Deals only (Overview submits tagged "my-deals"). Not on the company page, Active Intros or Demand Board.
 
 ## Company page Deal Details
+- Card metrics: SIZE · NET · STRUCTURE · DEADLINE (4006402 via _resolve_deal_deadline, "Oct 31, 2026", amber "in N days" hint when 0-14 days out and not closed; admin edit_mode puts the date input in this column). Empty values = amber "Not set" (_dc_value_html), never "—". EXEMPTION column = Fund Exemption 4006089 short label (EXEMPTION_SHORT_LABELS: 3(c)(1)/3(c)(7)/Other) via _resolve_deal_exemption (newer-wins Dynamo exemption_override/_at); no separate "Exemption:" line. Admin edit_mode: .ei-exemption select in the column -> POST exemption (admin-only, tenant 403) -> Pipeline PUT int option id first, then Dynamo override + audit. Live cards: paperwork badge in place, then .dc-footer = verify line (DC_VERIFY_TEXT) left + solid green pill Update button right. No seller "last confirmed" timestamp exists (deal-update-form only PUTs to Pipeline).
 - Cards ordered: live, then "Won" subheading (expanded), then collapsed "▸ Closed down (N)" (_is_closed_down_stage, resolved stage). Closed cards: no paperwork, no overdue chip, close label from _deal_closed_label ("Won <date>" / "Closed <date>"). "This Company" stats unchanged.
 
 ## Won / Capital Raised — ONE definition everywhere

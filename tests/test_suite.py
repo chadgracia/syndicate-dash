@@ -1047,6 +1047,49 @@ resp_tenant = lf.lambda_handler(post_event({"deal_id": "900", "deadline": "2026-
                                             cookies=[tenant_cookie(TENANT_EMAIL)]), None)
 check("tenant deadline write is rejected with 403", resp_tenant["statusCode"] == 403)
 
+# --- Deal Details EXEMPTION column (Fund Exemption 4006089) + admin selector
+check("tenant card: EXEMPTION column right of DEADLINE, amber 'Not set' when empty, no old 'Exemption:' line",
+      'dc-label">Deadline' in page_company
+      and page_company.index('dc-label">Deadline') < page_company.index('dc-label">Exemption')
+      and "Exemption: " not in page_company and 'class="ei-exemption"' not in page_company
+      and page_company.split('dc-label">Exemption</span>')[1].startswith(
+          '<span class="dc-value">' + lf.DC_NOT_SET_HTML))
+_ex_cf = dict(deal_future["custom_fields"]); _ex_cf[lf.EXEMPTION_FIELD] = 7200028
+_ex_card = lf._deal_card_html(dict(deal_future, custom_fields=_ex_cf), "Delta Co")
+check("card: Fund Exemption 7200028 renders as the short '3(c)(7)' value",
+      'dc-label">Exemption</span><span class="dc-value">3(c)(7)</span>' in _ex_card and "Exemption: " not in _ex_card)
+_ex_edit = lf._deal_card_html(dict(deal_future, custom_fields=_ex_cf), "Delta Co", edit_mode=True)
+check("admin edit mode: exemption selector sits in the column with the current option selected",
+      'dc-label">Exemption</span><span class="dc-value"><select class="ei-exemption"' in _ex_edit
+      and '<option value="7200028" selected>3(c)(7)</option>' in _ex_edit)
+check("admin edit page includes the exemption selector + its change handler",
+      'class="ei-exemption"' in page_company_edit and "saveField(el, 'exemption')" in page_company_edit)
+check("override newer than Pipeline wins for the exemption",
+      lf._resolve_deal_exemption(dict(deal_future, custom_fields=_ex_cf),
+                                 {"exemption_override": 7200027, "exemption_override_at": 4102444800}) == 7200027
+      and lf._resolve_deal_exemption(dict(deal_future, custom_fields=_ex_cf),
+                                     {"exemption_override": 7200027, "exemption_override_at": 1}) == 7200028)
+pipeline_calls.clear(); fake_table.updates.clear()
+resp_ex = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "900", "exemption": "7200027"}), None)
+check("admin exemption write -> 200, one Pipeline PUT of the int option id, Dynamo override, admin audit",
+      resp_ex["statusCode"] == 200 and len(pipeline_calls) == 1
+      and pipeline_calls[0]["data"]["deal"]["custom_fields"][lf.EXEMPTION_FIELD] == 7200027
+      and fake_table.updates and fake_table.updates[-1]["ExpressionAttributeValues"].get(":eo") == 7200027
+      and fake_table.puts[-1].get("actor") == "admin")
+pipeline_calls.clear()
+resp_ex_bad = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "900", "exemption": "123"}), None)
+check("admin exemption write with an unknown option -> 400, no Pipeline call",
+      resp_ex_bad["statusCode"] == 400 and not pipeline_calls)
+lf.urllib.request.urlopen = fake_urlopen_fail
+fake_table.updates.clear()
+resp_ex_fail = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "900", "exemption": "7200028"}), None)
+check("Pipeline failure on exemption write -> 502, no Dynamo write",
+      resp_ex_fail["statusCode"] == 502 and len(fake_table.updates) == 0)
+lf.urllib.request.urlopen = fake_urlopen
+resp_ex_tenant = lf.lambda_handler(post_event({"deal_id": "900", "exemption": "7200027"},
+                                              cookies=[tenant_cookie(TENANT_EMAIL)]), None)
+check("tenant exemption write is rejected with 403", resp_ex_tenant["statusCode"] == 403)
+
 # No auth at all -> 403
 resp_noauth = lf.lambda_handler(post_event({"deal_id": "900", "next_steps": "x"}), None)
 check("no admin key and no identity cookie -> 403", resp_noauth["statusCode"] == 403)
@@ -6386,6 +6429,28 @@ check("paperwork: table row and detail card agree on the amber agreement mailto"
           in md_noagr_row
       and f'<a class="id-status-badge id-needed" href="{_noagr_mailto}">Agent agreement needed before introductions</a>'
           in md_noagr_card and "Paperwork in order" not in md_noagr_card)
+
+# --- Deal Details card: Deadline column, "Not set", footer button + verify line
+_dc_soon = (lf.datetime.now(lf.timezone.utc) + lf.timedelta(days=9)).strftime("%Y/%m/%d")
+_dc_far = "2099/10/31"
+_dc_cf_soon = dict(md_noagr["custom_fields"]); _dc_cf_soon[lf.DEADLINE_FIELD] = _dc_soon
+_dc_cf_far = dict(md_noagr["custom_fields"]); _dc_cf_far[lf.DEADLINE_FIELD] = _dc_far
+_dc_cf_none = {k: v for k, v in md_noagr["custom_fields"].items() if k not in (lf.DEADLINE_FIELD, lf.NET_FIELD)}
+_dc_pw = lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602)
+dc_soon = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_soon), "Hark Labs", paperwork=_dc_pw)
+dc_far = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_far), "Hark Labs", paperwork=_dc_pw)
+dc_none = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_none), "Hark Labs", paperwork=_dc_pw)
+check("deal card: DEADLINE column after STRUCTURE, 'Oct 31, 2099' format, no hint when far out",
+      dc_far.index('dc-label">Structure') < dc_far.index('dc-label">Deadline')
+      and "Oct 31, 2099" in dc_far and "dc-hint" not in dc_far and "Deadline: " not in dc_far)
+check("deal card: deadline within 14 days carries the 'in 9 days' hint",
+      '<span class="dc-hint">in 9 days</span>' in dc_soon)
+check("deal card: missing Net / Deadline show amber 'Not set', never a bare dash",
+      dc_none.count(lf.DC_NOT_SET_HTML) >= 2 and 'class="dc-value">—<' not in dc_none)
+check("deal card: live card puts the Update button in the footer beside the verify line, badge stays above",
+      '<div class="dc-footer"><div class="dc-verify">' + lf._esc(lf.DC_VERIFY_TEXT) + '</div><a class="update-cancel-btn"'
+      in dc_far and dc_far.count("update-cancel-btn") == 1
+      and dc_far.index("Agent agreement needed before introductions") < dc_far.index("dc-footer"))
 
 # --- Actions on every team row + write auth
 _md_fixture(lf.CEF_YES_ID)
