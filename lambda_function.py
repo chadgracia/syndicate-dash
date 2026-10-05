@@ -444,6 +444,8 @@ EXEMPTION_LABELS = {
     7200028: "3(c)(7) — qualified purchasers only ($5M+ investments)",
     7201486: "Other",
 }
+# Deal Details EXEMPTION column / admin selector: the short form.
+EXEMPTION_SHORT_LABELS = {7200027: "3(c)(1)", 7200028: "3(c)(7)", 7201486: "Other"}
 
 # Full-terms audit fields (_deal_terms_missing) with no other reader in this
 # file yet — same trust basis as every other bare field id given directly.
@@ -4562,7 +4564,7 @@ def _intro_entry_freshness(entry):
     """Latest timestamp an intro entry carries -- decides which copy wins
     when the same deal_id turns up in more than one team partition."""
     stamps = [entry.get(k) for k in ("notes_updated_at", "override_at", "stage_override_at",
-                                     "deadline_override_at")]
+                                     "deadline_override_at", "exemption_override_at")]
     stamps += list((entry.get("milestones") or {}).values())
     best = 0.0
     for v in stamps:
@@ -4650,6 +4652,8 @@ def _intro_entry_from_item(item):
         "override_at": item.get("override_at"),
         "deadline_override": item.get("deadline_override"),
         "deadline_override_at": item.get("deadline_override_at"),
+        "exemption_override": item.get("exemption_override"),
+        "exemption_override_at": item.get("exemption_override_at"),
         "stage_override": item.get("stage_override"),
         "stage_override_at": item.get("stage_override_at"),
         "milestones": item.get("milestones") or {},
@@ -6576,6 +6580,33 @@ def _pipeline_update_deal_deadline(deal_id, deadline_iso):
         return False, f"{type(e).__name__}: {e}"
 
 
+def _pipeline_update_deal_exemption(deal_id, exemption_id):
+    """PUT the Fund Exemption option id (EXEMPTION_FIELD) to Pipeline -- the
+    same int option-id shape deal-update-form writes. Returns (ok, error);
+    abort-on-any-non-2xx like _pipeline_update_deal_deadline."""
+    if exemption_id not in EXEMPTION_SHORT_LABELS:
+        return False, "invalid exemption"
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    body = json.dumps({"deal": {"custom_fields": {EXEMPTION_FIELD: exemption_id}}}).encode("utf-8")
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
+        data=body, method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def _pipeline_get_deal(deal_id):
     """Live GET of a single deal from Pipeline -- never the S3 snapshot
     (see _handle_debug_deal for that read path). Returns
@@ -7173,7 +7204,7 @@ def _seller_email_order(index):
 
 def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
                                 old_values, actor, milestones=None, loss_reason_shared=None, notes_history=None,
-                                history_entry=None):
+                                history_entry=None, exemption=None):
     """Update the intro item's Dynamo-owned attributes (status_override/
     override_at when status_id is not None, next_steps/notes/follow_up
     when they are not None, deadline_override/deadline_override_at when
@@ -7237,6 +7268,12 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         update_parts.append("deadline_override_at = :doa")
         expr_values[":doa"] = int(now)
         new_values["deadline"] = deadline
+    if exemption is not None:
+        update_parts.append("exemption_override = :eo")
+        expr_values[":eo"] = exemption
+        update_parts.append("exemption_override_at = :eoa")
+        expr_values[":eoa"] = int(now)
+        new_values["exemption"] = exemption
     if loss_reason_shared is not None:
         update_parts.append("loss_reason_shared = :lrs")
         expr_values[":lrs"] = bool(loss_reason_shared)
@@ -7378,6 +7415,40 @@ def _resolve_deal_deadline(deal, override_entry=None):
             if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
                 deadline = override_val
     return deadline
+
+
+def _resolve_deal_exemption(deal, override_entry=None):
+    """Fund Exemption option id (EXEMPTION_FIELD), with the same newer-wins
+    Dynamo overlay as _resolve_deal_deadline (exemption_override/
+    exemption_override_at, written by the admin selector). None if unset
+    or not a known option."""
+    exemption_id = next(iter(_deal_cf_option_ids(deal, EXEMPTION_FIELD)), None)
+    if override_entry:
+        override_val = override_entry.get("exemption_override")
+        override_at = override_entry.get("exemption_override_at")
+        if override_val is not None and override_at:
+            pipeline_dt = _parse_dt(deal.get("updated_at"))
+            try:
+                override_dt = datetime.fromtimestamp(float(override_at), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                override_dt = None
+            if override_dt is not None and (pipeline_dt is None or override_dt > pipeline_dt):
+                try:
+                    exemption_id = int(override_val)
+                except (TypeError, ValueError):
+                    pass
+    return exemption_id if exemption_id in EXEMPTION_SHORT_LABELS else None
+
+
+def _ei_exemption_select_html(deal_id, exemption_id):
+    """Admin edit-mode Fund Exemption selector for the Deal Details
+    EXEMPTION column; saves on change through _edit_script_html."""
+    opts = [] if exemption_id else ['<option value="" selected disabled>Not set</option>']
+    for oid, label in EXEMPTION_SHORT_LABELS.items():
+        sel = " selected" if oid == exemption_id else ""
+        opts.append(f'<option value="{oid}"{sel}>{_esc(label)}</option>')
+    return (f'<select class="ei-exemption" data-deal-id="{_esc(deal_id)}" data-field="exemption">'
+            f'{"".join(opts)}</select><span class="ei-msg"></span>')
 
 
 def _deal_size_text(deal):
@@ -7661,16 +7732,11 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
             overdue_html = (f'<a class="overdue-chip" href="{href}" target="_blank" rel="noopener noreferrer">'
                              'Deadline passed — update or cancel this deal</a>')
 
-    exemption_id = next(iter(_deal_cf_option_ids(deal, EXEMPTION_FIELD)), None)
-    exemption_label = EXEMPTION_LABELS.get(exemption_id)
-    if exemption_id == 7200027:
-        # 3(c)(1): carry > 0 (or unknown) means Rule 205-3 Qualified Client
-        # standard applies; only an explicit 0 carry keeps the accredited label.
-        _carry_num = _deal_cf_number(deal, CARRY_FIELD)
-        exemption_label = ("3(c)(1) — accredited investors ($1M+ net worth) & QPs ($5M+ investments)" if _carry_num == 0
-                           else "3(c)(1) — qualified clients ($2.2M+ net worth) & QPs ($5M+ investments)")
-    exemption_html = (f'<div class="dc-line">Exemption: {_esc(exemption_label)}</div>'
-                       if exemption_label else "")
+    exemption_id = _resolve_deal_exemption(deal, override_entry)
+    if edit_mode:
+        exemption_value_html = _ei_exemption_select_html(deal_id, exemption_id)
+    else:
+        exemption_value_html = _dc_value_html(EXEMPTION_SHORT_LABELS.get(exemption_id))
 
     fees = _fmt_fees(deal)
     fees_html = f'<div class="dc-line">{_esc(fees)}</div>' if fees else ""
@@ -7712,9 +7778,9 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         <div><span class="dc-label">Net</span><span class="dc-value">{net_text}</span></div>
         <div><span class="dc-label">Structure</span><span class="dc-value">{structure_text}</span></div>
         <div><span class="dc-label">Deadline</span><span class="dc-value">{deadline_value_html}</span></div>
+        <div><span class="dc-label">Exemption</span><span class="dc-value">{exemption_value_html}</span></div>
       </div>
       {per_share_html}
-      {exemption_html}
       {fees_html}
       {badge_html}
       {footer_html}
@@ -8527,6 +8593,9 @@ def _edit_script_html(key, tenant_email=None):
   }});
   document.querySelectorAll('.ei-loss-shared').forEach(function(el) {{
     el.addEventListener('change', function() {{ saveLossShared(el); }});
+  }});
+  document.querySelectorAll('.ei-exemption').forEach(function(el) {{
+    el.addEventListener('change', function() {{ saveField(el, 'exemption'); }});
   }});
   document.querySelectorAll('.ei-next-steps, .ei-notes, .ei-follow-up, .ei-deadline').forEach(function(el) {{
     var field = el.getAttribute('data-field');
@@ -13215,7 +13284,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     font-style: italic;
   }}
   .table-scroll {{ overflow-x: auto; }}
-  .ei-status, .ei-notes, .ei-flag, .ei-deadline {{
+  .ei-status, .ei-notes, .ei-flag, .ei-deadline, .ei-exemption {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -13226,6 +13295,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     box-sizing: border-box;
   }}
   .ei-deadline {{ width: 150px; }}
+  .ei-exemption {{ width: 110px; }}
   /* Dedup fix (turn 19, ported by the parity refactor): the flag select
      carries the Stalled/Passed/Withdrawn state itself (glanceable
      border+tint) whenever it's the only place that state shows — see
@@ -17231,6 +17301,8 @@ def _handle_update_intro(event):
             return _json_response({"error": "forbidden"}, 403)
         if body.get("deadline") not in (None, ""):
             return _json_response({"error": "forbidden"}, 403)
+        if body.get("exemption") not in (None, ""):
+            return _json_response({"error": "forbidden"}, 403)
         if "share_loss_reason" in body:
             return _json_response({"error": "forbidden"}, 403)
 
@@ -17316,6 +17388,16 @@ def _handle_update_intro(event):
             except ValueError:
                 return _json_response({"error": "invalid deadline date"}, 400)
 
+    # Admin-only Fund Exemption (Deal Details EXEMPTION selector).
+    exemption = None
+    if is_admin and body.get("exemption") not in (None, ""):
+        try:
+            exemption = int(body.get("exemption"))
+        except (TypeError, ValueError):
+            return _json_response({"error": "invalid exemption"}, 400)
+        if exemption not in EXEMPTION_SHORT_LABELS:
+            return _json_response({"error": "invalid exemption"}, 400)
+
     # Admin-only "share this closed deal's loss notes with the tenant"
     # flag (a tenant posting this key at all was already rejected above,
     # before is_admin could even matter) -- default unshared, per
@@ -17327,7 +17409,7 @@ def _handle_update_intro(event):
 
     has_status_intent = status_id is not None or milestone_step is not None or flag is not None
     if (not has_status_intent and next_steps is None and notes is None and follow_up is None
-            and deadline is None and share_loss_reason is None):
+            and deadline is None and share_loss_reason is None and exemption is None):
         return _json_response({"error": "nothing to update"}, 400)
 
     deals = get_deals_list()
@@ -17387,6 +17469,7 @@ def _handle_update_intro(event):
         "notes": old_entry.get("notes"),
         "follow_up": old_entry.get("follow_up"),
         "deadline": _resolve_deal_deadline(deal, old_entry),
+        "exemption": _resolve_deal_exemption(deal, old_entry),
         "loss_reason_shared": bool(old_entry.get("loss_reason_shared")),
     }
 
@@ -17439,6 +17522,11 @@ def _handle_update_intro(event):
         if not ok:
             return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
+    if exemption is not None:
+        ok, err = _pipeline_update_deal_exemption(deal_id, exemption)
+        if not ok:
+            return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
+
     actor = "admin" if is_admin else tenant_identity_email
 
     # Deal notes are append-only: every non-blank notes save adds one
@@ -17459,7 +17547,7 @@ def _handle_update_intro(event):
     ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
                                           old_values, actor, milestones=milestones_update,
                                           loss_reason_shared=share_loss_reason, notes_history=notes_history,
-                                          history_entry=history_entry)
+                                          history_entry=history_entry, exemption=exemption)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
 
