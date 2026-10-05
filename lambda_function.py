@@ -17737,7 +17737,10 @@ def _handle_update_intro(event):
     if history_entry is not None:
         return _json_response({"ok": True, "entry": _note_entry_payload(history_entry)})
     if tenant_deadline_edit:
-        _send_tenant_deadline_email(actor, deal, deal_id, old_values["deadline"], deadline)
+        # Email Chad only for a real seller session -- never for his own
+        # admin Tenant-view (impersonated) saves.
+        if impersonated_actor is None:
+            _send_tenant_deadline_email(actor, deal, deal_id, old_values["deadline"], deadline)
         # overdue: the same UTC-date test _deal_card_html uses, so the card
         # can drop its red "Deadline passed" state without a reload.
         return _json_response({"ok": True, "deadline": deadline,
