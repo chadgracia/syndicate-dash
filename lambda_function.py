@@ -6163,6 +6163,13 @@ TENANT_DEADLINE_ALLOWED_KEYS = {"deal_id", "deadline"}
 TENANT_DEADLINE_TZ_SLACK_HOURS = 12
 
 
+def _deadline_is_overdue(deadline, now=None):
+    """True when the deadline's date is before today (UTC) -- the card's
+    red "Deadline passed" test (_deal_card_html, live deals)."""
+    dt = _parse_dt(deadline) if deadline else None
+    return bool(dt and dt.date() < (now or datetime.now(timezone.utc)).date())
+
+
 def _tenant_deadline_min_date(now=None):
     return ((now or datetime.now(timezone.utc)) - timedelta(hours=TENANT_DEADLINE_TZ_SLACK_HOURS)).date()
 
@@ -7756,6 +7763,12 @@ TENANT_DEADLINE_SCRIPT = """<script>
         saveBtn.disabled = false;
         if (res.ok) {
           orig = input.value; val.innerHTML = res.d.display || input.value;
+          var card = box.closest('.deal-card');
+          if (card && res.d.overdue === false) {
+            card.classList.remove('overdue');
+            var chip = card.querySelector('.overdue-chip');
+            if (chip) chip.parentNode.removeChild(chip);
+          }
           form.hidden = true; view.hidden = false; setMsg('Saved \u2713', 'saved');
           setTimeout(function() { setMsg(''); }, 2500);
         } else {
@@ -7812,8 +7825,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
             deadline_value_html = _tenant_deadline_editor_html(deal_id, deadline, deadline_value_html)
     is_overdue = False
     if deadline and not is_closed:
-        deadline_dt = _parse_dt(deadline)
-        is_overdue = bool(deadline_dt and deadline_dt.date() < datetime.now(timezone.utc).date())
+        is_overdue = _deadline_is_overdue(deadline)
 
     card_cls = "deal-card overdue" if is_overdue else "deal-card"
     overdue_html = ""
@@ -17691,8 +17703,11 @@ def _handle_update_intro(event):
         return _json_response({"ok": True, "entry": _note_entry_payload(history_entry)})
     if tenant_deadline_edit:
         _send_tenant_deadline_email(tenant_identity_email, deal, deal_id, old_values["deadline"], deadline)
+        # overdue: the same UTC-date test _deal_card_html uses, so the card
+        # can drop its red "Deadline passed" state without a reload.
         return _json_response({"ok": True, "deadline": deadline,
-                               "display": _deal_deadline_display_html(deadline)})
+                               "display": _deal_deadline_display_html(deadline),
+                               "overdue": _deadline_is_overdue(deadline)})
     return _json_response({"ok": True})
 
 
