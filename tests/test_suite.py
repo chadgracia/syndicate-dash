@@ -1106,6 +1106,53 @@ resp_t_ex = lf.lambda_handler(post_event({"deal_id": "900", "exemption": "720002
                                          cookies=[tenant_cookie(TENANT_EMAIL)]), None)
 check("tenant still can't write any other admin field (exemption) -> 403", resp_t_ex["statusCode"] == 403)
 
+# Empty deadline -> "Set date"; admin Tenant view (impersonation) gets the link too
+_nd_block = page_company.split("Sell Deal No Deadline")[1][:3000]
+check("empty deadline: 'Not set' with a 'Set date' link (not 'Edit')",
+      'class="dc-dl-edit">Set date</a>' in _nd_block and "Not set" in _nd_block)
+page_company_tv = lf.render_company_page("Delta Co", "Admin", tenant_rec, TENANT_EMAIL, "mydeals",
+                                         key=ADMIN_KEY, view_as=TENANT_EMAIL, edit_mode=False)
+check("admin Tenant view shows the seller Edit link, carrying the key + previewed tenant, plus the script",
+      'class="dc-dl-edit">Edit</a>' in page_company_tv
+      and f'data-key="{ADMIN_KEY}" data-view-as="{TENANT_EMAIL}"' in page_company_tv
+      and lf.TENANT_DEADLINE_SCRIPT in page_company_tv)
+check("a real tenant page never carries data-key on the deadline editor",
+      'data-key=' not in page_company.split('class="dc-dl"')[1][:300] if 'class="dc-dl"' in page_company else False)
+check("deadline script sends key + view_as only when the editor carries data-key",
+      "if (box.getAttribute('data-key'))" in lf.TENANT_DEADLINE_SCRIPT
+      and "payload.view_as = box.getAttribute('data-view-as')" in lf.TENANT_DEADLINE_SCRIPT)
+
+ses_calls.clear(); pipeline_calls.clear(); fake_table.updates.clear(); fake_table.puts.clear()
+_imp_dl = iso_dash(60)
+resp_imp = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": TENANT_EMAIL, "deal_id": "900",
+                                         "deadline": _imp_dl}), None)
+_imp_actor = f"cgracia@rainmakersecurities.com (as {TENANT_EMAIL})"
+check("impersonated deadline save -> 200, Pipeline PUT, audit actor 'cgracia@… (as <tenant>)'",
+      resp_imp["statusCode"] == 200 and len(pipeline_calls) == 1
+      and fake_table.puts and fake_table.puts[-1].get("actor") == _imp_actor
+      and fake_table.puts[-1]["new"].get("deadline") == _imp_dl)
+check("impersonated deadline save still emails Chad, naming the admin-as-tenant actor",
+      len(ses_calls) == 1 and f"{_imp_actor} changed Sell Deal Overdue deadline:"
+      in ses_calls[-1]["Message"]["Body"]["Text"]["Data"])
+pipeline_calls.clear()
+resp_imp_past = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": TENANT_EMAIL, "deal_id": "900",
+                                              "deadline": iso_dash(-3)}), None)
+check("impersonated save runs the tenant rules: past date -> 400, no Pipeline call",
+      resp_imp_past["statusCode"] == 400 and not pipeline_calls)
+resp_imp_extra = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": TENANT_EMAIL, "deal_id": "900",
+                                               "deadline": iso_dash(20), "notes": "x"}), None)
+resp_imp_nodl = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": TENANT_EMAIL, "deal_id": "900",
+                                              "notes": "x"}), None)
+resp_imp_unknown = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": "nobody@example.com",
+                                                 "deal_id": "900", "deadline": iso_dash(20)}), None)
+check("impersonated request: extra field, no deadline, or unknown tenant -> 403, nothing written",
+      resp_imp_extra["statusCode"] == 403 and resp_imp_nodl["statusCode"] == 403
+      and resp_imp_unknown["statusCode"] == 403 and not pipeline_calls)
+resp_imp_badkey = lf.lambda_handler(post_event({"key": "wrong", "view_as": TENANT_EMAIL, "deal_id": "900",
+                                                "deadline": iso_dash(20)}), None)
+check("view_as with a wrong admin key gets no impersonation (no cookie -> 403)",
+      resp_imp_badkey["statusCode"] == 403 and not pipeline_calls)
+
 lf.urllib.request.urlopen = fake_urlopen_fail
 fake_table.updates.clear(); fake_table.puts.clear(); ses_calls.clear()
 resp_t_fail = lf.lambda_handler(post_event({"deal_id": "900", "deadline": iso_dash(50)},
@@ -1177,6 +1224,10 @@ resp_foreign_dl = lf.lambda_handler(post_event({"deal_id": "900", "deadline": is
                                                 cookies=[tenant_cookie("other@example.com")]), None)
 check("a tenant can't change ANOTHER tenant's deal deadline -> 403, no Pipeline call",
       resp_foreign_dl["statusCode"] == 403 and not pipeline_calls)
+resp_imp_foreign = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": "other@example.com",
+                                                 "deal_id": "900", "deadline": iso_dash(20)}), None)
+check("impersonating a tenant who doesn't own the deal -> 403, no Pipeline call",
+      resp_imp_foreign["statusCode"] == 403 and not pipeline_calls)
 
 
 # ======================================================================

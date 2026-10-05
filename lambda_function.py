@@ -6160,6 +6160,11 @@ def _send_tenant_deadline_email(tenant_email, deal, deal_id, old_deadline, new_d
 # (UTC minus TENANT_DEADLINE_TZ_SLACK_HOURS), so an evening edit in
 # Pacific time isn't refused for being "yesterday" in UTC.
 TENANT_DEADLINE_ALLOWED_KEYS = {"deal_id", "deadline"}
+# Admin "Tenant view" (key + &view_as, not Admin view) gets the same Edit
+# link; its save posts {key, view_as, deal_id, deadline}, runs every tenant
+# rule as the impersonated tenant, and is audited/emailed under this address.
+ADMIN_IMPERSONATION_EMAIL = "cgracia@rainmakersecurities.com"
+TENANT_DEADLINE_IMPERSONATION_KEYS = TENANT_DEADLINE_ALLOWED_KEYS | {"key", "view_as"}
 TENANT_DEADLINE_TZ_SLACK_HOURS = 12
 
 
@@ -7722,14 +7727,19 @@ def _deal_deadline_display_html(deadline, is_closed=False):
     return f'{_esc(text)} <span class="dc-hint">{hint}</span>'
 
 
-def _tenant_deadline_editor_html(deal_id, deadline, display_html):
+def _tenant_deadline_editor_html(deal_id, deadline, display_html, admin_key=None, view_as=None):
     """Tenant self-edit for a live deal's DEADLINE cell: the date with a
     small "Edit" link under it; Edit swaps in a date picker + Save/Cancel
     (TENANT_DEADLINE_SCRIPT posts ?action=update_intro {deal_id, deadline})."""
     min_date = _tenant_deadline_min_date().isoformat()
-    return (f'<span class="dc-dl" data-deal-id="{_esc(deal_id)}">'
+    label = "Edit" if deadline else "Set date"
+    # Admin Tenant view only: the save carries the key + previewed tenant
+    # (a real tenant session never gets these attributes).
+    imp_attrs = (f' data-key="{_esc(admin_key)}" data-view-as="{_esc(view_as)}"'
+                 if admin_key and view_as else "")
+    return (f'<span class="dc-dl" data-deal-id="{_esc(deal_id)}"{imp_attrs}>'
             f'<span class="dc-dl-view"><span class="dc-dl-value">{display_html}</span>'
-            f'<a href="#" class="dc-dl-edit">Edit</a></span>'
+            f'<a href="#" class="dc-dl-edit">{label}</a></span>'
             f'<span class="dc-dl-form" hidden><input type="date" class="dc-dl-input" value="{_esc(deadline or "")}" '
             f'min="{min_date}"><button type="button" class="dc-dl-save">Save</button>'
             f'<button type="button" class="dc-dl-cancel">Cancel</button></span>'
@@ -7753,16 +7763,21 @@ TENANT_DEADLINE_SCRIPT = """<script>
     saveBtn.addEventListener('click', function() {
       if (!input.value) { setMsg('Please pick a date.', 'error'); return; }
       saveBtn.disabled = true; setMsg('Saving\u2026');
+      var payload = { deal_id: box.getAttribute('data-deal-id'), deadline: input.value };
+      if (box.getAttribute('data-key')) {
+        payload.key = box.getAttribute('data-key'); payload.view_as = box.getAttribute('data-view-as');
+      }
       fetch('?action=update_intro', {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deal_id: box.getAttribute('data-deal-id'), deadline: input.value })
+        body: JSON.stringify(payload)
       }).then(function(r) {
         return r.json().then(function(d) { return { ok: r.ok, d: d }; }, function() { return { ok: false, d: {} }; });
       }).then(function(res) {
         saveBtn.disabled = false;
         if (res.ok) {
           orig = input.value; val.innerHTML = res.d.display || input.value;
+          box.querySelector('.dc-dl-edit').textContent = 'Edit';
           var card = box.closest('.deal-card');
           if (card && res.d.overdue === false) {
             card.classList.remove('overdue');
@@ -7782,7 +7797,7 @@ TENANT_DEADLINE_SCRIPT = """<script>
 
 
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None, reopen_html="",
-                    tenant_deadline_edit=False):
+                    tenant_deadline_edit=False, impersonation_key=None, impersonation_view_as=None):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
     render_company_page), used to resolve any deadline_override. edit_mode
@@ -7822,7 +7837,9 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     else:
         deadline_value_html = _deal_deadline_display_html(deadline, is_closed=is_closed)
         if tenant_deadline_edit and not is_closed and not _deal_is_public(deal):
-            deadline_value_html = _tenant_deadline_editor_html(deal_id, deadline, deadline_value_html)
+            deadline_value_html = _tenant_deadline_editor_html(deal_id, deadline, deadline_value_html,
+                                                               admin_key=impersonation_key,
+                                                               view_as=impersonation_view_as)
     is_overdue = False
     if deadline and not is_closed:
         is_overdue = _deadline_is_overdue(deadline)
@@ -12634,6 +12651,10 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             # _is_closed_down_stage My Deals' Archived section uses).
             # Closed cards carry no paperwork (see _deal_card_html).
             live_cards, won_cards, down_cards = [], [], []
+            # Seller deadline Edit link: a real tenant session, and the admin
+            # "Tenant view" preview (&view_as without Admin view) too.
+            impersonating = key is not None and bool(view_as) and not edit_mode
+            tenant_view = key is None or impersonating
             live_ordered, archived_ordered = _sell_deals_by_preference(sell_deals, intro_details)
             # "Re-Open Deal": only with no live Sell deal, on the newest-
             # updated archived one (= _preferred_sell_deal) when it is
@@ -12653,7 +12674,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                 else:
                     live_cards.append(_deal_card_html(d, company, entry, edit_mode=edit_mode,
                                                       paperwork=deal_paperwork_status(d, anon_key_email, person_id),
-                                                      tenant_deadline_edit=(key is None)))
+                                                      tenant_deadline_edit=tenant_view,
+                                                      impersonation_key=(key if impersonating else None),
+                                                      impersonation_view_as=(view_as if impersonating else None)))
             deals_body = "".join(live_cards)
             if 'class="dc-dl-edit"' in deals_body:
                 deals_body += TENANT_DEADLINE_SCRIPT
@@ -17424,7 +17447,19 @@ def _handle_update_intro(event):
 
     tenant_identity_email = None
     tenant_deadline_edit = False
-    if not is_admin:
+    impersonated_actor = None
+    if is_admin and body.get("view_as") not in (None, ""):
+        # Admin Tenant-view deadline save: ONLY a deadline, through the
+        # tenant rules below, as the previewed tenant.
+        if set(body.keys()) - TENANT_DEADLINE_IMPERSONATION_KEYS or "deadline" not in body:
+            return _json_response({"error": "forbidden"}, 403)
+        tenant_identity_email = str(body.get("view_as")).strip().lower()
+        if _resolve_tenant(tenant_identity_email) is None:
+            return _json_response({"error": "forbidden"}, 403)
+        is_admin = False
+        tenant_deadline_edit = True
+        impersonated_actor = f"{ADMIN_IMPERSONATION_EMAIL} (as {tenant_identity_email})"
+    elif not is_admin:
         identity_email = _read_identity_email(event)
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
         if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
@@ -17675,7 +17710,7 @@ def _handle_update_intro(event):
         if not ok:
             return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
-    actor = "admin" if is_admin else tenant_identity_email
+    actor = "admin" if is_admin else (impersonated_actor or tenant_identity_email)
 
     # Deal notes are append-only: every non-blank notes save adds one
     # history entry on this same intro item (legacy "notes" seeded first);
@@ -17702,7 +17737,7 @@ def _handle_update_intro(event):
     if history_entry is not None:
         return _json_response({"ok": True, "entry": _note_entry_payload(history_entry)})
     if tenant_deadline_edit:
-        _send_tenant_deadline_email(tenant_identity_email, deal, deal_id, old_values["deadline"], deadline)
+        _send_tenant_deadline_email(actor, deal, deal_id, old_values["deadline"], deadline)
         # overdue: the same UTC-date test _deal_card_html uses, so the card
         # can drop its red "Deadline passed" state without a reload.
         return _json_response({"ok": True, "deadline": deadline,
