@@ -1064,6 +1064,16 @@ resp_tenant = lf.lambda_handler(post_event({"deal_id": "900", "deadline": _new_d
 _tbody = json.loads(resp_tenant["body"])
 check("tenant can change their own live deal's deadline -> 200 with the new display",
       resp_tenant["statusCode"] == 200 and _tbody.get("deadline") == _new_dl and "dc-hint" not in _tbody.get("display", "x"))
+check("tenant deadline save on an overdue deal returns overdue=False for a future date",
+      _tbody.get("overdue") is False and 'class="deal-card overdue"' in page_company)
+check("card script drops the overdue border + 'Deadline passed' chip in place when overdue is false",
+      "res.d.overdue === false" in lf.TENANT_DEADLINE_SCRIPT
+      and "card.classList.remove('overdue')" in lf.TENANT_DEADLINE_SCRIPT
+      and "card.querySelector('.overdue-chip')" in lf.TENANT_DEADLINE_SCRIPT)
+_now = lf.datetime(2026, 10, 5, 3, 0, tzinfo=lf.timezone.utc)
+check("_deadline_is_overdue: today/future not overdue, yesterday (UTC) overdue, empty not overdue",
+      not lf._deadline_is_overdue("2026-10-05", _now) and not lf._deadline_is_overdue("2026-10-20", _now)
+      and lf._deadline_is_overdue("2026-10-04", _now) and not lf._deadline_is_overdue(None, _now))
 check("tenant deadline write: ONE Pipeline PUT of only the deadline field, slash format",
       len(pipeline_calls) == 1
       and pipeline_calls[0]["data"]["deal"]["custom_fields"] == {lf.DEADLINE_FIELD: _new_dl.replace("-", "/")})
