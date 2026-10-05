@@ -7569,6 +7569,36 @@ def _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won=False):
     return '<span class="visibility-badge live">Live · shown to buyers</span>'
 
 
+DC_NOT_SET_HTML = '<span class="dc-not-set">Not set</span>'
+DC_VERIFY_TEXT = "Please check these terms. If anything is wrong or missing, use Update."
+DEADLINE_HINT_DAYS = 14
+
+
+def _dc_value_html(text):
+    """A Deal Details metric value, or the muted-amber "Not set" when the
+    field is empty ("—"/None), so the client knows to supply it."""
+    if text is None or text == "" or text == "—":
+        return DC_NOT_SET_HTML
+    return _esc(text)
+
+
+def _deal_deadline_display_html(deadline, is_closed=False):
+    """Deal Details DEADLINE column: "Oct 31, 2026", plus a small relative
+    hint ("in 9 days") when it is 0..DEADLINE_HINT_DAYS days out on a deal
+    that isn't closed. Unparseable-but-present values render raw."""
+    if not deadline:
+        return DC_NOT_SET_HTML
+    dt = _parse_dt(deadline)
+    if dt is None:
+        return _esc(deadline)
+    text = f"{dt.strftime('%b')} {dt.day}, {dt.year}"
+    days = (dt.date() - datetime.now(timezone.utc).date()).days
+    if is_closed or days < 0 or days > DEADLINE_HINT_DAYS:
+        return _esc(text)
+    hint = "today" if days == 0 else ("in 1 day" if days == 1 else f"in {days} days")
+    return f'{_esc(text)} <span class="dc-hint">{hint}</span>'
+
+
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None, reopen_html=""):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
@@ -7582,8 +7612,8 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     stage = _esc(_deal_stage_label(sid))
     # Item 2 (company-page parity pass): a min-max RANGE here, not the
     # single largest-value figure row-level Size cells use.
-    size_text = _esc(_deal_size_range_text(deal))
-    net_text = _esc(_fmt_money(_deal_cf_number(deal, NET_FIELD)))
+    size_text = _dc_value_html(_deal_size_range_text(deal))
+    net_text = _dc_value_html(_fmt_money(_deal_cf_number(deal, NET_FIELD)))
     # Item 5: net per-share, won deals only -- a subtle line, never shown
     # for a still-live deal (nothing to report per-share on until it's
     # actually closed).
@@ -7595,21 +7625,19 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
     layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
     struct_parts = [p for p in (struct_label, layer_label) if p]
-    structure_text = _esc(" · ".join(struct_parts)) if struct_parts else "—"
+    structure_text = _dc_value_html(" · ".join(struct_parts))
 
     deal_id = str(deal.get("id"))
     deadline = _resolve_deal_deadline(deal, override_entry)
-    if edit_mode:
-        deadline_input = _ei_date_field_html(deal_id, deadline or "", css_class="ei-deadline", field="deadline")
-        deadline_html = f'<div class="dc-line">Deadline: {deadline_input}</div>'
-    else:
-        deadline_html = (f'<div class="dc-line">Deadline: {_esc(deadline)}</div>'
-                          if deadline else "")
 
     # Closed (Won or closed-down, resolved like My Deals): no overdue
     # warning, no paperwork, a close label instead.
     resolved_sid = _resolve_deal_stage(deal, override_entry)
     is_closed = _is_won_stage(resolved_sid) or _is_closed_down_stage(resolved_sid)
+    if edit_mode:
+        deadline_value_html = _ei_date_field_html(deal_id, deadline or "", css_class="ei-deadline", field="deadline")
+    else:
+        deadline_value_html = _deal_deadline_display_html(deadline, is_closed=is_closed)
     is_overdue = False
     if deadline and not is_closed:
         deadline_dt = _parse_dt(deadline)
@@ -7652,6 +7680,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     # Engaged badge). None only when there's no tenant context.
     is_public = _deal_is_public(deal)
     action_html = _deal_action_html(deal_id, resolved_sid, public=is_public)
+    footer_html = ""
     if is_public:
         reopen_html = ""
     if is_public and not _is_won_stage(resolved_sid):
@@ -7659,10 +7688,18 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     elif is_closed:
         badge_html = (f'<div class="dc-line dc-closed-label">{_esc(_deal_closed_label(deal, resolved_sid))}</div>'
                       + action_html + reopen_html)
-    elif paperwork is not None:
-        badge_html = f'<div class="dc-line">{_paperwork_badge_html(paperwork, deal)}</div>' + action_html
     else:
-        badge_html = _engagement_badge_html(deal, company) + action_html
+        # Live: the paperwork badge stays put; the Update button moves to
+        # the footer (bottom-right) beside the verify line (bottom-left).
+        # No seller-confirmation timestamp exists yet (deal-update-form
+        # only PUTs to Pipeline), so the verify line is always the ask.
+        if paperwork is not None:
+            badge_html = f'<div class="dc-line">{_paperwork_badge_html(paperwork, deal)}</div>'
+        else:
+            badge_html = _engagement_badge_html(deal, company)
+        if action_html:
+            footer_html = (f'<div class="dc-footer"><div class="dc-verify">{_esc(DC_VERIFY_TEXT)}</div>'
+                           f'{action_html}</div>')
 
     return f"""<div class="{card_cls}">
       {overdue_html}
@@ -7674,12 +7711,13 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         <div><span class="dc-label">Size</span><span class="dc-value">{size_text}</span></div>
         <div><span class="dc-label">Net</span><span class="dc-value">{net_text}</span></div>
         <div><span class="dc-label">Structure</span><span class="dc-value">{structure_text}</span></div>
+        <div><span class="dc-label">Deadline</span><span class="dc-value">{deadline_value_html}</span></div>
       </div>
       {per_share_html}
-      {deadline_html}
       {exemption_html}
       {fees_html}
       {badge_html}
+      {footer_html}
     </div>"""
 
 
@@ -13034,6 +13072,14 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   }}
   .dc-value {{ font-size: 16px; font-weight: 600; }}
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
+  .dc-not-set {{ color: var(--accredited); font-weight: 500; }}
+  .dc-hint {{ font-size: 12px; font-weight: 500; color: var(--accredited); margin-left: 4px; }}
+  .dc-footer {{ display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
+               gap: 10px 16px; margin-top: 16px; }}
+  .dc-verify {{ font-size: 13px; color: var(--muted); flex: 1 1 240px; }}
+  .dc-footer .update-cancel-btn {{ margin: 0 0 0 auto; background: var(--qp); color: #fff; border-radius: 9999px;
+                                  padding: 8px 18px; font-size: 13px; white-space: nowrap; }}
+  .dc-footer .update-cancel-btn:hover {{ opacity: 0.9; text-decoration: none; }}
   .cd-deals-subhead {{ font-size: 14px; font-weight: 600; margin: 16px 0 8px; }}
   details.cd-closed-down {{ margin-top: 16px; }}
   .action-chip.reopen {{ display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3;

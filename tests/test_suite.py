@@ -6387,6 +6387,28 @@ check("paperwork: table row and detail card agree on the amber agreement mailto"
       and f'<a class="id-status-badge id-needed" href="{_noagr_mailto}">Agent agreement needed before introductions</a>'
           in md_noagr_card and "Paperwork in order" not in md_noagr_card)
 
+# --- Deal Details card: Deadline column, "Not set", footer button + verify line
+_dc_soon = (lf.datetime.now(lf.timezone.utc) + lf.timedelta(days=9)).strftime("%Y/%m/%d")
+_dc_far = "2099/10/31"
+_dc_cf_soon = dict(md_noagr["custom_fields"]); _dc_cf_soon[lf.DEADLINE_FIELD] = _dc_soon
+_dc_cf_far = dict(md_noagr["custom_fields"]); _dc_cf_far[lf.DEADLINE_FIELD] = _dc_far
+_dc_cf_none = {k: v for k, v in md_noagr["custom_fields"].items() if k not in (lf.DEADLINE_FIELD, lf.NET_FIELD)}
+_dc_pw = lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602)
+dc_soon = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_soon), "Hark Labs", paperwork=_dc_pw)
+dc_far = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_far), "Hark Labs", paperwork=_dc_pw)
+dc_none = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_none), "Hark Labs", paperwork=_dc_pw)
+check("deal card: DEADLINE column after STRUCTURE, 'Oct 31, 2099' format, no hint when far out",
+      dc_far.index('dc-label">Structure') < dc_far.index('dc-label">Deadline')
+      and "Oct 31, 2099" in dc_far and "dc-hint" not in dc_far and "Deadline: " not in dc_far)
+check("deal card: deadline within 14 days carries the 'in 9 days' hint",
+      '<span class="dc-hint">in 9 days</span>' in dc_soon)
+check("deal card: missing Net / Deadline show amber 'Not set', never a bare dash",
+      dc_none.count(lf.DC_NOT_SET_HTML) >= 2 and 'class="dc-value">—<' not in dc_none)
+check("deal card: live card puts the Update button in the footer beside the verify line, badge stays above",
+      '<div class="dc-footer"><div class="dc-verify">' + lf._esc(lf.DC_VERIFY_TEXT) + '</div><a class="update-cancel-btn"'
+      in dc_far and dc_far.count("update-cancel-btn") == 1
+      and dc_far.index("Agent agreement needed before introductions") < dc_far.index("dc-footer"))
+
 # --- Actions on every team row + write auth
 _md_fixture(lf.CEF_YES_ID)
 bob_md = body_only(_md_get("bob@harkcap.com", {})["body"])
