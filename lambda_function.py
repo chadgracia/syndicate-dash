@@ -12835,14 +12835,13 @@ def _buyer_demand_key_html(admin=False):
                 f'<svg viewBox="0 0 24 24" width="12" height="12"><path fill="{fill}" d="{STANDING_STAR_PATH}"/></svg>'
                 '</span>')
     sep = '<span class="bd-key-sep">·</span>'
-    parts = []
+    parts = [f'{_tier_badge_html("qp")} Qualified purchaser',
+             f'{_tier_badge_html("accredited")} Accredited investor or qualified client']
     if admin:
         # Admin view only: tenants' tiles carry no stars at all.
-        parts += [f'{key_star("gold")} Closed a trade, onboarding complete, keeps to terms',
-                  f'{key_star("green")} Keeps to terms and responds',
-                  '<span class="bd-key-alert" aria-hidden="true">!</span> Missed terms or slow to respond (hover for reason)']
-    parts += [f'{_tier_badge_html("qp")} Qualified purchaser',
-              f'{_tier_badge_html("accredited")} Accredited investor']
+        parts += [f'{key_star("gold")} Proven: closed a trade, onboarding complete, keeps to terms',
+                  f'{key_star("green")} Ready to transact',
+                  '<span class="bd-key-alert" aria-hidden="true">!</span> Missed terms or response']
     return '<p class="bd-key">' + sep.join(parts) + '</p>'
 
 
@@ -15951,9 +15950,9 @@ ADMIN_ALERT_COLOR = "#C2410C"
 def _admin_standing_alert_reason(standing_record):
     reasons = []
     if standing_record.get("terms_repair"):
-        reasons.append("Missed agreed terms")
+        reasons.append("Missed terms")
     if standing_record.get("respond_repair"):
-        reasons.append("Slow to respond")
+        reasons.append("Missed response")
     return "; ".join(reasons) or "Needs attention"
 
 
