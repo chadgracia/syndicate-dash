@@ -1345,6 +1345,156 @@ check("Demand Board latest interest reads people's real updated_at format",
       and _rf_row.get("latest_interest_ts") == int(datetime(2026, 9, 14, 13, 30, tzinfo=timezone.utc).timestamp()))
 
 # ======================================================================
+# SECTION: Deal Details — SPV valuation cell (custom_label_4009563, billions)
+# ======================================================================
+check("valuation parsing: B / M / lower-case / commas / $ -> whole dollars",
+      lf._parse_valuation_input("4.2B") == 4_200_000_000 and lf._parse_valuation_input("$850M") == 850_000_000
+      and lf._parse_valuation_input("850m") == 850_000_000
+      and lf._parse_valuation_input("4,200,000,000") == 4_200_000_000
+      and lf._parse_valuation_input(" $1.25 bn ") == 1_250_000_000)
+check("valuation parsing: zero, negative, unparseable and sub-$1M rejected",
+      all(lf._parse_valuation_input(v) is None for v in ("0", "-5B", "abc", "4.2X", "", None, "500k", "$0M", True)))
+check("valuation display: $4.0B / $4.2B / $1.25B / $850M",
+      [lf._fmt_valuation_billions(b) for b in (4.0, 4.2, 1.25, 0.85)] == ["$4.0B", "$4.2B", "$1.25B", "$850M"])
+
+EV_EMAIL = "ev-seller@example.com"
+EV_PID = 41
+EV_OTHER_EMAIL = "ev-other@example.com"
+EV_OTHER_PID = 42
+_ev_people = {"people": [
+    {"id": EV_PID, "full_name": "Eve Seller", "email": EV_EMAIL, "custom_fields": {}},
+    {"id": EV_OTHER_PID, "full_name": "Otto Seller", "email": EV_OTHER_EMAIL, "custom_fields": {}}]}
+
+def _ev_deal(deal_id, name, extra, pid=EV_PID, stage=None):
+    return {"id": deal_id, "name": name, "company": {"name": "EV Co"},
+            "deal_stage": {"id": stage or lf.STAGE_FIRM}, "custom_fields": cf_sell(extra),
+            "people": [{"id": pid}], "updated_at": "2026/08/01 09:00:00 -0400"}
+
+ev_fund = _ev_deal(8801, "EV Fund Deal", {lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID], lf.EST_VAL_FIELD: 4.0,
+                                          lf.NET_FIELD: 30})
+ev_direct = _ev_deal(8802, "EV Direct Deal", {lf.STRUCTURE_FIELD: [6250090], lf.NET_FIELD: 30})
+ev_newalloc = _ev_deal(8803, "EV New Alloc", {lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID],
+                                              lf.SELLER_ROLE_FIELD: [lf.SR_NEW_ALLOCATION_ID]})
+ev_unknown = _ev_deal(8804, "EV Unknown", {lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID], lf.EST_VAL_FIELD: 0})
+ev_foreign = _ev_deal(8805, "EV Foreign Fund", {lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID], lf.EST_VAL_FIELD: 2.0},
+                      pid=EV_OTHER_PID)
+ev_closed = _ev_deal(8806, "EV Closed Fund", {lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID], lf.EST_VAL_FIELD: 1.0},
+                     stage=lf.OBSOLETE_STAGE_ID)
+_ev_fake_s3, ev_table = use_fixture({"people.json": _ev_people, "interest_people.json": {"buy": {}},
+                                     "deals.json": {"deals": [ev_fund, ev_direct, ev_newalloc, ev_unknown, ev_foreign]}},
+                                    ses=FakeSES())
+lf._closed_deals_cache["deals"] = [ev_closed]
+
+_c_fund = lf._deal_card_html(ev_fund, "EV Co", tenant_deadline_edit=True)
+_c_direct = lf._deal_card_html(ev_direct, "EV Co", tenant_deadline_edit=True)
+_c_new = lf._deal_card_html(ev_newalloc, "EV Co", tenant_deadline_edit=True)
+_c_unk = lf._deal_card_html(ev_unknown, "EV Co", tenant_deadline_edit=True)
+check("Fund deal: EST. VALUATION cell with $4.0B, muted '$30 / sh' second line, Edit link",
+      'dc-label">Est. valuation</span>' in _c_fund and '<span class="dc-ev-value">$4.0B</span>' in _c_fund
+      and '<span class="dc-sub">$30 / sh</span>' in _c_fund and 'class="dc-ev-edit">Edit</a>' in _c_fund
+      and 'dc-label">Net</span>' not in _c_fund)
+check("non-Fund deal: NET cell unchanged, no valuation editor",
+      'dc-label">Net</span><span class="dc-value">$30</span>' in _c_direct and "dc-ev" not in _c_direct
+      and "valuation" not in _c_direct.lower())
+check("New allocation Fund deal: 'PRE-MONEY VALUATION' label; unset -> amber Not set + 'Set value'",
+      'dc-label">Pre-money valuation</span>' in _c_new and lf.DC_NOT_SET_HTML in _c_new.split("dc-price")[1][:600]
+      and 'class="dc-ev-edit">Set value</a>' in _c_new)
+check("stored 0 (seller ticked Unknown) -> amber 'Unknown' + 'Set value'",
+      '<span class="dc-not-set">Unknown</span>' in _c_unk and 'class="dc-ev-edit">Set value</a>' in _c_unk)
+_c_admin = lf._deal_card_html(ev_fund, "EV Co", edit_mode=True)
+check("admin edit mode: valuation input sits in the cell (saves on change), no tenant editor",
+      'class="ei-est-val" data-deal-id="8801" data-field="est_valuation" value="$4.0B"' in _c_admin
+      and "dc-ev-edit" not in _c_admin)
+_ev_src = open(lf.__file__).read()
+check("grid CSS: 4 equal columns; labels never wrap; 2 columns below 640px or when the card is too narrow",
+      "grid-template-columns: repeat(4, minmax(0, 1fr));" in _ev_src
+      and "white-space: nowrap;" in _ev_src.split(".dc-label {{")[1][:300]
+      and "@media (max-width: 640px) {{\n    .deal-card-metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}" in _ev_src
+      and "@container (max-width: 527px)" in _ev_src)
+
+_ev_tenant = lf._resolve_tenant(EV_EMAIL)
+_ev_page = lf.render_company_page("EV Co", "Eve Seller", _ev_tenant, EV_EMAIL, "mydeals",
+                                  key=None, view_as=None, edit_mode=False)
+check("tenant company page carries the valuation editor + its script",
+      'class="dc-ev-edit"' in _ev_page and lf.TENANT_EST_VAL_SCRIPT in _ev_page)
+
+ev_pipeline = []
+def _ev_urlopen(req, timeout=15):
+    ev_pipeline.append({"url": req.full_url, "data": json.loads(req.data.decode()) if req.data else None})
+    return FakeHTTPResponse(200)
+def _ev_urlopen_fail(req, timeout=15):
+    raise lf.urllib.error.HTTPError(req.full_url, 502, "boom", {}, None)
+lf.urllib.request.urlopen = _ev_urlopen
+
+def _ev_post(body, email=EV_EMAIL):
+    return lf.lambda_handler(post_event(body, cookies=[tenant_cookie(email)] if email else []), None)
+
+ses_calls.clear()
+_r = _ev_post({"deal_id": "8801", "est_valuation": "4.2B"})
+check("tenant can edit their own Fund deal's valuation -> 200 with the new display",
+      _r["statusCode"] == 200 and json.loads(_r["body"]).get("display") == "$4.2B")
+check("valuation save: ONE Pipeline PUT of only the valuation field, in billions",
+      len(ev_pipeline) == 1 and ev_pipeline[0]["data"]["deal"]["custom_fields"] == {lf.EST_VAL_FIELD: 4.2})
+check("valuation save: Dynamo override + audit (tenant email, old 4.0 -> new 4.2)",
+      ev_table.updates and ev_table.updates[-1]["ExpressionAttributeValues"].get(":evo") == lf.Decimal("4.2")
+      and ev_table.puts[-1].get("actor") == EV_EMAIL
+      and ev_table.puts[-1]["old"].get("est_valuation") == lf.Decimal("4.0")
+      and ev_table.puts[-1]["new"].get("est_valuation") == lf.Decimal("4.2"))
+check("real seller save emails cgracia@: '<email> changed <deal> est. valuation: $4.0B → $4.2B'",
+      len(ses_calls) == 1 and ses_calls[-1]["Destination"]["ToAddresses"] == ["cgracia@rainmakersecurities.com"]
+      and f"{EV_EMAIL} changed EV Fund Deal est. valuation: $4.0B \u2192 $4.2B"
+          in ses_calls[-1]["Message"]["Body"]["Text"]["Data"])
+
+for _bad in ("0", "-5B", "abc", "500k"):
+    ev_pipeline.clear()
+    _r = _ev_post({"deal_id": "8801", "est_valuation": _bad})
+    check(f"invalid valuation {_bad!r} -> 400, no Pipeline call", _r["statusCode"] == 400 and not ev_pipeline)
+
+ev_pipeline.clear(); ses_calls.clear()
+_r_dir = _ev_post({"deal_id": "8802", "est_valuation": "4.2B"})
+_r_closed = _ev_post({"deal_id": "8806", "est_valuation": "4.2B"})
+_r_foreign = _ev_post({"deal_id": "8805", "est_valuation": "4.2B"})
+check("tenant valuation edit refused on a non-Fund deal (409), a closed deal (409), another tenant's deal (403)",
+      _r_dir["statusCode"] == 409 and _r_closed["statusCode"] == 409 and _r_foreign["statusCode"] == 403
+      and not ev_pipeline and not ses_calls)
+for _extra in ({"deadline": iso_dash(20)}, {"notes": "x"}, {"exemption": "7200027"}, {"next_steps": "x"}):
+    _r = _ev_post(dict({"deal_id": "8801", "est_valuation": "4.2B"}, **_extra))
+    check(f"tenant valuation request carrying {sorted(_extra)[0]!r} too -> 403, nothing written",
+          _r["statusCode"] == 403 and not ev_pipeline)
+
+ses_calls.clear(); ev_table.puts.clear()
+_r_imp = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": EV_EMAIL, "deal_id": "8801",
+                                       "est_valuation": "$4.5B"}), None)
+check("impersonated valuation save -> 200, audited as 'cgracia@… (as <tenant>)', NO email",
+      _r_imp["statusCode"] == 200 and ev_table.puts[-1].get("actor") == f"cgracia@rainmakersecurities.com (as {EV_EMAIL})"
+      and not ses_calls)
+_r_imp_dir = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": EV_EMAIL, "deal_id": "8802",
+                                           "est_valuation": "4.5B"}), None)
+check("impersonated valuation save runs the tenant rules (non-Fund -> 409)", _r_imp_dir["statusCode"] == 409)
+ev_pipeline.clear(); ses_calls.clear()
+_r_adm = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "8802", "est_valuation": "850m"}), None)
+check("Admin view save is unrestricted (non-Fund ok) -> 200, Pipeline PUT 0.85, actor admin, NO email",
+      _r_adm["statusCode"] == 200 and ev_pipeline[-1]["data"]["deal"]["custom_fields"] == {lf.EST_VAL_FIELD: 0.85}
+      and ev_table.puts[-1].get("actor") == "admin" and not ses_calls)
+
+lf.urllib.request.urlopen = _ev_urlopen_fail
+ev_table.updates.clear(); ev_table.puts.clear(); ses_calls.clear()
+_r_fail = _ev_post({"deal_id": "8801", "est_valuation": "5B"})
+check("Pipeline failure on a valuation save -> 502, no Dynamo write, no audit, no email",
+      _r_fail["statusCode"] == 502 and not ev_table.updates and not ev_table.puts and not ses_calls)
+lf.urllib.request.urlopen = _ev_urlopen
+
+lf._req_cache_reset()
+_ev_ov = {"est_val_override": lf.Decimal("4.2"), "est_val_override_at": (_now_dt - timedelta(hours=3)).timestamp()}
+check("valuation override wins until Pipeline moves on",
+      lf._resolve_deal_est_val(dict(ev_fund, updated_at=_pl_ts(_now_dt - timedelta(hours=5))), _ev_ov) == 4.2)
+check("a Pipeline edit after the card save wins (real format '2026/10/05 14:03:22 -0400' style)",
+      lf._resolve_deal_est_val(dict(ev_fund, updated_at=_pl_ts(_now_dt - timedelta(hours=1))), _ev_ov) == 4.0
+      and lf._override_is_current({"id": 1, "updated_at": "2026/10/05 14:03:22 -0400"},
+                                  datetime(2026, 10, 5, 17, 0, tzinfo=timezone.utc).timestamp()) is False)
+FakeBoto3.SES = None
+
+# ======================================================================
 # SECTION: Active Intros — layout, status restrictions, sort/grouping,
 # pending note, empty state
 # ======================================================================
@@ -3432,8 +3582,10 @@ check("Parity (admin edit): pending buyer (Nina) IS named -- edit mode never ano
 page_parity_range = lf.render_company_page("Parity Co", "Sella Seller", tenant_parity, TENANT_A_EMAIL, "mydeals",
                                             key=None, view_as=None, edit_mode=False)
 check("Deal Details: Size shows a min-max range ('$500K – $25M')", "$500K – $25M" in page_parity_range)
-check("Deal Details: Fees line lists seller fee FIRST, then mgmt, then carry",
-      "7% seller fee · 2% mgmt · 20% carry" in page_parity_range)
+check("Deal Details: fees are grid cells (SELLER FEE, MGMT / CARRY), no free-text fees line",
+      'dc-label">Seller fee</span><span class="dc-value">7%</span>' in page_parity_range
+      and 'dc-label">Mgmt / Carry</span><span class="dc-value">2% / 20%</span>' in page_parity_range
+      and "7% seller fee · 2% mgmt · 20% carry" not in page_parity_range)
 
 page_parity_single = lf.render_company_page("Parity Single Co", "Sella Seller", tenant_parity, TENANT_A_EMAIL,
                                              "mydeals", key=None, view_as=None, edit_mode=False)
@@ -6678,8 +6830,10 @@ _dc_pw = lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602)
 dc_soon = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_soon), "Hark Labs", paperwork=_dc_pw)
 dc_far = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_far), "Hark Labs", paperwork=_dc_pw)
 dc_none = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_none), "Hark Labs", paperwork=_dc_pw)
-check("deal card: DEADLINE column after STRUCTURE, 'Oct 31, 2099' format, no hint when far out",
-      dc_far.index('dc-label">Structure') < dc_far.index('dc-label">Deadline')
+_grid_order = [m for m in re.findall(r'dc-label">([^<]+)<', dc_far)]
+check("deal card: 4x2 grid order SIZE|NET|SELLER FEE|DEADLINE / STRUCTURE|EXEMPTION|MGMT / CARRY|(empty); 'Oct 31, 2099', no far hint",
+      _grid_order == ["Size", "Net", "Seller fee", "Deadline", "Structure", "Exemption", "Mgmt / Carry"]
+      and dc_far.count('class="dc-cell') == 8 and 'dc-cell-empty' in dc_far
       and "Oct 31, 2099" in dc_far and "dc-hint" not in dc_far and "Deadline: " not in dc_far)
 check("deal card: deadline within 14 days carries the 'in 9 days' hint",
       '<span class="dc-hint">in 9 days</span>' in dc_soon)
