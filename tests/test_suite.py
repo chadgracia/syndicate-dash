@@ -1330,11 +1330,13 @@ check("intro last-update time reads Pipeline's real updated_at format",
 _tile_buyer = {"tier": "qp", "ticket_range": (None, None), "person_id": 99001, "iqf_pending": False}
 _recent_real = _pl_ts(_now_dt - timedelta(days=30))
 _old_real = _pl_ts(_now_dt - timedelta(days=500))
-_tile_recent = lf._buyer_tile_html(dict(_tile_buyer, updated_at=_recent_real), "x@example.com", _now_dt)
-_tile_old = lf._buyer_tile_html(dict(_tile_buyer, updated_at=_old_real), "x@example.com", _now_dt)
-check("buyer tile 'Active within 12 months' dot reads people's real updated_at format",
-      'class="buyer-dot filled"' in _tile_recent and "Active within 12 months" in _tile_recent
-      and 'class="buyer-dot filled"' not in _tile_old and "No recent activity" in _tile_old)
+_tile_recent = lf._buyer_tile_html(dict(_tile_buyer, updated_at=_recent_real), "x@example.com")
+_tile_admin = lf._buyer_tile_html(dict(_tile_buyer, updated_at=_old_real), "x@example.com", is_admin=True,
+                                  buyer_name="Ann Buyer")
+check("buyer tiles (tenant and admin) carry no activity dot at all",
+      all("buyer-dot" not in t and "Active within 12 months" not in t and "No recent activity" not in t
+          for t in (_tile_recent, _tile_admin))
+      and "buyer-dot" not in open(lf.__file__).read())
 
 use_fixture({"people.json": {"people": [{"id": 99002, "full_name": "Real Fmt", "email": "rf@example.com",
                                           "updated_at": "2026/09/14 09:30:00 -0400", "custom_fields": {}}]},
@@ -3674,9 +3676,9 @@ check("Item 2: Stalled row (1103) gets an id anchor and the stalled-row class",
       row_1103 is not None and 'id="intro-row-1103"' in row_1103 and "stalled-row" in row_1103)
 check("Item 2: healthy row (1102) is unchanged -- no stalled-row class or id anchor",
       row_1102 is not None and "stalled-row" not in row_1102 and 'id="intro-row-1102"' not in row_1102)
-check("Item 2: amber left-border CSS rule for stalled rows",
-      "tr.stalled-row {{ box-shadow: inset 3px 0 0 #c9a227; }}" not in page_nav_intros
-      and "tr.stalled-row { box-shadow: inset 3px 0 0 #c9a227; }" in page_nav_intros)
+check("Item 2: warning-orange left-border CSS rule for stalled rows",
+      "tr.stalled-row {{ box-shadow: inset 3px 0 0 #C2410C; }}" not in page_nav_intros
+      and "tr.stalled-row { box-shadow: inset 3px 0 0 #C2410C; }" in page_nav_intros)
 check("Item 2: summary strip's '1 stalled' is a same-page anchor to the first stalled row",
       '<a href="#intro-row-1103">1 stalled</a>' in page_nav_intros)
 
@@ -9363,6 +9365,27 @@ _st_anon = _st_pages["anonymous buyer page"]
 _st_pend = _st_pages["active intros (pending cell)"]
 _st_tiles = _st_pages["company page (demand tiles)"]
 _st_tile_divs = [seg.split("</div>\n    </div>")[0] for seg in _st_tiles.split('<div class="buyer-tile">')[1:]]
+_bd_key = lf._buyer_demand_key_html()
+check("Buyer Demand key: one muted line under the heading, before the tiles",
+      _st_tiles.count('<p class="bd-key">') == 1
+      and _st_tiles.find(">Buyer Demand</h2>") < _st_tiles.find('<p class="bd-key">') < _st_tiles.find('class="buyer-grid"'))
+check("Buyer Demand key: gold/green stars, QP and Accredited pills, wording from the code's rules",
+      all(t in _bd_key for t in ("Closed a trade, onboarding complete, keeps to terms", "Keeps to terms and responds",
+                                 "Qualified purchaser", "Accredited investor or qualified client"))
+      and 'class="tier-badge tier-qp"' in _bd_key and 'class="tier-badge tier-accredited"' in _bd_key
+      and lf.STANDING_STAR_STYLE["gold"][0] in _bd_key and lf.STANDING_STAR_STYLE["green"][0] in _bd_key)
+check("Buyer Demand key never uses a buyer standing marker (gs-star) or any buyer data",
+      "gs-star" not in _bd_key and "Buyer " not in _bd_key)
+_col_src = open(lf.__file__).read()
+check("colors: warnings are orange #C2410C on #FDF0E9 (Not set, deadline hint, agreement/ID badges)",
+      ".dc-not-set {{ color: #C2410C;" in _col_src and ".dc-hint {{ font-size: 12px; font-weight: 500; color: #C2410C;" in _col_src
+      and ".id-status-badge.id-needed {{ background: #FDF0E9; color: #C2410C;" in _col_src
+      and ".paperwork-note.needed {{ font-size: 11px; font-weight: 600; color: #C2410C;" in _col_src)
+check("colors: no warning still uses the old gold/amber; ACCREDITED pill + gold star stay gold, QP/green unchanged",
+      "201,162,39" not in _col_src and "color: #8a6d1f" not in _col_src and "color: var(--accredited" not in _col_src
+      and _col_src.count(".tier-badge.tier-accredited {{ background: #c9a227; }}") == 3
+      and lf.STANDING_STAR_STYLE["gold"][0] == "#C9A227" and lf.STANDING_STAR_STYLE["green"][0] == "#1f7a4d"
+      and ".tier-badge.tier-qp {{ background: var(--qp); }}" in _col_src)
 check("anonymous buyer page: Bob (respond repair) -> yellow 'In progress' star, no card",
       'class="gs-star" role="img" title="In progress" aria-label="In progress"' in _st_anon
       and "Client standing" not in _st_anon)
