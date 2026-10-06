@@ -90,6 +90,7 @@ import uuid
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 import boto3
 from boto3.dynamodb.conditions import Attr, Key
 
@@ -446,6 +447,17 @@ EXEMPTION_LABELS = {
     7200028: "3(c)(7) — qualified purchasers only ($5M+ investments)",
     7201486: "Other",
 }
+# Est. Valuation (deal-level). Same field deal-update-form writes: stored
+# in BILLIONS (4.2 = $4.2B), and an explicit 0 means the seller ticked
+# "Unknown". Shown (and editable) only on SPV/Fund deals; on Seller Role
+# "GP — syndicating new allocation" it is the pre-money round valuation.
+EST_VAL_FIELD = "custom_label_4009563"
+SR_NEW_ALLOCATION_ID = 7020357
+EST_VAL_MIN_DOLLARS = 1_000_000   # same floor as deal-update-form's parse_valuation
+_VAL_SUFFIX = {"": 1, "k": 1e3, "thousand": 1e3,
+               "m": 1e6, "mm": 1e6, "mn": 1e6, "mil": 1e6, "million": 1e6,
+               "b": 1e9, "bn": 1e9, "bil": 1e9, "billion": 1e9}
+
 # Deal Details EXEMPTION column / admin selector: the short form.
 EXEMPTION_SHORT_LABELS = {7200027: "3(c)(1)", 7200028: "3(c)(7)", 7201486: "Other"}
 
@@ -1989,7 +2001,7 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name"
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
     1958, 3052210, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3759156, 3759163,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
-    3998063, 4006089, 4006402, 4008329))
+    3998063, 4006089, 4006402, 4008329, 4009563))
 
 
 def _people_slim_schema():
@@ -4619,7 +4631,7 @@ def _intro_entry_freshness(entry):
     """Latest timestamp an intro entry carries -- decides which copy wins
     when the same deal_id turns up in more than one team partition."""
     stamps = [entry.get(k) for k in ("notes_updated_at", "override_at", "stage_override_at",
-                                     "deadline_override_at", "exemption_override_at")]
+                                     "deadline_override_at", "exemption_override_at", "est_val_override_at")]
     stamps += list((entry.get("milestones") or {}).values())
     best = 0.0
     for v in stamps:
@@ -4709,6 +4721,8 @@ def _intro_entry_from_item(item):
         "deadline_override_at": item.get("deadline_override_at"),
         "exemption_override": item.get("exemption_override"),
         "exemption_override_at": item.get("exemption_override_at"),
+        "est_val_override": item.get("est_val_override"),
+        "est_val_override_at": item.get("est_val_override_at"),
         "stage_override": item.get("stage_override"),
         "stage_override_at": item.get("stage_override_at"),
         "milestones": item.get("milestones") or {},
@@ -6204,6 +6218,30 @@ def _send_tenant_deadline_email(tenant_email, deal, deal_id, old_deadline, new_d
         return False
 
 
+def _send_tenant_est_val_email(tenant_email, deal, deal_id, old_b, new_b):
+    """Best-effort SES note to Chad when a real seller changes their Fund
+    deal's Est. Valuation from the card. Never raises."""
+    label = _est_val_label(deal).lower()
+    line = (f"{tenant_email} changed {_deal_title(deal)} {label}: "
+            f"{_est_val_text(old_b)} \u2192 {_est_val_text(new_b)}")
+    body = (f"{line}\n"
+            f"Deal ID: {deal_id}\n"
+            f"Company: {_deal_company_name(deal) or '—'}\n"
+            f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n")
+    try:
+        ses = boto3.client("ses", region_name="us-east-1")
+        ses.send_email(
+            Source=DEAL_STAGE_EMAIL_FROM,
+            Destination={"ToAddresses": [DEAL_STAGE_EMAIL_TO]},
+            Message={"Subject": {"Data": f"[Dashboard] {_est_val_label(deal)} changed: {_deal_title(deal)}"},
+                     "Body": {"Text": {"Data": body}}},
+        )
+        return True
+    except Exception as e:
+        print(f"tenant est. valuation email failed (non-fatal): {type(e).__name__}: {e}")
+        return False
+
+
 # Tenant deadline self-edit (Deal Details card): the request may carry ONLY
 # these keys; the date must be on or after "today" anywhere in the US
 # (UTC minus TENANT_DEADLINE_TZ_SLACK_HOURS), so an evening edit in
@@ -6214,6 +6252,20 @@ TENANT_DEADLINE_ALLOWED_KEYS = {"deal_id", "deadline"}
 # rule as the impersonated tenant, and is audited/emailed under this address.
 ADMIN_IMPERSONATION_EMAIL = "cgracia@rainmakersecurities.com"
 TENANT_DEADLINE_IMPERSONATION_KEYS = TENANT_DEADLINE_ALLOWED_KEYS | {"key", "view_as"}
+# Card fields a seller may self-edit; a request carries exactly ONE of them
+# (plus deal_id, and key/view_as for admin Tenant view) -- nothing else.
+TENANT_SELF_EDIT_FIELDS = ("deadline", "est_valuation")
+
+
+def _tenant_self_edit_field(body, extra_keys=()):
+    """The single self-edit field a tenant request carries, or None when the
+    body is not exactly {deal_id, <one field>, *extra_keys}."""
+    present = [f for f in TENANT_SELF_EDIT_FIELDS if f in body]
+    if len(present) != 1:
+        return None
+    if set(body.keys()) - ({"deal_id", present[0]} | set(extra_keys)):
+        return None
+    return present[0]
 TENANT_DEADLINE_TZ_SLACK_HOURS = 12
 
 
@@ -6689,6 +6741,30 @@ def _pipeline_update_deal_exemption(deal_id, exemption_id):
     if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
         return False, "Pipeline API credentials not configured"
     body = json.dumps({"deal": {"custom_fields": {EXEMPTION_FIELD: exemption_id}}}).encode("utf-8")
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
+        data=body, method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _pipeline_update_deal_est_val(deal_id, billions):
+    """PUT Est. Valuation (billions, deal-update-form's storage shape) to
+    Pipeline. Returns (ok, error); abort-on-any-non-2xx like the others."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    body = json.dumps({"deal": {"custom_fields": {EST_VAL_FIELD: billions}}}).encode("utf-8")
     qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
     req = urllib.request.Request(
         f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
@@ -7304,7 +7380,7 @@ def _seller_email_order(index):
 
 def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
                                 old_values, actor, milestones=None, loss_reason_shared=None, notes_history=None,
-                                history_entry=None, exemption=None):
+                                history_entry=None, exemption=None, est_val=None):
     """Update the intro item's Dynamo-owned attributes (status_override/
     override_at when status_id is not None, next_steps/notes/follow_up
     when they are not None, deadline_override/deadline_override_at when
@@ -7374,6 +7450,12 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         update_parts.append("exemption_override_at = :eoa")
         expr_values[":eoa"] = int(now)
         new_values["exemption"] = exemption
+    if est_val is not None:
+        update_parts.append("est_val_override = :evo")
+        expr_values[":evo"] = Decimal(str(est_val))
+        update_parts.append("est_val_override_at = :evoa")
+        expr_values[":evoa"] = int(now)
+        new_values["est_valuation"] = Decimal(str(est_val))
     if loss_reason_shared is not None:
         update_parts.append("loss_reason_shared = :lrs")
         expr_values[":lrs"] = bool(loss_reason_shared)
@@ -7526,6 +7608,84 @@ def _resolve_deal_exemption(deal, override_entry=None):
             except (TypeError, ValueError):
                 pass
     return exemption_id if exemption_id in EXEMPTION_SHORT_LABELS else None
+
+
+def _deal_is_spv(deal):
+    """SPV/Fund structure (option 5077906 -- the only SPV marker)."""
+    return SPV_STRUCTURE_ID in _deal_cf_option_ids(deal, STRUCTURE_FIELD)
+
+
+def _deal_is_new_allocation(deal):
+    return SR_NEW_ALLOCATION_ID in _deal_cf_option_ids(deal, SELLER_ROLE_FIELD)
+
+
+def _est_val_label(deal):
+    return "Pre-money valuation" if _deal_is_new_allocation(deal) else "Est. valuation"
+
+
+def _resolve_deal_est_val(deal, override_entry=None):
+    """Est. Valuation in BILLIONS (0.0 = seller said Unknown), or None when
+    unset; Dynamo est_val_override bridges a card save until Pipeline
+    catches up (_override_is_current)."""
+    val = _deal_cf_number(deal, EST_VAL_FIELD)
+    if override_entry:
+        ov = override_entry.get("est_val_override")
+        ov_at = override_entry.get("est_val_override_at")
+        if ov is not None and ov_at and _override_is_current(deal, ov_at):
+            try:
+                val = float(ov)
+            except (TypeError, ValueError):
+                pass
+    if val is not None and val < 0:
+        return None
+    return val
+
+
+def _parse_valuation_input(raw):
+    """"4.2B", "$850M", "850m", "4,200,000,000" -> whole dollars (int), or
+    None when unparseable, zero/negative, or under EST_VAL_MIN_DOLLARS."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    s = str(raw).strip().lower().replace("$", "").replace(",", "").replace(" ", "")
+    m = re.fullmatch(r"(\d+(?:\.\d*)?|\.\d+)([a-z]*)", s)
+    if not m or m.group(2) not in _VAL_SUFFIX:
+        return None
+    dollars = int(round(float(m.group(1)) * _VAL_SUFFIX[m.group(2)]))
+    return dollars if dollars >= EST_VAL_MIN_DOLLARS else None
+
+
+def _fmt_valuation_billions(b):
+    """Stored billions -> "$4.0B" / "$4.2B" / "$1.25B" / "$850M". None for unset or 0."""
+    if b is None or b <= 0:
+        return None
+    if b >= 1:
+        t = f"{b:.2f}"
+        return "$" + (t[:-1] if t.endswith("0") else t) + "B"   # $4.0B, $4.2B, $1.25B
+    m = b * 1000
+    return "$" + (f"{m:.1f}".rstrip("0").rstrip(".") if m < 10 else f"{m:,.0f}") + "M"
+
+
+def _est_val_display_html(b):
+    """Card value: "$4.2B", amber "Unknown" for a stored 0, amber "Not set"."""
+    if b is None:
+        return DC_NOT_SET_HTML
+    if b == 0:
+        return '<span class="dc-not-set">Unknown</span>'
+    return _esc(_fmt_valuation_billions(b))
+
+
+def _est_val_text(b):
+    """Plain text for emails/audit display."""
+    if b is None:
+        return "Not set"
+    if b == 0:
+        return "Unknown"
+    return _fmt_valuation_billions(b)
+
+
+def _fmt_share_price(v):
+    """$30 / $30.50 per share (never K/M rounding)."""
+    return f"${v:,.0f}" if v == int(v) else f"${v:,.2f}"
 
 
 def _ei_exemption_select_html(deal_id, exemption_id):
@@ -7827,6 +7987,87 @@ TENANT_DEADLINE_SCRIPT = """<script>
 </script>"""
 
 
+def _tenant_est_val_editor_html(deal_id, est_b, display_html, admin_key=None, view_as=None):
+    """Tenant self-edit for a live SPV deal's valuation cell: the value with
+    "Edit" ("Set value" when unset/Unknown) under it; Edit swaps in a text
+    input + Save/Cancel (TENANT_EST_VAL_SCRIPT posts ?action=update_intro
+    {deal_id, est_valuation})."""
+    has_value = est_b is not None and est_b > 0
+    label = "Edit" if has_value else "Set value"
+    current = _fmt_valuation_billions(est_b) if has_value else ""
+    imp_attrs = (f' data-key="{_esc(admin_key)}" data-view-as="{_esc(view_as)}"'
+                 if admin_key and view_as else "")
+    return (f'<span class="dc-ev" data-deal-id="{_esc(deal_id)}"{imp_attrs}>'
+            f'<span class="dc-ev-view"><span class="dc-ev-value">{display_html}</span>'
+            f'<a href="#" class="dc-ev-edit">{label}</a></span>'
+            f'<span class="dc-ev-form" hidden><input type="text" class="dc-ev-input" value="{_esc(current)}" '
+            f'placeholder="e.g. 4.2B" inputmode="decimal" autocomplete="off">'
+            f'<button type="button" class="dc-ev-save">Save</button>'
+            f'<button type="button" class="dc-ev-cancel">Cancel</button></span>'
+            f'<span class="dc-ev-msg" role="status"></span></span>')
+
+
+TENANT_EST_VAL_SCRIPT = """<script>
+(function() {
+  document.querySelectorAll('.dc-ev').forEach(function(box) {
+    var view = box.querySelector('.dc-ev-view'), form = box.querySelector('.dc-ev-form');
+    var input = box.querySelector('.dc-ev-input'), msg = box.querySelector('.dc-ev-msg');
+    var val = box.querySelector('.dc-ev-value'), saveBtn = box.querySelector('.dc-ev-save');
+    var orig = input.value;
+    function setMsg(t, cls) { msg.textContent = t; msg.className = 'dc-ev-msg' + (cls ? ' ' + cls : ''); }
+    box.querySelector('.dc-ev-edit').addEventListener('click', function(e) {
+      e.preventDefault(); input.value = orig; view.hidden = true; form.hidden = false; setMsg(''); input.focus();
+    });
+    box.querySelector('.dc-ev-cancel').addEventListener('click', function() {
+      form.hidden = true; view.hidden = false; setMsg('');
+    });
+    input.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); saveBtn.click(); }
+    });
+    saveBtn.addEventListener('click', function() {
+      if (!input.value.trim()) { setMsg('Enter a valuation like 4.2B or 850M.', 'error'); return; }
+      saveBtn.disabled = true; setMsg('Saving\u2026');
+      var payload = { deal_id: box.getAttribute('data-deal-id'), est_valuation: input.value.trim() };
+      if (box.getAttribute('data-key')) {
+        payload.key = box.getAttribute('data-key'); payload.view_as = box.getAttribute('data-view-as');
+      }
+      fetch('?action=update_intro', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).then(function(r) {
+        return r.json().then(function(d) { return { ok: r.ok, d: d }; }, function() { return { ok: false, d: {} }; });
+      }).then(function(res) {
+        saveBtn.disabled = false;
+        if (res.ok) {
+          val.innerHTML = res.d.display || input.value;
+          orig = val.textContent;
+          box.querySelector('.dc-ev-edit').textContent = 'Edit';
+          form.hidden = true; view.hidden = false; setMsg('Saved \u2713', 'saved');
+          setTimeout(function() { setMsg(''); }, 2500);
+        } else {
+          setMsg((res.d && res.d.error) || 'Could not save. Please try again.', 'error');
+        }
+      }).catch(function() { saveBtn.disabled = false; setMsg('Could not save. Please try again.', 'error'); });
+    });
+  });
+})();
+</script>"""
+
+
+def _ei_est_val_input_html(deal_id, est_b):
+    """Admin edit-mode valuation input (saves on change via _edit_script_html)."""
+    current = _fmt_valuation_billions(est_b) if (est_b is not None and est_b > 0) else ""
+    return (f'<input type="text" class="ei-est-val" data-deal-id="{_esc(deal_id)}" data-field="est_valuation" '
+            f'value="{_esc(current)}" placeholder="e.g. 4.2B" autocomplete="off"><span class="ei-msg"></span>')
+
+
+def _dc_cell_html(label, value_html, extra_cls=""):
+    cls = f"dc-cell {extra_cls}".strip()
+    return (f'<div class="{cls}"><span class="dc-label">{_esc(label)}</span>'
+            f'<span class="dc-value">{value_html}</span></div>')
+
+
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None, reopen_html="",
                     tenant_deadline_edit=False, impersonation_key=None, impersonation_view_as=None):
     """override_entry is this deal's Dynamo intro item (from
@@ -7899,8 +8140,34 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     else:
         exemption_value_html = _dc_value_html(EXEMPTION_SHORT_LABELS.get(exemption_id))
 
-    fees = _fmt_fees(deal)
-    fees_html = f'<div class="dc-line">{_esc(fees)}</div>' if fees else ""
+    # Price cell: SPV/Fund deals show the valuation (editable like the
+    # deadline) with net per share as a muted second line; every other
+    # structure keeps NET.
+    net_val = _deal_cf_number(deal, NET_FIELD)
+    if _deal_is_spv(deal):
+        price_label = _est_val_label(deal)
+        est_b = _resolve_deal_est_val(deal, override_entry)
+        if edit_mode:
+            price_html = _ei_est_val_input_html(deal_id, est_b)
+        else:
+            price_html = _est_val_display_html(est_b)
+            if tenant_deadline_edit and not is_closed and not _deal_is_public(deal):
+                price_html = _tenant_est_val_editor_html(deal_id, est_b, price_html,
+                                                         admin_key=impersonation_key,
+                                                         view_as=impersonation_view_as)
+        if net_val is not None:
+            price_html += f'<span class="dc-sub">{_esc(_fmt_share_price(net_val))} / sh</span>'
+    else:
+        price_label = "Net"
+        price_html = net_text
+
+    seller_fee_html = _dc_value_html(_fmt_pct(_deal_cf_number(deal, SELLER_FEE_FIELD)))
+    mgmt_pct = _fmt_pct(_deal_cf_number(deal, MGMT_FEE_FIELD))
+    carry_pct = _fmt_pct(_deal_cf_number(deal, CARRY_FIELD))
+    if mgmt_pct is None and carry_pct is None:
+        mgmt_carry_html = DC_NOT_SET_HTML
+    else:
+        mgmt_carry_html = f"{_dc_value_html(mgmt_pct)} / {_dc_value_html(carry_pct)}"
 
     # Paperwork: the same deal_paperwork_status the My Deals row uses
     # (it covers the agent agreement too, so it replaces the older
@@ -7935,14 +8202,16 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         <div class="deal-card-stage">{stage}</div>
       </div>
       <div class="deal-card-metrics">
-        <div><span class="dc-label">Size</span><span class="dc-value">{size_text}</span></div>
-        <div><span class="dc-label">Net</span><span class="dc-value">{net_text}</span></div>
-        <div><span class="dc-label">Structure</span><span class="dc-value">{structure_text}</span></div>
-        <div><span class="dc-label">Deadline</span><span class="dc-value">{deadline_value_html}</span></div>
-        <div><span class="dc-label">Exemption</span><span class="dc-value">{exemption_value_html}</span></div>
+        {_dc_cell_html("Size", size_text)}
+        {_dc_cell_html(price_label, price_html, "dc-price")}
+        {_dc_cell_html("Seller fee", seller_fee_html)}
+        {_dc_cell_html("Deadline", deadline_value_html)}
+        {_dc_cell_html("Structure", structure_text)}
+        {_dc_cell_html("Exemption", exemption_value_html)}
+        {_dc_cell_html("Mgmt / Carry", mgmt_carry_html)}
+        <div class="dc-cell dc-cell-empty" aria-hidden="true"></div>
       </div>
       {per_share_html}
-      {fees_html}
       {badge_html}
       {footer_html}
     </div>"""
@@ -8757,6 +9026,12 @@ def _edit_script_html(key, tenant_email=None):
   }});
   document.querySelectorAll('.ei-exemption').forEach(function(el) {{
     el.addEventListener('change', function() {{ saveField(el, 'exemption'); }});
+  }});
+  document.querySelectorAll('.ei-est-val').forEach(function(el) {{
+    el.addEventListener('change', function() {{ saveField(el, 'est_valuation'); }});
+    el.addEventListener('keydown', function(e) {{
+      if (e.key === 'Enter') {{ e.preventDefault(); el.blur(); }}
+    }});
   }});
   document.querySelectorAll('.ei-next-steps, .ei-notes, .ei-follow-up, .ei-deadline').forEach(function(el) {{
     var field = el.getAttribute('data-field');
@@ -12711,6 +12986,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             deals_body = "".join(live_cards)
             if 'class="dc-dl-edit"' in deals_body:
                 deals_body += TENANT_DEADLINE_SCRIPT
+            if 'class="dc-ev-edit"' in deals_body:
+                deals_body += TENANT_EST_VAL_SCRIPT
             if won_cards:
                 deals_body += ('<div class="cd-won-deals"><h3 class="cd-deals-subhead">Won</h3>'
                                + "".join(won_cards) + '</div>')
@@ -13262,7 +13539,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     background: var(--card);
     border: 1px solid var(--line);
     border-radius: 12px;
-    padding: 22px 24px;
+    padding: 22px 20px;
     margin-bottom: 16px;
   }}
   .deal-card:last-child {{ margin-bottom: 0; }}
@@ -13295,30 +13572,64 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     color: var(--muted);
     white-space: nowrap;
   }}
+  /* Terms grid: 4 equal columns x 2 rows (2 columns below 640px). Cells
+     never grow past their track: min-width 0, editors fill the cell. */
   .deal-card-metrics {{
-    display: flex;
-    flex-wrap: wrap;
-    gap: 32px;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 16px 8px;
     margin-bottom: 14px;
   }}
+  /* 2 columns below 640px, and whenever the card itself is too narrow for
+     the longest label ("PRE-MONEY VALUATION") on one line in 4 columns. */
+  .deal-card {{ container-type: inline-size; }}
+  @media (max-width: 640px) {{
+    .deal-card-metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .dc-cell-empty {{ display: none; }}
+  }}
+  @container (max-width: 527px) {{
+    .deal-card-metrics {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .dc-cell-empty {{ display: none; }}
+  }}
+  .dc-cell {{ min-width: 0; }}
   .dc-label {{
     display: block;
-    font-size: 11px;
+    font-size: 10px;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.01em;
     color: var(--muted);
     margin-bottom: 4px;
+    white-space: nowrap;
   }}
-  .dc-value {{ font-size: 16px; font-weight: 600; }}
+  .dc-value {{ display: block; font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }}
+  .dc-sub {{ display: block; font-size: 12px; font-weight: 500; color: var(--muted); margin-top: 2px; }}
+  .deal-card-metrics input, .deal-card-metrics select {{ max-width: 100%; box-sizing: border-box; }}
+  .deal-card-metrics .ei-deadline, .deal-card-metrics .ei-exemption,
+  .deal-card-metrics .ei-est-val {{ width: 100%; }}
+  .dc-ev-edit {{ display: block; font-size: 11px; font-weight: 500; color: var(--accent); text-decoration: none;
+                 margin-top: 2px; }}
+  .dc-ev-edit:hover {{ text-decoration: underline; }}
+  .dc-ev-form {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }}
+  .dc-ev-view[hidden], .dc-ev-form[hidden] {{ display: none !important; }}
+  .dc-ev-input {{ font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
+                  width: 100%; min-width: 0; }}
+  .dc-ev-form button {{ font: inherit; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+                        cursor: pointer; border: 1px solid var(--line); background: var(--card); color: var(--ink); }}
+  .dc-ev-form .dc-ev-save {{ background: var(--qp); border-color: var(--qp); color: #fff; }}
+  .dc-ev-form button:disabled {{ opacity: 0.6; cursor: default; }}
+  .dc-ev-msg {{ display: block; font-size: 11px; font-weight: 500; margin-top: 2px; }}
+  .dc-ev-msg.saved {{ color: var(--qp); }}
+  .dc-ev-msg.error {{ color: #b23b3b; }}
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
   .dc-not-set {{ color: var(--accredited); font-weight: 500; }}
   .dc-hint {{ font-size: 12px; font-weight: 500; color: var(--accredited); margin-left: 4px; }}
   .dc-dl-edit {{ display: block; font-size: 11px; font-weight: 500; color: var(--accent); text-decoration: none;
                  margin-top: 2px; }}
   .dc-dl-edit:hover {{ text-decoration: underline; }}
-  .dc-dl-form {{ display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }}
+  .dc-dl-form {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }}
   .dc-dl-view[hidden], .dc-dl-form[hidden] {{ display: none !important; }}
-  .dc-dl-input {{ font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px; }}
+  .dc-dl-input {{ font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
+                  width: 100%; min-width: 0; }}
   .dc-dl-form button {{ font: inherit; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
                         cursor: pointer; border: 1px solid var(--line); background: var(--card); color: var(--ink); }}
   .dc-dl-form .dc-dl-save {{ background: var(--qp); border-color: var(--qp); color: #fff; }}
@@ -13467,7 +13778,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     font-style: italic;
   }}
   .table-scroll {{ overflow-x: auto; }}
-  .ei-status, .ei-notes, .ei-flag, .ei-deadline, .ei-exemption {{
+  .ei-status, .ei-notes, .ei-flag, .ei-deadline, .ei-exemption, .ei-est-val {{
     background: var(--bg);
     border: 1px solid var(--line);
     color: var(--ink);
@@ -17477,34 +17788,37 @@ def _handle_update_intro(event):
     is_admin = bool(admin_key) and body.get("key") == admin_key
 
     tenant_identity_email = None
-    tenant_deadline_edit = False
+    tenant_self_field = None
     impersonated_actor = None
     if is_admin and body.get("view_as") not in (None, ""):
-        # Admin Tenant-view deadline save: ONLY a deadline, through the
-        # tenant rules below, as the previewed tenant.
-        if set(body.keys()) - TENANT_DEADLINE_IMPERSONATION_KEYS or "deadline" not in body:
+        # Admin Tenant-view card save: ONE self-edit field (deadline or
+        # est_valuation), through the tenant rules below, as the
+        # previewed tenant.
+        tenant_self_field = _tenant_self_edit_field(body, extra_keys=("key", "view_as"))
+        if tenant_self_field is None:
             return _json_response({"error": "forbidden"}, 403)
         tenant_identity_email = str(body.get("view_as")).strip().lower()
         if _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
         is_admin = False
-        tenant_deadline_edit = True
         impersonated_actor = f"{ADMIN_IMPERSONATION_EMAIL} (as {tenant_identity_email})"
     elif not is_admin:
         identity_email = _read_identity_email(event)
         tenant_identity_email = identity_email.strip().lower() if identity_email else None
         if not tenant_identity_email or _resolve_tenant(tenant_identity_email) is None:
             return _json_response({"error": "forbidden"}, 403)
-        if "deadline" in body:
-            # Tenant deadline self-edit: deadline is the ONLY field allowed
-            # in the request; anything alongside it is refused outright.
-            if set(body.keys()) - TENANT_DEADLINE_ALLOWED_KEYS:
+        if any(f in body for f in TENANT_SELF_EDIT_FIELDS):
+            # Tenant card self-edit: exactly one of deadline / est_valuation
+            # is the ONLY field allowed; anything alongside it is refused.
+            tenant_self_field = _tenant_self_edit_field(body)
+            if tenant_self_field is None:
                 return _json_response({"error": "forbidden"}, 403)
-            tenant_deadline_edit = True
         if body.get("exemption") not in (None, ""):
             return _json_response({"error": "forbidden"}, 403)
         if "share_loss_reason" in body:
             return _json_response({"error": "forbidden"}, 403)
+    tenant_deadline_edit = tenant_self_field == "deadline"
+    tenant_est_val_edit = tenant_self_field == "est_valuation"
 
     deal_id = str(body.get("deal_id") or "").strip()
     if not deal_id:
@@ -17592,6 +17906,15 @@ def _handle_update_intro(event):
         elif tenant_deadline_edit:
             return _json_response({"error": "Please pick a date."}, 400)
 
+    # Est. Valuation (admin, or a tenant card self-edit): any of "4.2B",
+    # "$850M", "850m", "4,200,000,000" -> stored in billions.
+    est_val = None
+    if (is_admin or tenant_est_val_edit) and "est_valuation" in body:
+        est_dollars = _parse_valuation_input(body.get("est_valuation"))
+        if est_dollars is None:
+            return _json_response({"error": "Enter a valuation like 4.2B or 850M (at least $1M)."}, 400)
+        est_val = round(est_dollars / 1e9, 6)
+
     # Admin-only Fund Exemption (Deal Details EXEMPTION selector).
     exemption = None
     if is_admin and body.get("exemption") not in (None, ""):
@@ -17613,7 +17936,7 @@ def _handle_update_intro(event):
 
     has_status_intent = status_id is not None or milestone_step is not None or flag is not None
     if (not has_status_intent and next_steps is None and notes is None and follow_up is None
-            and deadline is None and share_loss_reason is None and exemption is None):
+            and deadline is None and share_loss_reason is None and exemption is None and est_val is None):
         return _json_response({"error": "nothing to update"}, 400)
 
     deals = get_deals_list()
@@ -17639,15 +17962,19 @@ def _handle_update_intro(event):
     old_entry = intro_details.get(deal_id) or {}
     old_resolved = _resolve_intro_status(deal, old_entry)
 
-    if tenant_deadline_edit:
+    if tenant_self_field:
         # Only the tenant's own live Sell deal (what the card's Edit link
-        # is shown on): never a buy deal, a public company, or a closed one.
+        # is shown on): never a buy deal, a public company, or a closed one;
+        # Est. Valuation additionally only on an SPV/Fund deal.
         if DEAL_SIDE_SELL_ID not in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
             return _json_response({"error": "forbidden"}, 403)
         tenant_rsid = _resolve_deal_stage(deal, old_entry)
+        what = "deadline" if tenant_deadline_edit else "valuation"
         if (_deal_is_public(deal) or _is_won_stage(tenant_rsid)
                 or _is_closed_down_stage(tenant_rsid)):
-            return _json_response({"error": "This deal is closed — its deadline can't be changed."}, 409)
+            return _json_response({"error": f"This deal is closed — its {what} can't be changed."}, 409)
+        if tenant_est_val_edit and not _deal_is_spv(deal):
+            return _json_response({"error": "Valuation applies to SPV deals only."}, 409)
 
     if has_status_intent and not is_admin:
         if not old_resolved["disclosed"]:
@@ -17684,6 +18011,8 @@ def _handle_update_intro(event):
         "follow_up": old_entry.get("follow_up"),
         "deadline": _resolve_deal_deadline(deal, old_entry),
         "exemption": _resolve_deal_exemption(deal, old_entry),
+        "est_valuation": (None if _resolve_deal_est_val(deal, old_entry) is None
+                          else Decimal(str(_resolve_deal_est_val(deal, old_entry)))),
         "loss_reason_shared": bool(old_entry.get("loss_reason_shared")),
     }
 
@@ -17741,6 +18070,11 @@ def _handle_update_intro(event):
         if not ok:
             return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
+    if est_val is not None:
+        ok, err = _pipeline_update_deal_est_val(deal_id, est_val)
+        if not ok:
+            return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
+
     actor = "admin" if is_admin else (impersonated_actor or tenant_identity_email)
 
     # Deal notes are append-only: every non-blank notes save adds one
@@ -17761,7 +18095,7 @@ def _handle_update_intro(event):
     ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
                                           old_values, actor, milestones=milestones_update,
                                           loss_reason_shared=share_loss_reason, notes_history=notes_history,
-                                          history_entry=history_entry, exemption=exemption)
+                                          history_entry=history_entry, exemption=exemption, est_val=est_val)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
 
@@ -17777,6 +18111,13 @@ def _handle_update_intro(event):
         return _json_response({"ok": True, "deadline": deadline,
                                "display": _deal_deadline_display_html(deadline),
                                "overdue": _deadline_is_overdue(deadline)})
+    if tenant_est_val_edit:
+        if impersonated_actor is None:
+            old_b = old_values["est_valuation"]
+            _send_tenant_est_val_email(actor, deal, deal_id, None if old_b is None else float(old_b), est_val)
+        return _json_response({"ok": True, "est_valuation": est_val, "display": _est_val_display_html(est_val)})
+    if est_val is not None:
+        return _json_response({"ok": True, "est_valuation": est_val, "display": _est_val_display_html(est_val)})
     return _json_response({"ok": True})
 
 
