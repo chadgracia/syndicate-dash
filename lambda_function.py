@@ -597,7 +597,7 @@ STACKED_ACTION_CSS = """
   .next-step { margin-bottom: 6px; }
   .next-step:last-child { margin-bottom: 0; }
   .next-step-owner { font-size: 10px; color: var(--muted); margin-top: 2px; }
-  .action-chip.paperwork-needed, .action-chip.awaiting { background: rgba(201,162,39,0.15); color: var(--accredited); }
+  .action-chip.paperwork-needed, .action-chip.awaiting { background: #FDF0E9; color: #C2410C; }
   .action-chip.awaiting { font-weight: 600; }
 """
 
@@ -9652,7 +9652,7 @@ NAV_CSS = """
     text-decoration: none;
   }
   .gg-cef-badge.cef-ok { background: rgba(31,122,77,0.15); color: var(--qp); }
-  .gg-cef-badge.cef-pending { background: rgba(201,162,39,0.15); color: var(--accredited); }
+  .gg-cef-badge.cef-pending { background: #FDF0E9; color: #C2410C; }
   .gg-cef-badge.cef-missing { background: rgba(178,59,59,0.12); color: #b23b3b; }
   .gg-cef-badge.cef-missing:hover { text-decoration: underline; }
   .gg-view-toggle {
@@ -11217,7 +11217,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     border-radius: 999px;
     padding: 3px 9px;
   }}
-  .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #8a6d1f; }}
+  .status-chip.stalled {{ background: #FDF0E9; color: #C2410C; }}
   .status-chip.exit {{ background: rgba(178,59,59,0.15); color: #b23b3b; }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .buyer-code {{ font-size: 12px; font-weight: 600; color: var(--ink); }}
@@ -11240,13 +11240,13 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   tr.pending-row {{ opacity: 0.85; }}
   .pending-block .action-chip {{ display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3;
                                  padding: 3px 9px; border-radius: 12px; text-decoration: none; margin: 0 4px 4px 0;
-                                 background: rgba(201,162,39,0.15); color: var(--accredited, #8a6d1f); }}
+                                 background: #FDF0E9; color: #C2410C; }}
   .pending-awaiting {{ font-size: 12px; color: var(--muted); }}
   tr.closed-out-row {{ opacity: 0.7; }}
   .via-colleague-chip {{ display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }}
   /* Nav pass, item 2: a soft amber left-border accent on Stalled rows so
      the top of the triage queue visibly differs from healthy rows. */
-  tr.stalled-row {{ box-shadow: inset 3px 0 0 #c9a227; }}
+  tr.stalled-row {{ box-shadow: inset 3px 0 0 #C2410C; }}
   .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
   .loss-reason-notes {{ color: var(--muted); font-size: 11px; margin-top: 4px; }}
   .loss-reason-share {{ display: block; font-size: 11px; color: var(--muted); margin-top: 4px; }}
@@ -11288,7 +11288,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
     border-bottom: 1px solid var(--line);
   }}
   .gg-note {{
-    color: var(--accredited, #8a6d1f);
+    color: #C2410C;
     font-size: 13px;
     margin: 0 0 16px;
   }}
@@ -11305,7 +11305,7 @@ def render_intros_page(viewer_name, tenant=None, tenant_email=None, key=None, vi
   /* Dedup fix (turn 19): the flag select carries the Stalled/Passed/
      Withdrawn state itself (glanceable border+tint) whenever it's the
      only place that state shows — see _status_milestones_column_html. */
-  select.ei-flag.flag-stalled {{ border-color: #c9a227; background: rgba(201,162,39,0.15); color: #8a6d1f; }}
+  select.ei-flag.flag-stalled {{ border-color: #C2410C; background: #FDF0E9; color: #C2410C; }}
   select.ei-flag.flag-exit {{ border-color: var(--muted); background: rgba(22,24,29,0.06); }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
@@ -11811,7 +11811,7 @@ OVERVIEW_CSS = """
   .ov-title { font-size: 22px; font-weight: 700; margin: 0; }
   .ov-subtitle { font-size: 13px; color: var(--muted); margin: 4px 0 0; }
   .ov-tiles { display: grid; grid-template-columns: 1.6fr repeat(7, minmax(0, 1fr)); gap: 10px; margin-bottom: 18px; }
-  .ov-waiting { font-size: 12px; font-weight: 600; color: var(--accredited); }
+  .ov-waiting { font-size: 12px; font-weight: 600; color: #C2410C; }
   .pending-awaiting { font-size: 12px; color: var(--muted); }
   .ov-tile-primary { border-color: rgba(31,122,77,0.35); background: rgba(31,122,77,0.06); }
   .ov-tile-primary .ov-tile-value { font-size: 26px; color: var(--qp); }
@@ -11851,13 +11851,13 @@ OVERVIEW_CSS = """
   .visibility-badge { display: inline-block; font-size: 12px; font-weight: 600; line-height: 1.3; padding: 4px 10px;
                       border-radius: 14px; }
   .visibility-badge.live, .visibility-badge.sold { background: rgba(31,122,77,0.15); color: var(--qp); }
-  .visibility-badge.held { background: rgba(201,162,39,0.15); color: var(--accredited); }
+  .visibility-badge.held { background: #FDF0E9; color: #C2410C; }
   .visibility-badge.id-required, .visibility-badge.agreement-unsigned, .visibility-badge.terms-incomplete {
     background: rgba(178,59,59,0.12); color: #b23b3b; }
   .paperwork-note-line { margin-top: 4px; }
   .paperwork-note.buy-side { font-size: 11px; font-weight: 600; color: var(--qp); }
-  .paperwork-note.needed { font-size: 11px; font-weight: 600; color: var(--accredited); }
-  .action-chip.paperwork-needed { background: rgba(201,162,39,0.15); color: var(--accredited); }
+  .paperwork-note.needed { font-size: 11px; font-weight: 600; color: #C2410C; }
+  .action-chip.paperwork-needed { background: #FDF0E9; color: #C2410C; }
   .ov-empty-line { color: var(--muted); font-size: 13px; margin: -6px 0 18px; }
   .action-chip { display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3; padding: 3px 9px;
                  border-radius: 12px; text-decoration: none; }
@@ -11865,7 +11865,7 @@ OVERVIEW_CSS = """
   .status-pill { display: inline-block; font-size: 11px; font-weight: 600; color: var(--muted);
                  background: rgba(22,24,29,0.06); border-radius: 999px; padding: 2px 8px; }
   .status-chip { display: inline-block; font-size: 11px; font-weight: 600; border-radius: 999px; padding: 3px 9px; }
-  .status-chip.stalled { background: rgba(201,162,39,0.15); color: #8a6d1f; }
+  .status-chip.stalled { background: #FDF0E9; color: #C2410C; }
   .status-chip.exit { background: rgba(178,59,59,0.15); color: #b23b3b; }
   .status-chip.closed { background: rgba(31,122,77,0.15); color: var(--qp); }
   details.closed-out-section { margin-top: 10px; }
@@ -12572,7 +12572,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     text-decoration: underline;
   }}
   .update-cancel-btn {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
-  .deal-stage-btn[data-target="hold"] {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .deal-stage-btn[data-target="hold"] {{ background: #FDF0E9; color: #C2410C; }}
   .deal-stage-btn[data-target="cancel"] {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .mydeals-section-heading {{
     font-size: 14px;
@@ -12583,9 +12583,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     gap: 8px;
   }}
   .mydeals-section-heading .count {{ color: var(--muted); font-weight: 500; font-size: 12px; }}
-  .card.section-hold {{ border-color: rgba(201,162,39,0.45); }}
-  .card.section-hold thead th {{ background: rgba(201,162,39,0.08); }}
-  .mydeals-section-heading.hold {{ color: var(--accredited); }}
+  .card.section-hold {{ border-color: rgba(194,65,12,0.35); }}
+  .card.section-hold thead th {{ background: #FEF6F1; }}
+  .mydeals-section-heading.hold {{ color: #C2410C; }}
   .card.section-cancelled {{ opacity: 0.7; }}
   .mydeals-section-heading.cancelled {{ color: var(--muted); }}
   /* Turn 26: the Closed section is the trophy shelf, not a graveyard —
@@ -12615,9 +12615,9 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   .id-status-badge.id-missing {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .paperwork-note-line {{ margin-top: 4px; }}
   .paperwork-note.buy-side {{ font-size: 11px; font-weight: 600; color: var(--qp); }}
-  .paperwork-note.needed {{ font-size: 11px; font-weight: 600; color: var(--accredited); text-decoration: none; }}
+  .paperwork-note.needed {{ font-size: 11px; font-weight: 600; color: #C2410C; text-decoration: none; }}
   .paperwork-note.needed:hover {{ text-decoration: underline; }}
-  .id-status-badge.id-needed {{ background: rgba(201,162,39,0.15); color: var(--accredited); text-decoration: none; }}
+  .id-status-badge.id-needed {{ background: #FDF0E9; color: #C2410C; text-decoration: none; }}
   .visibility-badge {{
     display: inline-block;
     font-size: 12px;
@@ -12629,7 +12629,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
     white-space: normal;
   }}
   .visibility-badge.live, .visibility-badge.sold {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
-  .visibility-badge.held {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .visibility-badge.held {{ background: #FDF0E9; color: #C2410C; }}
   .visibility-badge.id-required, .visibility-badge.agreement-unsigned, .visibility-badge.terms-incomplete {{
     background: rgba(178,59,59,0.12); color: #b23b3b;
   }}
@@ -12652,7 +12652,7 @@ def render_my_deals_page(viewer_name, deals=None, tenant_picker=False, key=None,
   }}
   .action-chip.paperwork + .action-chip.paperwork {{ margin-top: 4px; }}
   .action-chip.nudge, .action-chip.terms, .action-chip.terms-nudge {{
-    background: rgba(201,162,39,0.15); color: var(--accredited);
+    background: #FDF0E9; color: #C2410C;
   }}
   .ei-deadline {{
     background: var(--bg);
@@ -12762,10 +12762,10 @@ def _tier_badge_html(tier, iqf_needed=False):
     return badge
 
 
-def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None, company=None, tenant_email=None):
+def _buyer_tile_html(buyer, anon_key_email, is_admin=False, buyer_name=None, company=None, tenant_email=None):
     """Anonymized buyer-code tile for a real tenant (is_admin=False --
-    the ONLY path a tenant's own render ever reaches: code/tier/range/
-    recency dot exactly as before, no name, no raw person id, no
+    the ONLY path a tenant's own render ever reaches: code/tier/range
+    exactly as before, no name, no raw person id, no
     controls of any kind -- this function still never receives a
     buyer's name/email in that case, matching render_company_page's own
     documented invariant for this section).
@@ -12790,15 +12790,9 @@ def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<div class="buyer-range">{_esc(range_text)}</div>' if range_text else ""
 
-    dt = _parse_pipeline_ts(buyer["updated_at"])
-    recent = bool(dt and (now - dt).days <= 365)
-    dot_cls = "buyer-dot filled" if recent else "buyer-dot"
-    dot_title = "Active within 12 months" if recent else "No recent activity"
-
     if not is_admin:
         code = _anon_buyer_code(anon_key_email, buyer["person_id"])
         return f"""<div class="buyer-tile">
-      <span class="{dot_cls}" title="{dot_title}"></span>
       <div class="buyer-code">Buyer {_esc(code)}</div>
       {tier_html}{_standing_star_for(buyer["person_id"])}
       {range_html}
@@ -12819,12 +12813,36 @@ def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None
         <span class="ei-msg intro-msg"></span>
       </div>"""
     return f"""<div class="buyer-tile admin">
-      <span class="{dot_cls}" title="{dot_title}"></span>
       {name_html}
       {tier_html}
       {range_html}
       {controls_html}
     </div>"""
+
+
+def _buyer_demand_key_html():
+    """One muted key line under the BUYER DEMAND heading, worded from the
+    code's actual rules: stars = _standing_star_from_cs (gold: >= 1
+    closed trade AND role-required onboarding forms done AND no missed
+    terms/response marks; green: no missed terms/response marks), pills =
+    classify_person (QP: Investor Level QP; Accredited: Investor Level
+    Accredited or Qualified Client, or an IQF on file). Qualitative only."""
+    def key_star(star):
+        # Legend glyph only: its own class (never gs-star), so it can never
+        # be mistaken for -- or counted as -- any buyer's standing.
+        fill = STANDING_STAR_STYLE[star][0]
+        return ('<span class="bd-key-star" aria-hidden="true">'
+                f'<svg viewBox="0 0 24 24" width="12" height="12"><path fill="{fill}" d="{STANDING_STAR_PATH}"/></svg>'
+                '</span>')
+    return ('<p class="bd-key">'
+            f'{key_star("gold")} Closed a trade, onboarding complete, keeps to terms'
+            '<span class="bd-key-sep">·</span>'
+            f'{key_star("green")} Keeps to terms and responds'
+            '<span class="bd-key-sep">·</span>'
+            f'{_tier_badge_html("qp")} Qualified purchaser'
+            '<span class="bd-key-sep">·</span>'
+            f'{_tier_badge_html("accredited")} Accredited investor or qualified client'
+            '</p>')
 
 
 def _introduce_buyer_script_html(key):
@@ -13305,7 +13323,6 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     buyers = get_company_buyer_details(company)
     buyers.sort(key=lambda b: b["updated_at"] or "", reverse=True)
     buyers.sort(key=lambda b: TIER_ORDER.get(b["tier"], 3))
-    now = datetime.now(timezone.utc)
     # Introduce controls need an actual tenant to link the buyer to --
     # anon_key_email is the literal string "admin" for admin-without-
     # &view_as (see lambda_handler), which must never be sent as a fake
@@ -13319,14 +13336,14 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
         if edit_mode:
             buyer_people_by_id = get_people_by_ids({b["person_id"] for b in buyers})
             tiles_html = "".join(
-                _buyer_tile_html(b, anon_key_email, now, is_admin=True,
+                _buyer_tile_html(b, anon_key_email, is_admin=True,
                                   buyer_name=_person_display_name(buyer_people_by_id.get(b["person_id"])),
                                   company=company, tenant_email=introduce_tenant_email)
                 for b in buyers
             )
         else:
-            tiles_html = "".join(_buyer_tile_html(b, anon_key_email, now) for b in buyers)
-        buyer_demand_body = f'<div class="buyer-grid">{tiles_html}</div>'
+            tiles_html = "".join(_buyer_tile_html(b, anon_key_email) for b in buyers)
+        buyer_demand_body = _buyer_demand_key_html() + f'<div class="buyer-grid">{tiles_html}</div>'
     else:
         buyer_demand_body = '<div class="gg-placeholder small">No buy interest recorded yet.</div>'
     introduce_script_html = _introduce_buyer_script_html(key) if (edit_mode and buyers) else ""
@@ -13460,6 +13477,10 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
     gap: 12px;
   }}
+  .bd-key {{ font-size: 12px; color: var(--muted); margin: -4px 0 12px; line-height: 1.9; }}
+  .bd-key .tier-badge {{ margin: 0 2px 0 0; font-size: 9.5px; padding: 1px 6px; vertical-align: middle; }}
+  .bd-key-star {{ display: inline-flex; vertical-align: middle; margin-right: 2px; }}
+  .bd-key-sep {{ margin: 0 8px; }}
   .buyer-tile {{
     background: var(--card);
     border: 1px solid var(--line);
@@ -13467,17 +13488,6 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     padding: 14px;
     position: relative;
   }}
-  .buyer-dot {{
-    position: absolute;
-    top: 14px;
-    right: 14px;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    border: 1px solid var(--muted);
-    background: transparent;
-  }}
-  .buyer-dot.filled {{ background: var(--qp); border-color: var(--qp); }}
   .buyer-code {{
     font-size: 13px;
     font-weight: 600;
@@ -13621,8 +13631,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .dc-ev-msg.saved {{ color: var(--qp); }}
   .dc-ev-msg.error {{ color: #b23b3b; }}
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
-  .dc-not-set {{ color: var(--accredited); font-weight: 500; }}
-  .dc-hint {{ font-size: 12px; font-weight: 500; color: var(--accredited); margin-left: 4px; }}
+  .dc-not-set {{ color: #C2410C; font-weight: 500; }}
+  .dc-hint {{ font-size: 12px; font-weight: 500; color: #C2410C; margin-left: 4px; }}
   .dc-dl-edit {{ display: block; font-size: 11px; font-weight: 500; color: var(--accent); text-decoration: none;
                  margin-top: 2px; }}
   .dc-dl-edit:hover {{ text-decoration: underline; }}
@@ -13668,9 +13678,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .id-status-badge.id-missing {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .paperwork-note-line {{ margin-top: 4px; }}
   .paperwork-note.buy-side {{ font-size: 11px; font-weight: 600; color: var(--qp); }}
-  .paperwork-note.needed {{ font-size: 11px; font-weight: 600; color: var(--accredited); text-decoration: none; }}
+  .paperwork-note.needed {{ font-size: 11px; font-weight: 600; color: #C2410C; text-decoration: none; }}
   .paperwork-note.needed:hover {{ text-decoration: underline; }}
-  .id-status-badge.id-needed {{ background: rgba(201,162,39,0.15); color: var(--accredited); text-decoration: none; }}
+  .id-status-badge.id-needed {{ background: #FDF0E9; color: #C2410C; text-decoration: none; }}
   .engagement-badge {{
     display: inline-block;
     font-size: 12px;
@@ -13681,7 +13691,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     text-decoration: none;
   }}
   .engagement-badge.engaged {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
-  .engagement-badge.in-process {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .engagement-badge.in-process {{ background: #FDF0E9; color: #C2410C; }}
   .engagement-badge.not-engaged {{ background: rgba(178,59,59,0.12); color: #b23b3b; }}
   .engagement-badge.not-engaged:hover {{ text-decoration: underline; }}
   .update-cancel-btn {{
@@ -13713,7 +13723,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     border-radius: 999px;
     padding: 3px 9px;
   }}
-  .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: var(--accredited); }}
+  .status-chip.stalled {{ background: #FDF0E9; color: #C2410C; }}
   .status-chip.exit {{ background: rgba(178,59,59,0.15); color: #b23b3b; }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   .status-chip.won {{ background: var(--qp); color: #fff; }}
@@ -13732,14 +13742,14 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .tier-badge-line {{ margin-top: 4px; }}
   tr.grouped-row {{ box-shadow: inset 3px 0 0 var(--line); }}
   .gg-note {{
-    color: var(--accredited);
+    color: #C2410C;
     font-size: 13px;
     margin: 0 0 10px;
   }}
   tr.pending-row {{ opacity: 0.85; }}
   .pending-block .action-chip {{ display: inline-block; font-size: 11px; font-weight: 700; line-height: 1.3;
                                  padding: 3px 9px; border-radius: 12px; text-decoration: none; margin: 0 4px 4px 0;
-                                 background: rgba(201,162,39,0.15); color: var(--accredited, #8a6d1f); }}
+                                 background: #FDF0E9; color: #C2410C; }}
   .pending-awaiting {{ font-size: 12px; color: var(--muted); }}
   tr.closed-out-row {{ opacity: 0.7; }}
   tr.closed-out-row-won {{ opacity: 1; background: rgba(31,122,77,0.08); }}
@@ -13794,7 +13804,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
      carries the Stalled/Passed/Withdrawn state itself (glanceable
      border+tint) whenever it's the only place that state shows — see
      _status_milestones_column_html. */
-  select.ei-flag.flag-stalled {{ border-color: #c9a227; background: rgba(201,162,39,0.15); color: #8a6d1f; }}
+  select.ei-flag.flag-stalled {{ border-color: #C2410C; background: #FDF0E9; color: #C2410C; }}
   select.ei-flag.flag-exit {{ border-color: var(--muted); background: rgba(22,24,29,0.06); }}
   textarea.ei-notes {{
     resize: vertical;
@@ -14822,7 +14832,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     border-radius: 999px;
     padding: 3px 9px;
   }}
-  .status-chip.stalled {{ background: rgba(201,162,39,0.15); color: #8a6d1f; }}
+  .status-chip.stalled {{ background: #FDF0E9; color: #C2410C; }}
   .status-chip.exit {{ background: rgba(178,59,59,0.15); color: #b23b3b; }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
   /* "About the firm" card: description is admin-only for now (a
@@ -15861,6 +15871,10 @@ def _standing_card_html(items, heading="Client standing"):
             f'<ul style="list-style:none;margin:0;padding:0;position:relative">{rows}</ul></div>')
 
 
+# Site palette: warnings/cautions (Not set, deadline countdown, paperwork
+# needed, Held, Stalled, nudges) = orange WARN #C2410C on #FDF0E9 (L* 46);
+# status gold = ACCREDITED pill #C9A227 / gold star (L* 68); QP + green
+# star = #1f7a4d (L* 45). Gold is never used for a warning.
 STANDING_STAR_STYLE = {
     # star -> (fill colour, title/aria-label). Nothing else is ever shown.
     "gold": ("#C9A227", "Proven"),
@@ -16548,7 +16562,7 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600&display=swap" rel="stylesheet">
 <style>
-  :root { --ink: #16181d; --muted: #6b7280; --line: #ececea; --amber: #a15c07; --amber-bg: #fdf3e1;
+  :root { --ink: #16181d; --muted: #6b7280; --line: #ececea; --amber: #C2410C; --amber-bg: #FDF0E9;
           --green: #1f7a4d; --green-bg: #e7f5ec; --red: #b91c1c; --accent: #3d5a73; }
   body { margin: 0; background: #ffffff; color: var(--ink); padding: 32px 20px 64px;
          font: 400 14px/1.45 "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
@@ -17439,7 +17453,7 @@ STANDING_IMPORT_PAGE_HTML = """<!DOCTYPE html>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,600&display=swap" rel="stylesheet">
 <style>
-  :root { --ink: #16181d; --muted: #6b7280; --line: #ececea; --amber: #a15c07; --amber-bg: #fdf3e1;
+  :root { --ink: #16181d; --muted: #6b7280; --line: #ececea; --amber: #C2410C; --amber-bg: #FDF0E9;
           --green: #1f7a4d; --green-bg: #e7f5ec; --red: #b91c1c; --accent: #3d5a73; }
   body { margin: 0; background: #ffffff; color: var(--ink); padding: 32px 20px 64px;
          font: 400 14px/1.45 "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
