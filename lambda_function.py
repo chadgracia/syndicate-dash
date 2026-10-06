@@ -2130,7 +2130,7 @@ def _build_table():
         cf = rec.get("custom_fields") or {}
         tier_by_id[str(pid)] = classify_person(cf)
         ticket_by_id[str(pid)] = get_person_ticket_range(cf)
-        updated_dt = _parse_dt(rec.get("updated_at"))
+        updated_dt = _parse_pipeline_ts(rec.get("updated_at"))
         updated_ts_by_id[str(pid)] = updated_dt.timestamp() if updated_dt is not None else None
 
     buy = _interest_buy_map()
@@ -11363,7 +11363,7 @@ def _intro_last_update_epoch(deal, entry):
     override, notes, milestones, stage/deadline overrides) or the deal's
     own Pipeline updated_at."""
     stamps = [_intro_entry_freshness(entry or {})]
-    dt = _parse_dt(deal.get("updated_at"))
+    dt = _parse_pipeline_ts(deal.get("updated_at"))
     if dt:
         stamps.append(dt.timestamp())
     return max(stamps)
@@ -12515,7 +12515,7 @@ def _buyer_tile_html(buyer, anon_key_email, now, is_admin=False, buyer_name=None
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<div class="buyer-range">{_esc(range_text)}</div>' if range_text else ""
 
-    dt = _parse_dt(buyer["updated_at"])
+    dt = _parse_pipeline_ts(buyer["updated_at"])
     recent = bool(dt and (now - dt).days <= 365)
     dot_cls = "buyer-dot filled" if recent else "buyer-dot"
     dot_title = "Active within 12 months" if recent else "No recent activity"

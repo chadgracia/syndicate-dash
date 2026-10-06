@@ -1321,6 +1321,29 @@ _card2 = lf._deal_card_html(_sot_deal(_pl_after), "SOT Co", _sot_override)
 check("Deal Details card shows Pipeline's values when Pipeline's real-format updated_at is after the save",
       f"{_pipe_dl.strftime('%b')} {_pipe_dl.day}, {_pipe_dl.year}" in _card2 and "3(c)(1)</span>" in _card2)
 
+# Other Pipeline updated_at readers use the same real format
+_real = "2026/10/05 14:03:22 -0400"
+_real_epoch = datetime(2026, 10, 5, 18, 3, 22, tzinfo=timezone.utc).timestamp()
+check("intro last-update time reads Pipeline's real updated_at format",
+      lf._intro_last_update_epoch({"updated_at": _real}, {}) == _real_epoch)
+
+_tile_buyer = {"tier": "qp", "ticket_range": (None, None), "person_id": 99001, "iqf_pending": False}
+_recent_real = _pl_ts(_now_dt - timedelta(days=30))
+_old_real = _pl_ts(_now_dt - timedelta(days=500))
+_tile_recent = lf._buyer_tile_html(dict(_tile_buyer, updated_at=_recent_real), "x@example.com", _now_dt)
+_tile_old = lf._buyer_tile_html(dict(_tile_buyer, updated_at=_old_real), "x@example.com", _now_dt)
+check("buyer tile 'Active within 12 months' dot reads people's real updated_at format",
+      'class="buyer-dot filled"' in _tile_recent and "Active within 12 months" in _tile_recent
+      and 'class="buyer-dot filled"' not in _tile_old and "No recent activity" in _tile_old)
+
+use_fixture({"people.json": {"people": [{"id": 99002, "full_name": "Real Fmt", "email": "rf@example.com",
+                                          "updated_at": "2026/09/14 09:30:00 -0400", "custom_fields": {}}]},
+             "interest_people.json": {"buy": {"RealFmt Co": [99002]}}, "deals.json": {"deals": []}})
+_rf_row = next((r for r in lf.get_company_table() if r["company"] == "RealFmt Co"), {})
+check("Demand Board latest interest reads people's real updated_at format",
+      _rf_row.get("latest_interest_display") == "Sep 2026"
+      and _rf_row.get("latest_interest_ts") == int(datetime(2026, 9, 14, 13, 30, tzinfo=timezone.utc).timestamp()))
+
 # ======================================================================
 # SECTION: Active Intros — layout, status restrictions, sort/grouping,
 # pending note, empty state
