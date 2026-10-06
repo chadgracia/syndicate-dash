@@ -8328,7 +8328,8 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
     (_anon_buyer_code, classify_person/TIER_LABELS, get_person_ticket_range/
     _fmt_ticket_range, .buyer-code/.tier-badge/.buyer-range) as the Buyer
     Demand tiles. No name, company, email, or phone is ever looked up or
-    written here."""
+    written here -- and no standing (star, label, tooltip) or closer note:
+    before an introduction sellers see only the QP/ACCREDITED pill."""
     if not buyer_recs:
         return "—"
     blocks = []
@@ -8344,7 +8345,7 @@ def _pending_buyer_cell_html(buyer_recs, anon_key_email):
         blocks.append(
             f'<div class="pending-buyer">'
             f'<span class="buyer-code">Buyer {_esc(code)}</span> '
-            f'{tier_html}{_standing_star_for(pid)}'
+            f'{tier_html}'
             f'{range_html}</div>'
         )
     return "".join(blocks)
@@ -14519,8 +14520,9 @@ def _buyer_page_anonymized_html(rec, anon_key_email, buyer_id):
     min_v, max_v = get_person_ticket_range(cf)
     range_text = _fmt_ticket_range(min_v, max_v)
     range_html = f'<div class="buyer-page-row">{_esc(range_text)}</div>' if range_text else ""
-    star_html = _standing_star_for(buyer_id)
-    tier_row = f'<div class="buyer-page-row">{tier_html}{star_html}</div>' if (tier_html or star_html) else ""
+    # Pre-introduction: the QP/ACCREDITED pill only -- no standing star,
+    # label, tooltip or closer note.
+    tier_row = f'<div class="buyer-page-row">{tier_html}</div>' if tier_html else ""
     return (f'<div class="card"><div class="buyer-page-code">Buyer {_esc(code)}</div>'
             f'{tier_row}{range_html}'
             f'<div class="buyer-page-note">Identity available after introduction.</div></div>')

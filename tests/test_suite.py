@@ -9394,14 +9394,30 @@ check("colors: no warning still uses the old gold/amber; ACCREDITED pill + gold 
       and _col_src.count(".tier-badge.tier-accredited {{ background: #c9a227; }}") == 3
       and lf.STANDING_STAR_STYLE["gold"][0] == "#C9A227" and lf.STANDING_STAR_STYLE["green"][0] == "#1f7a4d"
       and ".tier-badge.tier-qp {{ background: var(--qp); }}" in _col_src)
-check("anonymous buyer page: Bob (respond repair) -> yellow 'In progress' star, no card",
-      'class="gs-star" role="img" title="In progress" aria-label="In progress"' in _st_anon
-      and "Client standing" not in _st_anon)
-_st_pb = re.search(r'<div class="pending-buyer">(.*?)</div>', _st_pend, re.S)
-check("pending cell: star sits right after the Buyer code and tier pill",
-      _st_pb is not None and 'title="In progress"' in _st_pb.group(1)
-      and _st_pb.group(1).find("Buyer ") < _st_pb.group(1).find("gs-star")
-      and ("tier" not in _st_pb.group(1) or _st_pb.group(1).rfind("tier") < _st_pb.group(1).find("gs-star")))
+# Before an introduction sellers see only the QP/ACCREDITED pill: nothing
+# that reveals standing (star, label, tooltip, colour) or a closer note.
+_PRE_INTRO_LEAKS = ("gs-star", "gs-alert", "bd-key-star", "<svg", "Proven", "Ready to transact", "In progress",
+                    "Missed", "closer", "Firm has closed", "closed-dot", "Client standing", "standing",
+                    "#C9A227", "#E9B949", "Prefers not")
+def _pre_intro_clean(fragment):
+    return not any(t in fragment for t in _PRE_INTRO_LEAKS)
+def _pending_divs(html_text):
+    return re.findall(r'<div class="pending-buyer">(.*?)</div>', html_text, re.S)
+def _anon_card(html_text):
+    m = re.search(r'<div class="card"><div class="buyer-page-code">.*?Identity available after introduction\.</div></div>',
+                  html_text, re.S)
+    return m.group(0) if m else None
+check("anonymous buyer page (Bob, respond repair): no star, label, tooltip or closer note; card still renders",
+      _anon_card(_st_anon) is not None and _pre_intro_clean(_anon_card(_st_anon)) and "Client standing" not in _st_anon)
+check("pending-introduction cells (Active Intros): Buyer code (+ pill) only, no standing of any kind",
+      _pending_divs(_st_pend) and all(_pre_intro_clean(d) and "Buyer " in d for d in _pending_divs(_st_pend)))
+_pb_qp = lf._pending_buyer_cell_html([{"id": 2, "custom_fields": {lf.INVESTOR_LEVEL_FIELD: [lf.QP_ID]}}], "x@example.com")
+_anon_qp = lf._buyer_page_anonymized_html({"custom_fields": {lf.INVESTOR_LEVEL_FIELD: [lf.QP_ID]}}, "x@example.com", 2)
+check("company page pending (pre-introduction) buyer rows: no standing of any kind",
+      all(_pre_intro_clean(d) for d in _pending_divs(_st_tiles)))
+check("pre-introduction surfaces keep the QP / ACCREDITED pill",
+      'class="tier-badge tier-qp"' in _pb_qp and 'class="tier-badge tier-qp"' in _anon_qp
+      and _pre_intro_clean(_pb_qp) and _pre_intro_clean(_anon_qp))
 check("tenant demand tiles: no stars at all (gold/green/yellow) and no '!'",
       len(_st_tile_divs) >= 2 and not any("gs-star" in d or "gs-alert" in d for d in _st_tile_divs))
 _qp_tile = lf._buyer_tile_html({"tier": "qp", "ticket_range": (None, None), "person_id": 99003, "updated_at": None},
@@ -9460,10 +9476,10 @@ def _st_noshare_checks(label, pages, explicit):
     surfaces show the opt-out text only after an explicit opt-out."""
     _tiles = pages["company page (demand tiles)"]
     _tile_divs = [seg.split("</div>\n    </div>")[0] for seg in _tiles.split('<div class="buyer-tile">')[1:]]
-    check(f"{label}: anonymous buyer page + Pending-introduction cell keep the star (share switch ignored)",
-          'title="In progress"' in pages["anonymous buyer page"]
-          and 'title="In progress"' in pages["active intros (pending cell)"]
-          and "Prefers not" not in pages["anonymous buyer page"] and "Prefers not" not in pages["active intros (pending cell)"])
+    check(f"{label}: anonymous buyer page + Pending-introduction cells show no standing (share switch ignored)",
+          _anon_card(pages["anonymous buyer page"]) is not None
+          and _pre_intro_clean(_anon_card(pages["anonymous buyer page"]))
+          and all(_pre_intro_clean(d) for d in _pending_divs(pages["active intros (pending cell)"])))
     check(f"{label}: tenant Buyer Demand tiles show no star (stars are admin-only there)",
           _tile_divs and not any("gs-star" in d or "Prefers not" in d for d in _tile_divs))
     check(f"{label}: disclosed buyer page has no card or star",
@@ -9534,10 +9550,11 @@ for _name, _html in _st_tenant_pages().items():
           and "prefers not to share" not in _html)
 _st_put({}, extra={"settings": {"sellers_visible": True, "buyers_visible": True}})
 _st_nr = _st_tenant_pages()
-check("no record (not hidden, never chose, old global setting ignored): no named card/star/text, anonymous surfaces keep the star",
+check("no record (not hidden, never chose, old global setting ignored): no named card/star/text, no anonymous star anywhere",
       all("Client standing" not in h and "Prefers not" not in h and "prefers not" not in h for h in _st_nr.values())
-      and "gs-star" not in _st_nr["disclosed buyer page"] and "gs-star" in _st_nr["anonymous buyer page"]
-      and "gs-star" in _st_nr["active intros (pending cell)"] and "gs-star" in _st_nr["company page (demand tiles)"])
+      and "gs-star" not in _st_nr["disclosed buyer page"] and "gs-star" not in _st_nr["anonymous buyer page"]
+      and all(_pre_intro_clean(d) for d in _pending_divs(_st_nr["active intros (pending cell)"]))
+      and "gs-star" not in _st_nr["company page (demand tiles)"])
 _st_s3.objs[lf.STANDING_KEY] = "not a dict"
 lf._data_cache.pop(lf.STANDING_KEY, None)
 _st_real_get = _st_s3.get_object
