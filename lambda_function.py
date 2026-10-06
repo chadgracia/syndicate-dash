@@ -12794,7 +12794,7 @@ def _buyer_tile_html(buyer, anon_key_email, is_admin=False, buyer_name=None, com
         code = _anon_buyer_code(anon_key_email, buyer["person_id"])
         return f"""<div class="buyer-tile">
       <div class="buyer-code">Buyer {_esc(code)}</div>
-      {tier_html}{_standing_star_for(buyer["person_id"])}
+      {tier_html}
       {range_html}
     </div>"""
 
@@ -12814,13 +12814,13 @@ def _buyer_tile_html(buyer, anon_key_email, is_admin=False, buyer_name=None, com
       </div>"""
     return f"""<div class="buyer-tile admin">
       {name_html}
-      {tier_html}
+      {tier_html}{_admin_standing_mark_html(buyer["person_id"])}
       {range_html}
       {controls_html}
     </div>"""
 
 
-def _buyer_demand_key_html():
+def _buyer_demand_key_html(admin=False):
     """One muted key line under the BUYER DEMAND heading, worded from the
     code's actual rules: stars = _standing_star_from_cs (gold: >= 1
     closed trade AND role-required onboarding forms done AND no missed
@@ -12834,15 +12834,16 @@ def _buyer_demand_key_html():
         return ('<span class="bd-key-star" aria-hidden="true">'
                 f'<svg viewBox="0 0 24 24" width="12" height="12"><path fill="{fill}" d="{STANDING_STAR_PATH}"/></svg>'
                 '</span>')
-    return ('<p class="bd-key">'
-            f'{key_star("gold")} Closed a trade, onboarding complete, keeps to terms'
-            '<span class="bd-key-sep">·</span>'
-            f'{key_star("green")} Keeps to terms and responds'
-            '<span class="bd-key-sep">·</span>'
-            f'{_tier_badge_html("qp")} Qualified purchaser'
-            '<span class="bd-key-sep">·</span>'
-            f'{_tier_badge_html("accredited")} Accredited investor or qualified client'
-            '</p>')
+    sep = '<span class="bd-key-sep">·</span>'
+    parts = []
+    if admin:
+        # Admin view only: tenants' tiles carry no stars at all.
+        parts += [f'{key_star("gold")} Closed a trade, onboarding complete, keeps to terms',
+                  f'{key_star("green")} Keeps to terms and responds',
+                  '<span class="bd-key-alert" aria-hidden="true">!</span> Missed terms or slow to respond (hover for reason)']
+    parts += [f'{_tier_badge_html("qp")} Qualified purchaser',
+              f'{_tier_badge_html("accredited")} Accredited investor']
+    return '<p class="bd-key">' + sep.join(parts) + '</p>'
 
 
 def _introduce_buyer_script_html(key):
@@ -13343,7 +13344,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
             )
         else:
             tiles_html = "".join(_buyer_tile_html(b, anon_key_email) for b in buyers)
-        buyer_demand_body = _buyer_demand_key_html() + f'<div class="buyer-grid">{tiles_html}</div>'
+        buyer_demand_body = _buyer_demand_key_html(admin=edit_mode) + f'<div class="buyer-grid">{tiles_html}</div>'
     else:
         buyer_demand_body = '<div class="gg-placeholder small">No buy interest recorded yet.</div>'
     introduce_script_html = _introduce_buyer_script_html(key) if (edit_mode and buyers) else ""
@@ -13481,6 +13482,9 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .bd-key .tier-badge {{ margin: 0 2px 0 0; font-size: 9.5px; padding: 1px 6px; vertical-align: middle; }}
   .bd-key-star {{ display: inline-flex; vertical-align: middle; margin-right: 2px; }}
   .bd-key-sep {{ margin: 0 8px; }}
+  .bd-key-alert {{ display: inline-flex; align-items: center; justify-content: center; vertical-align: middle;
+                   width: 12px; height: 12px; border-radius: 50%; background: #C2410C; color: #fff;
+                   font-size: 9px; font-weight: 700; line-height: 1; margin-right: 2px; }}
   .buyer-tile {{
     background: var(--card);
     border: 1px solid var(--line);
@@ -15936,6 +15940,45 @@ def _standing_star_html(star):
 
 def _standing_star_for(pid, named=False):
     return _standing_star_html(standing_star(pid, named=named))
+
+
+# Admin-only Buyer Demand mark: the gold/green star as usual, but the
+# yellow "In progress" state becomes a small orange "!" whose tooltip names
+# the reason (missed terms / slow to respond). Hidden clients: nothing.
+ADMIN_ALERT_COLOR = "#C2410C"
+
+
+def _admin_standing_alert_reason(standing_record):
+    reasons = []
+    if standing_record.get("terms_repair"):
+        reasons.append("Missed agreed terms")
+    if standing_record.get("respond_repair"):
+        reasons.append("Slow to respond")
+    return "; ".join(reasons) or "Needs attention"
+
+
+def _admin_alert_html(reason):
+    return (f'<span class="gs-alert" role="img" title="{_esc(reason)}" aria-label="{_esc(reason)}" '
+            f'style="display:inline-flex;align-items:center;justify-content:center;vertical-align:middle;'
+            f'margin-left:6px;width:13px;height:13px;border-radius:50%;background:{ADMIN_ALERT_COLOR};'
+            f'color:#fff;font-size:10px;font-weight:700;line-height:1">!</span>')
+
+
+def _admin_standing_mark_html(pid):
+    try:
+        state = _load_client_standing()
+        if state is None:
+            return ""
+        cs = compute_client_standing(pid, state=state)
+        star = _standing_star_from_cs(cs)
+    except Exception as e:
+        print(f"client-standing admin mark failed: {type(e).__name__}: {e}")
+        return ""
+    if star == "yellow":
+        return _admin_alert_html(_admin_standing_alert_reason(cs["record"]))
+    if star in ("gold", "green"):
+        return _standing_star_html(star)
+    return ""
 
 
 def _standing_buyer_page_card_html(person_id, admin):

@@ -9369,11 +9369,17 @@ _bd_key = lf._buyer_demand_key_html()
 check("Buyer Demand key: one muted line under the heading, before the tiles",
       _st_tiles.count('<p class="bd-key">') == 1
       and _st_tiles.find(">Buyer Demand</h2>") < _st_tiles.find('<p class="bd-key">') < _st_tiles.find('class="buyer-grid"'))
-check("Buyer Demand key: gold/green stars, QP and Accredited pills, wording from the code's rules",
-      all(t in _bd_key for t in ("Closed a trade, onboarding complete, keeps to terms", "Keeps to terms and responds",
-                                 "Qualified purchaser", "Accredited investor or qualified client"))
-      and 'class="tier-badge tier-qp"' in _bd_key and 'class="tier-badge tier-accredited"' in _bd_key
-      and lf.STANDING_STAR_STYLE["gold"][0] in _bd_key and lf.STANDING_STAR_STYLE["green"][0] in _bd_key)
+_bd_key_admin = lf._buyer_demand_key_html(admin=True)
+check("Buyer Demand key (tenant): only 'QP Qualified purchaser · ACCREDITED Accredited investor', no stars",
+      'class="tier-badge tier-qp"' in _bd_key and "Qualified purchaser" in _bd_key
+      and 'class="tier-badge tier-accredited"' in _bd_key and "Accredited investor<" in _bd_key
+      and "qualified client" not in _bd_key and "bd-key-star" not in _bd_key and "bd-key-alert" not in _bd_key
+      and _bd_key.index("Qualified purchaser") < _bd_key.index("Accredited investor"))
+check("Buyer Demand key (admin view): gold + green stars and the orange '!' too, then QP / Accredited",
+      all(t in _bd_key_admin for t in ("Closed a trade, onboarding complete, keeps to terms", "Keeps to terms and responds",
+                                       "Missed terms or slow to respond", "Qualified purchaser", "Accredited investor"))
+      and lf.STANDING_STAR_STYLE["gold"][0] in _bd_key_admin and lf.STANDING_STAR_STYLE["green"][0] in _bd_key_admin
+      and 'class="bd-key-alert"' in _bd_key_admin and lf.STANDING_STAR_STYLE["yellow"][0] not in _bd_key_admin)
 check("Buyer Demand key never uses a buyer standing marker (gs-star) or any buyer data",
       "gs-star" not in _bd_key and "Buyer " not in _bd_key)
 _col_src = open(lf.__file__).read()
@@ -9394,9 +9400,21 @@ check("pending cell: star sits right after the Buyer code and tier pill",
       _st_pb is not None and 'title="In progress"' in _st_pb.group(1)
       and _st_pb.group(1).find("Buyer ") < _st_pb.group(1).find("gs-star")
       and ("tier" not in _st_pb.group(1) or _st_pb.group(1).rfind("tier") < _st_pb.group(1).find("gs-star")))
-check("demand tiles: star next to the tier pill (Bob yellow, Ivy green)",
-      len(_st_tile_divs) >= 2 and any('title="In progress"' in d for d in _st_tile_divs)
-      and any('title="Ready to transact"' in d for d in _st_tile_divs))
+check("tenant demand tiles: no stars at all (gold/green/yellow) and no '!'",
+      len(_st_tile_divs) >= 2 and not any("gs-star" in d or "gs-alert" in d for d in _st_tile_divs))
+_qp_tile = lf._buyer_tile_html({"tier": "qp", "ticket_range": (None, None), "person_id": 99003, "updated_at": None},
+                               "x@example.com")
+check("tenant demand tile keeps the QP / ACCREDITED pill", 'class="tier-badge tier-qp"' in _qp_tile)
+_st_admin_tiles = _st_get({"company": "Gamma Co", "key": ADMIN_KEY})["body"]
+_st_admin_divs = [seg.split("</div>\n    </div>")[0] for seg in _st_admin_tiles.split('<div class="buyer-tile admin">')[1:]]
+check("admin demand tiles: green star kept; yellow 'In progress' replaced by an orange '!' with the reason",
+      any('title="Ready to transact"' in d for d in _st_admin_divs)
+      and any('class="gs-alert"' in d and 'title="Slow to respond"' in d and ">!</span>" in d for d in _st_admin_divs)
+      and not any('title="In progress"' in d for d in _st_admin_divs)
+      and 'class="bd-key-alert"' in _st_admin_tiles)
+check("admin '!' reason names every repair present",
+      lf._admin_standing_alert_reason({"terms_repair": 2, "respond_repair": 1}) == "Missed agreed terms; Slow to respond"
+      and lf._admin_standing_alert_reason({"terms_repair": 2, "respond_repair": 0}) == "Missed agreed terms")
 check("anonymous surfaces: no check-mark ticks anywhere (the star replaced them)",
       all("gs-ticks" not in h and "Good standing" not in h for h in (_st_anon, _st_pend, _st_tiles)))
 for _star in ("gold", "green", "yellow", "noshare"):
@@ -9438,9 +9456,8 @@ def _st_noshare_checks(label, pages, explicit):
           'title="In progress"' in pages["anonymous buyer page"]
           and 'title="In progress"' in pages["active intros (pending cell)"]
           and "Prefers not" not in pages["anonymous buyer page"] and "Prefers not" not in pages["active intros (pending cell)"])
-    check(f"{label}: Buyer Demand tiles still show the anonymous star (share switch ignored)",
-          any('title="In progress"' in d for d in _tile_divs) and any('title="Ready to transact"' in d for d in _tile_divs)
-          and not any("Prefers not" in d for d in _tile_divs))
+    check(f"{label}: tenant Buyer Demand tiles show no star (stars are admin-only there)",
+          _tile_divs and not any("gs-star" in d or "Prefers not" in d for d in _tile_divs))
     check(f"{label}: disclosed buyer page has no card or star",
           ">Client standing<" not in pages["disclosed buyer page"] and "gs-star" not in pages["disclosed buyer page"]
           and "gs-ticks" not in pages["disclosed buyer page"])
