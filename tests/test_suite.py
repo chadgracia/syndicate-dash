@@ -7880,6 +7880,16 @@ _pf_slim_rec = next(r for r in _pf_s3.objs[lf.PEOPLE_SLIM_KEY]["people"] if r["i
 check("perf: slim records keep only used fields (no internal summary, no unreferenced custom fields)",
       "summary" not in _pf_slim_rec and _pf_slim_rec["full_name"] == "Pat Perf"
       and lf.CEF_FIELD in _pf_slim_rec["custom_fields"] and "custom_label_9999999" not in _pf_slim_rec["custom_fields"])
+# CRMDealDetails reads CEF + IQF Status per person from people-slim.json (Seller KYC / Buyer accreditation).
+_slim_cf = lf._slim_person({"id": 1, "custom_fields": {"custom_label_3796440": 6600515,
+                                                       "custom_label_3763008": [6496840]}})["custom_fields"]
+_slim_none = lf._slim_person({"id": 2, "custom_fields": {"custom_label_3759163": 6484810}})
+_slim_nocf = lf._slim_person({"id": 3})
+check("slim: CEF (3796440) and IQF Status (3763008) are kept raw for downstream readers",
+      {"custom_label_3796440", "custom_label_3763008"} <= lf.PEOPLE_SLIM_CUSTOM_FIELDS
+      and _slim_cf == {"custom_label_3796440": 6600515, "custom_label_3763008": [6496840]})
+check("slim: a person without CEF/IQF simply omits them (no nulls, no crash, no custom_fields invented)",
+      _slim_none["custom_fields"] == {"custom_label_3759163": 6484810} and _slim_nocf == {"id": 3})
 _pf_gets.clear()
 _pf_r2, _pf_l2 = _pf_req({"tab": "mydeals"})
 check("perf: a repeat request with unchanged versions re-parses nothing (no S3 GET at all)",
