@@ -6247,8 +6247,8 @@ def _send_tenant_est_val_email(tenant_email, deal, deal_id, old_b, new_b):
 
 
 def _send_net_price_email(actor, deal, deal_id, old_net, new_net, old_gross):
-    """SES note to Chad on EVERY Net price change (seller, admin Tenant view
-    or admin), so he can set the new gross. Best-effort; never raises."""
+    """SES note to Chad on every real seller Net price change (never his own
+    admin-key saves), so he can set the new gross. Best-effort; never raises."""
     company = _deal_company_name(deal) or _deal_title(deal)
     body = (f"{actor} changed the net price on {_deal_title(deal)}.\n"
             f"Net price: {_fmt_price_2dp(old_net)} \u2192 {_fmt_price_2dp(new_net)}\n"
@@ -18476,9 +18476,10 @@ def _handle_update_intro(event):
                                "display": _deal_deadline_display_html(deadline),
                                "overdue": _deadline_is_overdue(deadline)})
     if net_price is not None:
-        # Every net change emails Chad (real sellers, Tenant view and admin
-        # alike) so he can set the new gross.
-        _send_net_price_email(actor, deal, deal_id, old_net, net_price, old_gross)
+        # Email Chad only for a real seller session -- never for his own
+        # admin-key saves (Admin view or Tenant-view preview).
+        if not is_admin and impersonated_actor is None:
+            _send_net_price_email(actor, deal, deal_id, old_net, net_price, old_gross)
         return _json_response({"ok": True, "net_price": net_price, "display": _esc(_fmt_price_2dp(net_price)),
                                "input_value": f"{net_price:.2f}"})
     if tenant_est_val_edit:

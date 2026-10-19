@@ -1634,16 +1634,26 @@ check("net price refused: Buy deal (403), non-firm tenant (403), extra keys (403
 
 _r_np_imp = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": EV_EMAIL, "deal_id": "8811",
                                           "net_price": "33"}), None)
-check("admin Tenant view net save -> 200, audited as 'cgracia@… (as <tenant>)', email still fires",
+check("admin Tenant view net save -> 200, PUT clears gross, audited as 'cgracia@… (as <tenant>)', NO email",
       _r_np_imp["statusCode"] == 200
+      and len(ev_pipeline) == 1
+      and ev_pipeline[-1]["data"]["deal"]["custom_fields"] == {lf.NET_FIELD: 33.0, lf.GROSS_FIELD: None}
       and np_table.puts[-1].get("actor") == f"cgracia@rainmakersecurities.com (as {EV_EMAIL})"
-      and len(ses_calls) == 1)
-ses_calls.clear()
+      and np_table.puts[-1]["new"].get("net_price") == lf.Decimal("33.0")
+      and not ses_calls)
+ses_calls.clear(); ev_pipeline.clear()
 _r_np_adm = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "8811", "net_price": "34.1"}), None)
-check("Admin view net save -> 200, actor admin, PUT clears gross, email fires",
+check("Admin view net save -> 200, actor admin, PUT clears gross, audit written, NO email",
       _r_np_adm["statusCode"] == 200 and np_table.puts[-1].get("actor") == "admin"
+      and len(ev_pipeline) == 1
       and ev_pipeline[-1]["data"]["deal"]["custom_fields"] == {lf.NET_FIELD: 34.1, lf.GROSS_FIELD: None}
-      and len(ses_calls) == 1)
+      and np_table.puts[-1]["new"].get("net_price") == lf.Decimal("34.1")
+      and not ses_calls)
+ses_calls.clear(); ev_pipeline.clear()
+_r_np_ten2 = _ev_post({"deal_id": "8811", "net_price": "34.5"})
+check("tenant net save after admin saves still emails Chad (every real seller change)",
+      _r_np_ten2["statusCode"] == 200 and len(ev_pipeline) == 1 and len(ses_calls) == 1
+      and np_table.puts[-1].get("actor") == EV_EMAIL)
 
 lf.urllib.request.urlopen = _ev_urlopen_fail
 np_table.updates.clear(); np_table.puts.clear(); ses_calls.clear()
