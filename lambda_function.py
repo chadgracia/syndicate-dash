@@ -4632,7 +4632,8 @@ def _intro_entry_freshness(entry):
     """Latest timestamp an intro entry carries -- decides which copy wins
     when the same deal_id turns up in more than one team partition."""
     stamps = [entry.get(k) for k in ("notes_updated_at", "override_at", "stage_override_at",
-                                     "deadline_override_at", "exemption_override_at", "est_val_override_at")]
+                                     "deadline_override_at", "exemption_override_at", "est_val_override_at",
+                                     "net_override_at")]
     stamps += list((entry.get("milestones") or {}).values())
     best = 0.0
     for v in stamps:
@@ -4724,6 +4725,8 @@ def _intro_entry_from_item(item):
         "exemption_override_at": item.get("exemption_override_at"),
         "est_val_override": item.get("est_val_override"),
         "est_val_override_at": item.get("est_val_override_at"),
+        "net_override": item.get("net_override"),
+        "net_override_at": item.get("net_override_at"),
         "stage_override": item.get("stage_override"),
         "stage_override_at": item.get("stage_override_at"),
         "milestones": item.get("milestones") or {},
@@ -6243,6 +6246,30 @@ def _send_tenant_est_val_email(tenant_email, deal, deal_id, old_b, new_b):
         return False
 
 
+def _send_net_price_email(actor, deal, deal_id, old_net, new_net, old_gross):
+    """SES note to Chad on EVERY Net price change (seller, admin Tenant view
+    or admin), so he can set the new gross. Best-effort; never raises."""
+    company = _deal_company_name(deal) or _deal_title(deal)
+    body = (f"{actor} changed the net price on {_deal_title(deal)}.\n"
+            f"Net price: {_fmt_price_2dp(old_net)} \u2192 {_fmt_price_2dp(new_net)}\n"
+            f"Gross price cleared (was {_fmt_price_2dp(old_gross)}) -- please set the new gross.\n"
+            f"Changed by: {actor}\n"
+            f"Pipeline deal: {PIPELINE_DEAL_URL.format(deal_id)}\n"
+            f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n")
+    try:
+        ses = boto3.client("ses", region_name="us-east-1")
+        ses.send_email(
+            Source=DEAL_STAGE_EMAIL_FROM,
+            Destination={"ToAddresses": [DEAL_STAGE_EMAIL_TO]},
+            Message={"Subject": {"Data": f"Net price changed: {company} {deal_id}"},
+                     "Body": {"Text": {"Data": body}}},
+        )
+        return True
+    except Exception as e:
+        print(f"net price email failed (non-fatal): {type(e).__name__}: {e}")
+        return False
+
+
 # Tenant deadline self-edit (Deal Details card): the request may carry ONLY
 # these keys; the date must be on or after "today" anywhere in the US
 # (UTC minus TENANT_DEADLINE_TZ_SLACK_HOURS), so an evening edit in
@@ -6255,7 +6282,7 @@ ADMIN_IMPERSONATION_EMAIL = "cgracia@rainmakersecurities.com"
 TENANT_DEADLINE_IMPERSONATION_KEYS = TENANT_DEADLINE_ALLOWED_KEYS | {"key", "view_as"}
 # Card fields a seller may self-edit; a request carries exactly ONE of them
 # (plus deal_id, and key/view_as for admin Tenant view) -- nothing else.
-TENANT_SELF_EDIT_FIELDS = ("deadline", "est_valuation")
+TENANT_SELF_EDIT_FIELDS = ("deadline", "est_valuation", "net_price")
 
 
 def _tenant_self_edit_field(body, extra_keys=()):
@@ -6766,6 +6793,31 @@ def _pipeline_update_deal_est_val(deal_id, billions):
     if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
         return False, "Pipeline API credentials not configured"
     body = json.dumps({"deal": {"custom_fields": {EST_VAL_FIELD: billions}}}).encode("utf-8")
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(
+        f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
+        data=body, method="PUT",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _pipeline_update_deal_net_price(deal_id, net):
+    """PUT Net price AND clear Gross price (null) in ONE request -- Chad's
+    rule: a seller's net change clears gross, Chad sets gross himself.
+    Gross is never computed. Returns (ok, error); abort on any non-2xx."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    body = json.dumps({"deal": {"custom_fields": {NET_FIELD: net, GROSS_FIELD: None}}}).encode("utf-8")
     qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
     req = urllib.request.Request(
         f"{PIPELINE_API_BASE}/deals/{deal_id}.json?{qs}",
@@ -7381,7 +7433,7 @@ def _seller_email_order(index):
 
 def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
                                 old_values, actor, milestones=None, loss_reason_shared=None, notes_history=None,
-                                history_entry=None, exemption=None, est_val=None):
+                                history_entry=None, exemption=None, est_val=None, net_price=None):
     """Update the intro item's Dynamo-owned attributes (status_override/
     override_at when status_id is not None, next_steps/notes/follow_up
     when they are not None, deadline_override/deadline_override_at when
@@ -7457,6 +7509,17 @@ def _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, not
         update_parts.append("est_val_override_at = :evoa")
         expr_values[":evoa"] = int(now)
         new_values["est_valuation"] = Decimal(str(est_val))
+    if net_price is not None:
+        # Net price card edit: the same PUT cleared Pipeline's gross, so the
+        # overlay blanks gross too until Pipeline catches up.
+        update_parts.append("net_override = :npo")
+        expr_values[":npo"] = Decimal(str(net_price))
+        update_parts.append("net_override_at = :npoa")
+        expr_values[":npoa"] = int(now)
+        new_values["net_price"] = Decimal(str(net_price))
+        new_values["gross_price"] = None
+        new_values["gross_cleared"] = True
+        new_values["at"] = datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
     if loss_reason_shared is not None:
         update_parts.append("loss_reason_shared = :lrs")
         expr_values[":lrs"] = bool(loss_reason_shared)
@@ -8076,23 +8139,166 @@ def _fmt_price_2dp(v):
     return "—" if v is None else f"${v:,.2f}"
 
 
-def _deal_price_cell(deal):
+def _net_override_current(deal, override_entry):
+    if not override_entry:
+        return False
+    ov_at = override_entry.get("net_override_at")
+    return override_entry.get("net_override") is not None and bool(ov_at) and _override_is_current(deal, ov_at)
+
+
+def _resolve_deal_net(deal, override_entry=None):
+    """Net price 3064369; a card save's Dynamo net_override bridges until
+    Pipeline catches up (_override_is_current, newer-wins)."""
+    val = _deal_cf_number(deal, NET_FIELD)
+    if _net_override_current(deal, override_entry):
+        try:
+            val = float(override_entry.get("net_override"))
+        except (TypeError, ValueError):
+            pass
+    return val
+
+
+def _resolve_deal_gross(deal, override_entry=None):
+    """Gross price 3064339; blank while a net card save is current (that
+    save cleared gross in Pipeline -- Chad sets the new one)."""
+    if _net_override_current(deal, override_entry):
+        return None
+    return _deal_cf_number(deal, GROSS_FIELD)
+
+
+_NET_PRICE_RE = re.compile(r"^\d+(\.\d{1,2})?$|^\.\d{1,2}$")
+
+
+def _parse_net_price_input(raw):
+    """"110.25" / "$110.25" / "1,250" -> float; None unless a positive
+    number with at most 2 decimals."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    text = str(raw).strip().replace(",", "").replace(" ", "")
+    if text.startswith("$"):
+        text = text[1:]
+    if not _NET_PRICE_RE.match(text):
+        return None
+    val = round(float(text), 2)
+    return val if val > 0 else None
+
+
+NET_PRICE_INFO_TEXT = ("Net price is the price per share (or unit) the seller receives. For a new allocation, "
+                       "this should match the round's price per share. It never includes one-time fees, upfront "
+                       "management fees, or broker commissions — those are handled separately.")
+NET_PRICE_INVALID_MSG = "Enter a price per share greater than $0, like 110.25 (up to 2 decimals)."
+
+
+def _net_price_info_html():
+    """The ⓘ next to the NET PRICE label; tap/click toggles the popover."""
+    return (f'<button type="button" class="dc-info" aria-label="What is net price?" aria-expanded="false">'
+            f'&#9432;</button><span class="dc-info-pop" role="tooltip" hidden>{_esc(NET_PRICE_INFO_TEXT)}</span>')
+
+
+def _net_price_editor_html(deal_id, net, display_html, admin_key=None, view_as=None):
+    """Sell-deal NET PRICE self-edit: value + "Edit" ("Set price" when
+    blank) like the valuation/deadline editors; the form repeats the
+    popover copy above the input. TENANT_NET_PRICE_SCRIPT posts
+    ?action=update_intro {deal_id, net_price} (+ key/view_as)."""
+    label = "Edit" if net is not None else "Set price"
+    current = f"{net:.2f}" if net is not None else ""
+    attrs = f' data-key="{_esc(admin_key)}"' if admin_key else ""
+    if admin_key and view_as:
+        attrs += f' data-view-as="{_esc(view_as)}"'
+    return (f'<span class="dc-np" data-deal-id="{_esc(deal_id)}"{attrs}>'
+            f'<span class="dc-np-view"><span class="dc-np-value">{display_html}</span>'
+            f'<a href="#" class="dc-np-edit">{label}</a></span>'
+            f'<span class="dc-np-form" hidden><span class="dc-np-help">{_esc(NET_PRICE_INFO_TEXT)}</span>'
+            f'<input type="text" class="dc-np-input" value="{_esc(current)}" '
+            f'placeholder="e.g. 110.25" inputmode="decimal" autocomplete="off">'
+            f'<button type="button" class="dc-np-save">Save</button>'
+            f'<button type="button" class="dc-np-cancel">Cancel</button></span>'
+            f'<span class="dc-np-msg" role="status"></span></span>')
+
+
+TENANT_NET_PRICE_SCRIPT = """<script>
+(function() {
+  document.querySelectorAll('.dc-info').forEach(function(btn) {
+    var pop = btn.parentNode.parentNode.querySelector('.dc-info-pop');
+    if (!pop) { return; }
+    btn.addEventListener('click', function(e) {
+      e.preventDefault(); e.stopPropagation();
+      var open = pop.hidden; pop.hidden = !open; btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    });
+    document.addEventListener('click', function(e) {
+      if (!pop.hidden && !pop.contains(e.target)) { pop.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
+    });
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') { pop.hidden = true; btn.setAttribute('aria-expanded', 'false'); }
+    });
+  });
+  var RE = /^\\$?\\s*(\\d{1,3}(,\\d{3})+|\\d+)?(\\.\\d{1,2})?$/;
+  document.querySelectorAll('.dc-np').forEach(function(box) {
+    var view = box.querySelector('.dc-np-view'), form = box.querySelector('.dc-np-form');
+    var input = box.querySelector('.dc-np-input'), msg = box.querySelector('.dc-np-msg');
+    var val = box.querySelector('.dc-np-value'), saveBtn = box.querySelector('.dc-np-save');
+    var orig = input.value;
+    function setMsg(t, cls) { msg.textContent = t; msg.className = 'dc-np-msg' + (cls ? ' ' + cls : ''); }
+    box.querySelector('.dc-np-edit').addEventListener('click', function(e) {
+      e.preventDefault(); input.value = orig; view.hidden = true; form.hidden = false; setMsg(''); input.focus();
+    });
+    box.querySelector('.dc-np-cancel').addEventListener('click', function() {
+      form.hidden = true; view.hidden = false; setMsg('');
+    });
+    input.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { e.preventDefault(); saveBtn.click(); }
+    });
+    saveBtn.addEventListener('click', function() {
+      var raw = input.value.trim();
+      if (!raw) { return; }
+      var n = RE.test(raw) ? parseFloat(raw.replace(/[$,\\s]/g, '')) : NaN;
+      if (!(n > 0)) { setMsg(%s, 'error'); return; }
+      saveBtn.disabled = true; setMsg('Saving\u2026');
+      var payload = { deal_id: box.getAttribute('data-deal-id'), net_price: raw };
+      if (box.getAttribute('data-key')) { payload.key = box.getAttribute('data-key'); }
+      if (box.getAttribute('data-view-as')) { payload.view_as = box.getAttribute('data-view-as'); }
+      fetch('?action=update_intro', {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }).then(function(r) {
+        return r.json().then(function(d) { return { ok: r.ok, d: d }; }, function() { return { ok: false, d: {} }; });
+      }).then(function(res) {
+        saveBtn.disabled = false;
+        if (res.ok) {
+          val.innerHTML = res.d.display || raw;
+          orig = res.d.input_value || raw;
+          box.querySelector('.dc-np-edit').textContent = 'Edit';
+          form.hidden = true; view.hidden = false; setMsg('Saved \u2713', 'saved');
+          setTimeout(function() { setMsg(''); }, 2500);
+        } else {
+          setMsg((res.d && res.d.error) || 'Could not save. Please try again.', 'error');
+        }
+      }).catch(function() { saveBtn.disabled = false; setMsg('Could not save. Please try again.', 'error'); });
+    });
+  });
+})();
+</script>""" % json.dumps(NET_PRICE_INVALID_MSG)
+
+
+def _deal_price_cell(deal, override_entry=None):
     """(label, value) for the Deal Details price cell: Buy deals GROSS
     PRICE (3064339), Sell deals NET PRICE (3064369). Display only --
     never derived from the other price, never the deal value."""
     if _deal_is_buy(deal):
-        return "Gross price", _fmt_price_2dp(_deal_cf_number(deal, GROSS_FIELD))
-    return "Net price", _fmt_price_2dp(_deal_cf_number(deal, NET_FIELD))
+        return "Gross price", _fmt_price_2dp(_resolve_deal_gross(deal, override_entry))
+    return "Net price", _fmt_price_2dp(_resolve_deal_net(deal, override_entry))
 
 
-def _dc_cell_html(label, value_html, extra_cls=""):
+def _dc_cell_html(label, value_html, extra_cls="", label_extra_html=""):
     cls = f"dc-cell {extra_cls}".strip()
-    return (f'<div class="{cls}"><span class="dc-label">{_esc(label)}</span>'
+    return (f'<div class="{cls}"><span class="dc-label">{_esc(label)}{label_extra_html}</span>'
             f'<span class="dc-value">{value_html}</span></div>')
 
 
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None, reopen_html="",
-                    tenant_deadline_edit=False, impersonation_key=None, impersonation_view_as=None):
+                    tenant_deadline_edit=False, impersonation_key=None, impersonation_view_as=None,
+                    admin_key=None):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
     render_company_page), used to resolve any deadline_override. edit_mode
@@ -8106,7 +8312,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     # Item 2 (company-page parity pass): a min-max RANGE here, not the
     # single largest-value figure row-level Size cells use.
     size_text = _dc_value_html(_deal_size_range_text(deal))
-    net_text = _dc_value_html(_fmt_money(_deal_cf_number(deal, NET_FIELD)))
+    net_text = _dc_value_html(_fmt_money(_resolve_deal_net(deal, override_entry)))
     # Item 5: net per-share, won deals only -- a subtle line, never shown
     # for a still-live deal (nothing to report per-share on until it's
     # actually closed).
@@ -8166,7 +8372,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     # Price cell: SPV/Fund deals show the valuation (editable like the
     # deadline) with net per share as a muted second line; every other
     # structure keeps NET.
-    net_val = _deal_cf_number(deal, NET_FIELD)
+    net_val = _resolve_deal_net(deal, override_entry)
     if _deal_is_spv(deal):
         price_label = _est_val_label(deal)
         est_b = _resolve_deal_est_val(deal, override_entry)
@@ -8184,15 +8390,27 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         price_label = "Net"
         price_html = net_text
 
-    seller_fee_html = _dc_value_html(_fmt_pct(_deal_cf_number(deal, SELLER_FEE_FIELD)))
-    mgmt_pct = _fmt_pct(_deal_cf_number(deal, MGMT_FEE_FIELD))
-    carry_pct = _fmt_pct(_deal_cf_number(deal, CARRY_FIELD))
-    if mgmt_pct is None and carry_pct is None:
-        mgmt_carry_html = DC_NOT_SET_HTML
-    else:
-        mgmt_carry_html = f"{_dc_value_html(mgmt_pct)} / {_dc_value_html(carry_pct)}"
-    fees_html = f"{seller_fee_html} · {mgmt_carry_html}"
-    deal_price_label, deal_price_text = _deal_price_cell(deal)
+    # FEES: three labeled pieces (muted word + bold number), each with its
+    # own amber "Not set"; wraps piece-by-piece at phone width.
+    fee_pieces = (("Seller", SELLER_FEE_FIELD), ("Mgmt", MGMT_FEE_FIELD), ("Carry", CARRY_FIELD))
+    fees_html = '<span class="dc-fees">' + "".join(
+        f'<span class="dc-fee"><span class="dc-fee-k">{k}</span> '
+        f'<span class="dc-fee-v">{_dc_value_html(_fmt_pct(_deal_cf_number(deal, f)))}</span></span>'
+        for k, f in fee_pieces) + '</span>'
+
+    # NET PRICE (Sell) / GROSS PRICE (Buy, read-only). Sell deals carry the
+    # ⓘ popover; the Edit link shows where the deadline editor does (tenant
+    # and admin Tenant view) plus admin Admin view, live non-public only.
+    deal_price_label, deal_price_text = _deal_price_cell(deal, override_entry)
+    deal_price_html = _esc(deal_price_text)
+    deal_price_info = ""
+    if _deal_is_sell(deal):
+        deal_price_info = _net_price_info_html()
+        if (edit_mode or tenant_deadline_edit) and not is_closed and not _deal_is_public(deal):
+            deal_price_html = _net_price_editor_html(
+                deal_id, _resolve_deal_net(deal, override_entry), deal_price_html,
+                admin_key=(admin_key if edit_mode else impersonation_key),
+                view_as=(impersonation_view_as if not edit_mode else None))
 
     # Paperwork: the same deal_paperwork_status the My Deals row uses
     # (it covers the agent agreement too, so it replaces the older
@@ -8229,11 +8447,11 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
       <div class="deal-card-metrics">
         {_dc_cell_html("Size", size_text)}
         {_dc_cell_html(price_label, price_html, "dc-price")}
-        {_dc_cell_html(deal_price_label, _esc(deal_price_text))}
+        {_dc_cell_html(deal_price_label, deal_price_html, "dc-np-cell" if deal_price_info else "", deal_price_info)}
         {_dc_cell_html("Deadline", deadline_value_html)}
         {_dc_cell_html("Structure", structure_text)}
         {_dc_cell_html("Exemption", exemption_value_html)}
-        {_dc_cell_html("Seller fee · Mgmt / Carry", fees_html, "dc-cell-wide")}
+        {_dc_cell_html("Fees", fees_html, "dc-cell-wide")}
       </div>
       {per_share_html}
       {badge_html}
@@ -13025,7 +13243,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                                                       paperwork=deal_paperwork_status(d, anon_key_email, person_id),
                                                       tenant_deadline_edit=tenant_view,
                                                       impersonation_key=(key if impersonating else None),
-                                                      impersonation_view_as=(view_as if impersonating else None)))
+                                                      impersonation_view_as=(view_as if impersonating else None),
+                                                      admin_key=(key if edit_mode else None)))
             deals_body = "".join(live_cards)
             if 'class="dc-dl-edit"' in deals_body:
                 deals_body += TENANT_DEADLINE_SCRIPT
@@ -13038,6 +13257,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                 deals_body += ('<details class="closed-out-section cd-closed-down">'
                                f'<summary>Closed down <span class="count">({len(down_cards)})</span></summary>'
                                + "".join(down_cards) + '</details>')
+            if 'class="dc-info"' in deals_body:
+                deals_body += TENANT_NET_PRICE_SCRIPT
         else:
             deals_body = '<div class="gg-placeholder small">No deals with this company yet.</div>'
 
@@ -13660,6 +13881,37 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
   .dc-ev-msg {{ display: block; font-size: 11px; font-weight: 500; margin-top: 2px; }}
   .dc-ev-msg.saved {{ color: var(--qp); }}
   .dc-ev-msg.error {{ color: #b23b3b; }}
+  /* FEES: "Seller 4%   Mgmt 0%   Carry 0%" -- each piece stays whole and
+     the row wraps between pieces at phone width. */
+  .dc-fees {{ display: flex; flex-wrap: wrap; column-gap: 18px; row-gap: 2px; }}
+  .dc-fee {{ white-space: nowrap; }}
+  .dc-fee-k {{ font-size: 12px; font-weight: 500; color: var(--muted); }}
+  .dc-fee-v {{ font-weight: 700; }}
+  /* NET PRICE: ⓘ popover + Edit, styled like the valuation editor. */
+  .dc-np-cell {{ position: relative; }}
+  .dc-info {{ font: inherit; font-size: 12px; line-height: 1; padding: 0 0 0 4px; border: 0; background: none;
+              color: var(--muted); cursor: pointer; vertical-align: baseline; }}
+  .dc-info:hover, .dc-info[aria-expanded="true"] {{ color: var(--accent); }}
+  .dc-info-pop {{ position: absolute; z-index: 20; left: 0; top: 18px; width: 280px; max-width: calc(100vw - 32px);
+                  white-space: normal; text-transform: none; letter-spacing: 0; font-size: 12px; line-height: 1.45;
+                  color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+                  padding: 10px 12px; box-shadow: 0 6px 18px rgba(0,0,0,0.12); }}
+  .dc-info-pop[hidden] {{ display: none !important; }}
+  .dc-np-edit {{ display: block; font-size: 11px; font-weight: 500; color: var(--accent); text-decoration: none;
+                 margin-top: 2px; }}
+  .dc-np-edit:hover {{ text-decoration: underline; }}
+  .dc-np-form {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }}
+  .dc-np-view[hidden], .dc-np-form[hidden] {{ display: none !important; }}
+  .dc-np-help {{ flex-basis: 100%; font-size: 11px; font-weight: 400; line-height: 1.4; color: var(--muted); }}
+  .dc-np-form button {{ font: inherit; font-size: 12px; font-weight: 600; padding: 4px 10px; border-radius: 999px;
+                        cursor: pointer; border: 1px solid var(--line); background: var(--card); color: var(--ink); }}
+  .dc-np-form .dc-np-save {{ background: var(--qp); border-color: var(--qp); color: #fff; }}
+  .dc-np-form button:disabled {{ opacity: 0.6; cursor: default; }}
+  .dc-np-input {{ font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line); border-radius: 6px;
+                  width: 100%; min-width: 0; }}
+  .dc-np-msg {{ display: block; font-size: 11px; font-weight: 500; margin-top: 2px; }}
+  .dc-np-msg.saved {{ color: var(--qp); }}
+  .dc-np-msg.error {{ color: #b23b3b; }}
   .dc-line {{ font-size: 13px; color: var(--muted); margin-bottom: 4px; }}
   .dc-not-set {{ color: #C2410C; font-weight: 500; }}
   .dc-hint {{ font-size: 12px; font-weight: 500; color: #C2410C; margin-left: 4px; }}
@@ -17903,6 +18155,7 @@ def _handle_update_intro(event):
             return _json_response({"error": "forbidden"}, 403)
     tenant_deadline_edit = tenant_self_field == "deadline"
     tenant_est_val_edit = tenant_self_field == "est_valuation"
+    tenant_net_edit = tenant_self_field == "net_price"
 
     deal_id = str(body.get("deal_id") or "").strip()
     if not deal_id:
@@ -17999,6 +18252,16 @@ def _handle_update_intro(event):
             return _json_response({"error": "Enter a valuation like 4.2B or 850M (at least $1M)."}, 400)
         est_val = round(est_dollars / 1e9, 6)
 
+    # Net price (a tenant card self-edit, or admin): a positive dollar
+    # amount with at most 2 decimals. The PUT below also clears gross.
+    net_price = None
+    if (is_admin or tenant_net_edit) and "net_price" in body:
+        if is_admin and set(body.keys()) - {"key", "deal_id", "net_price"}:
+            return _json_response({"error": "net_price must be saved on its own"}, 400)
+        net_price = _parse_net_price_input(body.get("net_price"))
+        if net_price is None:
+            return _json_response({"error": NET_PRICE_INVALID_MSG}, 400)
+
     # Admin-only Fund Exemption (Deal Details EXEMPTION selector).
     exemption = None
     if is_admin and body.get("exemption") not in (None, ""):
@@ -18020,7 +18283,8 @@ def _handle_update_intro(event):
 
     has_status_intent = status_id is not None or milestone_step is not None or flag is not None
     if (not has_status_intent and next_steps is None and notes is None and follow_up is None
-            and deadline is None and share_loss_reason is None and exemption is None and est_val is None):
+            and deadline is None and share_loss_reason is None and exemption is None and est_val is None
+            and net_price is None):
         return _json_response({"error": "nothing to update"}, 400)
 
     deals = get_deals_list()
@@ -18053,12 +18317,15 @@ def _handle_update_intro(event):
         if DEAL_SIDE_SELL_ID not in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
             return _json_response({"error": "forbidden"}, 403)
         tenant_rsid = _resolve_deal_stage(deal, old_entry)
-        what = "deadline" if tenant_deadline_edit else "valuation"
+        what = "deadline" if tenant_deadline_edit else ("net price" if tenant_net_edit else "valuation")
         if (_deal_is_public(deal) or _is_won_stage(tenant_rsid)
                 or _is_closed_down_stage(tenant_rsid)):
             return _json_response({"error": f"This deal is closed — its {what} can't be changed."}, 409)
         if tenant_est_val_edit and not _deal_is_spv(deal):
             return _json_response({"error": "Valuation applies to SPV deals only."}, 409)
+    if net_price is not None and is_admin and not _deal_is_sell(deal):
+        # Net is editable on Sell deals only (Buy deals' gross is read-only).
+        return _json_response({"error": "Net price can be edited on Sell deals only."}, 403)
 
     if has_status_intent and not is_admin:
         if not old_resolved["disclosed"]:
@@ -18099,6 +18366,11 @@ def _handle_update_intro(event):
                           else Decimal(str(_resolve_deal_est_val(deal, old_entry)))),
         "loss_reason_shared": bool(old_entry.get("loss_reason_shared")),
     }
+    if net_price is not None:
+        old_net = _resolve_deal_net(deal, old_entry)
+        old_gross = _resolve_deal_gross(deal, old_entry)
+        old_values["net_price"] = None if old_net is None else Decimal(str(old_net))
+        old_values["gross_price"] = None if old_gross is None else Decimal(str(old_gross))
 
     milestones_update = None
 
@@ -18159,6 +18431,11 @@ def _handle_update_intro(event):
         if not ok:
             return _json_response({"error": f"Pipeline update failed: {err}"}, 502)
 
+    if net_price is not None:
+        ok, err = _pipeline_update_deal_net_price(deal_id, net_price)
+        if not ok:
+            return _json_response({"error": f"Could not save the net price (Pipeline update failed: {err})."}, 502)
+
     actor = "admin" if is_admin else (impersonated_actor or tenant_identity_email)
 
     # Deal notes are append-only: every non-blank notes save adds one
@@ -18179,7 +18456,8 @@ def _handle_update_intro(event):
     ok, err = _dynamo_write_intro_update(tenant_email, deal_id, status_id, next_steps, notes, follow_up, deadline,
                                           old_values, actor, milestones=milestones_update,
                                           loss_reason_shared=share_loss_reason, notes_history=notes_history,
-                                          history_entry=history_entry, exemption=exemption, est_val=est_val)
+                                          history_entry=history_entry, exemption=exemption, est_val=est_val,
+                                          net_price=net_price)
     if not ok:
         return _json_response({"error": f"Save failed: {err}"}, 502)
 
@@ -18195,6 +18473,12 @@ def _handle_update_intro(event):
         return _json_response({"ok": True, "deadline": deadline,
                                "display": _deal_deadline_display_html(deadline),
                                "overdue": _deadline_is_overdue(deadline)})
+    if net_price is not None:
+        # Every net change emails Chad (real sellers, Tenant view and admin
+        # alike) so he can set the new gross.
+        _send_net_price_email(actor, deal, deal_id, old_net, net_price, old_gross)
+        return _json_response({"ok": True, "net_price": net_price, "display": _esc(_fmt_price_2dp(net_price)),
+                               "input_value": f"{net_price:.2f}"})
     if tenant_est_val_edit:
         if impersonated_actor is None:
             old_b = old_values["est_valuation"]

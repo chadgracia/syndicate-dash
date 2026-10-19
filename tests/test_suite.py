@@ -341,6 +341,27 @@ def tenant_cookie(email):
     return lf._make_identity_cookie(email).split(";")[0]
 
 
+def _dc_cell(card, label):
+    m = re.search(r'dc-label">' + re.escape(label) + r'(?:<button[^>]*class="dc-info".*?</button>'
+                  r'<span class="dc-info-pop"[^>]*>[^<]*</span>)?</span><span class="dc-value">(.*?)</span></div>', card)
+    return m.group(1) if m else None
+
+
+def _dc_np_value(card):
+    """The NET PRICE display value, inside the editor when one is present."""
+    v = _dc_cell(card, "Net price")
+    if v and 'class="dc-np"' in v:
+        m = re.search(r'<span class="dc-np-value">(.*?)</span>', v)
+        return m.group(1) if m else None
+    return v
+
+
+def _fees_cell(seller, mgmt, carry):
+    return ('<span class="dc-fees">' + "".join(
+        f'<span class="dc-fee"><span class="dc-fee-k">{k}</span> <span class="dc-fee-v">{v}</span></span>'
+        for k, v in (("Seller", seller), ("Mgmt", mgmt), ("Carry", carry))) + '</span>')
+
+
 def post_event(body_dict, cookies=None):
     return {"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
             "queryStringParameters": {"action": "update_intro"}, "cookies": cookies or [],
@@ -1494,6 +1515,123 @@ check("a Pipeline edit after the card save wins (real format '2026/10/05 14:03:2
       lf._resolve_deal_est_val(dict(ev_fund, updated_at=_pl_ts(_now_dt - timedelta(hours=1))), _ev_ov) == 4.0
       and lf._override_is_current({"id": 1, "updated_at": "2026/10/05 14:03:22 -0400"},
                                   datetime(2026, 10, 5, 17, 0, tzinfo=timezone.utc).timestamp()) is False)
+
+# ======================================================================
+# SECTION: Deal Details — NET PRICE edit (Sell only; PUT clears gross)
+# ======================================================================
+check("net price parsing: dollars with up to 2 decimals, $ and commas ok",
+      lf._parse_net_price_input("110.25") == 110.25 and lf._parse_net_price_input("$1,250") == 1250.0
+      and lf._parse_net_price_input(" 30 ") == 30.0 and lf._parse_net_price_input(".5") == 0.5)
+check("net price parsing: zero, negative, >2 decimals, words, blank rejected",
+      all(lf._parse_net_price_input(v) is None
+          for v in ("0", "0.00", "-5", "110.255", "abc", "", None, "4.2B", "1e3", True, "$")))
+
+np_sell = _ev_deal(8811, "NP Sell Deal", {lf.STRUCTURE_FIELD: [6250090], lf.NET_FIELD: 30, lf.GROSS_FIELD: 31.5})
+np_buy = dict(_ev_deal(8812, "NP Buy Deal", {}),
+              custom_fields={lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID], lf.GROSS_FIELD: 31.5, lf.NET_FIELD: 30})
+np_foreign = _ev_deal(8813, "NP Foreign Deal", {lf.NET_FIELD: 12}, pid=EV_OTHER_PID)
+_np_s3, np_table = use_fixture({"people.json": _ev_people, "interest_people.json": {"buy": {}},
+                                "deals.json": {"deals": [np_sell, np_buy, np_foreign]}}, ses=FakeSES())
+
+_np_c_sell = lf._deal_card_html(np_sell, "EV Co", tenant_deadline_edit=True)
+_np_c_buy = lf._deal_card_html(np_buy, "EV Co", tenant_deadline_edit=True)
+_np_c_admin = lf._deal_card_html(np_sell, "EV Co", edit_mode=True, admin_key=ADMIN_KEY)
+_np_c_ro = lf._deal_card_html(np_sell, "EV Co")
+check("net price: Sell deal card shows the ⓘ popover (exact copy) and an Edit link under $30.00",
+      'class="dc-info"' in _np_c_sell and lf._esc(lf.NET_PRICE_INFO_TEXT) in _np_c_sell
+      and '<span class="dc-np-value">$30.00</span><a href="#" class="dc-np-edit">Edit</a>' in _np_c_sell
+      and lf.NET_PRICE_INFO_TEXT == ("Net price is the price per share (or unit) the seller receives. For a new "
+                                     "allocation, this should match the round's price per share. It never includes "
+                                     "one-time fees, upfront management fees, or broker commissions — those are "
+                                     "handled separately."))
+check("net price: the edit form repeats the popover copy above the input",
+      f'<span class="dc-np-help">{lf._esc(lf.NET_PRICE_INFO_TEXT)}</span><input type="text" class="dc-np-input"'
+      in _np_c_sell)
+check("net price: Buy deal GROSS PRICE is read-only -- no Edit link, no ⓘ",
+      _dc_cell(_np_c_buy, "Gross price") == "$31.50" and "dc-np" not in _np_c_buy and "dc-info" not in _np_c_buy)
+check("net price: Admin view card carries the editor with the admin key (no view_as)",
+      f'class="dc-np" data-deal-id="8811" data-key="{ADMIN_KEY}">' in _np_c_admin)
+check("net price: no Edit link outside an editing context (ⓘ still shown)",
+      "dc-np-edit" not in _np_c_ro and 'class="dc-info"' in _np_c_ro)
+_np_page = lf.render_company_page("EV Co", "Eve Seller", lf._resolve_tenant(EV_EMAIL), EV_EMAIL, "mydeals",
+                                  key=None, view_as=None, edit_mode=False)
+check("tenant company page carries the net price editor + its script once",
+      'class="dc-np-edit"' in _np_page and _np_page.count(lf.TENANT_NET_PRICE_SCRIPT) == 1)
+check("net price script: empty submit does nothing; invalid input shows the friendly message",
+      "if (!raw) { return; }" in lf.TENANT_NET_PRICE_SCRIPT
+      and json.dumps(lf.NET_PRICE_INVALID_MSG) in lf.TENANT_NET_PRICE_SCRIPT)
+
+ev_pipeline.clear(); ses_calls.clear(); np_table.updates.clear(); np_table.puts.clear()
+lf.urllib.request.urlopen = _ev_urlopen
+_r = _ev_post({"deal_id": "8811", "net_price": "$32.75"})
+_rb = json.loads(_r["body"])
+check("tenant net price save -> 200 with the new display",
+      _r["statusCode"] == 200 and _rb.get("display") == "$32.75" and _rb.get("net_price") == 32.75)
+check("net price save: ONE Pipeline PUT with Net = new value AND Gross cleared (null), nothing else",
+      len(ev_pipeline) == 1 and "/deals/8811.json" in ev_pipeline[0]["url"]
+      and ev_pipeline[0]["data"] == {"deal": {"custom_fields": {lf.NET_FIELD: 32.75, lf.GROSS_FIELD: None}}})
+check("net price save: Dynamo override + audit (tenant actor, old net 30, new net 32.75, old gross 31.5 cleared)",
+      bool(np_table.updates) and np_table.updates[-1]["ExpressionAttributeValues"].get(":npo") == lf.Decimal("32.75")
+      and np_table.puts[-1].get("actor") == EV_EMAIL
+      and np_table.puts[-1]["old"].get("net_price") == lf.Decimal("30.0")
+      and np_table.puts[-1]["old"].get("gross_price") == lf.Decimal("31.5")
+      and np_table.puts[-1]["new"].get("net_price") == lf.Decimal("32.75")
+      and np_table.puts[-1]["new"].get("gross_cleared") is True and bool(np_table.puts[-1]["new"].get("at")))
+_np_mail = ses_calls[-1] if ses_calls else {}
+_np_body = _np_mail.get("Message", {}).get("Body", {}).get("Text", {}).get("Data", "")
+check("net price save emails Chad: subject 'Net price changed: <Company> <deal_id>', old → new, cleared gross, actor, link",
+      len(ses_calls) == 1 and _np_mail["Destination"]["ToAddresses"] == ["cgracia@rainmakersecurities.com"]
+      and _np_mail["Message"]["Subject"]["Data"] == "Net price changed: EV Co 8811"
+      and "$30.00 → $32.75" in _np_body and "was $31.50" in _np_body and EV_EMAIL in _np_body
+      and "https://app.pipelinecrm.com/deals/8811" in _np_body)
+
+_np_ov = {"net_override": lf.Decimal("32.75"), "net_override_at": time.time() - 60}
+lf._req_cache_reset()
+_np_after = lf._deal_card_html(dict(np_sell, updated_at=_pl_ts(_now_dt - timedelta(hours=2))), "EV Co", _np_ov,
+                               tenant_deadline_edit=True)
+check("after saving, the card shows the new net (override bridges until Pipeline catches up)",
+      _dc_np_value(_np_after) == "$32.75" and 'value="32.75"' in _np_after)
+check("net override blanks gross until Pipeline catches up; a later Pipeline edit wins",
+      lf._resolve_deal_gross(dict(np_sell, updated_at=_pl_ts(_now_dt - timedelta(hours=2))), _np_ov) is None
+      and lf._resolve_deal_net(dict(np_sell, updated_at=_pl_ts(_now_dt + timedelta(hours=1))), _np_ov) == 30.0)
+
+for _bad in ("0", "-3", "abc", "12.345", ""):
+    ev_pipeline.clear(); np_table.updates.clear(); ses_calls.clear()
+    _r = _ev_post({"deal_id": "8811", "net_price": _bad})
+    check(f"invalid net price {_bad!r} -> 400 with the friendly message, nothing written",
+          _r["statusCode"] == 400 and json.loads(_r["body"]).get("error") == lf.NET_PRICE_INVALID_MSG
+          and not ev_pipeline and not np_table.updates and not ses_calls)
+
+ev_pipeline.clear(); ses_calls.clear(); np_table.updates.clear(); np_table.puts.clear()
+_r_np_buy = _ev_post({"deal_id": "8812", "net_price": "40"})
+_r_np_foreign = _ev_post({"deal_id": "8813", "net_price": "40"})
+_r_np_extra = _ev_post({"deal_id": "8811", "net_price": "40", "notes": "x"})
+_r_np_adm_buy = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "8812", "net_price": "40"}), None)
+check("net price refused: Buy deal (403), non-firm tenant (403), extra keys (403), admin on a Buy deal (403)",
+      _r_np_buy["statusCode"] == 403 and _r_np_foreign["statusCode"] == 403 and _r_np_extra["statusCode"] == 403
+      and _r_np_adm_buy["statusCode"] == 403 and not ev_pipeline and not np_table.updates and not ses_calls)
+
+_r_np_imp = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": EV_EMAIL, "deal_id": "8811",
+                                          "net_price": "33"}), None)
+check("admin Tenant view net save -> 200, audited as 'cgracia@… (as <tenant>)', email still fires",
+      _r_np_imp["statusCode"] == 200
+      and np_table.puts[-1].get("actor") == f"cgracia@rainmakersecurities.com (as {EV_EMAIL})"
+      and len(ses_calls) == 1)
+ses_calls.clear()
+_r_np_adm = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "8811", "net_price": "34.1"}), None)
+check("Admin view net save -> 200, actor admin, PUT clears gross, email fires",
+      _r_np_adm["statusCode"] == 200 and np_table.puts[-1].get("actor") == "admin"
+      and ev_pipeline[-1]["data"]["deal"]["custom_fields"] == {lf.NET_FIELD: 34.1, lf.GROSS_FIELD: None}
+      and len(ses_calls) == 1)
+
+lf.urllib.request.urlopen = _ev_urlopen_fail
+np_table.updates.clear(); np_table.puts.clear(); ses_calls.clear()
+_r_np_fail = _ev_post({"deal_id": "8811", "net_price": "35"})
+check("Pipeline failure on a net price save -> 502 error, NO Dynamo write, no audit, no email",
+      _r_np_fail["statusCode"] == 502
+      and "Could not save the net price" in json.loads(_r_np_fail["body"]).get("error", "")
+      and not np_table.updates and not np_table.puts and not ses_calls)
+lf.urllib.request.urlopen = _ev_urlopen
 FakeBoto3.SES = None
 
 # ======================================================================
@@ -3584,8 +3722,12 @@ check("Parity (admin edit): pending buyer (Nina) IS named -- edit mode never ano
 page_parity_range = lf.render_company_page("Parity Co", "Sella Seller", tenant_parity, TENANT_A_EMAIL, "mydeals",
                                             key=None, view_as=None, edit_mode=False)
 check("Deal Details: Size shows a min-max range ('$500K – $25M')", "$500K – $25M" in page_parity_range)
-check("Deal Details: fees are one grid cell (SELLER FEE · MGMT / CARRY), no free-text fees line",
-      'dc-label">Seller fee · Mgmt / Carry</span><span class="dc-value">7% · 2% / 20%</span>' in page_parity_range
+check("Deal Details: fees are one FEES grid cell (Seller 7% Mgmt 2% Carry 20%), no free-text fees line",
+      'dc-label">Fees</span><span class="dc-value"><span class="dc-fees">'
+      '<span class="dc-fee"><span class="dc-fee-k">Seller</span> <span class="dc-fee-v">7%</span></span>'
+      '<span class="dc-fee"><span class="dc-fee-k">Mgmt</span> <span class="dc-fee-v">2%</span></span>'
+      '<span class="dc-fee"><span class="dc-fee-k">Carry</span> <span class="dc-fee-v">20%</span></span>'
+      '</span></span>' in page_parity_range
       and 'dc-label">Seller fee</span>' not in page_parity_range
       and "7% seller fee · 2% mgmt · 20% carry" not in page_parity_range)
 
@@ -6833,26 +6975,23 @@ dc_soon = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_soon), "Hark La
 dc_far = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_far), "Hark Labs", paperwork=_dc_pw)
 dc_none = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_none), "Hark Labs", paperwork=_dc_pw)
 _grid_order = [m for m in re.findall(r'dc-label">([^<]+)<', dc_far)]
-check("deal card: grid order SIZE|NET|NET PRICE|DEADLINE / STRUCTURE|EXEMPTION|SELLER FEE · MGMT / CARRY (wide); 'Oct 31, 2099', no far hint",
-      _grid_order == ["Size", "Net", "Net price", "Deadline", "Structure", "Exemption", "Seller fee · Mgmt / Carry"]
+_grid_order = re.findall(r'dc-label">([^<]+)<', dc_far)
+check("deal card: grid order SIZE|NET|NET PRICE|DEADLINE / STRUCTURE|EXEMPTION|FEES (wide); 'Oct 31, 2099', no far hint",
+      _grid_order == ["Size", "Net", "Net price", "Deadline", "Structure", "Exemption", "Fees"]
       and dc_far.count('class="dc-cell') == 7 and 'dc-cell-empty' not in dc_far
-      and 'class="dc-cell dc-cell-wide"><span class="dc-label">Seller fee · Mgmt / Carry<' in dc_far
+      and 'class="dc-cell dc-cell-wide"><span class="dc-label">Fees<' in dc_far
       and "Oct 31, 2099" in dc_far and "dc-hint" not in dc_far and "Deadline: " not in dc_far)
 check("deal card: deadline within 14 days carries the 'in 9 days' hint",
       '<span class="dc-hint">in 9 days</span>' in dc_soon)
 check("deal card: missing Net / Deadline show amber 'Not set'; only the NET PRICE cell shows the em dash",
       dc_none.count(lf.DC_NOT_SET_HTML) >= 2 and dc_none.count('class="dc-value">—<') == 1
-      and '<span class="dc-label">Net price</span><span class="dc-value">—</span>' in dc_none)
+      and _dc_cell(dc_none, "Net price") == "—")
 check("deal card: live card puts the Update button in the footer beside the verify line, badge stays above",
       '<div class="dc-footer"><div class="dc-verify">' + lf._esc(lf.DC_VERIFY_TEXT) + '</div><a class="update-cancel-btn"'
       in dc_far and dc_far.count("update-cancel-btn") == 1
       and dc_far.index("No agent agreement — outreach OK, no introductions until signed") < dc_far.index("dc-footer"))
 
 # --- Deal Details card: NET PRICE (Sell) / GROSS PRICE (Buy), combined fee cell, Sell-only agreement chip
-def _dc_cell(card, label):
-    m = re.search(r'dc-label">' + re.escape(label) + r'</span><span class="dc-value">(.*?)</span></div>', card)
-    return m.group(1) if m else None
-
 _px_sell_cf = cf_sell({lf.NET_FIELD: 110.25, lf.GROSS_FIELD: 115.5})
 _px_buy_cf = dict(_px_sell_cf, **{lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID]})
 _px_sell = lf._deal_card_html(dict(md_noagr, custom_fields=dict(md_noagr["custom_fields"], **_px_sell_cf), value=999),
@@ -6872,9 +7011,11 @@ _px_buy_blank = lf._deal_card_html(dict(md_noagr, custom_fields=dict(
 check("deal card price: blank price shows the em dash, never derived from the other price",
       _dc_cell(dc_none, "Net price") == "—" and _dc_cell(_px_buy_blank, "Gross price") == "—")
 check("deal card price: the deal value (commission) never appears", "$999" not in _px_sell and "$999" not in _px_buy)
-check("deal card fees: combined SELLER FEE · MGMT / CARRY cell renders '4% · 2% / 20%'",
-      _dc_cell(dc_far, "Seller fee · Mgmt / Carry") == "4% · 2% / 20%"
-      and 'dc-label">Seller fee</span>' not in dc_far and 'dc-label">Mgmt / Carry</span>' not in dc_far)
+check("deal card fees: FEES cell renders three labeled pieces 'Seller 4%  Mgmt 2%  Carry 20%', no dots/slashes",
+      _dc_cell(dc_far, "Fees") == _fees_cell("4%", "2%", "20%")
+      and "Seller fee · Mgmt / Carry" not in dc_far and 'dc-label">Mgmt / Carry</span>' not in dc_far
+      and " · " not in re.sub("<[^>]+>", "", _dc_cell(dc_far, "Fees"))
+      and "/" not in re.sub("<[^>]+>", "", _dc_cell(dc_far, "Fees")))
 _fee_blank = lf._deal_card_html(dict(md_noagr, custom_fields={k: v for k, v in md_noagr["custom_fields"].items()
                                                               if k not in (lf.SELLER_FEE_FIELD, lf.CARRY_FIELD)}),
                                 "Hark Labs", paperwork=_dc_pw)
@@ -6883,9 +7024,8 @@ _fee_none = lf._deal_card_html(dict(md_noagr, custom_fields={k: v for k, v in md
                                                                           lf.CARRY_FIELD)}),
                                "Hark Labs", paperwork=_dc_pw)
 check("deal card fees: each piece keeps its own blank handling (amber Not set)",
-      _dc_cell(_fee_blank, "Seller fee · Mgmt / Carry")
-      == f"{lf.DC_NOT_SET_HTML} · 2% / {lf.DC_NOT_SET_HTML}"
-      and _dc_cell(_fee_none, "Seller fee · Mgmt / Carry") == f"{lf.DC_NOT_SET_HTML} · {lf.DC_NOT_SET_HTML}")
+      _dc_cell(_fee_blank, "Fees") == _fees_cell(lf.DC_NOT_SET_HTML, "2%", lf.DC_NOT_SET_HTML)
+      and _dc_cell(_fee_none, "Fees") == _fees_cell(lf.DC_NOT_SET_HTML, lf.DC_NOT_SET_HTML, lf.DC_NOT_SET_HTML))
 _chip = lf._esc("No agent agreement — outreach OK, no introductions until signed")
 check("agreement chip: new wording is the shared constant",
       lf.PAPERWORK_AGREEMENT_NEEDED_TEXT == "No agent agreement — outreach OK, no introductions until signed")
