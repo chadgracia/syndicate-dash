@@ -660,10 +660,10 @@ check("ID missing: Live pill plus amber 'ID needed before introductions' line to
           'ID needed before introductions</a>' in _id_badge)
 _agr_deal = {"id": 4242, "company": {"name": "Acme & Co"}, **deal_agreement_unsigned}
 _agr_badge = lf._my_deal_visibility_badge_html(_agr_deal, lf.CEF_YES_ID, False)
-check("agreement missing: Live pill plus amber 'Agent agreement needed before introductions' line",
+check("agreement missing: Live pill plus amber 'No agent agreement — outreach OK, no introductions until signed' line",
       _agr_badge.startswith('<span class="visibility-badge live">Live · shown to buyers</span>')
       and 'class="paperwork-note needed"' in _agr_badge
-      and "Agent agreement needed before introductions</a>" in _agr_badge and "ID needed" not in _agr_badge)
+      and "No agent agreement — outreach OK, no introductions until signed</a>" in _agr_badge and "ID needed" not in _agr_badge)
 _mailto = lf._agent_agreement_mailto("Acme & Co", 4242)
 check("agreement mailto: recipient, subject and body",
       _mailto == ("mailto:cgracia@rainmakersecurities.com?subject="
@@ -680,7 +680,7 @@ _both_badge = lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_
 check("both missing: Live pill, ID line then agreement line",
       'class="visibility-badge live"' in _both_badge
       and 0 < _both_badge.find("ID needed before introductions")
-      < _both_badge.find("Agent agreement needed before introductions"))
+      < _both_badge.find("No agent agreement — outreach OK, no introductions until signed"))
 check("archived rows (show_paperwork=False) get no paperwork lines",
       lf._my_deal_visibility_badge_html(deal_agreement_unsigned, lf.CEF_NO_ID, False, show_paperwork=False)
       == '<span class="visibility-badge live">Live · shown to buyers</span>')
@@ -3584,9 +3584,9 @@ check("Parity (admin edit): pending buyer (Nina) IS named -- edit mode never ano
 page_parity_range = lf.render_company_page("Parity Co", "Sella Seller", tenant_parity, TENANT_A_EMAIL, "mydeals",
                                             key=None, view_as=None, edit_mode=False)
 check("Deal Details: Size shows a min-max range ('$500K – $25M')", "$500K – $25M" in page_parity_range)
-check("Deal Details: fees are grid cells (SELLER FEE, MGMT / CARRY), no free-text fees line",
-      'dc-label">Seller fee</span><span class="dc-value">7%</span>' in page_parity_range
-      and 'dc-label">Mgmt / Carry</span><span class="dc-value">2% / 20%</span>' in page_parity_range
+check("Deal Details: fees are one grid cell (SELLER FEE · MGMT / CARRY), no free-text fees line",
+      'dc-label">Seller fee · Mgmt / Carry</span><span class="dc-value">7% · 2% / 20%</span>' in page_parity_range
+      and 'dc-label">Seller fee</span>' not in page_parity_range
       and "7% seller fee · 2% mgmt · 20% carry" not in page_parity_range)
 
 page_parity_single = lf.render_company_page("Parity Single Co", "Sella Seller", tenant_parity, TENANT_A_EMAIL,
@@ -6817,9 +6817,9 @@ md_noagr_card = lf._deal_card_html(md_noagr, "Hark Labs",
 _noagr_mailto = lf._esc(lf._agent_agreement_mailto("Hark Labs", md_noagr["id"]))
 check("paperwork: table row and detail card agree on the amber agreement mailto",
       'class="visibility-badge live"' in md_noagr_row and "Not live" not in md_noagr_row
-      and f'<a class="paperwork-note needed" href="{_noagr_mailto}">Agent agreement needed before introductions</a>'
+      and f'<a class="paperwork-note needed" href="{_noagr_mailto}">No agent agreement — outreach OK, no introductions until signed</a>'
           in md_noagr_row
-      and f'<a class="id-status-badge id-needed" href="{_noagr_mailto}">Agent agreement needed before introductions</a>'
+      and f'<a class="id-status-badge id-needed" href="{_noagr_mailto}">No agent agreement — outreach OK, no introductions until signed</a>'
           in md_noagr_card and "Paperwork in order" not in md_noagr_card)
 
 # --- Deal Details card: Deadline column, "Not set", footer button + verify line
@@ -6833,18 +6833,67 @@ dc_soon = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_soon), "Hark La
 dc_far = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_far), "Hark Labs", paperwork=_dc_pw)
 dc_none = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_none), "Hark Labs", paperwork=_dc_pw)
 _grid_order = [m for m in re.findall(r'dc-label">([^<]+)<', dc_far)]
-check("deal card: 4x2 grid order SIZE|NET|SELLER FEE|DEADLINE / STRUCTURE|EXEMPTION|MGMT / CARRY|(empty); 'Oct 31, 2099', no far hint",
-      _grid_order == ["Size", "Net", "Seller fee", "Deadline", "Structure", "Exemption", "Mgmt / Carry"]
-      and dc_far.count('class="dc-cell') == 8 and 'dc-cell-empty' in dc_far
+check("deal card: grid order SIZE|NET|NET PRICE|DEADLINE / STRUCTURE|EXEMPTION|SELLER FEE · MGMT / CARRY (wide); 'Oct 31, 2099', no far hint",
+      _grid_order == ["Size", "Net", "Net price", "Deadline", "Structure", "Exemption", "Seller fee · Mgmt / Carry"]
+      and dc_far.count('class="dc-cell') == 7 and 'dc-cell-empty' not in dc_far
+      and 'class="dc-cell dc-cell-wide"><span class="dc-label">Seller fee · Mgmt / Carry<' in dc_far
       and "Oct 31, 2099" in dc_far and "dc-hint" not in dc_far and "Deadline: " not in dc_far)
 check("deal card: deadline within 14 days carries the 'in 9 days' hint",
       '<span class="dc-hint">in 9 days</span>' in dc_soon)
-check("deal card: missing Net / Deadline show amber 'Not set', never a bare dash",
-      dc_none.count(lf.DC_NOT_SET_HTML) >= 2 and 'class="dc-value">—<' not in dc_none)
+check("deal card: missing Net / Deadline show amber 'Not set'; only the NET PRICE cell shows the em dash",
+      dc_none.count(lf.DC_NOT_SET_HTML) >= 2 and dc_none.count('class="dc-value">—<') == 1
+      and '<span class="dc-label">Net price</span><span class="dc-value">—</span>' in dc_none)
 check("deal card: live card puts the Update button in the footer beside the verify line, badge stays above",
       '<div class="dc-footer"><div class="dc-verify">' + lf._esc(lf.DC_VERIFY_TEXT) + '</div><a class="update-cancel-btn"'
       in dc_far and dc_far.count("update-cancel-btn") == 1
-      and dc_far.index("Agent agreement needed before introductions") < dc_far.index("dc-footer"))
+      and dc_far.index("No agent agreement — outreach OK, no introductions until signed") < dc_far.index("dc-footer"))
+
+# --- Deal Details card: NET PRICE (Sell) / GROSS PRICE (Buy), combined fee cell, Sell-only agreement chip
+def _dc_cell(card, label):
+    m = re.search(r'dc-label">' + re.escape(label) + r'</span><span class="dc-value">(.*?)</span></div>', card)
+    return m.group(1) if m else None
+
+_px_sell_cf = cf_sell({lf.NET_FIELD: 110.25, lf.GROSS_FIELD: 115.5})
+_px_buy_cf = dict(_px_sell_cf, **{lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID]})
+_px_sell = lf._deal_card_html(dict(md_noagr, custom_fields=dict(md_noagr["custom_fields"], **_px_sell_cf), value=999),
+                              "Hark Labs", paperwork=_dc_pw)
+_px_buy = lf._deal_card_html(dict(md_noagr, custom_fields=dict(md_noagr["custom_fields"], **_px_buy_cf), value=999),
+                             "Hark Labs", paperwork=_dc_pw)
+check("deal card price: Sell deal shows NET PRICE from Net 3064369 with 2 decimals, never Gross",
+      _dc_cell(_px_sell, "Net price") == "$110.25" and "Gross price" not in _px_sell and "$115.50" not in _px_sell)
+check("deal card price: Buy deal shows GROSS PRICE from Gross 3064339 with 2 decimals, never NET PRICE",
+      _dc_cell(_px_buy, "Gross price") == "$115.50" and "Net price" not in _px_buy)
+_px_whole = lf._deal_card_html(dict(md_noagr, custom_fields=dict(md_noagr["custom_fields"], **{lf.NET_FIELD: 30})),
+                               "Hark Labs", paperwork=_dc_pw)
+check("deal card price: whole-dollar price still renders 2 decimals ($30.00)", _dc_cell(_px_whole, "Net price") == "$30.00")
+_px_buy_blank = lf._deal_card_html(dict(md_noagr, custom_fields=dict(
+    {k: v for k, v in md_noagr["custom_fields"].items() if k != lf.GROSS_FIELD},
+    **{lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID], lf.NET_FIELD: 110.25})), "Hark Labs", paperwork=_dc_pw)
+check("deal card price: blank price shows the em dash, never derived from the other price",
+      _dc_cell(dc_none, "Net price") == "—" and _dc_cell(_px_buy_blank, "Gross price") == "—")
+check("deal card price: the deal value (commission) never appears", "$999" not in _px_sell and "$999" not in _px_buy)
+check("deal card fees: combined SELLER FEE · MGMT / CARRY cell renders '4% · 2% / 20%'",
+      _dc_cell(dc_far, "Seller fee · Mgmt / Carry") == "4% · 2% / 20%"
+      and 'dc-label">Seller fee</span>' not in dc_far and 'dc-label">Mgmt / Carry</span>' not in dc_far)
+_fee_blank = lf._deal_card_html(dict(md_noagr, custom_fields={k: v for k, v in md_noagr["custom_fields"].items()
+                                                              if k not in (lf.SELLER_FEE_FIELD, lf.CARRY_FIELD)}),
+                                "Hark Labs", paperwork=_dc_pw)
+_fee_none = lf._deal_card_html(dict(md_noagr, custom_fields={k: v for k, v in md_noagr["custom_fields"].items()
+                                                             if k not in (lf.SELLER_FEE_FIELD, lf.MGMT_FEE_FIELD,
+                                                                          lf.CARRY_FIELD)}),
+                               "Hark Labs", paperwork=_dc_pw)
+check("deal card fees: each piece keeps its own blank handling (amber Not set)",
+      _dc_cell(_fee_blank, "Seller fee · Mgmt / Carry")
+      == f"{lf.DC_NOT_SET_HTML} · 2% / {lf.DC_NOT_SET_HTML}"
+      and _dc_cell(_fee_none, "Seller fee · Mgmt / Carry") == f"{lf.DC_NOT_SET_HTML} · {lf.DC_NOT_SET_HTML}")
+_chip = lf._esc("No agent agreement — outreach OK, no introductions until signed")
+check("agreement chip: new wording is the shared constant",
+      lf.PAPERWORK_AGREEMENT_NEEDED_TEXT == "No agent agreement — outreach OK, no introductions until signed")
+check("agreement chip: renders (amber id-needed) on a Sell deal card with the new text",
+      f'class="id-status-badge id-needed" href=' in _px_sell and _chip + "</a>" in _px_sell
+      and "Agent agreement needed before introductions" not in _px_sell)
+check("agreement chip: never renders on a Buy deal card, same paperwork status",
+      "id-needed" not in _px_buy and _chip not in _px_buy)
 
 # --- Actions on every team row + write auth
 _md_fixture(lf.CEF_YES_ID)
@@ -6958,9 +7007,9 @@ check("detail card: full 'FINRA-mandated ID requirements unmet' wording",
 # In Process -> Agent agreement required
 _pw_fixture([6354283], bob_cef=lf.CEF_YES_ID)
 pw_row = row_for(body_only(_pw_get("ann@pwcap.com")["body"]), "88001") or ""
-check("In Process agreement -> Live pill + amber 'Agent agreement needed before introductions'",
+check("In Process agreement -> Live pill + amber 'No agent agreement — outreach OK, no introductions until signed'",
       'class="visibility-badge live"' in pw_row and "Not live" not in pw_row
-      and "Agent agreement needed before introductions</a>" in pw_row)
+      and "No agent agreement — outreach OK, no introductions until signed</a>" in pw_row)
 _pw_fixture([])
 check("blank agreement -> 'Agent agreement required'",
       lf.deal_paperwork_status(next(d for d in lf.get_deals_list() if d["id"] == 88001), "ann@pwcap.com", 1701)
@@ -7196,9 +7245,9 @@ check("attention: exactly My Deals' red chips excluding Reopen (same text + targ
       md_red == ov_red and len(ov_red) == 1 and "Extend deadline" in ov_red[0])
 _pax_mailto = lf._esc(lf._agent_agreement_mailto("Pax Co", 89002))
 check("attention: includes the amber paperwork item with the same mailto as the Status line",
-      f'<a class="action-chip paperwork-needed" href="{_pax_mailto}">Agent agreement needed before introductions</a>'
+      f'<a class="action-chip paperwork-needed" href="{_pax_mailto}">No agent agreement — outreach OK, no introductions until signed</a>'
       in ov_att
-      and f'<a class="paperwork-note needed" href="{_pax_mailto}">Agent agreement needed before introductions</a>'
+      and f'<a class="paperwork-note needed" href="{_pax_mailto}">No agent agreement — outreach OK, no introductions until signed</a>'
       in (row_for(md_page, "89002") or ""))
 check("attention: never contains a Reopen chip", "Reopen" not in ov_att)
 check("attention: no all-clear line when there are items", "All paperwork in order" not in ov_att)
@@ -7227,8 +7276,8 @@ check("status: My Deals header reads Status, not Visibility", "<th>Status</th>" 
 _pax_row = row_for(md_page, "89002") or ""
 check("status: Pax (no agent agreement) is 'Live · shown to buyers' plus the amber agreement line",
       '<span class="visibility-badge live">Live · shown to buyers</span>' in _pax_row
-      and "Agent agreement needed before introductions</a>" in _pax_row and "Not live" not in _pax_row
-      and "Pax Co" in ov_open and "Agent agreement needed before introductions</a>" in ov_open)
+      and "No agent agreement — outreach OK, no introductions until signed</a>" in _pax_row and "Not live" not in _pax_row
+      and "Pax Co" in ov_open and "No agent agreement — outreach OK, no introductions until signed</a>" in ov_open)
 _live_ids = {r["deal"]["id"] for r in md_model["live_rows"]}
 check("status: Pax counts in Live deals and in $ in pipeline",
       89002 in _live_ids and t["live_deals"] == len(_live_ids) == 3
@@ -7788,7 +7837,7 @@ check("attention (team): Extend deadline row labelled 'Mangusta Capital to do'",
 _ns_ivy_ov = _ns_get("ivy.solo@gmail.com", {"tab": "overview"})
 _ns_ivy_att = _ns_ivy_ov[_ns_ivy_ov.find('class="ov-section ov-attention"'):_ns_ivy_ov.find('class="ov-section ov-track"')]
 check("attention (individual): agreement row labelled 'You to do'",
-      _ns_owner_after(_ns_ivy_att, "Agent agreement needed before introductions") == "You to do")
+      _ns_owner_after(_ns_ivy_att, "No agent agreement — outreach OK, no introductions until signed") == "You to do")
 
 # --- Stacked action button: every table action cell uses the compact variant
 _ns_stack = lf._deal_action_html("99801", lf.STAGE_FIRM, stacked=True)

@@ -3767,7 +3767,7 @@ def _buy_side_note_html():
 # not) never depends on deal_paperwork_status. Each missing item renders
 # as an amber, actionable line under the Status pill (My Deals, Overview
 # Open deals) and in Overview's "Needs your attention".
-PAPERWORK_AGREEMENT_NEEDED_TEXT = "Agent agreement needed before introductions"
+PAPERWORK_AGREEMENT_NEEDED_TEXT = "No agent agreement — outreach OK, no introductions until signed"
 PAPERWORK_ID_NEEDED_TEXT = "ID needed before introductions"
 
 
@@ -3837,7 +3837,8 @@ def _pending_block_html(items):
 def _paperwork_badge_html(paperwork, deal=None):
     """Deal Details card badge -- same paperwork status as the My Deals
     row: a missing ID keeps the red FINRA wording; a missing agreement is
-    the amber "Agent agreement needed before introductions" mailto."""
+    the amber PAPERWORK_AGREEMENT_NEEDED_TEXT mailto, Sell deals only
+    (never on a Buy deal)."""
     if paperwork.get("buy_side"):
         return f'<span class="id-status-badge id-ok">&#10003; {_esc(BUY_SIDE_AGREEMENT_TEXT)}</span>'
     if paperwork["in_order"]:
@@ -3847,7 +3848,7 @@ def _paperwork_badge_html(paperwork, deal=None):
         if m == PAPERWORK_CEF_MISSING:
             parts.append(f'<a class="id-status-badge id-missing" href="{CEF_FORM_URL}" target="_blank" '
                          f'rel="noopener noreferrer">&#10007; {_esc(FINRA_ID_UNMET_TEXT)}</a>')
-        elif m == PAPERWORK_AGREEMENT_MISSING:
+        elif m == PAPERWORK_AGREEMENT_MISSING and _deal_is_sell(deal or {}):
             href = _agent_agreement_mailto(_deal_company_name(deal or {}), (deal or {}).get("id"))
             parts.append(f'<a class="id-status-badge id-needed" href="{_esc(href)}">'
                          f'{_esc(PAPERWORK_AGREEMENT_NEEDED_TEXT)}</a>')
@@ -8062,6 +8063,28 @@ def _ei_est_val_input_html(deal_id, est_b):
             f'value="{_esc(current)}" placeholder="e.g. 4.2B" autocomplete="off"><span class="ei-msg"></span>')
 
 
+def _deal_is_sell(deal):
+    return DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+
+
+def _deal_is_buy(deal):
+    return DEAL_SIDE_BUY_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD)
+
+
+def _fmt_price_2dp(v):
+    """$110.25 -- always 2 decimals; em dash when blank."""
+    return "—" if v is None else f"${v:,.2f}"
+
+
+def _deal_price_cell(deal):
+    """(label, value) for the Deal Details price cell: Buy deals GROSS
+    PRICE (3064339), Sell deals NET PRICE (3064369). Display only --
+    never derived from the other price, never the deal value."""
+    if _deal_is_buy(deal):
+        return "Gross price", _fmt_price_2dp(_deal_cf_number(deal, GROSS_FIELD))
+    return "Net price", _fmt_price_2dp(_deal_cf_number(deal, NET_FIELD))
+
+
 def _dc_cell_html(label, value_html, extra_cls=""):
     cls = f"dc-cell {extra_cls}".strip()
     return (f'<div class="{cls}"><span class="dc-label">{_esc(label)}</span>'
@@ -8168,6 +8191,8 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         mgmt_carry_html = DC_NOT_SET_HTML
     else:
         mgmt_carry_html = f"{_dc_value_html(mgmt_pct)} / {_dc_value_html(carry_pct)}"
+    fees_html = f"{seller_fee_html} · {mgmt_carry_html}"
+    deal_price_label, deal_price_text = _deal_price_cell(deal)
 
     # Paperwork: the same deal_paperwork_status the My Deals row uses
     # (it covers the agent agreement too, so it replaces the older
@@ -8204,12 +8229,11 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
       <div class="deal-card-metrics">
         {_dc_cell_html("Size", size_text)}
         {_dc_cell_html(price_label, price_html, "dc-price")}
-        {_dc_cell_html("Seller fee", seller_fee_html)}
+        {_dc_cell_html(deal_price_label, _esc(deal_price_text))}
         {_dc_cell_html("Deadline", deadline_value_html)}
         {_dc_cell_html("Structure", structure_text)}
         {_dc_cell_html("Exemption", exemption_value_html)}
-        {_dc_cell_html("Mgmt / Carry", mgmt_carry_html)}
-        <div class="dc-cell dc-cell-empty" aria-hidden="true"></div>
+        {_dc_cell_html("Seller fee · Mgmt / Carry", fees_html, "dc-cell-wide")}
       </div>
       {per_share_html}
       {badge_html}
@@ -13606,6 +13630,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     .dc-cell-empty {{ display: none; }}
   }}
   .dc-cell {{ min-width: 0; }}
+  /* SELLER FEE · MGMT / CARRY takes the row's last two tracks. */
+  .dc-cell-wide {{ grid-column: span 2; }}
   .dc-label {{
     display: block;
     font-size: 10px;
