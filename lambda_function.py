@@ -7730,9 +7730,9 @@ def _fmt_valuation_billions(b):
 
 
 def _est_val_display_html(b):
-    """Card value: "$4.2B", amber "Unknown" for a stored 0, amber "Not set"."""
+    """Card value: "$4.2B", amber "Unknown" for a stored 0, amber "Not provided"."""
     if b is None:
-        return DC_NOT_SET_HTML
+        return '<span class="dc-not-set">Not provided</span>'
     if b == 0:
         return '<span class="dc-not-set">Unknown</span>'
     return _esc(_fmt_valuation_billions(b))
@@ -7745,11 +7745,6 @@ def _est_val_text(b):
     if b == 0:
         return "Unknown"
     return _fmt_valuation_billions(b)
-
-
-def _fmt_share_price(v):
-    """$30 / $30.50 per share (never K/M rounding)."""
-    return f"${v:,.0f}" if v == int(v) else f"${v:,.2f}"
 
 
 def _ei_exemption_select_html(deal_id, exemption_id):
@@ -8312,7 +8307,6 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     # Item 2 (company-page parity pass): a min-max RANGE here, not the
     # single largest-value figure row-level Size cells use.
     size_text = _dc_value_html(_deal_size_range_text(deal))
-    net_text = _dc_value_html(_fmt_money(_resolve_deal_net(deal, override_entry)))
     # Item 5: net per-share, won deals only -- a subtle line, never shown
     # for a still-live deal (nothing to report per-share on until it's
     # actually closed).
@@ -8369,26 +8363,18 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     else:
         exemption_value_html = _dc_value_html(EXEMPTION_SHORT_LABELS.get(exemption_id))
 
-    # Price cell: SPV/Fund deals show the valuation (editable like the
-    # deadline) with net per share as a muted second line; every other
-    # structure keeps NET.
-    net_val = _resolve_deal_net(deal, override_entry)
-    if _deal_is_spv(deal):
-        price_label = _est_val_label(deal)
-        est_b = _resolve_deal_est_val(deal, override_entry)
-        if edit_mode:
-            price_html = _ei_est_val_input_html(deal_id, est_b)
-        else:
-            price_html = _est_val_display_html(est_b)
-            if tenant_deadline_edit and not is_closed and not _deal_is_public(deal):
-                price_html = _tenant_est_val_editor_html(deal_id, est_b, price_html,
-                                                         admin_key=impersonation_key,
-                                                         view_as=impersonation_view_as)
-        if net_val is not None:
-            price_html += f'<span class="dc-sub">{_esc(_fmt_share_price(net_val))} / sh</span>'
+    # Valuation cell, every structure: PRE-MONEY / EST. VALUATION (editable
+    # like the deadline). Net lives only in the NET PRICE cell.
+    price_label = _est_val_label(deal)
+    est_b = _resolve_deal_est_val(deal, override_entry)
+    if edit_mode:
+        price_html = _ei_est_val_input_html(deal_id, est_b)
     else:
-        price_label = "Net"
-        price_html = net_text
+        price_html = _est_val_display_html(est_b)
+        if tenant_deadline_edit and not is_closed and not _deal_is_public(deal):
+            price_html = _tenant_est_val_editor_html(deal_id, est_b, price_html,
+                                                     admin_key=impersonation_key,
+                                                     view_as=impersonation_view_as)
 
     # FEES: three labeled pieces (muted word + bold number), each with its
     # own amber "Not set"; wraps piece-by-piece at phone width.
@@ -18321,8 +18307,6 @@ def _handle_update_intro(event):
         if (_deal_is_public(deal) or _is_won_stage(tenant_rsid)
                 or _is_closed_down_stage(tenant_rsid)):
             return _json_response({"error": f"This deal is closed — its {what} can't be changed."}, 409)
-        if tenant_est_val_edit and not _deal_is_spv(deal):
-            return _json_response({"error": "Valuation applies to SPV deals only."}, 409)
     if net_price is not None and is_admin and not _deal_is_sell(deal):
         # Net is editable on Sell deals only (Buy deals' gross is read-only).
         return _json_response({"error": "Net price can be edited on Sell deals only."}, 403)

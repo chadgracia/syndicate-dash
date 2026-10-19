@@ -1412,15 +1412,25 @@ _c_fund = lf._deal_card_html(ev_fund, "EV Co", tenant_deadline_edit=True)
 _c_direct = lf._deal_card_html(ev_direct, "EV Co", tenant_deadline_edit=True)
 _c_new = lf._deal_card_html(ev_newalloc, "EV Co", tenant_deadline_edit=True)
 _c_unk = lf._deal_card_html(ev_unknown, "EV Co", tenant_deadline_edit=True)
-check("Fund deal: EST. VALUATION cell with $4.0B, muted '$30 / sh' second line, Edit link",
+check("Fund deal: EST. VALUATION cell with $4.0B and Edit link, NO '/ sh' line",
       'dc-label">Est. valuation</span>' in _c_fund and '<span class="dc-ev-value">$4.0B</span>' in _c_fund
-      and '<span class="dc-sub">$30 / sh</span>' in _c_fund and 'class="dc-ev-edit">Edit</a>' in _c_fund
+      and "/ sh" not in _c_fund and "dc-sub" not in _c_fund and 'class="dc-ev-edit">Edit</a>' in _c_fund
       and 'dc-label">Net</span>' not in _c_fund)
-check("non-Fund deal: NET cell unchanged, no valuation editor",
-      'dc-label">Net</span><span class="dc-value">$30</span>' in _c_direct and "dc-ev" not in _c_direct
-      and "valuation" not in _c_direct.lower())
-check("New allocation Fund deal: 'PRE-MONEY VALUATION' label; unset -> amber Not set + 'Set value'",
-      'dc-label">Pre-money valuation</span>' in _c_new and lf.DC_NOT_SET_HTML in _c_new.split("dc-price")[1][:600]
+_c_direct_set = lf._deal_card_html(dict(ev_direct, custom_fields=dict(ev_direct["custom_fields"],
+                                                                      **{lf.EST_VAL_FIELD: 1.25})),
+                                   "EV Co", tenant_deadline_edit=True)
+check("Direct deal: second cell is EST. VALUATION 'Not provided' + 'Set value' when blank, no NET cell",
+      'dc-label">Est. valuation</span>' in _c_direct
+      and '<span class="dc-ev-value"><span class="dc-not-set">Not provided</span></span>' in _c_direct
+      and 'class="dc-ev-edit">Set value</a>' in _c_direct
+      and 'dc-label">Net</span>' not in _c_direct and "/ sh" not in _c_direct)
+check("Direct deal with a valuation: '$1.25B' + Edit, net only in the NET PRICE cell",
+      '<span class="dc-ev-value">$1.25B</span><a href="#" class="dc-ev-edit">Edit</a>' in _c_direct_set
+      and 'dc-label">Net</span>' not in _c_direct_set and _dc_np_value(_c_direct_set) == "$30.00"
+      and "$30<" not in _c_direct_set.replace("$30.00", ""))
+check("New allocation Fund deal: 'PRE-MONEY VALUATION' label; unset -> amber 'Not provided' + 'Set value'",
+      'dc-label">Pre-money valuation</span>' in _c_new
+      and '<span class="dc-not-set">Not provided</span>' in _c_new.split("dc-price")[1][:600]
       and 'class="dc-ev-edit">Set value</a>' in _c_new)
 check("stored 0 (seller ticked Unknown) -> amber 'Unknown' + 'Set value'",
       '<span class="dc-not-set">Unknown</span>' in _c_unk and 'class="dc-ev-edit">Set value</a>' in _c_unk)
@@ -1475,10 +1485,13 @@ for _bad in ("0", "-5B", "abc", "500k"):
 
 ev_pipeline.clear(); ses_calls.clear()
 _r_dir = _ev_post({"deal_id": "8802", "est_valuation": "4.2B"})
+check("tenant valuation edit works on a Direct (non-Fund) deal too -> 200, PUT 4.2",
+      _r_dir["statusCode"] == 200 and ev_pipeline[-1]["data"]["deal"]["custom_fields"] == {lf.EST_VAL_FIELD: 4.2})
+ev_pipeline.clear(); ses_calls.clear()
 _r_closed = _ev_post({"deal_id": "8806", "est_valuation": "4.2B"})
 _r_foreign = _ev_post({"deal_id": "8805", "est_valuation": "4.2B"})
-check("tenant valuation edit refused on a non-Fund deal (409), a closed deal (409), another tenant's deal (403)",
-      _r_dir["statusCode"] == 409 and _r_closed["statusCode"] == 409 and _r_foreign["statusCode"] == 403
+check("tenant valuation edit refused on a closed deal (409) and another tenant's deal (403)",
+      _r_closed["statusCode"] == 409 and _r_foreign["statusCode"] == 403
       and not ev_pipeline and not ses_calls)
 for _extra in ({"deadline": iso_dash(20)}, {"notes": "x"}, {"exemption": "7200027"}, {"next_steps": "x"}):
     _r = _ev_post(dict({"deal_id": "8801", "est_valuation": "4.2B"}, **_extra))
@@ -1493,10 +1506,11 @@ check("impersonated valuation save -> 200, audited as 'cgracia@… (as <tenant>)
       and not ses_calls)
 _r_imp_dir = lf.lambda_handler(post_event({"key": ADMIN_KEY, "view_as": EV_EMAIL, "deal_id": "8802",
                                            "est_valuation": "4.5B"}), None)
-check("impersonated valuation save runs the tenant rules (non-Fund -> 409)", _r_imp_dir["statusCode"] == 409)
+check("impersonated valuation save on a Direct deal -> 200 (valuation applies to every structure)",
+      _r_imp_dir["statusCode"] == 200)
 ev_pipeline.clear(); ses_calls.clear()
 _r_adm = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "8802", "est_valuation": "850m"}), None)
-check("Admin view save is unrestricted (non-Fund ok) -> 200, Pipeline PUT 0.85, actor admin, NO email",
+check("Admin view save on a Direct deal -> 200, Pipeline PUT 0.85, actor admin, NO email",
       _r_adm["statusCode"] == 200 and ev_pipeline[-1]["data"]["deal"]["custom_fields"] == {lf.EST_VAL_FIELD: 0.85}
       and ev_table.puts[-1].get("actor") == "admin" and not ses_calls)
 
@@ -1591,6 +1605,13 @@ _np_after = lf._deal_card_html(dict(np_sell, updated_at=_pl_ts(_now_dt - timedel
                                tenant_deadline_edit=True)
 check("after saving, the card shows the new net (override bridges until Pipeline catches up)",
       _dc_np_value(_np_after) == "$32.75" and 'value="32.75"' in _np_after)
+_np_spv_after = lf._deal_card_html(dict(np_sell, updated_at=_pl_ts(_now_dt - timedelta(hours=2)),
+                                        custom_fields=dict(np_sell["custom_fields"],
+                                                           **{lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID]})),
+                                   "EV Co", _np_ov, tenant_deadline_edit=True)
+check("a net save shows ONLY in the NET PRICE cell: no second-cell NET, no '/ sh' line (Direct and SPV)",
+      all(c.count("$32.75") == 1 and 'dc-label">Net</span>' not in c and "/ sh" not in c
+          and _dc_np_value(c) == "$32.75" for c in (_np_after, _np_spv_after)))
 check("net override blanks gross until Pipeline catches up; a later Pipeline edit wins",
       lf._resolve_deal_gross(dict(np_sell, updated_at=_pl_ts(_now_dt - timedelta(hours=2))), _np_ov) is None
       and lf._resolve_deal_net(dict(np_sell, updated_at=_pl_ts(_now_dt + timedelta(hours=1))), _np_ov) == 30.0)
@@ -6974,10 +6995,9 @@ _dc_pw = lf.deal_paperwork_status(md_noagr, "bob@harkcap.com", 1602)
 dc_soon = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_soon), "Hark Labs", paperwork=_dc_pw)
 dc_far = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_far), "Hark Labs", paperwork=_dc_pw)
 dc_none = lf._deal_card_html(dict(md_noagr, custom_fields=_dc_cf_none), "Hark Labs", paperwork=_dc_pw)
-_grid_order = [m for m in re.findall(r'dc-label">([^<]+)<', dc_far)]
 _grid_order = re.findall(r'dc-label">([^<]+)<', dc_far)
-check("deal card: grid order SIZE|NET|NET PRICE|DEADLINE / STRUCTURE|EXEMPTION|FEES (wide); 'Oct 31, 2099', no far hint",
-      _grid_order == ["Size", "Net", "Net price", "Deadline", "Structure", "Exemption", "Fees"]
+check("deal card: grid order SIZE|EST. VALUATION|NET PRICE|DEADLINE / STRUCTURE|EXEMPTION|FEES (wide); 'Oct 31, 2099', no far hint",
+      _grid_order == ["Size", "Est. valuation", "Net price", "Deadline", "Structure", "Exemption", "Fees"]
       and dc_far.count('class="dc-cell') == 7 and 'dc-cell-empty' not in dc_far
       and 'class="dc-cell dc-cell-wide"><span class="dc-label">Fees<' in dc_far
       and "Oct 31, 2099" in dc_far and "dc-hint" not in dc_far and "Deadline: " not in dc_far)
