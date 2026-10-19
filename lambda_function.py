@@ -16879,9 +16879,9 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
   h1 { font-size: 26px; margin: 0 0 16px; }
   h2 { font-size: 16px; margin: 0 0 8px; }
   table { width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }
-  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+  th, td { text-align: left; padding: 10px 5px; border-bottom: 1px solid var(--line); vertical-align: middle; }
   th { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em;
-       white-space: nowrap; }
+       white-space: nowrap; line-height: 1.25; }
   .num, input.num { font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace; font-variant-numeric: tabular-nums; }
   input[type=search], input[type=text], input[type=date] { padding: 6px 8px; font: inherit; font-size: 13px;
          border: 1px solid #d6d6d2; border-radius: 6px; box-sizing: border-box; background: #fff; }
@@ -16909,8 +16909,15 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
   .st-ok-mark { color: var(--green); font-weight: 600; }
   .st-togo { color: var(--amber); background: var(--amber-bg); border-radius: 4px; padding: 1px 6px; font-weight: 500;
              white-space: nowrap; }
-  .st-rep { white-space: nowrap; } .st-rep .st-btns { display: block; margin-top: 4px; }
-  .st-rep .st-btns button { font-size: 11px; padding: 1px 6px; }
+  .st-rep { display: inline-block; white-space: nowrap; }
+  .st-rep .st-btns { display: flex; flex-direction: column; gap: 3px; margin-top: 4px; width: max-content; }
+  .st-rep .st-btns button { font-size: 11px; padding: 1px 6px; width: 100%; }
+  td.st-name, td.st-firm { min-width: 96px; max-width: 160px; overflow-wrap: break-word; }
+  td.st-trades { min-width: 130px; max-width: 170px; } td.st-trades a { text-decoration: none; display: block; }
+  td.st-trades a .st-tline { text-decoration: underline; white-space: nowrap; }
+  td.st-trades a .st-muted { font-size: 11px; line-height: 1.3; margin-top: 2px; }
+  td.st-refs { max-width: 110px; } td.st-tier .st-muted { white-space: normal; } select[data-act=floor] { max-width: 84px; }
+  td.st-notescol { width: 100%; }
   .st-yes { color: var(--green); font-weight: 600; text-decoration: none; }
   .st-no { color: #9ca3af; text-decoration: none; }
   tr.st-changed td { background: #fffbeb; }
@@ -16922,7 +16929,7 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
   .st-panel table { background: transparent; margin: 6px 0; }
   .st-panel th, .st-panel td { padding: 6px 8px; }
   .st-results div { padding: 3px 0; }
-  textarea.st-notes { width: 190px; min-height: 30px; font: 12px/1.4 "IBM Plex Sans", sans-serif; resize: vertical;
+  textarea.st-notes { width: 100%; min-width: 170px; min-height: 30px; font: 12px/1.4 "IBM Plex Sans", sans-serif; resize: vertical;
          overflow: hidden; border: 1px solid #d6d6d2; border-radius: 6px; padding: 5px 7px; box-sizing: border-box; }
   input.st-size { width: 130px; text-align: right; }
   th.st-selcol, td.st-selcol { background: #f4f4f1; border-right: 2px solid #d6d6d2; text-align: center; width: 56px; }
@@ -16955,9 +16962,9 @@ __BANNER__
 <div class="st-save"><span id="st-dirty">No unsaved changes</span>
   <button type="button" id="st-savebtn">Save changes</button><div id="st-msg"></div></div>
 <table>
-<thead><tr><th class="st-selcol"><label><input type="checkbox" id="st-all"> Select</label></th><th>Name</th><th>Firm</th><th>ID forms</th><th>Qualification</th>
+<thead><tr><th class="st-selcol"><label><input type="checkbox" id="st-all"> Select</label></th><th>Name</th><th>Firm</th><th>ID<br>forms</th><th>IQF</th>
 <th>Terms</th><th>Payments</th><th>Responds</th><th>Trades</th><th>Referrals</th>
-<th>Tier floor</th><th title="Sensitive client — standing shown nowhere, not even to the client">Hidden everywhere</th><th>Shared with sellers</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
+<th>Min<br>tier</th><th title="Sensitive client — standing shown nowhere, not even to the client">Hidden<br>everywhere</th><th>Shared<br>w/ sellers</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
 </table>
 </div>
@@ -17048,17 +17055,28 @@ STANDING_PAGE_JS = r"""
   function rep(r, f) { var v = cur(r).rec[f];
     return '<span class="st-rep">' + (v === 0 ? '<span class="st-ok-mark">✓</span>' : '<span class="st-togo num">' + v + ' to go</span>') +
       '<span class="st-btns"><button type="button" data-act="miss" data-f="' + f + '"' + (v >= D.repair_max ? ' disabled' : '') +
-      '>Missed</button> <button type="button" data-act="clear" data-f="' + f + '"' + (v === 0 ? ' disabled' : '') +
+      '>Missed</button><button type="button" data-act="clear" data-f="' + f + '"' + (v === 0 ? ' disabled' : '') +
       '>Cleared</button></span></span>'; }
   function tierHtml(r) { var st = standing(r);
     return esc(st.tier ? (D.tier_labels[st.tier] + ' · ' + D.discounts[st.tier] + '%') : '—') +
       (st.good ? '' : '<div class="st-muted" style="font-weight:400">not in good standing</div>'); }
+  // Next tier the trade data alone would reach: the closer of the volume and
+  // trade-count routes (by fraction of the threshold still to go).
+  function tradesNext(ts) {
+    var plat = ts.vol >= D.plat_vol || ts.t1m >= D.plat_1m, gold = ts.vol >= D.gold_vol || ts.t250 >= D.gold_250k;
+    if (plat) return '';
+    var lbl = gold ? 'Platinum' : 'Gold', vt = gold ? D.plat_vol : D.gold_vol, ct = gold ? D.plat_1m : D.gold_250k;
+    var have = gold ? ts.t1m : ts.t250, size = gold ? '$1M+' : '$250K+';
+    var dv = vt - ts.vol, dc = ct - have;
+    return lbl + ': ' + (dv / vt <= dc / ct ? money(dv) : dc + ' more ' + size + ' trade' + (dc === 1 ? '' : 's')); }
   function tradesCell(r) { var ts = standing(r).ts;
-    return '<a href="#" data-act="trades" class="num">' + ts.trades + ' trade' + (ts.trades === 1 ? '' : 's') + ' · ' +
-      money(ts.vol) + '</a><div class="st-muted num">' + ts.t250 + ' of $250K+ · ' + ts.t1m + ' of $1M+</div>' +
+    if (!ts.trades) return '<a href="#" data-act="trades"><span class="st-tline">—</span></a>';
+    var next = tradesNext(ts);
+    return '<a href="#" data-act="trades"><span class="st-tline num">' + ts.trades + ' trade' + (ts.trades === 1 ? '' : 's') + ' · ' +
+      money(ts.vol) + '</span>' + (next ? '<div class="st-muted">' + esc(next) + '</div>' : '') + '</a>' +
       (ts.unknown ? '<div class="st-amber">' + ts.unknown + ' size unknown</div>' : ''); }
   function refsCell(r) { var st = standing(r);
-    return '<a href="#" data-act="refs">' + st.conf + ' confirmed · ' + st.pend + ' pending</a>'; }
+    return '<a href="#" data-act="refs">' + (st.conf || st.pend ? st.conf + ' confirmed · ' + st.pend + ' pending' : '—') + '</a>'; }
   function fmtVal(v) {
     if (v == null || v === '') return '—';
     if (Array.isArray(v)) return v.length ? v.map(function(x) { return x && x.person_id ? '#' + x.person_id +
@@ -17082,17 +17100,17 @@ STANDING_PAGE_JS = r"""
     return '<tr data-id="' + esc(r.id) + '"' + (cls.trim() ? ' class="' + cls.trim() + '"' : '') + '>' +
       '<td class="st-selcol"><input type="checkbox" data-act="sel" aria-label="Select ' + esc(r.name) + '"' +
         (selected[r.id] ? ' checked' : '') + '></td>' +
-      '<td><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) + '</a>' +
+      '<td class="st-name"><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) + '</a>' +
         (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') +
         '<div class="st-muted">' + roleLabel(r) + '</div></td>' +
-      '<td>' + esc(r.firm) + '</td>' +
+      '<td class="st-firm">' + esc(r.firm) + '</td>' +
       '<td>' + (roleOf(r).seller ? '<a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' +
         (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a>' : '<span class="st-muted">n/a</span>') + ovNote(r, 'id_forms') + '</td>' +
       '<td>' + (roleOf(r).buyer ? '<span class="' + (r.qual ? 'st-yes">✓' : 'st-no">○') + '</span>' :
         '<span class="st-muted">n/a</span>') + ovNote(r, 'qualification') + '</td>' +
       '<td>' + rep(r, 'terms_repair') + '</td><td>' + rep(r, 'payments_repair') + '</td><td>' + rep(r, 'respond_repair') + '</td>' +
-      '<td data-role="trades">' + tradesCell(r) + '</td>' +
-      '<td data-role="refs">' + refsCell(r) + '</td>' +
+      '<td class="st-trades" data-role="trades">' + tradesCell(r) + '</td>' +
+      '<td class="st-refs" data-role="refs">' + refsCell(r) + '</td>' +
       '<td><select data-act="floor">' + floorOpts + '</select></td>' +
       '<td><label title="Sensitive client — standing shown nowhere, not even to the client"><input type="checkbox" data-act="hidden"' +
         (rec.hidden ? ' checked' : '') + '> Hidden</label></td>' +
@@ -17101,7 +17119,7 @@ STANDING_PAGE_JS = r"""
         (r.share_at ? '<div class="st-muted">' + (r.share ? 'Opted in ' : 'Opted out ') +
           esc(String(r.share_at).slice(0, 10)) + '</div>' : (r.share ? '' : '<div class="st-muted">Not shared</div>')) + '</td>' +
       '<td class="st-tier" data-role="tier">' + tierHtml(r) + '</td>' +
-      '<td><textarea class="st-notes" data-act="notes" maxlength="' + D.notes_max + '" rows="1">' + esc(rec.notes) + '</textarea></td>' +
+      '<td class="st-notescol"><textarea class="st-notes" data-act="notes" maxlength="' + D.notes_max + '" rows="1">' + esc(rec.notes) + '</textarea></td>' +
       '<td>' + (hist.length ? '<a href="#" data-act="hist">History (' + hist.length + ')</a>' : '<span class="st-muted">History (0)</span>') + '</td></tr>' +
       (openTrades[r.id] ? tradesHtml(r) : '') + (openRefs === r.id ? refsHtml(r) : '') + (openHist[r.id] ? histHtml(r) : '');
   }

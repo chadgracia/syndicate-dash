@@ -9334,7 +9334,7 @@ _st_html = _st_page["body"].split("<script>")[0]
 check("admin scoreboard: rows embedded as JSON, not one server-rendered <tr> each", _st_html.count("<tr") == 1)
 check("admin scoreboard: no global toggles; Hidden everywhere column + filter, no Visible control",
       "Show standing to sellers" not in _st_html and "Show status to buyers" not in _st_html
-      and ">Hidden everywhere</th>" in _st_html and ">Hidden everywhere only<" in _st_html
+      and ">Hidden<br>everywhere</th>" in _st_html and ">Hidden everywhere only<" in _st_html
       and ">Not hidden only<" in _st_html and "Visible" not in _st_html and "visible_on" not in _st_html
       and "Make visible" not in lf.STANDING_PAGE_JS and "Set Private" not in _st_html)
 check("admin scoreboard: per-row Hidden checkbox with the tooltip, saved as hidden, count of hidden",
@@ -9856,7 +9856,7 @@ check("standing_share: opt back out -> second history entry, muted line shows ag
 _st_sb = _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
 _st_row2 = [x for x in _st_page_data(_st_sb)["rows"] if x["id"] == "2"][0]
 check("scoreboard: read-only 'Shared with sellers' column shows the opt-out date",
-      ">Shared with sellers</th>" in _st_sb and _st_row2["share"] is False and _st_row2["share_at"] == _st_sh[-1]["at"]
+      ">Shared<br>w/ sellers</th>" in _st_sb and _st_row2["share"] is False and _st_row2["share_at"] == _st_sh[-1]["at"]
       and "'Opted out'" not in _st_sb and "Opted out" in lf.STANDING_PAGE_JS and "Not shared" in lf.STANDING_PAGE_JS
       and "share_with_sellers" not in _st_row2["rec"] and _st_row2["rec"]["hidden"] is False)
 _st_s3.put_calls.clear()
