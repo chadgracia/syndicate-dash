@@ -16962,7 +16962,7 @@ __BANNER__
 <div class="st-save"><span id="st-dirty">No unsaved changes</span>
   <button type="button" id="st-savebtn">Save changes</button><div id="st-msg"></div></div>
 <table>
-<thead><tr><th class="st-selcol"><label><input type="checkbox" id="st-all"> Select</label></th><th>Name</th><th>Firm</th><th>ID<br>forms</th><th>IQF</th>
+<thead><tr><th class="st-selcol"><label><input type="checkbox" id="st-all"> Select</label></th><th>Name</th><th>Firm</th><th>CEF</th><th>IQF</th>
 <th>Terms</th><th>Payments</th><th>Responds</th><th>Trades</th><th>Referrals</th>
 <th>Min<br>tier</th><th title="Sensitive client — standing shown nowhere, not even to the client">Hidden<br>everywhere</th><th>Shared<br>w/ sellers</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
