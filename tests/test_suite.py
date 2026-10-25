@@ -10513,6 +10513,32 @@ check("Re-Open confirm: other deals keep the Inquiry wording",
 check("Re-Open confirm: script reads the server-built wording",
       "window.confirm(btn.getAttribute('data-confirm'))" in lf._reopen_deal_script_html())
 
+# ======================================================================
+# SECTION: Client Standing — "See card" link under each name
+# ======================================================================
+_sc_saved = (lf._load_client_standing, lf.standing_admin_rows)
+lf._load_client_standing = lambda fresh=False: {"rev": 3, "clients": {}}
+lf.standing_admin_rows = lambda state: [
+    {"id": "41001", "name": "Normal Client", "has_record": True, "rec": {"hidden": False}},
+    {"id": "41002", "name": "No Record Client", "has_record": False, "rec": {"hidden": False}},
+    {"id": "41003", "name": "Hidden Client", "has_record": True, "rec": {"hidden": True}},
+]
+try:
+    _sc_page = lf.render_standing_page(ADMIN_KEY)
+finally:
+    lf._load_client_standing, lf.standing_admin_rows = _sc_saved
+_sc_rows = {r["id"]: r for r in _st_page_data(_sc_page)["rows"]}
+check("See card: normal, no-record and hidden rows each link the desk view-as Profile for their person_id",
+      all(_sc_rows[pid]["card_url"] == f"https://desk.graciagroup.com/?as={pid}&view=profile"
+          for pid in ("41001", "41002", "41003")))
+check("See card: link rendered under the role line, new tab, muted, on every row (no has_record/hidden gate)",
+      "'<div class=\"st-muted\">' + roleLabel(r) + '</div>' +\n"
+      "        '<div class=\"st-muted\"><a target=\"_blank\" rel=\"noopener\" href=\"' + esc(r.card_url) + '\">See card</a>' +"
+      in lf.STANDING_PAGE_JS)
+check("See card: hidden rows get the muted 'client sees nothing' note",
+      "(rec.hidden ? ' (hidden — client sees nothing)' : '') + '</div></td>'" in lf.STANDING_PAGE_JS)
+check("See card: no admin key in the card URL", ADMIN_KEY not in "".join(r["card_url"] for r in _sc_rows.values()))
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)

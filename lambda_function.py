@@ -16429,6 +16429,9 @@ def render_standing_page(key, focus_pid=None):
     state = _load_client_standing(fresh=True)
     load_error = state is None
     rows = [] if load_error else standing_admin_rows(state)
+    for r in rows:
+        # "See card": the desk's admin view-as Profile page (what the client sees on their status card).
+        r["card_url"] = f"{PUBLIC_HOST_URL}/?as={urllib.parse.quote(str(r['id']), safe='')}&view=profile"
     data = {
         "key": key or "", "rev": 0 if load_error else state["rev"], "load_error": load_error, "rows": rows,
         "page_rows": STANDING_PAGE_ROWS, "repair_max": STANDING_REPAIR_MAX, "notes_max": STANDING_NOTES_MAX_LEN,
@@ -17102,7 +17105,9 @@ STANDING_PAGE_JS = r"""
         (selected[r.id] ? ' checked' : '') + '></td>' +
       '<td class="st-name"><a target="_blank" rel="noopener" href="' + esc(personUrl) + '">' + esc(r.name) + '</a>' +
         (r.has_record ? '' : ' <span class="st-muted">(no record)</span>') +
-        '<div class="st-muted">' + roleLabel(r) + '</div></td>' +
+        '<div class="st-muted">' + roleLabel(r) + '</div>' +
+        '<div class="st-muted"><a target="_blank" rel="noopener" href="' + esc(r.card_url) + '">See card</a>' +
+        (rec.hidden ? ' (hidden — client sees nothing)' : '') + '</div></td>' +
       '<td class="st-firm">' + esc(r.firm) + '</td>' +
       '<td>' + (roleOf(r).seller ? '<a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' +
         (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a>' : '<span class="st-muted">n/a</span>') + ovNote(r, 'id_forms') + '</td>' +
