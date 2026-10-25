@@ -2237,6 +2237,16 @@ check("header: work_phone preferred over phone; home never read",
 check("header: work phone equal to mobile shown once",
       lf._buyer_header_html({"id": 2, "custom_fields": {}, "mobile": "+1 212 555 0142", "phone": "+12125550142"},
                             None, show_phones=True).count("tel:") == 1)
+check("deal team: home phone only -> no phone rendered",
+      "tel:" not in lf._deal_team_member_html({"id": 2, "name": "Alice Buyer", "home_phone": "+15555550199",
+                                               "phones": [{"number": "+15555550199"}]})
+      and "15555550199" not in lf._deal_team_member_html({"id": 2, "name": "Alice Buyer",
+                                                          "home_phone": "+15555550199",
+                                                          "phones": ["+15555550199"]}))
+_dt_line = lf._deal_team_member_html(_ph_rec)
+check("deal team: mobile + work tel: links like the header, never home",
+      'Mobile <a href="tel:+971585629481">' in _dt_line and 'Work <a href="tel:+442079460958">' in _dt_line
+      and "15555550199" not in _dt_line)
 check("header: home phone alone -> no phone at all",
       "tel:" not in lf._buyer_header_html({"id": 2, "custom_fields": {}, "home_phone": "+15555550199"},
                                           None, show_phones=True))

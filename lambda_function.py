@@ -14618,7 +14618,9 @@ def _deal_team_member_html(rec, key=None, view_as=None):
     """One person's line in DEAL TEAM: a small avatar (item 1: ?photo=
     <id>, fallback initials otherwise), name (linking to their own buyer
     page), position/title if present (same on-trust "title" field
-    _buyer_header_html already reads), mailto email, phone."""
+    _buyer_header_html already reads), mailto email, mobile/work tel:
+    links (_person_phone_links, same as the header -- never the home
+    phone or the "phones" list)."""
     name = _esc(_person_display_name(rec) or "—")
     href = _buyer_href(rec.get("id"), key, view_as)
     photo_html = (f'<img class="deal-team-avatar" src="{_photo_href(rec.get("id"), key, view_as)}" '
@@ -14629,9 +14631,7 @@ def _deal_team_member_html(rec, key=None, view_as=None):
     email = _person_email_text(rec)
     if email:
         contact_parts.append(f'<a href="mailto:{_esc(email)}">{_esc(email)}</a>')
-    phone = _person_phone_text(rec)
-    if phone:
-        contact_parts.append(_esc(phone))
+    contact_parts.extend(_person_phone_links(rec))
     contact_html = (f'<div class="buyer-page-row">{" &middot; ".join(contact_parts)}</div>'
                      if contact_parts else "")
     return (f'<div class="deal-team-member">'
