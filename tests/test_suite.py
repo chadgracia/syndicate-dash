@@ -2116,7 +2116,8 @@ TENANT_B_PID = 8
 people = {"people": [
     {"id": TENANT_A_PID, "full_name": "Sella Seller", "email": TENANT_A_EMAIL, "custom_fields": {}},
     {"id": TENANT_B_PID, "full_name": "Tabor Seller", "email": TENANT_B_EMAIL, "custom_fields": {}},
-    {"id": 2, "name": "Alice Buyer", "email": "alice@example.com", "custom_fields": {}},
+    {"id": 2, "name": "Alice Buyer", "email": "alice@example.com", "custom_fields": {},
+     "mobile": "+971585629481", "phone": "+12125550142", "home_phone": "+15555550199"},
 ]}
 deal_802 = {"id": 802, "name": "Alpha Deal", "company": {"name": "Alpha Industries"}, "deal_stage": {"id": lf.STAGE_MATCHED},
             "custom_fields": cf_status(7207579), "people": [{"id": TENANT_A_PID}, {"id": 2}], "updated_at": "2026-08-02T00:00:00Z"}
@@ -2206,6 +2207,39 @@ check("full-access buyer page: deal-note input per disclosed intro",
 check("full-access buyer page: no deal-note input for the undisclosed 805", "Deal notes: Delta Corp" not in page_buyer_full)
 check("full-access buyer page: person-note input titled with the first name", ">Your notes on Alice</h2>" in page_buyer_full)
 check("full-access buyer page includes the note save script", "?action=' + action" in page_buyer_full)
+
+check("buyer page phones: introduced tenant sees mobile + work as tel: links",
+      'Mobile <a href="tel:+971585629481">+971585629481</a>' in page_buyer_full
+      and 'Work <a href="tel:+12125550142">+12125550142</a>' in page_buyer_full)
+check("buyer page phones: home phone never rendered (tenant)", "15555550199" not in page_buyer_full)
+_page_buyer_admin_ph = lf.render_buyer_page(2, "Admin", tenant_a, TENANT_A_EMAIL, key=ADMIN_KEY, view_as=None,
+                                            edit_mode=True)
+check("buyer page phones: Admin view shows mobile + work, never home",
+      'href="tel:+971585629481"' in _page_buyer_admin_ph and 'href="tel:+12125550142"' in _page_buyer_admin_ph
+      and "15555550199" not in _page_buyer_admin_ph)
+_orig_disclosed = lf._tenant_has_disclosed_deal_with
+lf._tenant_has_disclosed_deal_with = lambda *a: False
+try:
+    _page_buyer_matched = lf.render_buyer_page(2, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None,
+                                               edit_mode=False)
+finally:
+    lf._tenant_has_disclosed_deal_with = _orig_disclosed
+check("buyer page phones: no Introduced-or-later deal -> no phone anywhere",
+      "tel:" not in _page_buyer_matched and "585629481" not in _page_buyer_matched
+      and "2125550142" not in _page_buyer_matched)
+_ph_rec = {"id": 2, "name": "Alice Buyer", "custom_fields": {}, "mobile": "+971585629481",
+           "work_phone": "+442079460958", "phone": "+12125550142", "home_phone": "+15555550199"}
+check("header: phones hidden unless show_phones is passed",
+      "tel:" not in lf._buyer_header_html(_ph_rec, None))
+_ph_hdr = lf._buyer_header_html(_ph_rec, None, show_phones=True)
+check("header: work_phone preferred over phone; home never read",
+      'Work <a href="tel:+442079460958">' in _ph_hdr and "2125550142" not in _ph_hdr and "15555550199" not in _ph_hdr)
+check("header: work phone equal to mobile shown once",
+      lf._buyer_header_html({"id": 2, "custom_fields": {}, "mobile": "+1 212 555 0142", "phone": "+12125550142"},
+                            None, show_phones=True).count("tel:") == 1)
+check("header: home phone alone -> no phone at all",
+      "tel:" not in lf._buyer_header_html({"id": 2, "custom_fields": {}, "home_phone": "+15555550199"},
+                                          None, show_phones=True))
 
 page_buyer_anon = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
 check("anonymized (no disclosed deal) buyer page has no Notes section", ">Notes</h2>" not in page_buyer_anon)
@@ -2585,7 +2619,7 @@ check("admin: same Summary text, no hidden flag for clean text",
       "word79" in page_alice_admin and "Hidden from sellers" not in page_alice_admin)
 
 _firm_rec = {"id": 7001, "summary": "Line one.\nLine <two>.", "description": "Old desc",
-             "address_1": "1 Main St", "address2": "Suite 5", "city": "Austin", "state": "TX", "zip": "78701",
+             "address_1": "1 Main St", "address_2": "Suite 5", "city": "Austin", "postal_code": "78701",
              "country": "USA", "phone1": "+1 512 555 0100", "web_url": "acme.example.com",
              "custom_fields": {lf.COMPANY_LEGAL_NAME_FIELD: "Acme LLC", lf.COMPANY_PITCHBOOK_FIELD: "pitchbook.com/a",
                                lf.COMPANY_CRUNCHBASE_FIELD: "crunchbase.com/a",
@@ -2597,9 +2631,20 @@ check("About card: Summary wins over description, one <p> per line, escaped",
       and "Old desc" not in _firm_t)
 check("About card: row order Summary, Legal name, address, phone, website, Founded, PitchBook, Crunchbase",
       _firm_t.index("Line one.") < _firm_t.index("Legal name: Acme LLC")
-      < _firm_t.index("1 Main St, Suite 5, Austin, TX, 78701, USA") < _firm_t.index("+1 512 555 0100")
+      < _firm_t.index("1 Main St, Suite 5, Austin, 78701, USA") < _firm_t.index("+1 512 555 0100")
       < _firm_t.index('href="https://acme.example.com"') < _firm_t.index("Founded 2001")
       < _firm_t.index("PitchBook profile") < _firm_t.index('href="https://crunchbase.com/a"'))
+_firm_t2d3 = lf._buyer_about_firm_html("T2D3 Ventures", {
+    "id": 138490920, "address": "POST BOX 9305", "address1": "PO Box 1", "zip": "POST BOX 9305", "state": "Dubai",
+    "address_1": "2210 Peninsula Five, Business Bay", "city": "Dubai", "postal_code": "00000",
+    "country": "United Arab Emirates", "custom_fields": {}}, False)
+check("About card: address = address_1, address_2, city, postal_code, country only",
+      '<div class="buyer-page-row">2210 Peninsula Five, Business Bay, Dubai, 00000, United Arab Emirates</div>'
+      in _firm_t2d3 and "POST BOX" not in _firm_t2d3 and "PO Box 1" not in _firm_t2d3)
+check("About card: only non-empty links render",
+      "href" not in lf._buyer_about_firm_html("X", {"id": 1, "city": "Dubai", "web_url": " ",
+                                                    "custom_fields": {lf.COMPANY_PITCHBOOK_FIELD: "",
+                                                                      lf.COMPANY_CRUNCHBASE_FIELD: None}}, False))
 check("About card: Entity Tax ID / Beneficial Owner never rendered",
       "TAXID-11-2222222" not in _firm_t and "BENEFICIAL OWNER X" not in _firm_t
       and "TAXID-11-2222222" not in lf._buyer_about_firm_html("Acme", _firm_rec, True))

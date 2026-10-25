@@ -774,6 +774,7 @@ ACCEPTS_LABELS = {
 # option/field id supplied this way in this file).
 COMPANY_PITCHBOOK_FIELD = "custom_label_3320818"
 COMPANY_LEGAL_NAME_FIELD = "custom_label_3769275"   # public, firm card "Legal name:"
+COMPANY_ADDRESS_KEYS = ("address_1", "address_2", "city", "postal_code", "country")
 COMPANY_CRUNCHBASE_FIELD = "custom_label_3064297"   # public, firm card "Crunchbase profile"
 # Never tenant-facing and never read here: company Entity Tax ID (3803741), Beneficial Owner (3985424).
 
@@ -2000,7 +2001,7 @@ def _cached_object_version(s3, key):
 # of band: event {"task": "rebuild_slim"} (see _task_rebuild_slim).
 PEOPLE_SLIM_KEY = "syndicate-dash/people-slim.json"
 PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name", "full_name", "company_id",
-                      "company_name", "title", "position", "phone", "phones", "mobile", "website", "linked_in_url",
+                      "company_name", "title", "position", "phone", "phones", "mobile", "work_phone", "website", "linked_in_url",
                       "work_country", "home_country", "work_city", "home_city", "updated_at", "created_at",
                       "won_deals_total", "custom_fields")
 # Every custom_label_N this file references (a test keeps this in sync).
@@ -14414,7 +14415,27 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 </html>"""
 
 
-def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html=""):
+def _person_tel_html(label, number):
+    """'Mobile <a href="tel:+971…">+971…</a>'; "" when the number has no digits."""
+    number = (number or "").strip() if isinstance(number, str) else ""
+    dial = re.sub(r"[^\d+]", "", number)
+    if not re.search(r"\d", dial):
+        return ""
+    return f'{label} <a href="tel:{_esc(dial)}">{_esc(number)}</a>'
+
+
+def _person_phone_links(rec):
+    """Mobile, then work phone (work_phone, else phone), as tel: links. The
+    home phone is never read."""
+    mobile = rec.get("mobile") if isinstance(rec.get("mobile"), str) else ""
+    work = next((v for v in (rec.get("work_phone"), rec.get("phone")) if isinstance(v, str) and v.strip()), "")
+    links = [_person_tel_html("Mobile", mobile)]
+    if re.sub(r"\D", "", work) != re.sub(r"\D", "", mobile):
+        links.append(_person_tel_html("Work", work))
+    return [h for h in links if h]
+
+
+def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html="", show_phones=False):
     """Turn 24: the buyer page's single header card, merging what used
     to be two separate blocks (IDENTITY + CAPACITY, turn 23) into one —
     a circular photo (item 1: ?photo=<id>, same key/view_as context as
@@ -14434,7 +14455,10 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html="
     "home_city", but they follow the exact naming convention
     work_country/home_country already verified working in production.
     Person-record fields only; nothing about any company, deal, or
-    interest is read or shown here."""
+    interest is read or shown here. Phones (mobile, work; never home)
+    render as tel: links only when show_phones -- the caller passes
+    edit_mode or the tenant's Introduced-or-later gate, so the default
+    hides them."""
     photo_html = (f'<img class="buyer-header-photo" src="{_photo_href(rec.get("id"), key, view_as)}" '
                   f'alt="" width="64" height="64">')
     name = _esc(_person_display_name(rec) or "—")
@@ -14461,6 +14485,8 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html="
     if linked_in:
         href_l = linked_in if "://" in linked_in else f"https://{linked_in}"
         line2_links.append(f'<a href="{_esc(href_l)}" target="_blank" rel="noopener noreferrer">LinkedIn</a>')
+    if show_phones:
+        line2_links.extend(_person_phone_links(rec))
     if website:
         href_w = website if "://" in website else f"https://{website}"
         line2_links.append(f'<a href="{_esc(href_w)}" target="_blank" rel="noopener noreferrer">{_esc(website)}</a>')
@@ -14534,13 +14560,11 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     summary = (str(company_rec.get("summary") or "").strip()
                or str(company_rec.get("description") or "").strip())
     internal = _summary_looks_internal(summary)
-    address = ", ".join(p for p in (
-        _first_text(company_rec, ("address", "address_1", "address1")),
-        _first_text(company_rec, ("address_2", "address2")),
-        _first_text(company_rec, ("city",)),
-        _first_text(company_rec, ("state",)),
-        _first_text(company_rec, ("postal_code", "zip")),
-        _first_text(company_rec, ("country",))) if p)
+    # The company's own address only: address_1, address_2, city,
+    # postal_code, country. Other address-like keys on the record ("address",
+    # "address1", "zip", "state") are not read -- mixing them joined two
+    # different addresses into one line.
+    address = ", ".join(p for p in (_first_text(company_rec, (k,)) for k in COMPANY_ADDRESS_KEYS) if p)
     phone = _first_text(company_rec, ("phone", "phone1", "phone_number"))
     website = _first_text(company_rec, ("website", "web", "web_url"))
     founded = company_rec.get("founded_year")
@@ -15161,6 +15185,10 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
         else:
             person_id = tenant.get("person_id")
             full_access = edit_mode or _tenant_has_disclosed_deal_with(person_id, anon_key_email, buyer_id)
+            # Phones get their own explicit flag (not "we're inside full_access")
+            # so they stay behind the Introduced-or-later gate even if the page
+            # gate is ever loosened.
+            show_phones = full_access
             if full_access:
                 closer_kind = _closer_kind(rec, _build_firm_won_index())
                 # Public Bio: the bio card (headline = title, points =
@@ -15172,7 +15200,8 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 bio_edit_on = bool(edit_mode and key)
                 header_html = _buyer_header_html(rec, closer_kind, key=key, view_as=view_as,
                                                  bio_edit_html=(_bio_edit_html(buyer_id, bio_text)
-                                                                if bio_edit_on else ""))
+                                                                if bio_edit_on else ""),
+                                                 show_phones=show_phones)
                 standing_html = _standing_buyer_page_card_html(buyer_id, admin=key is not None)
 
                 # About-the-firm: only ever looked up for an entity buyer
