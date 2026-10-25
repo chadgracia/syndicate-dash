@@ -2644,6 +2644,9 @@ def _sm_urlopen(req, timeout=15):
 _, sm_table = use_fixture({lf.PEOPLE_KEY: {"people": []}, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": []}})
 _sm_saved_urlopen = lf.urllib.request.urlopen
 lf.urllib.request.urlopen = _sm_urlopen
+_sm_sleeps = []
+_sm_saved_sleep = lf._sm_sleep
+lf._sm_sleep = _sm_sleeps.append
 try:
     _sm_body = json.dumps({"501": {"summary": "Public text.", "note": "Chad: internal stuff"},
                            "502": {"summary": "", "note": "Other note"}})
@@ -2669,15 +2672,116 @@ try:
     check("migration: resubmit after success skips the note and only re-PUTs the Summary",
           _sm_calls == [("PUT", "/companies/501.json", {"company": {"description": "Public text v2."}})]
           and _sm_again["note_ok"] == "skipped" and _sm_again["summary_ok"] is True)
-    check("migration: bad batch rejected whole (400), >100 entries rejected",
+    check("migration: bad batch rejected whole (400), >40 entries rejected, 40 accepted",
           lf.validate_summary_migration_batch(json.dumps({"1": {"summary": "x", "note": "n"}, "x": {}}))[0] is None
           and lf.validate_summary_migration_batch(json.dumps({str(i): {"summary": "", "note": "n"}
-                                                              for i in range(101)}))[0] is None)
+                                                              for i in range(41)}))[0] is None
+          and len(lf.validate_summary_migration_batch(json.dumps({str(i): {"summary": "", "note": "n"}
+                                                                  for i in range(40)}))[0]) == 40)
+    check("migration: 0.6s pause before every Pipeline call; failed note (500) retried 2/4/8/16s then ERR",
+          lf.SUMMARY_MIGRATE_CALL_GAP_SECONDS == 0.6 and 0.6 in _sm_sleeps
+          and sum(1 for c in _sm_calls if c[1] == "/notes.json" and c[2]["note"]["company_id"] == 502) == 0)
+    _sm_calls.clear()
+    _sm_sleeps.clear()
+    _sm_r502 = lf.migrate_company_summary("502", "", "Other note")
+    check("migration: 5xx retried 4 times with 2/4/8/16s backoff, paced 0.6s, then ERR",
+          sum(1 for c in _sm_calls if c[1] == "/notes.json") == 5
+          and _sm_sleeps == [0.6, 2, 0.6, 4, 0.6, 8, 0.6, 16, 0.6]
+          and _sm_r502["note_ok"] is False and _sm_r502["summary_ok"] is None and not _sm_r502["rate_limited"])
+    _sm_calls.clear()
+    _sm_same = lf.migrate_company_summary("501", "Public text v2.", "Chad: internal stuff")
+    check("migration: resubmit with the same Summary already saved -> no note, no Summary PUT",
+          _sm_calls == [] and _sm_same["note_ok"] == "skipped" and _sm_same["summary_ok"] == "skipped")
+
+    # 429 handling: Retry-After honored (capped 30s), success on a later try
+    _sm_429 = {"left": 0, "retry_after": None, "always": set()}
+
+    def _sm_urlopen_429(req, timeout=15):
+        path = req.full_url.split("/api/v3")[1].split("?")[0]
+        body = json.loads(req.data.decode())
+        _sm_calls.append((req.get_method(), path, body))
+        cid = body.get("note", {}).get("company_id") if path == "/notes.json" else int(path.split("/")[2].split(".")[0])
+        if cid in _sm_429["always"] or _sm_429["left"] > 0:
+            _sm_429["left"] -= 1
+            hdrs = {"Retry-After": _sm_429["retry_after"]} if _sm_429["retry_after"] is not None else {}
+            raise lf.urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", hdrs, lf.io.BytesIO(b"slow down"))
+        return FakeHTTPResponse(200)
+
+    lf.urllib.request.urlopen = _sm_urlopen_429
+    _sm_calls.clear(); _sm_sleeps.clear()
+    _sm_429.update(left=2, retry_after="45")
+    _sm_r601 = lf.migrate_company_summary("601", "S601", "N601")
+    check("migration: 429 retried, Retry-After honored but capped at 30s, then succeeds",
+          _sm_r601["note_ok"] is True and _sm_r601["summary_ok"] is True
+          and _sm_sleeps == [0.6, 30, 0.6, 30, 0.6, 0.6])
+    check("migration: note_done written right after the note POST, before the Summary PUT",
+          [it for it in sm_table.puts if it.get("sk") == "done#601"][0].get("note_done") is True
+          and "summary_done" not in [it for it in sm_table.puts if it.get("sk") == "done#601"][0]
+          and next(it for it in sm_table.items if it.get("sk") == "done#601").get("summary_done") is True)
+    # Note saved but Summary rate-limited: resubmit skips the note, retries only the Summary
+    _sm_calls.clear(); _sm_sleeps.clear()
+    _sm_429.update(left=0, retry_after=None, always={602})
+    _sm_r602 = lf.migrate_company_summary("602", "S602", "N602")
+    check("migration: 429 after 4 retries -> ERR flagged rate_limited (note never posted twice)",
+          _sm_r602["note_ok"] is False and _sm_r602["rate_limited"] is True
+          and sum(1 for c in _sm_calls if c[1] == "/notes.json") == 5)
+    sm_table.items.append({"tenant": "__summary_migration__", "sk": "done#603", "note_done": True})
+    _sm_calls.clear()
+    _sm_429.update(always={603})
+    _sm_r603 = lf.migrate_company_summary("603", "S603", "N603")
+    check("migration: note already done + Summary 429 -> no note POST, Summary ERR, rate_limited",
+          not any(c[1] == "/notes.json" for c in _sm_calls) and _sm_r603["note_ok"] == "skipped"
+          and _sm_r603["summary_ok"] is False and _sm_r603["rate_limited"] is True)
+    _sm_calls.clear()
+    _sm_429.update(always=set())
+    _sm_r603b = lf.migrate_company_summary("603", "S603", "N603")
+    check("migration: resubmit after the Summary 429 -> only the Summary PUT",
+          _sm_calls == [("PUT", "/companies/603.json", {"company": {"description": "S603"}})]
+          and _sm_r603b["note_ok"] == "skipped" and _sm_r603b["summary_ok"] is True)
+
+    # Batch: 3 consecutive rate-limited entries stop the run; the rest are NOT RUN
+    _sm_calls.clear()
+    _sm_429.update(always={701, 702, 703})
+    _sm_res, _sm_stop = lf.run_summary_migration(
+        [("700", "a", "n"), ("701", "a", "n"), ("702", "a", "n"), ("703", "a", "n"), ("704", "a", "n"),
+         ("705", "a", "n")])
+    check("migration batch: 3 consecutive 429 entries stop the batch; remaining rows NOT RUN, never called",
+          _sm_stop == "rate_limited" and [r["note_ok"] for r in _sm_res] == [True, False, False, False, "not_run", "not_run"]
+          and not any(("/companies/704" in c[1]) or (c[1] == "/notes.json" and c[2]["note"]["company_id"] in (704, 705))
+                      for c in _sm_calls))
+    _sm_429.update(always={711, 712})
+    _sm_res2, _sm_stop2 = lf.run_summary_migration(
+        [("711", "a", "n"), ("712", "a", "n"), ("713", "a", "n"), ("714", "a", "n")])
+    check("migration batch: a success resets the consecutive-429 count",
+          _sm_stop2 == "" and [r["note_ok"] for r in _sm_res2] == [False, False, True, True])
+    _sm_429.update(always=set())
+
+    class _SmCtx:
+        def __init__(self, ms):
+            self.ms = list(ms)
+
+        def get_remaining_time_in_millis(self):
+            return self.ms.pop(0) if len(self.ms) > 1 else self.ms[0]
+
+    _sm_calls.clear()
+    _sm_res3, _sm_stop3 = lf.run_summary_migration(
+        [("721", "a", "n"), ("722", "a", "n"), ("723", "a", "n")], _SmCtx([500000, 89999]))
+    check("migration batch: < 90s remaining before an entry -> stop, remaining rows NOT RUN",
+          _sm_stop3 == "time" and [r["note_ok"] for r in _sm_res3] == [True, "not_run", "not_run"]
+          and not any(c[1] == "/notes.json" and c[2]["note"]["company_id"] in (722, 723) for c in _sm_calls))
+    _sm_page = lf.render_summary_migrate_page(ADMIN_KEY, results=_sm_res3, stop_reason="time")
+    check("migration page: NOT RUN rows, stop message, direct Lambda URL note with the request's key, 600s timeout note",
+          "NOT RUN" in _sm_page and "close to its time limit" in _sm_page
+          and lf.SUMMARY_MIGRATE_DIRECT_URL + "?key=" + lf.urllib.parse.quote(ADMIN_KEY, safe="") + "&amp;view=summary_migrate"
+          in _sm_page
+          and "ws4stw4iul75a7yx5dra2wmnq40kipav.lambda-url.us-east-1.on.aws" in lf.SUMMARY_MIGRATE_DIRECT_URL
+          and "not via desk.graciagroup.com" in _sm_page and "600 seconds" in _sm_page)
     _sm_forb = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
                                   "queryStringParameters": {"key": "nope", "view": "summary_migrate"}}, None)
     check("migration: wrong key -> 403", _sm_forb["statusCode"] == 403)
 finally:
     lf.urllib.request.urlopen = _sm_saved_urlopen
+    lf._sm_sleep = _sm_saved_sleep
 
 ABOUT_HEADING_RE = re.compile(r'<h2 class="buyer-section-heading">About\b')
 page_bob = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
