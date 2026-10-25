@@ -5621,14 +5621,14 @@ document.querySelectorAll('.cl-copy').forEach(function(btn) {{
 # Moves internal text out of Pipeline company Summaries into company
 # notes: per entry, note POST first; the Summary PUT only after the note
 # succeeded. Progress per company lives in Dynamo
-# tenant=SUMMARY_MIGRATION_PARTITION, sk "done#<id>": note_done (written
-# right after the note POST succeeds) and summary_done + the summary text
-# last PUT, so a resubmit never duplicates a note or re-PUTs an unchanged
-# Summary. Pipeline calls are paced (SUMMARY_MIGRATE_CALL_GAP_SECONDS) and
+# tenant=SUMMARY_MIGRATION_PARTITION: sk "done#<id>" = note done (written
+# right after the note POST succeeds; earlier batches wrote it too, so a
+# company with it never gets a second note) and sk "summary_done#<id>" after
+# a successful Summary PUT (a resubmit skips the PUT). Pipeline calls are paced (SUMMARY_MIGRATE_CALL_GAP_SECONDS) and
 # 429/5xx are retried with backoff; the batch stops early ("NOT RUN") after
 # 3 consecutive rate-limited entries or when < 90s of Lambda time remain.
 SUMMARY_MIGRATION_PARTITION = "__summary_migration__"
-SUMMARY_MIGRATE_MAX_ENTRIES = 40
+SUMMARY_MIGRATE_MAX_ENTRIES = 100
 SUMMARY_MIGRATE_CALL_GAP_SECONDS = 0.6
 SUMMARY_MIGRATE_BACKOFF_SECONDS = (2, 4, 8, 16)
 SUMMARY_MIGRATE_RETRY_AFTER_CAP_SECONDS = 30
@@ -5722,48 +5722,48 @@ def validate_summary_migration_batch(raw):
 
 def migrate_company_summary(company_id, summary, note):
     """{"company_id", "note_ok" (True/False/"skipped"), "summary_ok" (True/False/"skipped"
-    = unchanged and done before/None = not attempted), "error", "rate_limited"}."""
+    = done before/None = not attempted), "error", "rate_limited"}."""
     result = {"company_id": str(company_id), "note_ok": False, "summary_ok": None, "error": "",
               "rate_limited": False}
-    progress_key = {"tenant": SUMMARY_MIGRATION_PARTITION, "sk": f"done#{company_id}"}
+    note_key = {"tenant": SUMMARY_MIGRATION_PARTITION, "sk": f"done#{company_id}"}
+    summary_key = {"tenant": SUMMARY_MIGRATION_PARTITION, "sk": f"summary_done#{company_id}"}
     table = None
-    progress = {}
+    note_done = summary_done = None
     try:
         table = _dynamo_table()
-        progress = dict(table.get_item(Key=progress_key).get("Item") or {})
+        note_done = table.get_item(Key=note_key).get("Item")
+        summary_done = table.get_item(Key=summary_key).get("Item")
     except Exception as e:
         print(f"summary migration progress read failed for {company_id}: {type(e).__name__}: {e}")
 
     def _now():
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def _save_progress(**fields):
-        progress.update(progress_key, **fields)
+    def _mark(key, **fields):
         try:
-            (table or _dynamo_table()).put_item(Item=dict(progress))
+            (table or _dynamo_table()).put_item(Item=dict(key, **fields))
         except Exception as e:
             result["error"] = (result["error"] + "; " if result["error"] else "") + \
                 f"Dynamo progress: {type(e).__name__}: {e}"
 
-    # Legacy markers (before note_done existed) carry only note_at.
-    if progress.get("note_done") or progress.get("note_at"):
+    if note_done:
         result["note_ok"] = "skipped"
     else:
         ok, err, status = _pipeline_create_company_note(company_id, note)
         result["note_ok"] = ok
         if ok:
-            _save_progress(note_done=True, note_at=_now())
+            _mark(note_key, note_at=_now())
         else:
             result["error"] = f"Note: {err}"
             result["rate_limited"] = status == 429
     if result["note_ok"] is True or result["note_ok"] == "skipped":
-        if progress.get("summary_done") and progress.get("summary") == summary:
+        if summary_done:
             result["summary_ok"] = "skipped"
         else:
             ok, err, status = _pipeline_update_company_summary(company_id, summary)
             result["summary_ok"] = ok
             if ok:
-                _save_progress(summary_done=True, summary=summary, summary_at=_now())
+                _mark(summary_key, summary=summary, summary_at=_now())
             else:
                 result["error"] = (result["error"] + "; " if result["error"] else "") + f"Summary: {err}"
                 result["rate_limited"] = status == 429
@@ -5829,11 +5829,16 @@ def render_summary_migrate_page(key, raw="", error="", results=None, stop_reason
             return "SKIPPED" if v is None else _ok_err(v)
         rows = "".join(
             f'<tr><td>{_esc(r["company_id"])}</td><td>{_cell(r["note_ok"], "SKIPPED (done before)")}</td>'
-            f'<td>{_cell(r["summary_ok"], "SKIPPED (unchanged, done before)")}</td>'
+            f'<td>{_cell(r["summary_ok"], "SKIPPED (done before)")}</td>'
             f'<td>{_esc(r["error"])}</td></tr>' for r in results)
         stop_html = (f'<p class="bios-error">{_esc(SUMMARY_MIGRATE_STOP_TEXT[stop_reason])}</p>'
                      if stop_reason in SUMMARY_MIGRATE_STOP_TEXT else "")
-        results_html = (stop_html + '<table class="bios-results"><thead><tr><th>company_id</th><th>Note</th>'
+        n_not_run = sum(1 for r in results if r["note_ok"] == "not_run")
+        n_err = sum(1 for r in results if r["note_ok"] is False or r["summary_ok"] is False)
+        n_done = len(results) - n_not_run - n_err
+        counts_html = (f'<p class="sm-counts">{n_done} done · {n_err} errors · {n_not_run} not run — '
+                       'resubmit the same batch to finish (already-done steps are skipped).</p>')
+        results_html = (stop_html + counts_html + '<table class="bios-results"><thead><tr><th>company_id</th><th>Note</th>'
                         f'<th>Summary</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>')
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -5859,7 +5864,7 @@ def render_summary_migrate_page(key, raw="", error="", results=None, stop_reason
 <div class="wrap">
 <h1>Company Summaries — move internal text to notes</h1>
 <p class="sm-warn">Run this only from the direct Lambda URL: <a href="{_esc(direct_url)}">{_esc(direct_url)}</a> — not via desk.graciagroup.com, which times out after about 30 seconds while the batch keeps running. The Lambda timeout must be set to 600 seconds (Lambda console → Configuration → General configuration).</p>
-<p>JSON object {{"&lt;company_id&gt;": {{"summary": "&lt;new public summary, may be empty&gt;", "note": "&lt;text to save as a company note&gt;"}}}}, max {SUMMARY_MIGRATE_MAX_ENTRIES} entries. Each entry creates the Pipeline company note first; the Summary is replaced only if the note saved. Resubmitting is safe: a note already created is never created again, and an unchanged Summary already saved is not re-sent. Calls are paced and rate-limit errors retried; rows marked NOT RUN were not attempted. Changes show on buyer pages after the next hourly refresh.</p>
+<p>JSON object {{"&lt;company_id&gt;": {{"summary": "&lt;new public summary, may be empty&gt;", "note": "&lt;text to save as a company note&gt;"}}}}, max {SUMMARY_MIGRATE_MAX_ENTRIES} entries. Each entry creates the Pipeline company note first; the Summary is replaced only if the note saved. Resubmitting is safe: a note already created is never created again, and a Summary already saved is not re-sent. Calls are paced and rate-limit errors retried; rows marked NOT RUN were not attempted. Changes show on buyer pages after the next hourly refresh.</p>
 {error_html}
 <form method="post" action="{_esc(action)}">
 <textarea name="entries">{_esc(raw)}</textarea>

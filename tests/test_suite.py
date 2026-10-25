@@ -2669,15 +2669,15 @@ try:
           and not any(it.get("sk") == "done#502" for it in sm_table.items))
     _sm_calls.clear()
     _sm_again = lf.migrate_company_summary("501", "Public text v2.", "Chad: internal stuff")
-    check("migration: resubmit after success skips the note and only re-PUTs the Summary",
-          _sm_calls == [("PUT", "/companies/501.json", {"company": {"description": "Public text v2."}})]
-          and _sm_again["note_ok"] == "skipped" and _sm_again["summary_ok"] is True)
-    check("migration: bad batch rejected whole (400), >40 entries rejected, 40 accepted",
+    check("migration: resubmit after success skips the note and the Summary PUT (done#, summary_done# markers)",
+          _sm_calls == [] and _sm_again["note_ok"] == "skipped" and _sm_again["summary_ok"] == "skipped"
+          and any(it.get("sk") == "summary_done#501" for it in sm_table.items))
+    check("migration: bad batch rejected whole (400), >100 entries rejected, 100 accepted",
           lf.validate_summary_migration_batch(json.dumps({"1": {"summary": "x", "note": "n"}, "x": {}}))[0] is None
           and lf.validate_summary_migration_batch(json.dumps({str(i): {"summary": "", "note": "n"}
-                                                              for i in range(41)}))[0] is None
+                                                              for i in range(101)}))[0] is None
           and len(lf.validate_summary_migration_batch(json.dumps({str(i): {"summary": "", "note": "n"}
-                                                                  for i in range(40)}))[0]) == 40)
+                                                                  for i in range(100)}))[0]) == 100)
     check("migration: 0.6s pause before every Pipeline call; failed note (500) retried 2/4/8/16s then ERR",
           lf.SUMMARY_MIGRATE_CALL_GAP_SECONDS == 0.6 and 0.6 in _sm_sleeps
           and sum(1 for c in _sm_calls if c[1] == "/notes.json" and c[2]["note"]["company_id"] == 502) == 0)
@@ -2714,10 +2714,10 @@ try:
     check("migration: 429 retried, Retry-After honored but capped at 30s, then succeeds",
           _sm_r601["note_ok"] is True and _sm_r601["summary_ok"] is True
           and _sm_sleeps == [0.6, 30, 0.6, 30, 0.6, 0.6])
-    check("migration: note_done written right after the note POST, before the Summary PUT",
-          [it for it in sm_table.puts if it.get("sk") == "done#601"][0].get("note_done") is True
-          and "summary_done" not in [it for it in sm_table.puts if it.get("sk") == "done#601"][0]
-          and next(it for it in sm_table.items if it.get("sk") == "done#601").get("summary_done") is True)
+    _sm_601_sks = [it.get("sk") for it in sm_table.puts if str(it.get("sk", "")).endswith("#601")
+                   and not str(it.get("sk", "")).startswith("audit#")]
+    check("migration: done# written right after the note POST, before the Summary PUT; then summary_done#",
+          _sm_601_sks == ["done#601", "summary_done#601"])
     # Note saved but Summary rate-limited: resubmit skips the note, retries only the Summary
     _sm_calls.clear(); _sm_sleeps.clear()
     _sm_429.update(left=0, retry_after=None, always={602})
