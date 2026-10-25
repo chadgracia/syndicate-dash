@@ -2519,7 +2519,11 @@ deal_809 = {"id": 809, "name": "Hotel Deal", "company": {"name": "Hotel Co"}, "d
 deals_list = [deal_802, deal_803, deal_806, deal_809, deal_900a]
 companies = {"companies": [
     {"id": 9001, "name": "Alice Capital", "city": "Austin", "country": "USA", "founded_year": 2015,
-     "description": LONG_DESC, "custom_fields": {lf.COMPANY_PITCHBOOK_FIELD: "pitchbook.com/profile/alice-capital"}},
+     "description": LONG_DESC, "custom_fields": {lf.COMPANY_PITCHBOOK_FIELD: "pitchbook.com/profile/alice-capital",
+                                         lf.COMPANY_LEGAL_NAME_FIELD: ["  Alice Capital LLC  "],
+                                         lf.COMPANY_CRUNCHBASE_FIELD: "crunchbase.com/organization/alice-capital",
+                                         "custom_label_3803741": "TAXID-98-7654321",
+                                         "custom_label_3985424": "SECRET BENEFICIAL OWNER"}},
     # No entry at all for company_id 9002 (Bob) -- tests graceful omission.
 ]}
 use_fixture({lf.PEOPLE_KEY: people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": deals_list},
@@ -2562,6 +2566,16 @@ check("header: ID verified chip present (CEF Yes)", 'class="id-verified-chip"' i
 check("About card: address (city/country) shown", "Austin, USA" in page_alice)
 check("About card: founded year shown", "Founded 2015" in page_alice)
 check("About card: PitchBook link shown", "PitchBook profile" in page_alice and "pitchbook.com" in page_alice)
+check("About card: Legal name row shown to a tenant (first list item, trimmed)",
+      '<div class="buyer-page-row">Legal name: Alice Capital LLC</div>' in page_alice)
+check("About card: Crunchbase link (https:// added) right after PitchBook",
+      'href="https://crunchbase.com/organization/alice-capital"' in page_alice and "Crunchbase profile &rarr;" in page_alice
+      and page_alice.find("PitchBook profile") < page_alice.find("Crunchbase profile"))
+check("About card: Legal name sits above the address/Founded rows",
+      page_alice.find("Legal name:") < page_alice.find("Founded 2015"))
+check("About card: Entity Tax ID and Beneficial Owner never in tenant HTML",
+      "TAXID-98-7654321" not in page_alice and "SECRET BENEFICIAL OWNER" not in page_alice
+      and "custom_label_3803741" not in page_alice and "custom_label_3985424" not in page_alice)
 check("About card: raw companies.json description NEVER shown to a tenant (no approved-text file)",
       "word0" not in page_alice and "word79" not in page_alice and "Internal Summary" not in page_alice
       and "No approved public text yet" not in page_alice)

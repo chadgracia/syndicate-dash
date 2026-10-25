@@ -773,6 +773,9 @@ ACCEPTS_LABELS = {
 # custom_fields (given directly, same trust basis as every other bare
 # option/field id supplied this way in this file).
 COMPANY_PITCHBOOK_FIELD = "custom_label_3320818"
+COMPANY_LEGAL_NAME_FIELD = "custom_label_3769275"   # public, firm card "Legal name:"
+COMPANY_CRUNCHBASE_FIELD = "custom_label_3064297"   # public, firm card "Crunchbase profile"
+# Never tenant-facing and never read here: company Entity Tax ID (3803741), Beneficial Owner (3985424).
 
 # Turn 25: three more stage ids, given directly as "verified from the live
 # deal_stages API" (same trust basis as every other bare id supplied this
@@ -2002,7 +2005,7 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name"
                       "won_deals_total", "custom_fields")
 # Every custom_label_N this file references (a test keeps this in sync).
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
-    1958, 3052210, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163,
+    1958, 3052210, 3064297, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163, 3769275,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
     3998063, 4006089, 4006402, 4008329, 4009563))
 
@@ -14248,9 +14251,10 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     on file -> no description. The raw companies.json "summary"/"description"
     holds internal notes and is NEVER shown to tenants: admin view
     (edit_mode) only, collapsed under "Internal Summary (not shown to
-    sellers)". Then address (one line), phone, website, Founded
-    ("founded_year" verbatim), PitchBook link (custom_label_3320818), each
-    only when present. Returns "" when there's nothing to show."""
+    sellers)". Then Legal name (custom_label_3769275), address (one line),
+    phone, website, Founded ("founded_year" verbatim), PitchBook link
+    (custom_label_3320818), Crunchbase link (custom_label_3064297), each
+    only when present. Entity Tax ID / Beneficial Owner are never read. Returns "" when there's nothing to show."""
     if company_rec is None or not firm_name:
         return ""
     cid = str(company_rec.get("id") or "").strip()
@@ -14268,15 +14272,23 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     founded = company_rec.get("founded_year")
     founded_text = str(founded).strip() if founded else ""
     cf = company_rec.get("custom_fields") or {}
-    pb_raw = cf.get(COMPANY_PITCHBOOK_FIELD)
-    if isinstance(pb_raw, list):
-        pb_raw = pb_raw[0] if pb_raw else None
-    pitchbook_url = str(pb_raw).strip() if pb_raw else ""
+
+    def _cf_text(field):
+        raw = cf.get(field)
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        return str(raw).strip() if raw is not None else ""
+
+    pitchbook_url = _cf_text(COMPANY_PITCHBOOK_FIELD)
+    legal_name = _cf_text(COMPANY_LEGAL_NAME_FIELD)
+    crunchbase_url = _cf_text(COMPANY_CRUNCHBASE_FIELD)
 
     rows = []
     if approved:
         rows.extend(f'<p class="firm-description">{_esc(para.strip())}</p>'
                     for para in approved.splitlines() if para.strip())
+    if legal_name:
+        rows.append(f'<div class="buyer-page-row">Legal name: {_esc(legal_name)}</div>')
     if edit_mode:
         if not approved:
             rows.append('<div class="buyer-page-row" style="color: var(--muted)">No approved public text yet</div>')
@@ -14299,6 +14311,10 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
         href = pitchbook_url if "://" in pitchbook_url else f"https://{pitchbook_url}"
         rows.append(f'<div class="buyer-page-row"><a href="{_esc(href)}" target="_blank" '
                     f'rel="noopener noreferrer">PitchBook profile &rarr;</a></div>')
+    if crunchbase_url:
+        href_c = crunchbase_url if "://" in crunchbase_url else f"https://{crunchbase_url}"
+        rows.append(f'<div class="buyer-page-row"><a href="{_esc(href_c)}" target="_blank" '
+                    f'rel="noopener noreferrer">Crunchbase profile &rarr;</a></div>')
 
     if not rows:
         return ""
