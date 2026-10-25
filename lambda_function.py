@@ -14383,16 +14383,23 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html="
 
 
 SUMMARY_INTERNAL_RE = re.compile(
-    r"\bchad\b|rainmaker|pipelinecrm\.com|\binactive\b|\*\*\*"
-    r"|\bfraud\.|\bsketchy\b|\bunprofess|\bavoid\b|\bdo not invest\b"
-    r"|\b(I|me|my)\b|\bwe (spoke|met|talked)\b|equityzen|\bkirat\b",
+    r"rainmaker|pipelinecrm\.com|\binactive\b|\*\*\*"
+    r"|\bfraud\.|\bsketchy\b|\bunprofess|\bdo not invest\b"
+    r"|\bwe (spoke|met|talked)\b|reference from equityzen|\bkirat\b"
+    r"|\bchad (met|spoke|talked|introduced)\b",
     re.IGNORECASE)
+# Case-sensitive: first-person "I <verb>" and lowercase "me"/"my" only, so
+# "Fund I, II", "BMW i Ventures" and "i.e." don't trip the guard.
+SUMMARY_INTERNAL_CASE_RE = re.compile(
+    r"\bI (met|spoke|talked|advise|advised|think|have|had|was|am|will|sent|called|emailed|know)\b"
+    r"|\b(me|my)\b")
 
 
 def _summary_looks_internal(text):
     """Safety guard on the live Pipeline company Summary: True when the
     text reads like an internal note (tenants then see no text)."""
-    return bool(SUMMARY_INTERNAL_RE.search(text or ""))
+    text = text or ""
+    return bool(SUMMARY_INTERNAL_RE.search(text) or SUMMARY_INTERNAL_CASE_RE.search(text))
 
 
 def _first_text(rec, keys):

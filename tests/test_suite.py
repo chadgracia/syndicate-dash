@@ -2607,11 +2607,16 @@ check("About card: description used when Summary is empty",
       "Old desc" in lf._buyer_about_firm_html("Acme", dict(_firm_rec, summary=""), False))
 _internal_samples = ["Chad met them in 2023.", "Rainmaker client", "see app.pipelinecrm.com/x", "Inactive fund",
                      "*** flagged", "Possible fraud. Beware", "Sketchy group", "Unprofessional on calls",
-                     "Avoid this one", "Do not invest alongside", "I think they are slow", "We spoke last week",
-                     "Came via EquityZen", "Ask Kirat"]
+                     "Do not invest alongside", "I think they are slow", "We spoke last week",
+                     "Ask Kirat", "I advise the CEO", "my family office", "***INACTIVE", "Reference from EquityZen"]
 check("guard: every listed internal marker trips _summary_looks_internal",
       all(lf._summary_looks_internal(t) for t in _internal_samples)
       or print("missed:", [t for t in _internal_samples if not lf._summary_looks_internal(t)]))
+_public_samples = ["Fund I, II", "BMW i Ventures", "i.e. growth equity", "EquityZen is a marketplace.",
+                   "founded by Chad Boeding", "avoids public attention"]
+check("guard: public phrasing (Roman numerals, 'i', i.e., EquityZen, a founder named Chad, 'avoids') is NOT hidden",
+      not any(lf._summary_looks_internal(t) for t in _public_samples)
+      or print("false hides:", [t for t in _public_samples if lf._summary_looks_internal(t)]))
 check("guard: a normal public description passes",
       not lf._summary_looks_internal("Acme Ventures is a growth-stage fund investing in AI and space."))
 _firm_int = dict(_firm_rec, summary="Chad says avoid. Sketchy.")
