@@ -2000,7 +2000,7 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name"
                       "won_deals_total", "custom_fields")
 # Every custom_label_N this file references (a test keeps this in sync).
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
-    1958, 3052210, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3759156, 3759163,
+    1958, 3052210, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
     3998063, 4006089, 4006402, 4008329, 4009563))
 
@@ -18481,6 +18481,180 @@ def _handle_update_intro(event):
     return _json_response({"ok": True})
 
 
+# ---- Research gaps (?view=research_gaps, admin only, read-only) ----------
+# Companies clients want to BUY where we know few HOLDERS. Person "Holding"
+# (custom_label_3740611) holds per-company option ids; names come from
+# s3://pipeline-token/agent-data.json "security_ids" {name: {"h": id, ...}}
+# (same map deal-matcher/pipeline-agent use). Next step: only natural-person
+# holders -> PitchBook (find the funds); only entity holders -> LinkedIn
+# (find employees); none or mixed -> both.
+HOLDING_FIELD = "custom_label_3740611"
+AGENT_DATA_BUCKET = "pipeline-token"
+AGENT_DATA_KEY = "agent-data.json"
+RESEARCH_GAPS_DEFAULT_MAX = 5
+_holding_names_cache = {"at": 0.0, "map": None}
+
+
+def _holding_option_names():
+    """{holding option id: company name}; cached 10 min per container.
+    Raises on failure (caller shows the error)."""
+    now = time.time()
+    if _holding_names_cache["map"] is not None and now - _holding_names_cache["at"] < 600:
+        return _holding_names_cache["map"]
+    obj = _s3_client().get_object(Bucket=AGENT_DATA_BUCKET, Key=AGENT_DATA_KEY)
+    data = json.loads(obj["Body"].read()) or {}
+    out = {}
+    for name, ids in (data.get("security_ids") or {}).items():
+        if isinstance(ids, dict) and ids.get("h") is not None:
+            try:
+                out[int(ids["h"])] = str(name)
+            except (TypeError, ValueError):
+                pass
+    _holding_names_cache.update(at=now, map=out)
+    return out
+
+
+def _research_gap_people():
+    """Slim people list, rebuilt once if the slim file predates the Holding
+    field (no record carries it yet)."""
+    people = _people_list()
+    if any(HOLDING_FIELD in (r.get("custom_fields") or {}) for r in people):
+        return people
+    print("research_gaps: slim people lacks Holding field; rebuilding slim index")
+    people, _ = _build_people_slim(_s3_client())
+    _people_cache.update(version=None, people=None, by_id=None)
+    _req_cache["people"] = None
+    return people
+
+
+def _research_next_step(natural, entity, unknown):
+    if natural and not entity:
+        return "PitchBook"
+    if entity and not natural:
+        return "LinkedIn employees"
+    if not natural and not entity and unknown:
+        return "Set transactor type"
+    return "PitchBook + LinkedIn"
+
+
+def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_GAPS_DEFAULT_MAX):
+    """Rows for buy-interest companies with fewer than max_holders holders."""
+    holders = {}  # lowercased company -> {"natural": set, "entity": set, "unknown": set}
+    for rec in people:
+        pid = rec.get("id")
+        if pid is None:
+            continue
+        cf = rec.get("custom_fields") or {}
+        hold_ids = cf_list(cf, HOLDING_FIELD)
+        if not hold_ids:
+            continue
+        ttypes = cf_list(cf, TRANSACTOR_TYPE_FIELD)
+        kind = ("natural" if ttypes[0] == NATURAL_PERSON_ID else "entity") if ttypes else "unknown"
+        for oid in hold_ids:
+            name = holding_names.get(oid)
+            if not name:
+                continue
+            b = holders.setdefault(name.strip().lower(), {"natural": set(), "entity": set(), "unknown": set()})
+            b[kind].add(pid)
+    rows = []
+    for company, ids in (buy_map or {}).items():
+        if not isinstance(ids, list) or not ids:
+            continue
+        name = str(company).strip()
+        if not name or _is_public_company(name) or name.lower() in _EXCLUDED_COMPANIES_LOWER:
+            continue
+        b = holders.get(name.lower(), {"natural": set(), "entity": set(), "unknown": set()})
+        n, e, u = len(b["natural"]), len(b["entity"]), len(b["unknown"])
+        total = n + e + u
+        if total >= max_holders:
+            continue
+        rows.append({"company": name, "buyers": len(set(ids)), "holders": total, "natural": n,
+                     "entity": e, "unknown": u, "next_step": _research_next_step(n, e, u)})
+    rows.sort(key=lambda r: (-r["buyers"], r["holders"], r["company"].lower()))
+    return rows
+
+
+def _company_pitchbook_url(name):
+    rec = get_company_record(None, name)
+    if not rec:
+        return ""
+    raw = (rec.get("custom_fields") or {}).get(COMPANY_PITCHBOOK_FIELD)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    return str(raw).strip() if raw else ""
+
+
+def _handle_research_gaps(query):
+    try:
+        max_holders = max(1, min(100, int(query.get("max") or RESEARCH_GAPS_DEFAULT_MAX)))
+    except (TypeError, ValueError):
+        max_holders = RESEARCH_GAPS_DEFAULT_MAX
+    try:
+        holding_names = _holding_option_names()
+    except Exception as e:
+        print(f"research_gaps: agent-data.json read failed: {e}")
+        return _html_response("<p>Could not read s3://pipeline-token/agent-data.json (the Holding "
+                              "company-name map). The syndicate-dash Lambda role needs s3:GetObject on "
+                              f"that object.</p><p>Error: {_esc(str(e))}</p>", status=500)
+    rows = compute_research_gaps(_research_gap_people(), _interest_buy_map(), holding_names, max_holders)
+    for r in rows:
+        r["pitchbook"] = _company_pitchbook_url(r["company"])
+    cols = ["Company", "Buyers", "Holders", "Natural-person holders", "Entity holders",
+            "Unknown-type holders", "Next step", "PitchBook URL"]
+    keys = ["company", "buyers", "holders", "natural", "entity", "unknown", "next_step", "pitchbook"]
+    if (query.get("format") or "").lower() == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow(cols)
+        for r in rows:
+            w.writerow([r[k] for k in keys])
+        return {"statusCode": 200,
+                "headers": {"Content-Type": "text/csv; charset=utf-8", "Cache-Control": "private, no-store",
+                            "Content-Disposition": 'attachment; filename="research-gaps.csv"'},
+                "body": buf.getvalue()}
+    counts = {}
+    for r in rows:
+        counts[r["next_step"]] = counts.get(r["next_step"], 0) + 1
+    summary = " · ".join(f"{_esc(k)}: {v}" for k, v in sorted(counts.items()))
+    trs = []
+    for r in rows:
+        pb = (f'<a href="{_esc(r["pitchbook"])}" target="_blank" rel="noopener">PitchBook</a>'
+              if r["pitchbook"] else "—")
+        trs.append(f'<tr data-step="{_esc(r["next_step"])}"><td>{_esc(r["company"])}</td>'
+                   f'<td class="n">{r["buyers"]}</td><td class="n">{r["holders"]}</td>'
+                   f'<td class="n">{r["natural"]}</td><td class="n">{r["entity"]}</td>'
+                   f'<td class="n">{r["unknown"]}</td><td>{_esc(r["next_step"])}</td><td>{pb}</td></tr>')
+    steps = sorted(counts)
+    opts = "".join(f'<option value="{_esc(s)}">{_esc(s)}</option>' for s in steps)
+    body = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Research gaps</title><style>
+body{{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px;color:#1a1a1a;background:#fff}}
+table{{border-collapse:collapse;width:100%;max-width:1100px;font-size:14px}}
+th,td{{border-bottom:1px solid #e5e5e5;padding:6px 8px;text-align:left;vertical-align:top}}
+th{{background:#f6f6f6;position:sticky;top:0}} td.n{{text-align:right;font-variant-numeric:tabular-nums}}
+.bar{{margin:12px 0;display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+button,select,a.btn{{font-size:14px;padding:6px 10px}} .muted{{color:#666}}
+</style></head><body>
+<h1>Research gaps</h1>
+<p>{len(rows)} companies · client buy interest, fewer than {max_holders} holders in Holding</p>
+<p class="muted">{summary}</p>
+<div class="bar"><label>Next step <select id="f"><option value="">All</option>{opts}</select></label>
+<button id="copy">Copy company names</button>
+<a class="btn" href="?key={_esc(query.get('key') or '')}&view=research_gaps&max={max_holders}&format=csv">Download CSV</a>
+<span id="msg" class="muted"></span></div>
+<table><thead><tr>{"".join(f"<th>{c}</th>" for c in ["Company", "Buyers", "Holders", "Natural", "Entity", "Unknown type", "Next step", "PitchBook"])}</tr></thead>
+<tbody>{"".join(trs)}</tbody></table>
+<script>
+var f=document.getElementById('f');
+f.onchange=function(){{document.querySelectorAll('tbody tr').forEach(function(tr){{tr.style.display=(!f.value||tr.getAttribute('data-step')===f.value)?'':'none';}});}};
+document.getElementById('copy').onclick=function(){{
+ var names=[];document.querySelectorAll('tbody tr').forEach(function(tr){{if(tr.style.display!=='none')names.push(tr.cells[0].textContent);}});
+ navigator.clipboard.writeText(names.join('\\n')).then(function(){{document.getElementById('msg').textContent='Copied '+names.length+' names';}});
+}};
+</script></body></html>"""
+    return _html_response(body)
+
+
 def _handle_demand_list():
     """?demand=list, admin-only (checked by the caller). Read-only JSON of the
     same per-company table the Demand Board renders (get_company_table),
@@ -19267,6 +19441,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_tenants_list()
+
+    if query.get("view") == "research_gaps":
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_research_gaps(query)
 
     if query.get("demand") == "list":
         if not is_admin_key:
