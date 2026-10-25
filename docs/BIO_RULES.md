@@ -2,7 +2,9 @@
 
 Where it lives: Pipeline person field "Public Bio" (custom_label_3801446) is the single source of truth. Edit it in Pipeline; syndicate-dash shows the change after the next hourly people.json refresh. Admin inline edit (&edit=1) and the bulk page (?view=bios) also write Pipeline first and show immediately.
 
-Format: "<headline> • <point> • <point>" as plain text, split on "•", max 1500 characters. No HTML, no markdown. The headline renders next to the header card; each point is a line in the "Before your call" box.
+Format: "<headline> • <point> • <point>" as plain text, split on "•", max 1500 characters. No HTML, no markdown. The headline is the bio card's title; each point is a bullet under it.
+
+Firm text: the company's Pipeline Summary field shows to sellers in the "About <firm>" card. Use the firm's own website description, kept very short (under ~100 words).
 
 1. Verify identity first: a source counts only if it matches at least 2 CRM facts (email domain, LinkedIn URL, company, city). If identity is unverified, write nothing and flag the person for Chad.
 2. Never repeat anything the header card shows: name, firm/company, title, location, email, phone, LinkedIn, ID verified, Investor Level/QP, ticket size, Transactor Type.
@@ -11,7 +13,7 @@ Format: "<headline> • <point> • <point>" as plain text, split on "•", max 
    a. Investing record first — syndicator/SPV-raiser status when known (essential), notable portfolio names, and counts from PitchBook/Crunchbase. If nothing is found, say "No public investing record found."
    b. Prior roles — notable or relevant firms only. Skip details of companies the person founded unless they are famous or very successful.
    c. One closing judgment line, framed as an inference from background, e.g. "Background suggests a sophisticated investor and hard bargainer."
-5. Sources: public sources (LinkedIn, company sites, press, SEC filings, PitchBook, Crunchbase) plus facts Chad supplies directly (e.g. "he told me he syndicates"). Never copy CRM notes, Summary, deal history, or anything from KYC/IQF/CEF.
+5. Sources: public sources (LinkedIn, company sites, press, SEC filings, PitchBook, Crunchbase) plus facts Chad supplies directly (e.g. "he told me he syndicates"). Never copy CRM notes, person Summary, deal history, or anything from KYC/IQF/CEF.
 6. Leave out: education, languages, call-prep about buying entity/domicile/jurisdiction (the IQF covers it), wealth or recent liquidity, net worth, age, ethnicity, nationality, mutual connections.
 7. Fact points stay neutral; dates as "Oct 2013" or "2009–2014".
 8. If fewer than 2 points can be verified, leave the field empty and do not pad.

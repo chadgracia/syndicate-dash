@@ -5377,18 +5377,15 @@ def validate_bio_batch(raw):
     return entries, None
 
 
-def _bio_headline_html(headline):
-    return f'<div class="buyer-header-line bio-headline">{_esc(headline)}</div>' if headline else ""
-
-
-def _bio_points_card_html(points):
-    if not points:
+def _bio_card_html(headline, points):
+    """Bio card: the headline is the card title, points are bullets
+    under it. No headline -> untitled points; both empty -> nothing."""
+    if not headline and not points:
         return ""
+    title_html = f'<h2 class="buyer-section-heading bio-headline">{_esc(headline)}</h2>' if headline else ""
     items = "".join(f'<li>{_esc(p)}</li>' for p in points)
-    return (
-        '<div class="card bio-card"><h2 class="buyer-section-heading">Before your call</h2>'
-        f'<ul class="bio-points">{items}</ul></div>'
-    )
+    list_html = f'<ul class="bio-points">{items}</ul>' if points else ""
+    return f'<div class="card bio-card">{title_html}{list_html}</div>'
 
 
 def _bio_edit_html(person_id, bio_text):
@@ -14141,7 +14138,7 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
 </html>"""
 
 
-def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_headline="", bio_edit_html=""):
+def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html=""):
     """Turn 24: the buyer page's single header card, merging what used
     to be two separate blocks (IDENTITY + CAPACITY, turn 23) into one —
     a circular photo (item 1: ?photo=<id>, same key/view_as context as
@@ -14211,42 +14208,23 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_headline=""
     return (
         f'<div class="card buyer-header"><div class="buyer-header-top">'
         f'<div class="buyer-header-identity">{photo_html}'
-        f'<div><div class="buyer-page-name">{name}</div>{line1_html}{_bio_headline_html(bio_headline)}'
+        f'<div><div class="buyer-page-name">{name}</div>{line1_html}'
         f'{line2_html}</div></div>'
         f'{badges_html}</div>{chip_row_html}{bio_edit_html}</div>'
     )
 
 
-def _truncate_words(text, limit):
-    """(visible_prefix, remainder) split at `limit` words. remainder is
-    "" when text is already short enough to show whole — callers treat
-    a non-empty remainder as "needs a more-expander"."""
-    words = text.split()
-    if len(words) <= limit:
-        return text, ""
-    return " ".join(words[:limit]), " " + " ".join(words[limit:])
-
-
 def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
-    """Turn 24, LEFT column: "About <firm>" — companies.json fields
-    only (get_company_record), each rendered only when present (this
-    snapshot's shape is unverified in this sandbox, see COMPANIES_KEY —
-    every field here degrades to "omit the line" rather than erroring
-    on a mismatch). description: rendered as-is (no rewriting), trimmed
-    to ~60 words with a zero-JS <details>/<summary> "more" expander;
-    ADMIN-ONLY for now, with an "(internal — review before publishing)"
-    marker — tenants see the rest of the card (location, founded year,
-    PitchBook link) without it until a real publish flow exists.
-    founded year is read verbatim from a "founded_year" field ONLY —
-    never derived or computed from anything else (a deal date, a
-    person's updated_at, etc.) — so a company with no real value there
-    simply has no "Founded" line, rather than a guessed one. PitchBook
-    link (custom_label_3320818) as "PitchBook profile →" when present.
-    Returns "" (card omitted) when there's nothing this viewer can see —
-    natural-person buyers (no firm at all) never even reach this."""
+    """LEFT column: "About <firm>" -- companies.json fields only
+    (get_company_record), each rendered only when present. The company
+    Summary ("summary", else "description") shows to tenants and admins
+    alike, in full, one <p> per line/paragraph. founded year is read
+    verbatim from "founded_year" only (never derived). PitchBook link
+    (custom_label_3320818) as "PitchBook profile ->" when present.
+    Returns "" when there's nothing to show."""
     if company_rec is None or not firm_name:
         return ""
-    description = (company_rec.get("description") or "").strip()
+    summary = (company_rec.get("summary") or "").strip() or (company_rec.get("description") or "").strip()
     city = (company_rec.get("city") or "").strip()
     country = (company_rec.get("country") or "").strip()
     location = ", ".join(p for p in (city, country) if p)
@@ -14259,16 +14237,9 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     pitchbook_url = str(pb_raw).strip() if pb_raw else ""
 
     rows = []
-    if edit_mode and description:
-        visible, rest = _truncate_words(description, 60)
-        if rest:
-            desc_html = (f'<p class="firm-description">{_esc(visible)}'
-                         f'<details class="firm-more"><summary>… more</summary>'
-                         f'<span>{_esc(rest)}</span></details></p>')
-        else:
-            desc_html = f'<p class="firm-description">{_esc(description)}</p>'
-        rows.append(desc_html)
-        rows.append('<div class="firm-internal-note">(internal — review before publishing)</div>')
+    if summary:
+        rows.extend(f'<p class="firm-description">{_esc(para.strip())}</p>'
+                    for para in summary.splitlines() if para.strip())
     if location:
         rows.append(f'<div class="buyer-page-row">{_esc(location)}</div>')
     if founded_text:
@@ -14375,40 +14346,28 @@ def _buyer_deal_team_html(buyer_id, buyer_rec, firm_name, tenant, anon_key_email
             f'{rows}</div>')
 
 
-def _track_deal_row_html(deal, entry, resolved, tenant_label=None, loss_reason=None, edit_mode=False):
-    """One deal's row in TRACK WITH YOU: company · size · the resolved
-    status as a flag chip (_status_display_html, compact — a pill for
-    an in-progress status, a colored chip for Stalled/Passed/Withdrawn/
-    Closed), then the same read-only milestone checkboxes Active
-    Intros itself uses (_milestone_checkboxes_html, disabled=True --
-    never editable here; turn 24 dropped the disabled flag SELECT
-    _status_milestones_column_html also drew, since the flag chip
-    alone already carries that state — one signal, not two). tenant_
-    label is set only in admin edit mode (grouped-by-tenant heading
-    above each of that tenant's rows). loss_reason (turn 27): a small
-    muted "— <reason>" suffix appended after the chip, for a stage-
-    derived closed-out deal that has one on record — see
-    _deal_loss_reason_text; None for every ordinary row, unchanged.
-    Same admin-only/share-gated loss notes as the Closed out table rows
-    -- see _loss_reason_notes_cell_html -- appended below the
-    checkboxes when the deal has one on record; edit_mode is the admin
-    branch's own flag (always True there), never True on the tenant
-    branch, matching every other admin-only control on this page."""
-    deal_id = str(deal.get("id"))
+def _track_deal_row_html(deal, entry, resolved, tenant_label=None, loss_reason=None, edit_mode=False,
+                         key=None, view_as=None):
+    """One compact line in DEALS WITH YOU: company · size · status chip
+    (_status_display_html, compact), the whole line linking to the
+    company on Active Intros (same target as the Active Intros company
+    cell). No milestone UI here. loss_reason: muted "— <reason>" after
+    the chip for a closed-out deal. tenant_label: admin grouping
+    heading. Admin-only loss notes (_loss_reason_notes_cell_html) sit
+    under the line, never on the tenant branch."""
     company_name = _deal_company_name(deal) or "—"
     size_text = _esc(_deal_size_text(deal))
-    milestones = entry.get("milestones")
-    checkboxes_html = _milestone_checkboxes_html(deal_id, milestones, disabled=True)
     flag_chip_html = _status_display_html(resolved, compact=True)
     if loss_reason:
         flag_chip_html += f' <span class="closed-out-reason">— {_esc(loss_reason)}</span>'
     label_html = f'<div class="track-row-tenant">{tenant_label}</div>' if tenant_label else ""
     loss_notes_html = _loss_reason_notes_cell_html(deal, entry, edit_mode)
+    href = _company_href(_deal_company_name(deal) or "", "intros", key, view_as)
     return (
         f'<div class="track-row">{label_html}'
-        f'<div class="track-row-head"><span class="track-row-company">{_esc(company_name)}</span>'
-        f'<span class="track-row-size">{size_text}</span>{flag_chip_html}</div>'
-        f'{checkboxes_html}{loss_notes_html}</div>'
+        f'<a class="track-row-head track-row-link" href="{href}"><span class="track-row-company">{_esc(company_name)}</span>'
+        f'<span class="track-row-size">{size_text}</span>{flag_chip_html}</a>'
+        f'{loss_notes_html}</div>'
     )
 
 
@@ -14428,8 +14387,8 @@ def _closed_out_resolved_dict(deal):
     }
 
 
-def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
-    """Turn 23, block 3 (TRACK WITH YOU): every deal linking this buyer
+def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode, key=None, view_as=None):
+    """Turn 23, block 3 (DEALS WITH YOU, was Track with you): every deal linking this buyer
     to the viewing tenant, read-only (company/size/milestones/flag/
     outcome — never an input; only the Notes Ledger below is
     editable). Tenant view: strictly this tenant's own deals, and only
@@ -14475,7 +14434,7 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
             for i, (d, entry, resolved, loss_reason) in enumerate(deals_for_tenant):
                 label = _esc(tenant_name) if i == 0 else None
                 rows.append(_track_deal_row_html(d, entry, resolved, tenant_label=label, loss_reason=loss_reason,
-                                                  edit_mode=True))
+                                                  edit_mode=True, key=key, view_as=view_as))
     else:
         person_id = tenant.get("person_id")
         intro_details, _ = get_intro_details(anon_key_email)
@@ -14501,7 +14460,7 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
             resolved = _resolve_intro_status(d, entry)
             if not resolved["disclosed"]:
                 continue
-            rows.append(_track_deal_row_html(d, entry, resolved))
+            rows.append(_track_deal_row_html(d, entry, resolved, key=key, view_as=view_as))
         for d in get_firm_closed_out_buy_deals(person_id):
             if buyer_id not in _deal_linked_person_ids(d):
                 continue
@@ -14509,10 +14468,11 @@ def _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode):
             if not resolved["disclosed"]:
                 continue
             entry = intro_details.get(str(d.get("id"))) or {}
-            rows.append(_track_deal_row_html(d, entry, resolved, loss_reason=_deal_loss_reason_text(d)))
+            rows.append(_track_deal_row_html(d, entry, resolved, loss_reason=_deal_loss_reason_text(d),
+                                              key=key, view_as=view_as))
 
     body = "".join(rows) if rows else '<div class="gg-placeholder small">No deals with this buyer yet.</div>'
-    return f'<div class="card buyer-track-card"><h2 class="buyer-section-heading">Track with you</h2>{body}</div>'
+    return f'<div class="card buyer-track-card"><h2 class="buyer-section-heading">Deals with you</h2>{body}</div>'
 
 
 def _note_visibility_text(tenant_email):
@@ -14867,18 +14827,17 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
             full_access = edit_mode or _tenant_has_disclosed_deal_with(person_id, anon_key_email, buyer_id)
             if full_access:
                 closer_kind = _closer_kind(rec, _build_firm_won_index())
-                # Public Bio: headline under the location line, points in
-                # the "Before your call" card under the header. edit_mode
+                # Public Bio: the bio card (headline = title, points =
+                # bullets) sits under the header card. edit_mode
                 # (admin key + Admin view) adds the inline editor, even
                 # when the bio is empty; Tenant view / tenants never get it.
                 bio_text = _person_public_bio(rec)
                 bio_headline, bio_points = parse_public_bio(bio_text)
                 bio_edit_on = bool(edit_mode and key)
                 header_html = _buyer_header_html(rec, closer_kind, key=key, view_as=view_as,
-                                                 bio_headline=bio_headline,
                                                  bio_edit_html=(_bio_edit_html(buyer_id, bio_text)
                                                                 if bio_edit_on else ""))
-                header_html += _standing_buyer_page_card_html(buyer_id, admin=key is not None)
+                standing_html = _standing_buyer_page_card_html(buyer_id, admin=key is not None)
 
                 # About-the-firm: only ever looked up for an entity buyer
                 # (a natural person has no firm to look up) and only when
@@ -14895,26 +14854,28 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                                                         key=key, view_as=view_as)
 
                 # Two columns whose tops align with the header card.
-                # Left: header, Before your call, Notes history (then the
-                # firm/deal-team cards). Right: Track with you, then the
-                # person-note and deal-note input cards. Each slot carries
-                # an order class so the narrow-screen single column reads
-                # header, Track with you, Before your call, note inputs,
-                # Notes history (see .bp-o* in the page CSS).
+                # Left: header, bio, firm/deal-team cards, Notes history.
+                # Right: Deals with you, the person-note and deal-note
+                # input cards, then client standing. Each slot carries an
+                # order class so the narrow-screen single column reads
+                # header, bio, Deals with you, note inputs, firm, Notes
+                # history, client standing (see .bp-o* in the page CSS).
                 about_html = _buyer_about_firm_html(firm_name, company_rec, edit_mode) + deal_team_html
                 history_html = _buyer_notes_history_html(
                     _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode), edit_mode)
                 inputs_html = (_buyer_person_note_input_html(rec, buyer_id, anon_key_email)
                                + _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode))
-                track_html = _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode)
+                track_html = _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode,
+                                                        key=key, view_as=view_as)
                 body_html = (
                     '<div class="buyer-columns">'
                     f'<div class="buyer-col-left"><div class="bp-slot bp-o1">{header_html}</div>'
-                    f'<div class="bp-slot bp-o3">{_bio_points_card_html(bio_points)}</div>'
-                    f'<div class="bp-slot bp-o5">{history_html}</div>'
-                    f'<div class="bp-slot bp-o6">{about_html}</div></div>'
-                    f'<div class="buyer-col-right"><div class="bp-slot bp-o2">{track_html}</div>'
-                    f'<div class="bp-slot bp-o4">{inputs_html}</div></div>'
+                    f'<div class="bp-slot bp-o2">{_bio_card_html(bio_headline, bio_points)}</div>'
+                    f'<div class="bp-slot bp-o5">{about_html}</div>'
+                    f'<div class="bp-slot bp-o6">{history_html}</div></div>'
+                    f'<div class="buyer-col-right"><div class="bp-slot bp-o3">{track_html}</div>'
+                    f'<div class="bp-slot bp-o4">{inputs_html}</div>'
+                    f'<div class="bp-slot bp-o7">{standing_html}</div></div>'
                     '</div>'
                 )
                 edit_script_html = _edit_script_html(key if edit_mode else None,
@@ -15043,7 +15004,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     .buyer-columns {{ display: flex; flex-direction: column; }}
     .buyer-col-left, .buyer-col-right {{ display: contents; }}
     .bp-o1 {{ order: 1; }} .bp-o2 {{ order: 2; }} .bp-o3 {{ order: 3; }}
-    .bp-o4 {{ order: 4; }} .bp-o5 {{ order: 5; }} .bp-o6 {{ order: 6; }}
+    .bp-o4 {{ order: 4; }} .bp-o5 {{ order: 5; }} .bp-o6 {{ order: 6; }} .bp-o7 {{ order: 7; }}
   }}
   .nh-subtitle {{ font-size: 12px; color: var(--muted); margin: -6px 0 8px; }}
   .nh-input {{
@@ -15071,7 +15032,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .bio-edit {{ margin-top: 12px; }}
   .bio-edit-text {{ width: 100%; min-height: 90px; box-sizing: border-box; font-family: inherit; font-size: 13px;
                    border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; resize: vertical; }}
-  .track-row {{ margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }}
+  .track-row {{ margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }}
   .track-row:first-of-type {{ margin-top: 0; padding-top: 0; border-top: none; }}
   .track-row-tenant {{
     font-size: 11px;
@@ -15081,7 +15042,9 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
     color: var(--muted);
     margin-bottom: 6px;
   }}
-  .track-row-head {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }}
+  .track-row-head {{ display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }}
+  a.track-row-link {{ color: inherit; text-decoration: none; border-radius: 4px; }}
+  a.track-row-link:hover .track-row-company {{ text-decoration: underline; }}
   .track-row-company {{ font-size: 14px; font-weight: 600; }}
   .track-row-size {{ font-size: 13px; color: var(--muted); }}
   .closed-out-reason {{ color: var(--muted); font-size: 11px; }}
@@ -15128,15 +15091,9 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .status-chip.stalled {{ background: #FDF0E9; color: #C2410C; }}
   .status-chip.exit {{ background: rgba(178,59,59,0.15); color: #b23b3b; }}
   .status-chip.closed {{ background: rgba(31,122,77,0.15); color: var(--qp); }}
-  /* "About the firm" card: description is admin-only for now (a
-     zero-JS <details>/<summary> "more" expander), everyone else sees
-     just location/founded/PitchBook -- see _buyer_about_firm_html. */
-  .firm-description {{ font-size: 14px; line-height: 1.5; margin: 0 0 2px; color: var(--ink); }}
-  .firm-more {{ display: inline; }}
-  .firm-more summary {{ display: inline; cursor: pointer; color: var(--accent); list-style: none; }}
-  .firm-more summary::-webkit-details-marker {{ display: none; }}
-  .firm-more[open] summary {{ display: none; }}
-  .firm-internal-note {{ font-size: 11px; color: #b23b3b; font-style: italic; margin-top: 6px; }}
+  /* "About the firm" card: full company Summary, one <p> per paragraph
+     -- see _buyer_about_firm_html. */
+  .firm-description {{ font-size: 14px; line-height: 1.5; margin: 0 0 8px; color: var(--ink); }}
   .ei-notes {{
     background: var(--bg);
     border: 1px solid var(--line);

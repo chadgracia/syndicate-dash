@@ -2428,12 +2428,15 @@ check("Process signals: no Accepts chip renders even though Alice's fixture sets
 check("Process signals: no IQF chip renders even though Alice is IQF-OK",
       "Qualification on file" not in page_alice)
 
-check("Track with you: heading present", "Track with you" in page_alice)
+check("Deals with you: heading present (old 'Track with you' gone)",
+      "Deals with you" in page_alice and "Track with you" not in page_alice)
 check("Track with you: Alpha Industries (disclosed) shown", "Alpha Industries" in page_alice)
 check("Track with you: Beta Holdings (disclosed) shown", "Beta Holdings" in page_alice)
 check("Track with you: Gamma Co (pending/non-disclosed) NOT shown", "Gamma Co" not in page_alice)
-check("Track with you: read-only milestone checkboxes present (disabled)",
-      re.search(r'<input type="checkbox" class="ei-milestone"[^>]*disabled', page_alice) is not None)
+check("Deals with you: no milestone checkboxes on the buyer page",
+      'class="ei-milestone' not in page_alice)
+check("Deals with you: each row links to the company on Active Intros",
+      'class="track-row-head track-row-link" href="?company=Alpha%20Industries&ref=intros"' in page_alice)
 
 page_alice_admin = lf.render_buyer_page(2, "Admin", tenant_a, TENANT_A_EMAIL, key=ADMIN_KEY, view_as=None, edit_mode=True)
 check("admin edit mode: Sella Seller's tenant label present", "Sella Seller" in page_alice_admin)
@@ -2542,7 +2545,7 @@ right_html = page_alice.split('class="buyer-col-right"')[1]
 check("About the firm card is in the LEFT column", "About Alice Capital" in left_html)
 check("Process signals card is gone entirely, not just moved (left column no longer carries it)",
       "Process signals" not in left_html)
-check("Track with you card is in the RIGHT column", "Track with you" in right_html)
+check("Deals with you card is in the RIGHT column", "Deals with you" in right_html)
 check("note input cards are in the RIGHT column", ">Deal notes: Alpha Industries</h2>" in right_html
       and "Your notes on Alice" in right_html)
 
@@ -2559,16 +2562,20 @@ check("header: ID verified chip present (CEF Yes)", 'class="id-verified-chip"' i
 check("About card: city/country shown", "Austin, USA" in page_alice)
 check("About card: founded year shown", "Founded 2015" in page_alice)
 check("About card: PitchBook link shown", "PitchBook profile" in page_alice and "pitchbook.com" in page_alice)
-check("About card: description text NOT shown to a tenant", "word0 word1" not in page_alice)
+check("About card: description (summary fallback) shown in full to a tenant",
+      "word0 word1" in page_alice and "word79" in page_alice and "firm-more" not in page_alice)
 check("About card: internal marker NOT shown to a tenant",
       "(internal — review before publishing)" not in page_alice)
 
 page_alice_admin = lf.render_buyer_page(2, "Admin", tenant_a, TENANT_A_EMAIL, key=ADMIN_KEY, view_as=None, edit_mode=True)
 check("admin: description text shown", "word0 word1" in page_alice_admin)
-check("admin: description trimmed with a details/summary 'more' expander (80 words > 60)",
-      '<details class="firm-more">' in page_alice_admin)
-check("admin: the full remainder of the description is present inside the expander", "word79" in page_alice_admin)
-check("admin: internal-review marker shown", "(internal — review before publishing)" in page_alice_admin)
+check("admin: full description, no expander, no internal marker",
+      "word79" in page_alice_admin and "firm-more" not in page_alice_admin
+      and "(internal — review before publishing)" not in page_alice_admin)
+_firm_sum = lf._buyer_about_firm_html("Acme", {"summary": "Para one.\n\nPara <two>.", "description": "Old desc"}, False)
+check("About card: summary wins over description, one <p> per paragraph, escaped",
+      '<p class="firm-description">Para one.</p><p class="firm-description">Para &lt;two&gt;.</p>' in _firm_sum
+      and "Old desc" not in _firm_sum)
 
 ABOUT_HEADING_RE = re.compile(r'<h2 class="buyer-section-heading">About\b')
 page_bob = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
@@ -2580,8 +2587,8 @@ page_nadia = lf.render_buyer_page(9, "Sella Seller", tenant_a, TENANT_A_EMAIL, k
 check("natural-person buyer: no firm line in the header", "Should Never Show" not in page_nadia)
 check("natural-person buyer: no About-the-firm card at all", ABOUT_HEADING_RE.search(page_nadia) is None)
 
-check("Track with you: read-only milestone checkboxes present", 'class="ei-milestones"' in right_html)
-check("Track with you: NO editable/disabled flag <select> anymore (chip only)",
+check("Deals with you: no milestone checkboxes", 'class="ei-milestones"' not in right_html)
+check("Deals with you: NO editable/disabled flag <select> anymore (chip only)",
       "<select" not in right_html.split("Notes")[0])
 check("Track with you: a Stalled deal (803) shows a Stalled status chip", 'class="status-chip stalled"' in right_html)
 check("Track with you: an in-progress deal (802) shows a plain status pill", 'class="status-pill"' in right_html)
@@ -6323,15 +6330,17 @@ check("bio parser: newlines but no bullet -> headline only",
       lf.parse_public_bio("Line one\nLine two\nLine three") == ("Line one\nLine two\nLine three", []))
 
 # --- HTML escaping
-esc_head = lf._bio_headline_html('<script>x</script> & "q"')
-check("bio headline is HTML-escaped",
+esc_head = lf._bio_card_html('<script>x</script> & "q"', [])
+check("bio headline (card title) is HTML-escaped",
       "<script>" not in esc_head and "&lt;script&gt;" in esc_head and "&amp;" in esc_head and "&quot;q&quot;" in esc_head)
-esc_card = lf._bio_points_card_html(['<b>bold</b>', 'a & b'])
+esc_card = lf._bio_card_html("Head", ['<b>bold</b>', 'a & b'])
 check("bio points are HTML-escaped",
       "<b>" not in esc_card and "&lt;b&gt;bold&lt;/b&gt;" in esc_card and "a &amp; b" in esc_card)
-check("bio points card titled 'Before your call'", "Before your call" in esc_card)
-check("bio points card hidden when there are no points", lf._bio_points_card_html([]) == "")
-check("bio headline renders nothing when empty", lf._bio_headline_html("") == "")
+check("bio card title is the headline (same h2 class), no 'Before your call'",
+      '<h2 class="buyer-section-heading bio-headline">Head</h2>' in esc_card and "Before your call" not in esc_card)
+check("bio card: points with no headline render untitled",
+      "<h2" not in lf._bio_card_html("", ["p1"]) and "<li>p1</li>" in lf._bio_card_html("", ["p1"]))
+check("bio card renders nothing when headline and points are empty", lf._bio_card_html("", []) == "")
 
 # --- Bulk validation
 def _vb(raw):
@@ -6367,12 +6376,14 @@ lf._s3_last_modified[lf.PEOPLE_KEY] = datetime(2026, 8, 31, tzinfo=timezone.utc)
 bio_page = lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None, view_as=None, edit_mode=False)
 check("display: Dynamo bio newer than the snapshot wins over the Pipeline field", "Dynamo head" in bio_page and "CRM headline" not in bio_page)
 check("display: headline escaped on the page", "Dynamo head &lt;i&gt;" in bio_page and "Dynamo head <i>" not in bio_page)
-check("display: headline sits right after the location line",
-      bio_page.find("Boston") < bio_page.find("Dynamo head") < bio_page.find("mailto:alice@example.com"))
-check("display: 'Before your call' card with escaped points",
-      "Before your call" in bio_page and "<li>Point one</li>" in bio_page and "<li>Point &lt;two&gt;</li>" in bio_page)
-check("display: 'Before your call' card sits below the header card, before the right column",
-      bio_page.find('class="card buyer-header"') < bio_page.find("Before your call")
+_bio_hdr = bio_page.split('class="card buyer-header"')[1].split('class="bp-slot bp-o2"')[0]
+check("display: headline NOT in the header card", "Dynamo head" not in _bio_hdr and "bio-headline" not in _bio_hdr)
+check("display: headline is the bio card title, points escaped below",
+      '<div class="card bio-card"><h2 class="buyer-section-heading bio-headline">Dynamo head &lt;i&gt;</h2>' in bio_page
+      and "<li>Point one</li>" in bio_page and "<li>Point &lt;two&gt;</li>" in bio_page)
+check("display: no 'Before your call' anywhere on the page", "Before your call" not in bio_page)
+check("display: bio card sits below the header card, before the right column",
+      bio_page.find('class="card buyer-header"') < bio_page.find('class="card bio-card"')
       < bio_page.find('class="buyer-col-right"'))
 check("tenant view: no bio edit textarea", 'id="bio-edit-text"' not in bio_page and "save_bio" not in bio_page)
 
@@ -6685,15 +6696,18 @@ nh_body = nh_page_a[nh_page_a.find('<div class="buyer-columns">'):]
 nh_left = nh_body.split('<div class="buyer-col-left">')[1].split('<div class="buyer-col-right">')[0]
 nh_right = nh_body.split('<div class="buyer-col-right">')[1]
 check("layout: header card is the first left-column card", nh_left.find('class="card buyer-header"') == nh_left.find('class="card'))
-check("layout: left column order header -> Before your call -> Notes history",
-      0 <= nh_left.find('class="card buyer-header"') < nh_left.find("Before your call") < nh_left.find(">Notes history</h2>"))
-check("layout: Track with you is the first right-column card",
+check("layout: left column slots header(o1) -> bio(o2) -> firm(o5) -> Notes history(o6)",
+      0 <= nh_left.find('bp-slot bp-o1') < nh_left.find('bp-slot bp-o2') < nh_left.find('bp-slot bp-o5')
+      < nh_left.find('bp-slot bp-o6') < nh_left.find(">Notes history</h2>")
+      and nh_left.find('class="card buyer-header"') < nh_left.find('bp-slot bp-o2'))
+check("layout: Deals with you is the first right-column card",
       nh_right.find('class="card') == nh_right.find('class="card buyer-track-card"'))
-check("layout: right column order Track with you -> person note -> deal note",
-      nh_right.find("Track with you") < nh_right.find("Your notes on Quinn") < nh_right.find("Deal notes: Orbit Labs"))
-check("layout: mobile order classes present (header 1, track 2, bio 3, inputs 4, history 5)",
-      all(c in nh_body for c in ('bp-slot bp-o1', 'bp-slot bp-o2', 'bp-slot bp-o3', 'bp-slot bp-o4', 'bp-slot bp-o5'))
-      and ".bp-o5 {{" not in nh_page_a and ".bp-o5 { order: 5; }" in nh_page_a)
+check("layout: right column order Deals with you -> person note -> deal note -> standing slot",
+      nh_right.find("Deals with you") < nh_right.find("Your notes on Quinn") < nh_right.find("Deal notes: Orbit Labs")
+      < nh_right.find('bp-slot bp-o7'))
+check("layout: mobile order classes (header 1, bio 2, deals 3, inputs 4, firm 5, history 6, standing 7)",
+      all(f'bp-slot bp-o{i}' in nh_body for i in range(1, 8))
+      and ".bp-o7 {{" not in nh_page_a and ".bp-o7 { order: 7; }" in nh_page_a)
 check("layout: old side-by-side private-notes card is gone", "buyer-top-row" not in nh_page_a)
 lf.urllib.request.urlopen = fake_urlopen
 
@@ -9619,8 +9633,8 @@ _st_pages = _st_tenant_pages()
 _st_disc = _st_pages["disclosed buyer page"]
 check("seller card: opted-in client's disclosed buyer page shows 'Client standing' with the five items",
       ">Client standing<" in _st_disc and all(lbl in _st_disc for _, lbl in lf.STANDING_ITEMS))
-check("seller card: sits under the header card",
-      _st_disc.find('class="card buyer-header"') < _st_disc.find(">Client standing<") < _st_disc.find('class="buyer-col-right"'))
+check("seller card: in the right column's last slot (after the note inputs)",
+      _st_disc.find('class="buyer-col-right"') < _st_disc.find('bp-slot bp-o7') < _st_disc.find(">Client standing<"))
 check("seller card: terms item open (grey ring), others done",
       _st_disc.count("border:2px solid #b8bcc4") == 1 and _st_disc.count(">✓</span>") == 4)
 check("seller card: closer chip unchanged, no second trades signal",
