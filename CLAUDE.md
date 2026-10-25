@@ -72,7 +72,7 @@ Stages: Inquiry 2109142, Firm 111800, Matched 2381534, LOI 2517909, Transfer Not
 ## Public Bio (custom_label_3801446)
 - Rules for writing bios (manual now, Bedrock later): docs/BIO_RULES.md.
 - Write path (write_public_bio): Pipeline person PUT of ONLY this field first; on failure stop. Then Dynamo upsert tenant="__bios__", sk="bio#<person_id>", bio, updated_at (ISO UTC) + audit item.
-- Display (buyer page): Dynamo __bios__ record first, else the person record's field. Headline under the location line; points in the "Before your call" card.
+- Display (buyer page, _person_public_bio): Pipeline field on the person record is the source of truth. The Dynamo __bios__ record only bridges the hourly refresh: used only when its updated_at is later than the people.json LastModified (_s3_last_modified[PEOPLE_KEY]); if that is unknown, only when updated_at is within 90 minutes. Otherwise the Pipeline value (empty stays empty). Headline under the location line; points in the "Before your call" card.
 - Admin inline edit: buyer page with admin key + &edit=1 only (POST ?action=save_bio). Bulk: ?key=ADMIN_KEY&view=bios (JSON {"<person_id>": "<bio>"}, ≤25 entries, ≤1500 chars each, whole batch rejected on any invalid entry).
 
 ## Domain team tenancy

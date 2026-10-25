@@ -5248,19 +5248,42 @@ def _get_bio_item(person_id):
         return None
 
 
+BIO_DYNAMO_BRIDGE_SECONDS = 90 * 60
+
+
+def _parse_bio_updated_at(value):
+    try:
+        return datetime.strptime(str(value or ""), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def _person_public_bio(rec):
-    """The Dynamo "__bios__" record wins whenever one exists (even an
-    empty one -- a cleared bio stays cleared); otherwise the person
-    record's own custom_label_3801446, if present. Never reads
-    people.json itself -- rec is the record the caller already has."""
-    person_id = (rec or {}).get("id")
-    item = _get_bio_item(person_id) if person_id is not None else None
-    if item is not None:
-        return str(item.get("bio") or "")
+    """Pipeline's custom_label_3801446 (on rec, the record the caller
+    already has) is the source of truth. The Dynamo "__bios__" record
+    only bridges the hourly refresh gap: it wins only when its
+    updated_at is later than the people.json snapshot's LastModified
+    (_s3_last_modified), or -- when that is unknown -- when it is within
+    BIO_DYNAMO_BRIDGE_SECONDS. Never reads people.json itself."""
     val = ((rec or {}).get("custom_fields") or {}).get(PUBLIC_BIO_FIELD)
     if isinstance(val, list):
         val = val[0] if val else ""
-    return str(val or "") if isinstance(val, str) else ""
+    pipeline_bio = str(val or "") if isinstance(val, str) else ""
+    person_id = (rec or {}).get("id")
+    item = _get_bio_item(person_id) if person_id is not None else None
+    if item is None:
+        return pipeline_bio
+    updated = _parse_bio_updated_at(item.get("updated_at"))
+    if updated is None:
+        return pipeline_bio
+    snapshot = _s3_last_modified.get(PEOPLE_KEY)
+    if snapshot is not None:
+        if snapshot.tzinfo is None:
+            snapshot = snapshot.replace(tzinfo=timezone.utc)
+        fresh = updated > snapshot
+    else:
+        fresh = (datetime.now(timezone.utc) - updated).total_seconds() <= BIO_DYNAMO_BRIDGE_SECONDS
+    return str(item.get("bio") or "") if fresh else pipeline_bio
 
 
 def _pipeline_update_person_bio(person_id, bio):
@@ -5479,7 +5502,7 @@ def render_bios_page(key, raw="", error="", results=None):
 <body>
 <div class="wrap">
 <h1>Public Bios — bulk write</h1>
-<p>JSON object {{"&lt;person_id&gt;": "&lt;bio&gt;", ...}}, max {BIO_BULK_MAX_ENTRIES} entries, each at most {BIO_MAX_LEN} characters. Writes Pipeline ({PUBLIC_BIO_FIELD}) first, then Dynamo.</p>
+<p>JSON object {{"&lt;person_id&gt;": "&lt;bio&gt;", ...}}, max {BIO_BULK_MAX_ENTRIES} entries, each at most {BIO_MAX_LEN} characters. Pipeline is the source of truth. Saving here writes Pipeline and shows immediately; edits made directly in Pipeline show after the next hourly refresh.</p>
 {error_html}
 <form method="post" action="{_esc(action)}">
 <textarea name="bios">{_esc(raw)}</textarea>

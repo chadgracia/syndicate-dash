@@ -6349,7 +6349,8 @@ check("bulk validation: one bad entry rejects the whole batch",
       _vb(json.dumps({"1": "ok", "2": "ok", "x": "bad"}))[0] is None)
 
 # --- Display fixture: tenant 1 disclosed on buyer 2 (deal 802); buyer 4
-# has a CRM bio only; buyer 2 has both (Dynamo wins).
+# has a CRM bio only; buyer 2 has both, Dynamo written after the
+# people.json snapshot (Dynamo bridges until the next refresh).
 bio_people = {"people": [
     {"id": TENANT_PID, "full_name": "Sella Seller", "email": TENANT_EMAIL, "custom_fields": {}},
     {"id": 2, "name": "Alice Buyer", "email": "alice@example.com", "work_city": "Boston",
@@ -6362,8 +6363,9 @@ bio_items = [{"tenant": "__bios__", "sk": "bio#2", "bio": "Dynamo head <i> • P
 _, bio_table = use_fixture({lf.PEOPLE_KEY: bio_people, lf.INTEREST_KEY: {"buy": {}},
                             lf.DEALS_KEY: {"deals": [deal_disc_802, deal_own_sell]}}, table_items=bio_items)
 bio_tenant = lf._resolve_tenant(TENANT_EMAIL)
+lf._s3_last_modified[lf.PEOPLE_KEY] = datetime(2026, 8, 31, tzinfo=timezone.utc)
 bio_page = lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None, view_as=None, edit_mode=False)
-check("display: Dynamo bio wins over the CRM field", "Dynamo head" in bio_page and "CRM headline" not in bio_page)
+check("display: Dynamo bio newer than the snapshot wins over the Pipeline field", "Dynamo head" in bio_page and "CRM headline" not in bio_page)
 check("display: headline escaped on the page", "Dynamo head &lt;i&gt;" in bio_page and "Dynamo head <i>" not in bio_page)
 check("display: headline sits right after the location line",
       bio_page.find("Boston") < bio_page.find("Dynamo head") < bio_page.find("mailto:alice@example.com"))
@@ -6380,8 +6382,33 @@ check("display: headline-only bio hides the 'Before your call' card", "Before yo
 
 bio_table.items.append({"tenant": "__bios__", "sk": "bio#4", "bio": "", "updated_at": "2026-09-02T00:00:00Z"})
 carol_cleared = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None, view_as=None, edit_mode=False)
-check("display: an empty Dynamo bio renders nothing (no CRM fallback)",
+check("display: a fresh empty Dynamo bio (newer than snapshot) renders nothing until the refresh",
       "Carol CRM headline" not in carol_cleared and "bio-headline" not in carol_cleared)
+
+# Pipeline is the source of truth: once a snapshot newer than the Dynamo
+# write lands, the Pipeline value wins (incl. an edit made in Pipeline).
+_ppb = lf._person_public_bio
+_bio_rec2 = {"id": 2, "custom_fields": {lf.PUBLIC_BIO_FIELD: "Pipeline edit • New point"}}
+lf._s3_last_modified[lf.PEOPLE_KEY] = datetime(2026, 9, 5, tzinfo=timezone.utc)
+check("precedence: Pipeline edit wins after a snapshot newer than the Dynamo write",
+      _ppb(_bio_rec2) == "Pipeline edit • New point")
+lf._s3_last_modified[lf.PEOPLE_KEY] = datetime(2026, 8, 31, tzinfo=timezone.utc)
+check("precedence: fresh Dynamo write (newer than snapshot) wins until the next snapshot",
+      _ppb(_bio_rec2).startswith("Dynamo head"))
+check("precedence: no Dynamo record -> Pipeline value",
+      _ppb({"id": 999, "custom_fields": {lf.PUBLIC_BIO_FIELD: "Only Pipeline"}}) == "Only Pipeline")
+lf._s3_last_modified[lf.PEOPLE_KEY] = datetime(2026, 9, 5, tzinfo=timezone.utc)
+check("precedence: cleared Pipeline field after refresh -> empty (no stale Dynamo bio)",
+      _ppb({"id": 2, "custom_fields": {lf.PUBLIC_BIO_FIELD: ""}}) == ""
+      and _ppb({"id": 2, "custom_fields": {}}) == "")
+lf._s3_last_modified.pop(lf.PEOPLE_KEY, None)
+check("precedence: snapshot time unknown -> Dynamo older than 90 min ignored",
+      _ppb(_bio_rec2) == "Pipeline edit • New point")
+_fresh_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+bio_table.items.append({"tenant": "__bios__", "sk": "bio#5", "bio": "Fresh Dynamo", "updated_at": _fresh_ts})
+check("precedence: snapshot time unknown -> Dynamo within 90 min wins",
+      _ppb({"id": 5, "custom_fields": {lf.PUBLIC_BIO_FIELD: "Old Pipeline"}}) == "Fresh Dynamo")
+lf._s3_last_modified[lf.PEOPLE_KEY] = datetime(2026, 8, 31, tzinfo=timezone.utc)
 
 admin_edit = lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
                                   view_as=TENANT_EMAIL, edit_mode=True)
