@@ -18871,7 +18871,7 @@ HOLDING_FIELD = "custom_label_3740611"
 AGENT_DATA_BUCKET = "pipeline-token"
 AGENT_DATA_KEY = "agent-data.json"
 RESEARCH_GAPS_DEFAULT_MAX = 5
-_holding_names_cache = {"at": 0.0, "map": None}
+_holding_names_cache = {"at": 0.0, "map": None, "errors": []}
 
 
 def _holding_option_names():
@@ -18884,12 +18884,39 @@ def _holding_option_names():
         return _holding_names_cache["map"]
     s3 = _s3_client()
     out, errors = {}, []
+    # 1) Live Pipeline dropdown entries for the Holding field (authoritative).
+    try:
+        if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+            raise RuntimeError("Pipeline API credentials not configured")
+        qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY,
+                                     "conditions[entity_type]": "person"})
+        req = urllib.request.Request(f"{PIPELINE_API_BASE}/admin/custom_field_labels.json?{qs}", method="GET")
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=20) as r:
+            body = json.loads(r.read().decode("utf-8"))
+        labels = (body.get("custom_field_labels") or body.get("entries") or body.get("data") or []) \
+            if isinstance(body, dict) else (body or [])
+        hold_id = int(HOLDING_FIELD.rsplit("_", 1)[1])
+        for label in labels:
+            if isinstance(label, dict) and str(label.get("id")) == str(hold_id):
+                for ent in (label.get("custom_field_label_dropdown_entries") or []):
+                    try:
+                        if ent.get("name") and ent.get("id") is not None:
+                            out[int(ent["id"])] = str(ent["name"])
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+                break
+        if not out:
+            errors.append("Pipeline: Holding field entries not found in custom_field_labels")
+    except Exception as e:
+        errors.append(f"Pipeline: {e}")
+    # 2) Cached files fill any gaps.
     try:
         obj = s3.get_object(Bucket=BUCKET, Key="security_names.json")
         for k, v in (json.loads(obj["Body"].read()) or {}).items():
             try:
                 if v:
-                    out[int(k)] = str(v)
+                    out.setdefault(int(k), str(v))
             except (TypeError, ValueError):
                 pass
     except Exception as e:
@@ -18909,7 +18936,7 @@ def _holding_option_names():
         raise RuntimeError("; ".join(errors) or "no Holding names found")
     if errors:
         print("research_gaps: partial Holding name map: " + "; ".join(errors))
-    _holding_names_cache.update(at=now, map=out)
+    _holding_names_cache.update(at=now, map=out, errors=errors)
     return out
 
 
@@ -18954,7 +18981,7 @@ def _research_next_step(natural, entity, unknown):
     return "PitchBook + LinkedIn"
 
 
-def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_GAPS_DEFAULT_MAX):
+def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_GAPS_DEFAULT_MAX, unmapped=None):
     """Rows for buy-interest companies with fewer than max_holders holders.
     Holding entries are matched to buy-list names loosely
     (_research_names_match); every matched Holding name is shown."""
@@ -18972,6 +18999,8 @@ def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_G
         for oid in hold_ids:
             name = holding_names.get(oid)
             if not name:
+                if unmapped is not None:
+                    unmapped[oid] = unmapped.get(oid, 0) + 1
                 continue
             b = holders.setdefault(name.strip(), {"natural": set(), "entity": set(), "unknown": set()})
             b[kind].add(pid)
@@ -19025,7 +19054,17 @@ def _handle_research_gaps(query):
         return _html_response("<p>Could not read the Holding company-name map "
                               "(full-pipeline-cache/security_names.json or pipeline-token/agent-data.json).</p>"
                               f"<p>Error: {_esc(str(e))}</p>", status=500)
-    rows = compute_research_gaps(_research_gap_people(), _interest_buy_map(), holding_names, max_holders)
+    unmapped = {}
+    rows = compute_research_gaps(_research_gap_people(), _interest_buy_map(), holding_names, max_holders, unmapped)
+    map_errors = _holding_names_cache.get("errors") or []
+    diag = (f"Holding names known: {len(holding_names)}. "
+            f"Holding entries on people with no known name: {len(unmapped)} "
+            f"({sum(unmapped.values())} person-holdings)")
+    if unmapped:
+        top = sorted(unmapped.items(), key=lambda kv: -kv[1])[:15]
+        diag += " — top ids: " + ", ".join(f"{k} ({v})" for k, v in top)
+    if map_errors:
+        diag += ". Name sources with errors: " + "; ".join(map_errors)
     for r in rows:
         r["pitchbook"] = _company_pitchbook_url(r["company"])
     cols = ["Company", "Buyers", "Holders", "Natural-person holders", "Entity holders",
@@ -19068,6 +19107,7 @@ button,select,a.btn{{font-size:14px;padding:6px 10px}} .muted{{color:#666}}
 <h1>Research gaps</h1>
 <p>{len(rows)} companies · client buy interest, fewer than {max_holders} holders in Holding</p>
 <p class="muted">{summary}</p>
+<p class="muted" style="font-size:12px">{_esc(diag)}</p>
 <div class="bar"><label>Next step <select id="f"><option value="">All</option>{opts}</select></label>
 <button id="copy">Copy company names</button>
 <a class="btn" href="?key={_esc(query.get('key') or '')}&view=research_gaps&max={max_holders}&format=csv">Download CSV</a>
