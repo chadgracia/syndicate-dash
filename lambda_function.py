@@ -329,6 +329,8 @@ ACCREDITED_ID = 6950563  # Accredited Investor ($1M in assets)
 IQF_FIELD = "custom_label_3763008"
 IQF_OK_IDS = {6496840, 6596073}
 IQF_UNNECESSARY_ID = 6596073
+# Raw IQF Status labels -- admin scoreboard tooltip only.
+IQF_STATUS_LABELS = {6496840: "Yes", 6496841: "No", 6496842: "Pending", 6596073: "Unnecessary"}
 
 # "Substantive" (Investor LEVEL option, added 2026/02/26) — verified via a
 # one-time person_custom_field_labels fetch against field 3923758. It is
@@ -16388,6 +16390,12 @@ def _standing_share_at(client):
     return h.get("at") if h else None
 
 
+def _standing_form_status(rec, field, labels):
+    """Raw Pipeline option label for a form field ("Blank" when empty)."""
+    ids = cf_list((rec or {}).get("custom_fields") or {}, field)
+    return ", ".join(labels.get(i, str(i)) for i in ids) or "Blank"
+
+
 def _standing_row(pid, rec, state):
     """One compact scoreboard row (admin only)."""
     cs = compute_client_standing(pid, state=state)
@@ -16396,6 +16404,8 @@ def _standing_row(pid, rec, state):
         "id": pid, "name": _person_display_name(rec) or f"#{pid}", "firm": rec.get("company_name") or "",
         "email": (_person_all_emails(rec) or [""])[0],
         "id_forms": cs["id_forms_done"], "qual": cs["qualification_done"], "roles": cs["roles"],
+        "id_forms_status": _standing_form_status(rec, CEF_FIELD, CEF_LABELS),
+        "qual_status": _standing_form_status(rec, IQF_FIELD, IQF_STATUS_LABELS),
         "won": cs["won_deals"], "has_record": cs["has_record"],
         "rec": {k: client[k] for k in STANDING_EDIT_FIELDS if k != "referrals"},
         "overrides": {k: client[f"{k}_override"] for k in STANDING_OVERRIDE_ITEMS},
@@ -16954,7 +16964,7 @@ STANDING_PAGE_HTML = """<!DOCTYPE html>
   td.st-refs { max-width: 110px; } td.st-tier .st-muted { white-space: normal; } select[data-act=floor] { max-width: 84px; }
   td.st-notescol { width: 100%; }
   .st-yes { color: var(--green); font-weight: 600; text-decoration: none; }
-  .st-no { color: #9ca3af; text-decoration: none; }
+  .st-no { color: #B42318; font-weight: 600; text-decoration: none; }
   tr.st-changed td { background: #fffbeb; }
   tr.st-focus td { background: #eef4fb; box-shadow: inset 0 1px 0 #3d5a73, inset 0 -1px 0 #3d5a73; }
   .st-tier { font-weight: 600; white-space: nowrap; } .st-muted { color: var(--muted); font-size: 12px; }
@@ -16999,7 +17009,7 @@ __BANNER__
 <table>
 <thead><tr><th class="st-selcol"><label><input type="checkbox" id="st-all"> Select</label></th><th>Name</th><th>Firm</th><th>CEF</th><th>IQF</th>
 <th>Terms</th><th>Payments</th><th>Responds</th><th>Trades</th><th>Referrals</th>
-<th>Min<br>tier</th><th title="Sensitive client — standing shown nowhere, not even to the client">Hidden<br>everywhere</th><th>Shared<br>w/ sellers</th><th>Tier</th><th>Notes</th><th>History</th></tr></thead>
+<th>Min<br>tier</th><th title="Sensitive client — standing shown nowhere, not even to the client">Hidden<br>everywhere</th><th>Shared<br>w/ sellers</th><th>Tier</th><th>Private<br>notes</th><th>History</th></tr></thead>
 <tbody id="st-body"></tbody>
 </table>
 </div>
@@ -17123,6 +17133,10 @@ STANDING_PAGE_JS = r"""
   function roleOf(r) { return r.roles || {seller: false, buyer: true}; }
   function roleLabel(r) { var o = roleOf(r);
     return o.seller && o.buyer ? 'Buyer + seller' : (o.seller ? 'Seller' : 'Buyer'); }
+  // CEF / IQF mark: override note wins, else ✓ done / red ✗ (raw Pipeline status in the title).
+  function formMark(r, k, done, label, status) {
+    if (r.overrides && r.overrides[k] === 'needs_update') return '">';
+    return done ? 'st-yes">✓' : 'st-no" title="Pipeline ' + label + ' status: ' + esc(status || 'Blank') + '">✗'; }
   function ovNote(r, k) { return (r.overrides && r.overrides[k] === 'needs_update') ?
     '<div class="st-amber" title="Admin override: not done regardless of Pipeline">Needs update (override)</div>' : ''; }
   function rowHtml(r) {
@@ -17143,8 +17157,8 @@ STANDING_PAGE_JS = r"""
         (rec.hidden ? ' (hidden — client sees nothing)' : '') + '</div></td>' +
       '<td class="st-firm">' + esc(r.firm) + '</td>' +
       '<td>' + (roleOf(r).seller ? '<a target="_blank" rel="noopener" href="' + esc(personUrl) + '" class="' +
-        (r.id_forms ? 'st-yes">✓' : 'st-no">○') + '</a>' : '<span class="st-muted">n/a</span>') + ovNote(r, 'id_forms') + '</td>' +
-      '<td>' + (roleOf(r).buyer ? '<span class="' + (r.qual ? 'st-yes">✓' : 'st-no">○') + '</span>' :
+        formMark(r, 'id_forms', r.id_forms, 'CEF', r.id_forms_status) + '</a>' : '<span class="st-muted">n/a</span>') + ovNote(r, 'id_forms') + '</td>' +
+      '<td>' + (roleOf(r).buyer ? '<span class="' + formMark(r, 'qualification', r.qual, 'IQF', r.qual_status) + '</span>' :
         '<span class="st-muted">n/a</span>') + ovNote(r, 'qualification') + '</td>' +
       '<td>' + rep(r, 'terms_repair') + '</td><td>' + rep(r, 'payments_repair') + '</td><td>' + rep(r, 'respond_repair') + '</td>' +
       '<td class="st-trades" data-role="trades">' + tradesCell(r) + '</td>' +

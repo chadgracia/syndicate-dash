@@ -8316,12 +8316,21 @@ def _pf_denied_scan(**kw):
 
 
 _pf_table.scan = _pf_denied_scan
+# Count Scan rounds (one parallel map over the segments): pool.map cancels
+# segments that have not started once one fails, so 1..4 segment calls run.
+_pf_scan_rounds = []
+_pf_orig_pmap = lf._dynamo_parallel_map
+
+
+def _pf_counting_pmap(fn, args):
+    if fn is lf._scan_aggregate_segment:
+        _pf_scan_rounds.append(1)
+    return _pf_orig_pmap(fn, args)
+
+
+lf._dynamo_parallel_map = _pf_counting_pmap
 _pf_fresp, _pf_fcounts, _pf_fout = _pf_admin_demand()
-# map() raises on the first failed segment while the others are still in
-# flight; drain the pool so every segment attempt is counted.
-if lf._dynamo_executor["pool"] is not None:
-    lf._dynamo_executor["pool"].shutdown(wait=True)
-    lf._dynamo_executor["pool"] = None
+lf._dynamo_parallel_map = _pf_orig_pmap
 _pf_raised_fallback = dict(lf._raised_cache)
 _pf_table.scan = _pf_orig_scan
 check("perf: Scan denied -> admin Demand Board still renders the same feature list via per-partition Queries",
@@ -8329,7 +8338,7 @@ check("perf: Scan denied -> admin Demand Board still renders the same feature li
       and int(_pf_fcounts.get("calls_get_feature_requests", "0")) >= 1
       and int(_pf_fcounts.get("calls_get_manual_intros", "0")) >= 1)
 check("perf: Scan denied -> the failed shared scan is attempted once per request (not retried by the second consumer)",
-      _pf_table.scan_calls == lf.AGGREGATE_SCAN_SEGMENTS
+      len(_pf_scan_rounds) == 1 and 1 <= _pf_table.scan_calls <= lf.AGGREGATE_SCAN_SEGMENTS
       and "feature aggregate scan failed, falling back to per-partition queries" in _pf_fout
       and "manual intro aggregate scan failed, falling back to per-partition queries" in _pf_fout)
 check("perf: desk Raised from the Scan equals the per-partition fallback",
@@ -10178,6 +10187,37 @@ check("scoreboard: 'no referral yet' only for good standing with no tier",
       and "no referral yet" not in _st_jr["b"] + _st_jr["c"] + _st_jr["d"]
       and "not in good standing" in _st_jr["b"] and "not in good standing" in _st_jr["d"]
       and _st_jr["c"] == "Gold · 15%")
+
+# CEF / IQF marks: red ✗ (raw Pipeline status tooltip) when applicable and not done
+_st_fm = ("function esc(s){return String(s);}\n" + _st_js_fn("formMark") + "\n"
+          "process.stdout.write(JSON.stringify({"
+          "done:formMark({},'qualification',true,'IQF','Yes'),"
+          "pend:formMark({},'qualification',false,'IQF','Pending'),"
+          "no:formMark({},'id_forms',false,'CEF','No'),"
+          "blank:formMark({},'id_forms',false,'CEF',''),"
+          "ov:formMark({overrides:{qualification:'needs_update'}},'qualification',false,'IQF','Yes')}));")
+_st_fmr = json.loads(subprocess.run(["node", "-e", _st_fm], capture_output=True, text=True, check=True).stdout)
+check("scoreboard: applicable-not-done CEF/IQF shows a red ✗ with the raw Pipeline status tooltip",
+      _st_fmr["pend"] == 'st-no" title="Pipeline IQF status: Pending">✗'
+      and _st_fmr["no"] == 'st-no" title="Pipeline CEF status: No">✗'
+      and _st_fmr["blank"] == 'st-no" title="Pipeline CEF status: Blank">✗'
+      and ".st-no { color: #B42318;" in lf.STANDING_PAGE_HTML)
+check("scoreboard: done keeps ✓; override wins over the ✗; n/a and 'Needs update (override)' unchanged",
+      _st_fmr["done"] == 'st-yes">✓' and "✗" not in _st_fmr["ov"] and "○" not in lf.STANDING_PAGE_JS
+      and "Needs update (override)" in lf.STANDING_PAGE_JS and '<span class="st-muted">n/a</span>' in lf.STANDING_PAGE_JS)
+check("scoreboard: raw form status labels from Pipeline option ids",
+      lf._standing_form_status({"custom_fields": {lf.IQF_FIELD: 6496842}}, lf.IQF_FIELD, lf.IQF_STATUS_LABELS) == "Pending"
+      and lf._standing_form_status({"custom_fields": {lf.IQF_FIELD: [6496841]}}, lf.IQF_FIELD, lf.IQF_STATUS_LABELS) == "No"
+      and lf._standing_form_status({"custom_fields": {}}, lf.IQF_FIELD, lf.IQF_STATUS_LABELS) == "Blank"
+      and lf._standing_form_status({"custom_fields": {lf.CEF_FIELD: 6600514}}, lf.CEF_FIELD, lf.CEF_LABELS) == "Pending"
+      and lf._standing_form_status({"custom_fields": {lf.CEF_FIELD: 6600513}}, lf.CEF_FIELD, lf.CEF_LABELS) == "No")
+_st_rows_fm = _st_page_data(_st_get({"view": "standing", "key": ADMIN_KEY})["body"])["rows"]
+check("scoreboard: rows carry qual_status / id_forms_status alongside unchanged qual / id_forms",
+      _st_rows_fm and all(isinstance(x.get("qual_status"), str) and isinstance(x.get("id_forms_status"), str)
+                          and isinstance(x.get("qual"), bool) and isinstance(x.get("id_forms"), bool) for x in _st_rows_fm))
+_st_sbh = _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
+check("scoreboard: Notes header reads Private notes (two lines)",
+      "<th>Private<br>notes</th>" in _st_sbh and "<th>Notes</th>" not in _st_sbh)
 
 # --- Desk JSON
 def _st_json(pid):
