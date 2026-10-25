@@ -8258,13 +8258,22 @@ check("perf: desk Raised counts the scanned seller manual intro (Wired)",
 _pf_orig_scan = _pf_table.scan
 
 
+_pf_scan_lock = __import__("threading").Lock()
+
+
 def _pf_denied_scan(**kw):
-    _pf_table.scan_calls = getattr(_pf_table, "scan_calls", 0) + 1
+    with _pf_scan_lock:
+        _pf_table.scan_calls = getattr(_pf_table, "scan_calls", 0) + 1
     raise RuntimeError("AccessDeniedException")
 
 
 _pf_table.scan = _pf_denied_scan
 _pf_fresp, _pf_fcounts, _pf_fout = _pf_admin_demand()
+# map() raises on the first failed segment while the others are still in
+# flight; drain the pool so every segment attempt is counted.
+if lf._dynamo_executor["pool"] is not None:
+    lf._dynamo_executor["pool"].shutdown(wait=True)
+    lf._dynamo_executor["pool"] = None
 _pf_raised_fallback = dict(lf._raised_cache)
 _pf_table.scan = _pf_orig_scan
 check("perf: Scan denied -> admin Demand Board still renders the same feature list via per-partition Queries",
@@ -10060,6 +10069,17 @@ _st_all = (json.dumps(json.loads(_st_get({"view": "standing_json", "pid": "2", "
            + json.dumps(json.loads(_st_get({"view": "standing_json", "pid": "13", "key": ADMIN_KEY})["body"]))
            + "".join(_st_np2.values()))
 check("override reason never appears in desk JSON or seller output", "ZZPRIVATEREASON" not in _st_all)
+_st_q13_off = [i for i in json.loads(_st_get({"view": "standing_json", "pid": "13", "key": ADMIN_KEY})["body"])["items"]
+              if i["key"] == "qualification"]
+_st_put({"2": {}, "13": {"qualification_override": "needs_update"}}, rev=74)
+lf._req_cache_reset()
+_st_q13_on = [i for i in json.loads(_st_get({"view": "standing_json", "pid": "13", "key": ADMIN_KEY})["body"])["items"]
+              if i["key"] == "qualification"][0]
+check("override: IQF note links IQF_FORM_URL only while the override is on",
+      lf.IQF_FORM_URL == "https://www.rainmakersecurities.com/investor-qualification-form-for-natural-persons"
+      and _st_q13_on.get("override") is True and _st_q13_on.get("form_url") == lf.IQF_FORM_URL
+      and all(i.get("form_url") != lf.IQF_FORM_URL for i in _st_q13_off)
+      and lf.IQF_FORM_URL not in _st_idf.get("form_url", ""))
 _st_put({"2": {}, "13": {"qualification_override": "needs_update", "qualification_override_reason": "r"}}, rev=73)
 _r = _st_client_post({"key": ADMIN_KEY, "pid": "13", "rev": 73, "fields": {"qualification_override": None}})
 lf._req_cache_reset()
@@ -10083,6 +10103,33 @@ check("scoreboard: deep link pid passed to the page, row shows the override stat
       and "id_forms_override_reason" not in json.dumps(_st_r13))
 check("scoreboard: non-numeric pid ignored", _st_page_data(_st_get({"view": "standing", "key": ADMIN_KEY,
                                                                    "pid": "<x>"})["body"])["focus_pid"] == "")
+
+# Scoreboard cell renderers (rep / tierHtml) run in node against stub data
+def _st_js_fn(name):
+    src = lf.STANDING_PAGE_JS
+    start = src.index("  function " + name + "(")
+    return src[start:src.index("\n  function ", start + 1)]
+_st_js = ("var D={repair_max:6,tier_labels:{preferred:'Preferred',gold:'Gold',platinum:'Platinum'},"
+          "discounts:{preferred:10,gold:15,platinum:20}};var ST={};"
+          "function esc(s){return String(s);}function cur(r){return {rec:r.rec};}function standing(r){return ST[r.id];}"
+          + "\n" + _st_js_fn("rep") + "\n" + _st_js_fn("tierHtml") + "\n" +
+          "ST.a={good:true,tier:null};ST.b={good:false,tier:null};ST.c={good:true,tier:'gold'};ST.d={good:false,tier:'gold'};"
+          "var R={rep0:rep({rec:{terms_repair:0}},'terms_repair'),rep2:rep({rec:{terms_repair:2}},'terms_repair'),"
+          "a:tierHtml({id:'a'}),b:tierHtml({id:'b'}),c:tierHtml({id:'c'}),d:tierHtml({id:'d'})};"
+          "process.stdout.write(JSON.stringify(R));")
+import subprocess
+_st_jr = json.loads(subprocess.run(["node", "-e", _st_js], capture_output=True, text=True, check=True).stdout)
+check("scoreboard: ✓ item shows only the ✓ and Missed (no Cleared)",
+      "✓" in _st_jr["rep0"] and ">Missed<" in _st_jr["rep0"] and "Cleared" not in _st_jr["rep0"]
+      and "to go" not in _st_jr["rep0"])
+check("scoreboard: repair count shows N to go, Missed and Cleared",
+      "2 to go" in _st_jr["rep2"] and ">Missed<" in _st_jr["rep2"] and 'data-act="clear"' in _st_jr["rep2"]
+      and ">Cleared<" in _st_jr["rep2"] and "✓" not in _st_jr["rep2"])
+check("scoreboard: 'no referral yet' only for good standing with no tier",
+      _st_jr["a"].startswith("—") and "no referral yet" in _st_jr["a"]
+      and "no referral yet" not in _st_jr["b"] + _st_jr["c"] + _st_jr["d"]
+      and "not in good standing" in _st_jr["b"] and "not in good standing" in _st_jr["d"]
+      and _st_jr["c"] == "Gold · 15%")
 
 # --- Desk JSON
 def _st_json(pid):

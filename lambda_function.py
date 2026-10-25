@@ -741,6 +741,7 @@ CEF_PENDING_ID = 6600514
 CEF_YES_ID = 6600515
 CEF_NA_ID = 6600516
 CEF_FORM_URL = "https://www.rainmakersecurities.com/client-engagement-form-for-entity-persons"
+IQF_FORM_URL = "https://www.rainmakersecurities.com/investor-qualification-form-for-natural-persons"
 CEF_LABELS = {
     CEF_NO_ID: "No",
     CEF_PENDING_ID: "Pending",
@@ -16342,6 +16343,8 @@ def standing_json_payload(pid):
                     # Client-facing override note (never the admin-only reason).
                     item["note"] = rec[f"{k}_override_note"]
                     item["override"] = True
+                    if k == "qualification":
+                        item["form_url"] = IQF_FORM_URL
                 else:
                     item["note"] = STANDING_ITEM_OPEN_NOTES[k]
                 if k == "id_forms":
@@ -17081,11 +17084,12 @@ STANDING_PAGE_JS = r"""
   function rep(r, f) { var v = cur(r).rec[f];
     return '<span class="st-rep">' + (v === 0 ? '<span class="st-ok-mark">✓</span>' : '<span class="st-togo num">' + v + ' to go</span>') +
       '<span class="st-btns"><button type="button" data-act="miss" data-f="' + f + '"' + (v >= D.repair_max ? ' disabled' : '') +
-      '>Missed</button><button type="button" data-act="clear" data-f="' + f + '"' + (v === 0 ? ' disabled' : '') +
-      '>Cleared</button></span></span>'; }
+      '>Missed</button>' + (v === 0 ? '' : '<button type="button" data-act="clear" data-f="' + f + '">Cleared</button>') +
+      '</span></span>'; }
   function tierHtml(r) { var st = standing(r);
     return esc(st.tier ? (D.tier_labels[st.tier] + ' · ' + D.discounts[st.tier] + '%') : '—') +
-      (st.good ? '' : '<div class="st-muted" style="font-weight:400">not in good standing</div>'); }
+      (st.good ? (st.tier ? '' : '<div class="st-muted" style="font-weight:400">no referral yet</div>')
+        : '<div class="st-muted" style="font-weight:400">not in good standing</div>'); }
   // Next tier the trade data alone would reach: the closer of the volume and
   // trade-count routes (by fraction of the threshold still to go).
   function tradesNext(ts) {
