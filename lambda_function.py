@@ -14214,20 +14214,55 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html="
     )
 
 
+PUBLIC_COMPANY_SUMMARIES_KEY = "syndicate-dash/public-company-summaries.json"
+
+
+def _public_company_summaries():
+    """{"<company_id>": "<approved text>"} from PUBLIC_COMPANY_SUMMARIES_KEY
+    (version-keyed _data_cache). Missing/unreadable/malformed -> {} so the
+    firm card shows no description (fail closed)."""
+    try:
+        comps = _versioned_s3_json(PUBLIC_COMPANY_SUMMARIES_KEY, "s3_public_summaries",
+                                   lambda d: (d or {}).get("companies") if isinstance(d, dict) else None)
+    except Exception as e:
+        if not _s3_is_missing(e):
+            print(f"public-company-summaries read failed: {type(e).__name__}: {e}")
+        return {}
+    return comps if isinstance(comps, dict) else {}
+
+
+def _first_text(rec, keys):
+    """First non-empty stripped string value among rec[k] for k in keys."""
+    for k in keys:
+        v = rec.get(k)
+        if v is not None and not isinstance(v, (dict, list)) and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
 def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
-    """LEFT column: "About <firm>" -- companies.json fields only
-    (get_company_record), each rendered only when present. The company
-    Summary ("summary", else "description") shows to tenants and admins
-    alike, in full, one <p> per line/paragraph. founded year is read
-    verbatim from "founded_year" only (never derived). PitchBook link
-    (custom_label_3320818) as "PitchBook profile ->" when present.
-    Returns "" when there's nothing to show."""
+    """LEFT column: "About <firm>". Description = ONLY the approved text for
+    this company_id in PUBLIC_COMPANY_SUMMARIES_KEY (one <p> per line); none
+    on file -> no description. The raw companies.json "summary"/"description"
+    holds internal notes and is NEVER shown to tenants: admin view
+    (edit_mode) only, collapsed under "Internal Summary (not shown to
+    sellers)". Then address (one line), phone, website, Founded
+    ("founded_year" verbatim), PitchBook link (custom_label_3320818), each
+    only when present. Returns "" when there's nothing to show."""
     if company_rec is None or not firm_name:
         return ""
-    summary = (company_rec.get("summary") or "").strip() or (company_rec.get("description") or "").strip()
-    city = (company_rec.get("city") or "").strip()
-    country = (company_rec.get("country") or "").strip()
-    location = ", ".join(p for p in (city, country) if p)
+    cid = str(company_rec.get("id") or "").strip()
+    approved = _public_company_summaries().get(cid) if cid else None
+    approved = approved.strip() if isinstance(approved, str) else ""
+    address = ", ".join(p for p in (
+        _first_text(company_rec, ("address", "address_1", "address1")),
+        _first_text(company_rec, ("address_2", "address2")),
+        _first_text(company_rec, ("city",)),
+        _first_text(company_rec, ("state",)),
+        _first_text(company_rec, ("postal_code", "zip")),
+        _first_text(company_rec, ("country",))) if p)
+    phone = _first_text(company_rec, ("phone", "phone1", "phone_number"))
+    website = _first_text(company_rec, ("website", "web", "web_url"))
     founded = company_rec.get("founded_year")
     founded_text = str(founded).strip() if founded else ""
     cf = company_rec.get("custom_fields") or {}
@@ -14237,11 +14272,25 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     pitchbook_url = str(pb_raw).strip() if pb_raw else ""
 
     rows = []
-    if summary:
+    if approved:
         rows.extend(f'<p class="firm-description">{_esc(para.strip())}</p>'
-                    for para in summary.splitlines() if para.strip())
-    if location:
-        rows.append(f'<div class="buyer-page-row">{_esc(location)}</div>')
+                    for para in approved.splitlines() if para.strip())
+    if edit_mode:
+        if not approved:
+            rows.append('<div class="buyer-page-row" style="color: var(--muted)">No approved public text yet</div>')
+        raw = (company_rec.get("summary") or "").strip() or (company_rec.get("description") or "").strip()
+        if raw:
+            rows.append('<details class="firm-internal-summary"><summary>Internal Summary (not shown to sellers)'
+                        '</summary>' + "".join(f'<p class="firm-description">{_esc(para.strip())}</p>'
+                                               for para in raw.splitlines() if para.strip()) + '</details>')
+    if address:
+        rows.append(f'<div class="buyer-page-row">{_esc(address)}</div>')
+    if phone:
+        rows.append(f'<div class="buyer-page-row">{_esc(phone)}</div>')
+    if website:
+        href_w = website if "://" in website else f"https://{website}"
+        rows.append(f'<div class="buyer-page-row"><a href="{_esc(href_w)}" target="_blank" '
+                    f'rel="noopener noreferrer">{_esc(website)}</a></div>')
     if founded_text:
         rows.append(f'<div class="buyer-page-row">Founded {_esc(founded_text)}</div>')
     if pitchbook_url:

@@ -2559,23 +2559,57 @@ check("header: transactor-type chip present", "Family Office" in header_html)
 check("header: badges (right-aligned block) present", 'class="buyer-header-badges"' in header_html)
 check("header: ID verified chip present (CEF Yes)", 'class="id-verified-chip"' in header_html)
 
-check("About card: city/country shown", "Austin, USA" in page_alice)
+check("About card: address (city/country) shown", "Austin, USA" in page_alice)
 check("About card: founded year shown", "Founded 2015" in page_alice)
 check("About card: PitchBook link shown", "PitchBook profile" in page_alice and "pitchbook.com" in page_alice)
-check("About card: description (summary fallback) shown in full to a tenant",
-      "word0 word1" in page_alice and "word79" in page_alice and "firm-more" not in page_alice)
-check("About card: internal marker NOT shown to a tenant",
-      "(internal — review before publishing)" not in page_alice)
+check("About card: raw companies.json description NEVER shown to a tenant (no approved-text file)",
+      "word0" not in page_alice and "word79" not in page_alice and "Internal Summary" not in page_alice
+      and "No approved public text yet" not in page_alice)
 
 page_alice_admin = lf.render_buyer_page(2, "Admin", tenant_a, TENANT_A_EMAIL, key=ADMIN_KEY, view_as=None, edit_mode=True)
-check("admin: description text shown", "word0 word1" in page_alice_admin)
-check("admin: full description, no expander, no internal marker",
-      "word79" in page_alice_admin and "firm-more" not in page_alice_admin
-      and "(internal — review before publishing)" not in page_alice_admin)
-_firm_sum = lf._buyer_about_firm_html("Acme", {"summary": "Para one.\n\nPara <two>.", "description": "Old desc"}, False)
-check("About card: summary wins over description, one <p> per paragraph, escaped",
-      '<p class="firm-description">Para one.</p><p class="firm-description">Para &lt;two&gt;.</p>' in _firm_sum
-      and "Old desc" not in _firm_sum)
+check("admin: raw description only inside the collapsed Internal Summary + 'No approved public text yet'",
+      '<details class="firm-internal-summary"><summary>Internal Summary (not shown to sellers)</summary>' in page_alice_admin
+      and "word79" in page_alice_admin.split("Internal Summary (not shown to sellers)")[1].split("</details>")[0]
+      and "No approved public text yet" in page_alice_admin)
+
+_pcs_saved = lf._public_company_summaries
+_firm_rec = {"id": 7001, "summary": "SECRET internal note.", "description": "Old desc",
+             "address_1": "1 Main St", "address2": "Suite 5", "city": "Austin", "state": "TX", "zip": "78701",
+             "country": "USA", "phone1": "+1 512 555 0100", "web_url": "acme.example.com"}
+lf._public_company_summaries = lambda: {"7001": "Approved line one.\nApproved <two>."}
+try:
+    _firm_t = lf._buyer_about_firm_html("Acme", _firm_rec, False)
+    _firm_a = lf._buyer_about_firm_html("Acme", _firm_rec, True)
+    _firm_other = lf._buyer_about_firm_html("Acme", dict(_firm_rec, id=7002), False)
+finally:
+    lf._public_company_summaries = _pcs_saved
+check("About card: tenant sees the approved text, one <p> per line, escaped",
+      '<p class="firm-description">Approved line one.</p><p class="firm-description">Approved &lt;two&gt;.</p>' in _firm_t)
+check("About card: raw summary/description never in tenant HTML",
+      "SECRET" not in _firm_t and "Old desc" not in _firm_t and "Internal Summary" not in _firm_t
+      and "SECRET" not in _firm_other)
+check("About card: no approved entry for this company_id -> no description for tenants",
+      "firm-description" not in _firm_other)
+check("About card: admin sees approved text, then raw Summary collapsed, no 'No approved' line",
+      "Approved line one." in _firm_a and "SECRET internal note." in _firm_a.split("<details")[1]
+      and "No approved public text yet" not in _firm_a)
+check("About card: address on one line, phone, website link with https://, in order before Founded/PitchBook",
+      '<div class="buyer-page-row">1 Main St, Suite 5, Austin, TX, 78701, USA</div>' in _firm_t
+      and '<div class="buyer-page-row">+1 512 555 0100</div>' in _firm_t
+      and 'href="https://acme.example.com"' in _firm_t
+      and _firm_t.index("Approved line one.") < _firm_t.index("1 Main St") < _firm_t.index("+1 512")
+      < _firm_t.index("acme.example.com"))
+fake_s3_pcs = FakeS3({lf.PUBLIC_COMPANY_SUMMARIES_KEY: {"built_at": "2026-10-25", "companies": {"7001": "From S3."}}})
+lf._s3_client_singleton["client"] = fake_s3_pcs
+lf._req_cache_reset(); lf._data_cache.pop(lf.PUBLIC_COMPANY_SUMMARIES_KEY, None)
+check("About card: approved text loaded from public-company-summaries.json by company_id",
+      "From S3." in lf._buyer_about_firm_html("Acme", _firm_rec, False))
+fake_s3_pcs.objs.pop(lf.PUBLIC_COMPANY_SUMMARIES_KEY)
+lf._req_cache_reset(); lf._data_cache.pop(lf.PUBLIC_COMPANY_SUMMARIES_KEY, None); lf._s3_version_cache.clear()
+_firm_missing = lf._buyer_about_firm_html("Acme", _firm_rec, False)
+check("About card: missing approved-text file fails closed (no description, no raw summary)",
+      "firm-description" not in _firm_missing and "SECRET" not in _firm_missing and "1 Main St" in _firm_missing)
+lf._s3_client_singleton["client"] = None
 
 ABOUT_HEADING_RE = re.compile(r'<h2 class="buyer-section-heading">About\b')
 page_bob = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
