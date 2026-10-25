@@ -18876,21 +18876,59 @@ _holding_names_cache = {"at": 0.0, "map": None}
 
 def _holding_option_names():
     """{holding option id: company name}; cached 10 min per container.
-    Raises on failure (caller shows the error)."""
+    Merges full-pipeline-cache/security_names.json (the full Holding
+    dropdown map daily-brief uses) with agent-data.json security_ids "h"
+    (fills gaps only). Raises only when both sources fail."""
     now = time.time()
     if _holding_names_cache["map"] is not None and now - _holding_names_cache["at"] < 600:
         return _holding_names_cache["map"]
-    obj = _s3_client().get_object(Bucket=AGENT_DATA_BUCKET, Key=AGENT_DATA_KEY)
-    data = json.loads(obj["Body"].read()) or {}
-    out = {}
-    for name, ids in (data.get("security_ids") or {}).items():
-        if isinstance(ids, dict) and ids.get("h") is not None:
+    s3 = _s3_client()
+    out, errors = {}, []
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key="security_names.json")
+        for k, v in (json.loads(obj["Body"].read()) or {}).items():
             try:
-                out[int(ids["h"])] = str(name)
+                if v:
+                    out[int(k)] = str(v)
             except (TypeError, ValueError):
                 pass
+    except Exception as e:
+        errors.append(f"security_names.json: {e}")
+    try:
+        obj = s3.get_object(Bucket=AGENT_DATA_BUCKET, Key=AGENT_DATA_KEY)
+        data = json.loads(obj["Body"].read()) or {}
+        for name, ids in (data.get("security_ids") or {}).items():
+            if isinstance(ids, dict) and ids.get("h") is not None:
+                try:
+                    out.setdefault(int(ids["h"]), str(name))
+                except (TypeError, ValueError):
+                    pass
+    except Exception as e:
+        errors.append(f"agent-data.json: {e}")
+    if not out:
+        raise RuntimeError("; ".join(errors) or "no Holding names found")
+    if errors:
+        print("research_gaps: partial Holding name map: " + "; ".join(errors))
     _holding_names_cache.update(at=now, map=out)
     return out
+
+
+def _research_name_key(name):
+    """Loose company-name key: lowercase, parentheticals dropped,
+    punctuation to spaces ("1X (US HoldCo)" -> "1x")."""
+    n = re.sub(r"\([^)]*\)", " ", str(name or "").lower())
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", n).split())
+
+
+def _research_names_match(a, b):
+    """Same key, or one key is a whole-word prefix of the other
+    ("aalo" ~ "aalo atomics")."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    short, long_ = (a, b) if len(a) < len(b) else (b, a)
+    return len(short) >= 2 and long_.startswith(short + " ")
 
 
 def _research_gap_people():
@@ -18917,8 +18955,10 @@ def _research_next_step(natural, entity, unknown):
 
 
 def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_GAPS_DEFAULT_MAX):
-    """Rows for buy-interest companies with fewer than max_holders holders."""
-    holders = {}  # lowercased company -> {"natural": set, "entity": set, "unknown": set}
+    """Rows for buy-interest companies with fewer than max_holders holders.
+    Holding entries are matched to buy-list names loosely
+    (_research_names_match); every matched Holding name is shown."""
+    holders = {}  # holding name -> {"natural": set, "entity": set, "unknown": set}
     for rec in people:
         pid = rec.get("id")
         if pid is None:
@@ -18933,8 +18973,9 @@ def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_G
             name = holding_names.get(oid)
             if not name:
                 continue
-            b = holders.setdefault(name.strip().lower(), {"natural": set(), "entity": set(), "unknown": set()})
+            b = holders.setdefault(name.strip(), {"natural": set(), "entity": set(), "unknown": set()})
             b[kind].add(pid)
+    holding_keys = [(hn, _research_name_key(hn)) for hn in holders]
     rows = []
     for company, ids in (buy_map or {}).items():
         if not isinstance(ids, list) or not ids:
@@ -18942,13 +18983,22 @@ def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_G
         name = str(company).strip()
         if not name or _is_public_company(name) or name.lower() in _EXCLUDED_COMPANIES_LOWER:
             continue
-        b = holders.get(name.lower(), {"natural": set(), "entity": set(), "unknown": set()})
-        n, e, u = len(b["natural"]), len(b["entity"]), len(b["unknown"])
+        key = _research_name_key(name)
+        matched = sorted(hn for hn, hk in holding_keys if _research_names_match(key, hk))
+        nat, ent, unk = set(), set(), set()
+        for hn in matched:
+            nat |= holders[hn]["natural"]
+            ent |= holders[hn]["entity"]
+            unk |= holders[hn]["unknown"]
+        ent -= nat
+        unk -= nat | ent
+        n, e, u = len(nat), len(ent), len(unk)
         total = n + e + u
         if total >= max_holders:
             continue
         rows.append({"company": name, "buyers": len(set(ids)), "holders": total, "natural": n,
-                     "entity": e, "unknown": u, "next_step": _research_next_step(n, e, u)})
+                     "entity": e, "unknown": u, "next_step": _research_next_step(n, e, u),
+                     "matched": ", ".join(matched)})
     rows.sort(key=lambda r: (-r["buyers"], r["holders"], r["company"].lower()))
     return rows
 
@@ -18972,15 +19022,15 @@ def _handle_research_gaps(query):
         holding_names = _holding_option_names()
     except Exception as e:
         print(f"research_gaps: agent-data.json read failed: {e}")
-        return _html_response("<p>Could not read s3://pipeline-token/agent-data.json (the Holding "
-                              "company-name map). The syndicate-dash Lambda role needs s3:GetObject on "
-                              f"that object.</p><p>Error: {_esc(str(e))}</p>", status=500)
+        return _html_response("<p>Could not read the Holding company-name map "
+                              "(full-pipeline-cache/security_names.json or pipeline-token/agent-data.json).</p>"
+                              f"<p>Error: {_esc(str(e))}</p>", status=500)
     rows = compute_research_gaps(_research_gap_people(), _interest_buy_map(), holding_names, max_holders)
     for r in rows:
         r["pitchbook"] = _company_pitchbook_url(r["company"])
     cols = ["Company", "Buyers", "Holders", "Natural-person holders", "Entity holders",
-            "Unknown-type holders", "Next step", "PitchBook URL"]
-    keys = ["company", "buyers", "holders", "natural", "entity", "unknown", "next_step", "pitchbook"]
+            "Unknown-type holders", "Next step", "PitchBook URL", "Holding names counted"]
+    keys = ["company", "buyers", "holders", "natural", "entity", "unknown", "next_step", "pitchbook", "matched"]
     if (query.get("format") or "").lower() == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)
@@ -19002,7 +19052,8 @@ def _handle_research_gaps(query):
         trs.append(f'<tr data-step="{_esc(r["next_step"])}"><td>{_esc(r["company"])}</td>'
                    f'<td class="n">{r["buyers"]}</td><td class="n">{r["holders"]}</td>'
                    f'<td class="n">{r["natural"]}</td><td class="n">{r["entity"]}</td>'
-                   f'<td class="n">{r["unknown"]}</td><td>{_esc(r["next_step"])}</td><td>{pb}</td></tr>')
+                   f'<td class="n">{r["unknown"]}</td><td>{_esc(r["next_step"])}</td><td>{pb}</td>'
+                   f'<td class="muted">{_esc(r["matched"]) or "—"}</td></tr>')
     steps = sorted(counts)
     opts = "".join(f'<option value="{_esc(s)}">{_esc(s)}</option>' for s in steps)
     body = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -19021,7 +19072,7 @@ button,select,a.btn{{font-size:14px;padding:6px 10px}} .muted{{color:#666}}
 <button id="copy">Copy company names</button>
 <a class="btn" href="?key={_esc(query.get('key') or '')}&view=research_gaps&max={max_holders}&format=csv">Download CSV</a>
 <span id="msg" class="muted"></span></div>
-<table><thead><tr>{"".join(f"<th>{c}</th>" for c in ["Company", "Buyers", "Holders", "Natural", "Entity", "Unknown type", "Next step", "PitchBook"])}</tr></thead>
+<table><thead><tr>{"".join(f"<th>{c}</th>" for c in ["Company", "Buyers", "Holders", "Natural", "Entity", "Unknown type", "Next step", "PitchBook", "Holding names counted"])}</tr></thead>
 <tbody>{"".join(trs)}</tbody></table>
 <script>
 var f=document.getElementById('f');
