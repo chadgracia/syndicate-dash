@@ -5617,6 +5617,169 @@ document.querySelectorAll('.cl-copy').forEach(function(btn) {{
 </body></html>"""
 
 
+# ── One-time Summary migration (?view=summary_migrate) ──────────────────
+# Moves internal text out of Pipeline company Summaries into company
+# notes: per entry, note POST first; the Summary PUT only after the note
+# succeeded. Done company ids live in Dynamo tenant=SUMMARY_MIGRATION_PARTITION
+# (sk "done#<id>") so a resubmit skips the note and only re-PUTs.
+SUMMARY_MIGRATION_PARTITION = "__summary_migration__"
+SUMMARY_MIGRATE_MAX_ENTRIES = 100
+
+
+def _pipeline_post_json(path, method, payload):
+    """(ok, error). Query-string auth; non-2xx -> (False, error)."""
+    if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
+        return False, "Pipeline API credentials not configured"
+    qs = urllib.parse.urlencode({"api_key": PIPELINE_API_KEY, "app_key": PIPELINE_APP_KEY})
+    req = urllib.request.Request(f"{PIPELINE_API_BASE}{path}?{qs}", data=json.dumps(payload).encode("utf-8"),
+                                 method=method, headers={"Content-Type": "application/json"})
+    try:
+        _perf_count("pipeline_api_call")
+        with _perf_timer("pipeline_api"), urllib.request.urlopen(req, timeout=15) as r:
+            if 200 <= r.status < 300:
+                return True, None
+            return False, f"HTTP {r.status}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def _pipeline_create_company_note(company_id, content):
+    return _pipeline_post_json("/notes.json", "POST",
+                               {"note": {"content": content, "company_id": int(company_id)}})
+
+
+def _pipeline_update_company_summary(company_id, summary):
+    """Pipeline UI "Summary" = the company "description" attribute."""
+    return _pipeline_post_json(f"/companies/{company_id}.json", "PUT", {"company": {"description": summary}})
+
+
+def validate_summary_migration_batch(raw):
+    """(entries, error): [(company_id, summary, note)], whole batch rejected on any bad entry."""
+    try:
+        data = json.loads(raw or "")
+    except Exception:
+        return None, "JSON does not parse"
+    if not isinstance(data, dict):
+        return None, 'JSON must be an object: {"<company_id>": {"summary": "...", "note": "..."}}'
+    if not data:
+        return None, "No entries"
+    if len(data) > SUMMARY_MIGRATE_MAX_ENTRIES:
+        return None, f"Too many entries ({len(data)}); max {SUMMARY_MIGRATE_MAX_ENTRIES}"
+    entries = []
+    for k, v in data.items():
+        if not (isinstance(k, str) and k.isdigit() and k.isascii()):
+            return None, f"Key {k!r} is not a numeric company_id"
+        if not isinstance(v, dict) or not isinstance(v.get("summary"), str) or not isinstance(v.get("note"), str):
+            return None, f'Value for {k} must be {{"summary": "<string>", "note": "<string>"}}'
+        if not v["note"].strip():
+            return None, f"Note for {k} is empty"
+        entries.append((k, v["summary"].strip(), v["note"].strip()))
+    return entries, None
+
+
+def migrate_company_summary(company_id, summary, note):
+    """{"company_id", "note_ok" (True/False/"skipped"), "summary_ok" (True/False/None=skipped), "error"}."""
+    result = {"company_id": str(company_id), "note_ok": False, "summary_ok": None, "error": ""}
+    table = None
+    try:
+        table = _dynamo_table()
+        done = table.get_item(Key={"tenant": SUMMARY_MIGRATION_PARTITION, "sk": f"done#{company_id}"}).get("Item")
+    except Exception as e:
+        done = None
+        print(f"summary migration done-check failed for {company_id}: {type(e).__name__}: {e}")
+    if done:
+        result["note_ok"] = "skipped"
+    else:
+        ok, err = _pipeline_create_company_note(company_id, note)
+        result["note_ok"] = ok
+        if not ok:
+            result["error"] = f"Note: {err}"
+    if result["note_ok"] is True or result["note_ok"] == "skipped":
+        ok, err = _pipeline_update_company_summary(company_id, summary)
+        result["summary_ok"] = ok
+        if not ok:
+            result["error"] = f"Summary: {err}"
+    now = datetime.now(timezone.utc)
+    try:
+        table = table or _dynamo_table()
+        if result["note_ok"] is True:
+            table.put_item(Item={"tenant": SUMMARY_MIGRATION_PARTITION, "sk": f"done#{company_id}",
+                                 "note_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")})
+        table.put_item(Item={
+            "tenant": SUMMARY_MIGRATION_PARTITION,
+            "sk": f"audit#summary#{company_id}#{int(now.timestamp() * 1000)}",
+            "actor": "admin",
+            "new": {"summary": summary, "note": note},
+            "note_ok": str(result["note_ok"]), "summary_ok": str(result["summary_ok"]),
+            "error": result["error"],
+        })
+    except Exception as e:
+        result["error"] = (result["error"] + "; " if result["error"] else "") + f"Dynamo: {type(e).__name__}: {e}"
+    return result
+
+
+def render_summary_migrate_page(key, raw="", error="", results=None):
+    """?key=ADMIN_KEY&view=summary_migrate -- one-time tool: GET form, POST same URL."""
+    action = f"?key={urllib.parse.quote(key or '', safe='')}&view=summary_migrate"
+    error_html = f'<p class="bios-error">{_esc(error)}</p>' if error else ""
+    results_html = ""
+    if results is not None:
+        def _note_cell(v):
+            return "SKIPPED (done before)" if v == "skipped" else _ok_err(v)
+        rows = "".join(
+            f'<tr><td>{_esc(r["company_id"])}</td><td>{_note_cell(r["note_ok"])}</td>'
+            f'<td>{"SKIPPED" if r["summary_ok"] is None else _ok_err(r["summary_ok"])}</td>'
+            f'<td>{_esc(r["error"])}</td></tr>' for r in results)
+        results_html = ('<table class="bios-results"><thead><tr><th>company_id</th><th>Note</th>'
+                        f'<th>Summary</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>')
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Summary migration · Gracia Group</title>
+<style>
+  body {{ margin: 0; background: #f4f2ee; color: #16181d; padding: 32px 24px 64px;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
+  .wrap {{ max-width: 900px; margin: 0 auto; }}
+  h1 {{ font-size: 20px; }}
+  textarea {{ width: 100%; min-height: 320px; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+             box-sizing: border-box; padding: 8px; }}
+  button {{ margin-top: 10px; padding: 6px 16px; font-size: 14px; }}
+  .bios-error {{ color: #b23b3b; font-weight: 600; }}
+  .bios-results {{ margin-top: 18px; border-collapse: collapse; width: 100%; font-size: 13px; background: #fff; }}
+  .bios-results th, .bios-results td {{ border: 1px solid #e7e5e0; padding: 6px 8px; text-align: left; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>Company Summaries — move internal text to notes</h1>
+<p>JSON object {{"&lt;company_id&gt;": {{"summary": "&lt;new public summary, may be empty&gt;", "note": "&lt;text to save as a company note&gt;"}}}}, max {SUMMARY_MIGRATE_MAX_ENTRIES} entries. Each entry creates the Pipeline company note first; the Summary is replaced only if the note saved. A company already done skips the note and only re-saves the Summary. Changes show on buyer pages after the next hourly refresh.</p>
+{error_html}
+<form method="post" action="{_esc(action)}">
+<textarea name="entries">{_esc(raw)}</textarea>
+<button type="submit">Run</button>
+</form>
+{results_html}
+</div>
+</body>
+</html>"""
+
+
+def _handle_summary_migrate_view(event, method, key):
+    """Caller has already verified the admin key."""
+    if method == "GET":
+        return _html_response(render_summary_migrate_page(key))
+    raw = _parse_form_body(event).get("entries", "")
+    entries, error = validate_summary_migration_batch(raw)
+    if error:
+        return _html_response(render_summary_migrate_page(key, raw=raw, error=error), 400)
+    results = [migrate_company_summary(cid, summary, note) for cid, summary, note in entries]
+    return _html_response(render_summary_migrate_page(key, raw=raw, results=results))
+
+
 def _handle_bios_view(event, method, key):
     """Caller has already verified the admin key."""
     if method == "GET":
@@ -14219,21 +14382,17 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html="
     )
 
 
-PUBLIC_COMPANY_SUMMARIES_KEY = "syndicate-dash/public-company-summaries.json"
+SUMMARY_INTERNAL_RE = re.compile(
+    r"\bchad\b|rainmaker|pipelinecrm\.com|\binactive\b|\*\*\*"
+    r"|\bfraud\.|\bsketchy\b|\bunprofess|\bavoid\b|\bdo not invest\b"
+    r"|\b(I|me|my)\b|\bwe (spoke|met|talked)\b|equityzen|\bkirat\b",
+    re.IGNORECASE)
 
 
-def _public_company_summaries():
-    """{"<company_id>": "<approved text>"} from PUBLIC_COMPANY_SUMMARIES_KEY
-    (version-keyed _data_cache). Missing/unreadable/malformed -> {} so the
-    firm card shows no description (fail closed)."""
-    try:
-        comps = _versioned_s3_json(PUBLIC_COMPANY_SUMMARIES_KEY, "s3_public_summaries",
-                                   lambda d: (d or {}).get("companies") if isinstance(d, dict) else None)
-    except Exception as e:
-        if not _s3_is_missing(e):
-            print(f"public-company-summaries read failed: {type(e).__name__}: {e}")
-        return {}
-    return comps if isinstance(comps, dict) else {}
+def _summary_looks_internal(text):
+    """Safety guard on the live Pipeline company Summary: True when the
+    text reads like an internal note (tenants then see no text)."""
+    return bool(SUMMARY_INTERNAL_RE.search(text or ""))
 
 
 def _first_text(rec, keys):
@@ -14246,20 +14405,20 @@ def _first_text(rec, keys):
 
 
 def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
-    """LEFT column: "About <firm>". Description = ONLY the approved text for
-    this company_id in PUBLIC_COMPANY_SUMMARIES_KEY (one <p> per line); none
-    on file -> no description. The raw companies.json "summary"/"description"
-    holds internal notes and is NEVER shown to tenants: admin view
-    (edit_mode) only, collapsed under "Internal Summary (not shown to
-    sellers)". Then Legal name (custom_label_3769275), address (one line),
-    phone, website, Founded ("founded_year" verbatim), PitchBook link
-    (custom_label_3320818), Crunchbase link (custom_label_3064297), each
-    only when present. Entity Tax ID / Beneficial Owner are never read. Returns "" when there's nothing to show."""
+    """LEFT column: "About <firm>". Text = the live Pipeline company
+    Summary (companies.json "summary", else "description"), one <p> per
+    line, for tenants and admins alike -- unless _summary_looks_internal:
+    then tenants see no text and Admin view (edit_mode) shows it with a
+    red "Hidden from sellers" line. Then Legal name (custom_label_3769275),
+    address (one line), phone, website, Founded ("founded_year" verbatim),
+    PitchBook link (custom_label_3320818), Crunchbase link
+    (custom_label_3064297), each only when present. Entity Tax ID /
+    Beneficial Owner are never read. Returns "" when there's nothing to show."""
     if company_rec is None or not firm_name:
         return ""
-    cid = str(company_rec.get("id") or "").strip()
-    approved = _public_company_summaries().get(cid) if cid else None
-    approved = approved.strip() if isinstance(approved, str) else ""
+    summary = (str(company_rec.get("summary") or "").strip()
+               or str(company_rec.get("description") or "").strip())
+    internal = _summary_looks_internal(summary)
     address = ", ".join(p for p in (
         _first_text(company_rec, ("address", "address_1", "address1")),
         _first_text(company_rec, ("address_2", "address2")),
@@ -14284,19 +14443,14 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     crunchbase_url = _cf_text(COMPANY_CRUNCHBASE_FIELD)
 
     rows = []
-    if approved:
+    if summary and (edit_mode or not internal):
         rows.extend(f'<p class="firm-description">{_esc(para.strip())}</p>'
-                    for para in approved.splitlines() if para.strip())
+                    for para in summary.splitlines() if para.strip())
+        if internal:
+            rows.append('<div class="firm-internal-flag">Hidden from sellers — looks internal. '
+                        'Edit the Summary in Pipeline.</div>')
     if legal_name:
         rows.append(f'<div class="buyer-page-row">Legal name: {_esc(legal_name)}</div>')
-    if edit_mode:
-        if not approved:
-            rows.append('<div class="buyer-page-row" style="color: var(--muted)">No approved public text yet</div>')
-        raw = (company_rec.get("summary") or "").strip() or (company_rec.get("description") or "").strip()
-        if raw:
-            rows.append('<details class="firm-internal-summary"><summary>Internal Summary (not shown to sellers)'
-                        '</summary>' + "".join(f'<p class="firm-description">{_esc(para.strip())}</p>'
-                                               for para in raw.splitlines() if para.strip()) + '</details>')
     if address:
         rows.append(f'<div class="buyer-page-row">{_esc(address)}</div>')
     if phone:
@@ -15161,6 +15315,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   /* "About the firm" card: full company Summary, one <p> per paragraph
      -- see _buyer_about_firm_html. */
   .firm-description {{ font-size: 14px; line-height: 1.5; margin: 0 0 8px; color: var(--ink); }}
+  .firm-internal-flag {{ font-size: 12px; color: #b23b3b; font-weight: 600; margin: 0 0 8px; }}
   .ei-notes {{
     background: var(--bg);
     border: 1px solid var(--line);
@@ -19476,6 +19631,15 @@ def _lambda_handler_impl(event, context):
         if method not in ("GET", "POST"):
             return _forbidden()
         return _handle_bios_view(event, method, query.get("key"))
+
+    # One-time company Summary -> note migration; same gate as ?view=bios.
+    if query.get("view") == "summary_migrate":
+        sm_admin_key = os.environ.get("ADMIN_KEY")
+        if not (sm_admin_key and query.get("key") == sm_admin_key):
+            return _forbidden()
+        if method not in ("GET", "POST"):
+            return _forbidden()
+        return _handle_summary_migrate_view(event, method, query.get("key"))
 
     if method != "GET":
         return _forbidden()

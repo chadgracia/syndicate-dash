@@ -2576,54 +2576,103 @@ check("About card: Legal name sits above the address/Founded rows",
 check("About card: Entity Tax ID and Beneficial Owner never in tenant HTML",
       "TAXID-98-7654321" not in page_alice and "SECRET BENEFICIAL OWNER" not in page_alice
       and "custom_label_3803741" not in page_alice and "custom_label_3985424" not in page_alice)
-check("About card: raw companies.json description NEVER shown to a tenant (no approved-text file)",
-      "word0" not in page_alice and "word79" not in page_alice and "Internal Summary" not in page_alice
-      and "No approved public text yet" not in page_alice)
+check("About card: live Pipeline Summary (description fallback) shown to a tenant, no internal label",
+      "word0" in page_alice and "word79" in page_alice and "Internal Summary" not in page_alice
+      and "Hidden from sellers" not in page_alice)
 
 page_alice_admin = lf.render_buyer_page(2, "Admin", tenant_a, TENANT_A_EMAIL, key=ADMIN_KEY, view_as=None, edit_mode=True)
-check("admin: raw description only inside the collapsed Internal Summary + 'No approved public text yet'",
-      '<details class="firm-internal-summary"><summary>Internal Summary (not shown to sellers)</summary>' in page_alice_admin
-      and "word79" in page_alice_admin.split("Internal Summary (not shown to sellers)")[1].split("</details>")[0]
-      and "No approved public text yet" in page_alice_admin)
+check("admin: same Summary text, no hidden flag for clean text",
+      "word79" in page_alice_admin and "Hidden from sellers" not in page_alice_admin)
 
-_pcs_saved = lf._public_company_summaries
-_firm_rec = {"id": 7001, "summary": "SECRET internal note.", "description": "Old desc",
+_firm_rec = {"id": 7001, "summary": "Line one.\nLine <two>.", "description": "Old desc",
              "address_1": "1 Main St", "address2": "Suite 5", "city": "Austin", "state": "TX", "zip": "78701",
-             "country": "USA", "phone1": "+1 512 555 0100", "web_url": "acme.example.com"}
-lf._public_company_summaries = lambda: {"7001": "Approved line one.\nApproved <two>."}
+             "country": "USA", "phone1": "+1 512 555 0100", "web_url": "acme.example.com",
+             "custom_fields": {lf.COMPANY_LEGAL_NAME_FIELD: "Acme LLC", lf.COMPANY_PITCHBOOK_FIELD: "pitchbook.com/a",
+                               lf.COMPANY_CRUNCHBASE_FIELD: "crunchbase.com/a",
+                               "custom_label_3803741": "TAXID-11-2222222", "custom_label_3985424": "BENEFICIAL OWNER X"},
+             "founded_year": 2001}
+_firm_t = lf._buyer_about_firm_html("Acme", _firm_rec, False)
+check("About card: Summary wins over description, one <p> per line, escaped",
+      '<p class="firm-description">Line one.</p><p class="firm-description">Line &lt;two&gt;.</p>' in _firm_t
+      and "Old desc" not in _firm_t)
+check("About card: row order Summary, Legal name, address, phone, website, Founded, PitchBook, Crunchbase",
+      _firm_t.index("Line one.") < _firm_t.index("Legal name: Acme LLC")
+      < _firm_t.index("1 Main St, Suite 5, Austin, TX, 78701, USA") < _firm_t.index("+1 512 555 0100")
+      < _firm_t.index('href="https://acme.example.com"') < _firm_t.index("Founded 2001")
+      < _firm_t.index("PitchBook profile") < _firm_t.index('href="https://crunchbase.com/a"'))
+check("About card: Entity Tax ID / Beneficial Owner never rendered",
+      "TAXID-11-2222222" not in _firm_t and "BENEFICIAL OWNER X" not in _firm_t
+      and "TAXID-11-2222222" not in lf._buyer_about_firm_html("Acme", _firm_rec, True))
+check("About card: description used when Summary is empty",
+      "Old desc" in lf._buyer_about_firm_html("Acme", dict(_firm_rec, summary=""), False))
+_internal_samples = ["Chad met them in 2023.", "Rainmaker client", "see app.pipelinecrm.com/x", "Inactive fund",
+                     "*** flagged", "Possible fraud. Beware", "Sketchy group", "Unprofessional on calls",
+                     "Avoid this one", "Do not invest alongside", "I think they are slow", "We spoke last week",
+                     "Came via EquityZen", "Ask Kirat"]
+check("guard: every listed internal marker trips _summary_looks_internal",
+      all(lf._summary_looks_internal(t) for t in _internal_samples)
+      or print("missed:", [t for t in _internal_samples if not lf._summary_looks_internal(t)]))
+check("guard: a normal public description passes",
+      not lf._summary_looks_internal("Acme Ventures is a growth-stage fund investing in AI and space."))
+_firm_int = dict(_firm_rec, summary="Chad says avoid. Sketchy.")
+_firm_int_t = lf._buyer_about_firm_html("Acme", _firm_int, False)
+_firm_int_a = lf._buyer_about_firm_html("Acme", _firm_int, True)
+check("guard: internal-looking Summary hidden from tenants (other rows still shown)",
+      "Chad says" not in _firm_int_t and "firm-description" not in _firm_int_t and "Old desc" not in _firm_int_t
+      and "Hidden from sellers" not in _firm_int_t and "Legal name: Acme LLC" in _firm_int_t)
+check("guard: Admin view shows the text plus the red hidden-from-sellers line",
+      "Chad says avoid. Sketchy." in _firm_int_a
+      and '<div class="firm-internal-flag">Hidden from sellers — looks internal. Edit the Summary in Pipeline.</div>'
+      in _firm_int_a)
+
+# --- One-time Summary -> note migration (?view=summary_migrate)
+_sm_calls = []
+_sm_fail_note_for = set()
+
+def _sm_urlopen(req, timeout=15):
+    path = req.full_url.split("/api/v3")[1].split("?")[0]
+    _sm_calls.append((req.get_method(), path, json.loads(req.data.decode())))
+    if path == "/notes.json" and _sm_calls[-1][2]["note"]["company_id"] in _sm_fail_note_for:
+        raise lf.urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
+    return FakeHTTPResponse(200)
+
+_, sm_table = use_fixture({lf.PEOPLE_KEY: {"people": []}, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": []}})
+_sm_saved_urlopen = lf.urllib.request.urlopen
+lf.urllib.request.urlopen = _sm_urlopen
 try:
-    _firm_t = lf._buyer_about_firm_html("Acme", _firm_rec, False)
-    _firm_a = lf._buyer_about_firm_html("Acme", _firm_rec, True)
-    _firm_other = lf._buyer_about_firm_html("Acme", dict(_firm_rec, id=7002), False)
+    _sm_body = json.dumps({"501": {"summary": "Public text.", "note": "Chad: internal stuff"},
+                           "502": {"summary": "", "note": "Other note"}})
+    _sm_fail_note_for.add(502)
+    _sm_resp = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                                  "queryStringParameters": {"key": ADMIN_KEY, "view": "summary_migrate"},
+                                  "body": lf.urllib.parse.urlencode({"entries": _sm_body})}, None)
+    check("migration: admin POST renders a results table",
+          _sm_resp["statusCode"] == 200 and "<th>company_id</th>" in _sm_resp["body"])
+    check("migration: note POST comes before the Summary PUT (company description) for the same company",
+          _sm_calls[0] == ("POST", "/notes.json", {"note": {"content": "Chad: internal stuff", "company_id": 501}})
+          and _sm_calls[1] == ("PUT", "/companies/501.json", {"company": {"description": "Public text."}}))
+    check("migration: failed note -> Summary PUT skipped for that company",
+          ("PUT", "/companies/502.json", {"company": {"description": ""}}) not in _sm_calls
+          and any(c[1] == "/notes.json" and c[2]["note"]["company_id"] == 502 for c in _sm_calls)
+          and "SKIPPED" in _sm_resp["body"])
+    check("migration: one audit item per entry; done marker only for the successful note",
+          sum(1 for it in sm_table.puts if str(it.get("sk", "")).startswith("audit#summary#")) == 2
+          and any(it.get("sk") == "done#501" and it.get("tenant") == "__summary_migration__" for it in sm_table.items)
+          and not any(it.get("sk") == "done#502" for it in sm_table.items))
+    _sm_calls.clear()
+    _sm_again = lf.migrate_company_summary("501", "Public text v2.", "Chad: internal stuff")
+    check("migration: resubmit after success skips the note and only re-PUTs the Summary",
+          _sm_calls == [("PUT", "/companies/501.json", {"company": {"description": "Public text v2."}})]
+          and _sm_again["note_ok"] == "skipped" and _sm_again["summary_ok"] is True)
+    check("migration: bad batch rejected whole (400), >100 entries rejected",
+          lf.validate_summary_migration_batch(json.dumps({"1": {"summary": "x", "note": "n"}, "x": {}}))[0] is None
+          and lf.validate_summary_migration_batch(json.dumps({str(i): {"summary": "", "note": "n"}
+                                                              for i in range(101)}))[0] is None)
+    _sm_forb = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                  "queryStringParameters": {"key": "nope", "view": "summary_migrate"}}, None)
+    check("migration: wrong key -> 403", _sm_forb["statusCode"] == 403)
 finally:
-    lf._public_company_summaries = _pcs_saved
-check("About card: tenant sees the approved text, one <p> per line, escaped",
-      '<p class="firm-description">Approved line one.</p><p class="firm-description">Approved &lt;two&gt;.</p>' in _firm_t)
-check("About card: raw summary/description never in tenant HTML",
-      "SECRET" not in _firm_t and "Old desc" not in _firm_t and "Internal Summary" not in _firm_t
-      and "SECRET" not in _firm_other)
-check("About card: no approved entry for this company_id -> no description for tenants",
-      "firm-description" not in _firm_other)
-check("About card: admin sees approved text, then raw Summary collapsed, no 'No approved' line",
-      "Approved line one." in _firm_a and "SECRET internal note." in _firm_a.split("<details")[1]
-      and "No approved public text yet" not in _firm_a)
-check("About card: address on one line, phone, website link with https://, in order before Founded/PitchBook",
-      '<div class="buyer-page-row">1 Main St, Suite 5, Austin, TX, 78701, USA</div>' in _firm_t
-      and '<div class="buyer-page-row">+1 512 555 0100</div>' in _firm_t
-      and 'href="https://acme.example.com"' in _firm_t
-      and _firm_t.index("Approved line one.") < _firm_t.index("1 Main St") < _firm_t.index("+1 512")
-      < _firm_t.index("acme.example.com"))
-fake_s3_pcs = FakeS3({lf.PUBLIC_COMPANY_SUMMARIES_KEY: {"built_at": "2026-10-25", "companies": {"7001": "From S3."}}})
-lf._s3_client_singleton["client"] = fake_s3_pcs
-lf._req_cache_reset(); lf._data_cache.pop(lf.PUBLIC_COMPANY_SUMMARIES_KEY, None)
-check("About card: approved text loaded from public-company-summaries.json by company_id",
-      "From S3." in lf._buyer_about_firm_html("Acme", _firm_rec, False))
-fake_s3_pcs.objs.pop(lf.PUBLIC_COMPANY_SUMMARIES_KEY)
-lf._req_cache_reset(); lf._data_cache.pop(lf.PUBLIC_COMPANY_SUMMARIES_KEY, None); lf._s3_version_cache.clear()
-_firm_missing = lf._buyer_about_firm_html("Acme", _firm_rec, False)
-check("About card: missing approved-text file fails closed (no description, no raw summary)",
-      "firm-description" not in _firm_missing and "SECRET" not in _firm_missing and "1 Main St" in _firm_missing)
-lf._s3_client_singleton["client"] = None
+    lf.urllib.request.urlopen = _sm_saved_urlopen
 
 ABOUT_HEADING_RE = re.compile(r'<h2 class="buyer-section-heading">About\b')
 page_bob = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)
