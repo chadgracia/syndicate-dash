@@ -10661,6 +10661,35 @@ check("See card: hidden rows get the muted 'client sees nothing' note",
       "(rec.hidden ? ' (hidden — client sees nothing)' : '') + '</div></td>'" in lf.STANDING_PAGE_JS)
 check("See card: no admin key in the card URL", ADMIN_KEY not in "".join(r["card_url"] for r in _sc_rows.values()))
 
+# ======================================================================
+# SECTION: Research gaps (?view=research_gaps)
+# ======================================================================
+_NP, _VC = lf.NATURAL_PERSON_ID, 6484808
+_rg_names = {901: "Covenant", 902: "Alpha Co", 903: "Beta Co", 904: "Gamma Co", 905: "Delta Co"}
+def _rg_p(pid, hold, tt):
+    cf = {lf.HOLDING_FIELD: hold}
+    if tt is not None:
+        cf[lf.TRANSACTOR_TYPE_FIELD] = [tt]
+    return {"id": pid, "custom_fields": cf}
+_rg_people = [_rg_p(1, [902], _NP), _rg_p(2, [902, 903], _NP),  # Alpha: 2 natural
+              _rg_p(3, [903], _VC),                                # Beta: 1 natural + 1 entity
+              _rg_p(4, [904], _VC), _rg_p(5, [904], _VC)]          # Gamma: entities only
+_rg_people += [_rg_p(10 + i, [905], _NP) for i in range(5)]       # Delta: 5 holders -> dropped
+_rg_buy = {"Covenant": [100], "Alpha Co": [100, 101, 102], "Beta Co": [100], "Gamma Co": [100, 101],
+           "Delta Co": [100], "Public Inc$": [100], "Empty Co": []}
+_rg = {r["company"]: r for r in lf.compute_research_gaps(_rg_people, _rg_buy, _rg_names, 5)}
+check("research gaps: zero holders -> PitchBook + LinkedIn", _rg["Covenant"]["holders"] == 0
+      and _rg["Covenant"]["next_step"] == "PitchBook + LinkedIn")
+check("research gaps: natural-only holders -> PitchBook", _rg["Alpha Co"]["natural"] == 2
+      and _rg["Alpha Co"]["next_step"] == "PitchBook")
+check("research gaps: entity-only holders -> LinkedIn employees", _rg["Gamma Co"]["next_step"] == "LinkedIn employees")
+check("research gaps: mixed holders -> both", _rg["Beta Co"]["next_step"] == "PitchBook + LinkedIn")
+check("research gaps: 5+ holders, public $ and empty buy lists excluded",
+      not ({"Delta Co", "Public Inc$", "Empty Co"} & set(_rg)))
+check("research gaps: sorted by buyers desc",
+      [r["company"] for r in lf.compute_research_gaps(_rg_people, _rg_buy, _rg_names, 5)][0] == "Alpha Co")
+check("research gaps: Holding field kept in the slim index", lf.HOLDING_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)
