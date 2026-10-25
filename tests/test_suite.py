@@ -9423,9 +9423,9 @@ del lf.print
 check("admin scoreboard: 200, private no-store", _st_page["statusCode"] == 200
       and _st_page["headers"]["Cache-Control"] == "private, no-store")
 _st_data = _st_page_data(_st_page["body"])
-check("admin scoreboard: rows = interest buy ids + buy-deal people + won-deal people (unknown ids skipped)",
-      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "15", "17", "2", "24", "3"])
-check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 8") == 1)
+check("admin scoreboard: rows = interest buy ids + buy-deal people + won-deal people + sellers (unknown ids skipped)",
+      sorted(r["id"] for r in _st_data["rows"]) == ["1", "10", "12", "15", "16", "17", "2", "24", "3"])
+check("admin scoreboard: logs the row count once", _st_printed.count("standing rows: 9") == 1)
 _st_roles = {r["id"]: r["roles"] for r in _st_data["rows"]}
 check("admin scoreboard: rows carry roles (Sella both, Bob buyer, Sid seller)",
       _st_roles["1"] == {"seller": True, "buyer": True} and _st_roles["3"] == {"seller": False, "buyer": True}
@@ -10218,6 +10218,63 @@ check("scoreboard: rows carry qual_status / id_forms_status alongside unchanged 
 _st_sbh = _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
 check("scoreboard: Notes header reads Private notes (two lines)",
       "<th>Private<br>notes</th>" in _st_sbh and "<th>Notes</th>" not in _st_sbh)
+
+# Sellers on the scoreboard: Sell-deal-only and Sell-Interest-only people, de-duplicated, blocklist skipped
+_sr_saved = (FakeBoto3.S3, FakeBoto3.TABLE, FakeBoto3.SES, set(lf.TENANT_BLOCKLIST))
+_sr_people = {"people": _st_people["people"] + [
+    {"id": 25, "full_name": "Stan Sellonly", "email": "stan@stanco.com", "custom_fields": {}},
+    {"id": 26, "full_name": "Ida Interestonly", "email": "ida@idaco.com",
+     "custom_fields": {lf.SELL_INTEREST_FIELD: [7300001]}},
+    {"id": 27, "full_name": "Bart Blocked", "email": "bart@bartco.com",
+     "custom_fields": {lf.SELL_INTEREST_FIELD: [7300001]}},
+    {"id": 28, "full_name": "Ned Noone", "email": "ned@nedco.com", "custom_fields": {lf.SELL_INTEREST_FIELD: []}},
+]}
+_sr_deals = _st_deals + [
+    {"id": 970, "name": "Stan Sell", "company": {"name": "Stan Target"}, "deal_stage": {"id": lf.STAGE_FIRM},
+     "custom_fields": cf_sell(), "people": [{"id": 25}], "updated_at": "2026-08-01T00:00:00Z"},
+    {"id": 971, "name": "Stan Sell 2", "company": {"name": "Stan Target 2"}, "deal_stage": {"id": lf.STAGE_FIRM},
+     "custom_fields": cf_sell(), "people": [{"id": 25}], "updated_at": "2026-08-01T00:00:00Z"},
+]
+use_fixture({lf.PEOPLE_KEY: _sr_people,
+             lf.INTEREST_KEY: {"buy": {"Gamma Co": [3, 10], "Other": [999], "Delta Co": [17, 24]}},
+             lf.DEALS_KEY: {"deals": _sr_deals}, lf.STANDING_KEY: dict(_st_s3.objs[lf.STANDING_KEY])})
+lf.TENANT_BLOCKLIST = set(lf.TENANT_BLOCKLIST) | {"bart@bartco.com"}
+_sr_rows = _st_page_data(_st_get({"view": "standing", "key": ADMIN_KEY})["body"])["rows"]
+_sr_ids = [r["id"] for r in _sr_rows]
+_sr_roles = {r["id"]: r["roles"] for r in _sr_rows}
+FakeBoto3.S3, FakeBoto3.TABLE, FakeBoto3.SES, lf.TENANT_BLOCKLIST = _sr_saved
+reset_caches()
+lf._req_cache_reset()
+check("scoreboard sellers: seller-only person from a non-won Sell deal appears (role Seller)",
+      "25" in _sr_ids and _sr_roles["25"] == {"seller": True, "buyer": False})
+check("scoreboard sellers: Sell-Interest-only people appear",
+      "26" in _sr_ids and "16" in _sr_ids and _sr_roles["26"] == {"seller": True, "buyer": False})
+check("scoreboard sellers: no duplicate rows (Stan on two Sell deals, Sella on Sell + Buy deals)",
+      len(_sr_ids) == len(set(_sr_ids)) and _sr_ids.count("25") == 1 and _sr_ids.count("1") == 1)
+check("scoreboard sellers: TENANT_BLOCKLIST and empty Sell Interest skipped",
+      "27" not in _sr_ids and "28" not in _sr_ids)
+
+# Role filter (Buyers and sellers / Buyers / Sellers) drives filtered() and the "N of M people" count
+_st_rf = ("var focusOnly=false,focusPid='';var SEL={'st-q':'','st-tier':'','st-bad':false,'st-vis':'','st-sort':'name','st-role':''};"
+          "var document={getElementById:function(id){return {value:SEL[id],checked:SEL[id]};}};"
+          "function standing(r){return {tier:null,good:true};}function cur(r){return {rec:{hidden:false}};}\n"
+          + _st_js_fn("filtered") + "\n" + _st_js_fn("roleOf") + "\n" +
+          "var rows=" + json.dumps(_sr_rows) + ";var out={};"
+          "['','buyer','seller'].forEach(function(v){SEL['st-role']=v;out[v||'all']=filtered().map(function(r){return r.id;});});"
+          "process.stdout.write(JSON.stringify(out));")
+_st_rfr = json.loads(subprocess.run(["node", "-e", _st_rf], capture_output=True, text=True, check=True).stdout)
+_sr_b = sorted(i for i, ro in _sr_roles.items() if ro["buyer"])
+_sr_s = sorted(i for i, ro in _sr_roles.items() if ro["seller"])
+check("role filter: default shows everyone; Buyers / Sellers match the row roles; Buyer + seller in both",
+      len(_st_rfr["all"]) == len(_sr_rows) and sorted(_st_rfr["buyer"]) == _sr_b and sorted(_st_rfr["seller"]) == _sr_s
+      and "1" in _st_rfr["buyer"] and "1" in _st_rfr["seller"] and "25" not in _st_rfr["buyer"]
+      and "3" not in _st_rfr["seller"] and 0 < len(_st_rfr["seller"]) < len(_sr_rows))
+_st_sbh2 = _st_get({"view": "standing", "key": ADMIN_KEY})["body"]
+check("role filter: select next to the tier filter, default 'Buyers and sellers'; count uses the filtered list",
+      '<select id="st-role"><option value="">Buyers and sellers</option><option value="buyer">Buyers</option>' in _st_sbh2
+      and _st_sbh2.index('id="st-tier"') < _st_sbh2.index('id="st-role"') < _st_sbh2.index('id="st-vis"')
+      and "list.length + ' of ' + rows.length + ' people" in lf.STANDING_PAGE_JS
+      and "'st-role'" in lf.STANDING_PAGE_JS)
 
 # --- Desk JSON
 def _st_json(pid):

@@ -16419,8 +16419,10 @@ def _standing_row(pid, rec, state):
 
 def standing_admin_rows(state):
     """Union of interest_people.json "buy" ids, people on >= 1 Buy-tagged
-    deal (any stage), people on >= 1 Won deal (any side) and anyone with a
-    client record; people not in people-slim are skipped (nothing to show)."""
+    deal (any stage), people on >= 1 Won deal (any side), anyone with a
+    client record, and sellers (>= 1 Sell-tagged deal, any stage, or a
+    non-empty Sell Interest; TENANT_BLOCKLIST emails skipped); people not in
+    people-slim are skipped (nothing to show)."""
     by_id = _people_data()["by_id"]
     ids = set()
     for pids in (_interest_buy_map() or {}).values():
@@ -16430,6 +16432,12 @@ def standing_admin_rows(state):
     ids |= deal_index["buy_any"]
     ids |= set(deal_index["won"].keys())
     ids |= set(state["clients"].keys())
+    sellers = set(deal_index["sell_any"])
+    for rec in _people_list():
+        if rec.get("id") is not None and _cf_nonempty(rec.get("custom_fields"), SELL_INTEREST_FIELD):
+            sellers.add(str(rec["id"]))
+    ids |= {pid for pid in sellers
+            if pid in by_id and not any(e in TENANT_BLOCKLIST for e in _person_all_emails(by_id[pid]))}
     rows = [_standing_row(pid, by_id[pid], state) for pid in ids if pid in by_id]
     print(f"standing rows: {len(rows)}")
     return rows
@@ -16990,6 +16998,8 @@ __BANNER__
   <input type="search" id="st-q" placeholder="Search name, firm, email or id…" style="min-width:320px">
   <select id="st-tier"><option value="">Any tier</option><option value="none">No tier</option>
     <option value="preferred">Preferred</option><option value="gold">Gold</option><option value="platinum">Platinum</option></select>
+  <select id="st-role"><option value="">Buyers and sellers</option><option value="buyer">Buyers</option>
+    <option value="seller">Sellers</option></select>
   <select id="st-vis"><option value="">Hidden and not hidden</option><option value="hidden">Hidden everywhere only</option>
     <option value="shown">Not hidden only</option></select>
   <label><input type="checkbox" id="st-bad"> Not in good standing</label>
@@ -17080,9 +17090,11 @@ STANDING_PAGE_JS = r"""
     var q = document.getElementById('st-q').value.trim().toLowerCase();
     var tf = document.getElementById('st-tier').value, bad = document.getElementById('st-bad').checked;
     var vis = document.getElementById('st-vis').value, sort = document.getElementById('st-sort').value;
+    var role = document.getElementById('st-role').value;
     var out = rows.filter(function(r) {
       if (focusOnly) return r.id === focusPid;
       if (q && (r.name + ' ' + r.firm + ' ' + r.id + ' ' + r.email).toLowerCase().indexOf(q) === -1) return false;
+      if (role && !roleOf(r)[role]) return false;
       var st = standing(r);
       if (tf === 'none' && st.tier) return false;
       if (tf && tf !== 'none' && st.tier !== tf) return false;
@@ -17376,7 +17388,7 @@ STANDING_PAGE_JS = r"""
     page = 0; render(); searchMore();
   });
   document.getElementById('st-q').addEventListener('input', function() { page = 0; render(); searchMore(); });
-  ['st-tier', 'st-bad', 'st-vis', 'st-sort'].forEach(function(id) {
+  ['st-tier', 'st-role', 'st-bad', 'st-vis', 'st-sort'].forEach(function(id) {
     document.getElementById(id).addEventListener('change', function() { page = 0; render(); });
   });
   document.getElementById('st-prev').addEventListener('click', function() { if (page > 0) { page--; render(); window.scrollTo(0, 0); } });
