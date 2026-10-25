@@ -2227,13 +2227,20 @@ finally:
 check("buyer page phones: no Introduced-or-later deal -> no phone anywhere",
       "tel:" not in _page_buyer_matched and "585629481" not in _page_buyer_matched
       and "2125550142" not in _page_buyer_matched)
+# Live Pipeline person keys (person 1309687264): Work Phone = "phone", Mobile = "mobile",
+# Home = "home_phone"; there is no "work_phone".
 _ph_rec = {"id": 2, "name": "Alice Buyer", "custom_fields": {}, "mobile": "+971585629481",
-           "work_phone": "+442079460958", "phone": "+12125550142", "home_phone": "+15555550199"}
+           "phone": "+442079460958", "home_phone": "+15555550199",
+           "phones": ["+15555550199"], "work_phone": "+19999999999"}
 check("header: phones hidden unless show_phones is passed",
       "tel:" not in lf._buyer_header_html(_ph_rec, None))
 _ph_hdr = lf._buyer_header_html(_ph_rec, None, show_phones=True)
-check("header: work_phone preferred over phone; home never read",
-      'Work <a href="tel:+442079460958">' in _ph_hdr and "2125550142" not in _ph_hdr and "15555550199" not in _ph_hdr)
+check("header: Work = phone, Mobile = mobile; home_phone / phones list / work_phone never read",
+      'Mobile <a href="tel:+971585629481">' in _ph_hdr and 'Work <a href="tel:+442079460958">' in _ph_hdr
+      and "15555550199" not in _ph_hdr and "19999999999" not in _ph_hdr)
+check("slim people index keeps phone + mobile, drops phones / work_phone, never home_phone",
+      {"phone", "mobile"} <= set(lf.PEOPLE_SLIM_FIELDS)
+      and not ({"phones", "work_phone", "home_phone"} & set(lf.PEOPLE_SLIM_FIELDS)))
 check("header: work phone equal to mobile shown once",
       lf._buyer_header_html({"id": 2, "custom_fields": {}, "mobile": "+1 212 555 0142", "phone": "+12125550142"},
                             None, show_phones=True).count("tel:") == 1)
@@ -2322,6 +2329,19 @@ check("Active Intros buyer cell: link carries the buyer-link class", 'class="buy
 check("Active Intros buyer cell: 'profile ->' suffix present", "profile" in cell_html and "buyer-link-suffix" in cell_html)
 
 name_cell_html = lf._buyer_name_cell_html(alice_primary, None, 0, show_contact=False, link=True, key=None, view_as=None)
+_nc_contact = lf._buyer_name_cell_html({"id": 2, "name": "Alice Buyer", "email": "alice@example.com",
+                                        "custom_fields": {}, "mobile": "+971585629481", "phone": "+12125550142",
+                                        "home_phone": "+15555550199", "phones": ["+15555550199"]},
+                                       None, 0, show_contact=True)
+check("buyer table contact line: email + Mobile (mobile) + Work (phone) tel: links",
+      'Mobile <a href="tel:+971585629481">' in _nc_contact and 'Work <a href="tel:+12125550142">' in _nc_contact
+      and "alice@example.com" in _nc_contact)
+check("buyer table contact line: never home_phone or the phones list",
+      "15555550199" not in _nc_contact
+      and "15555550199" not in lf._buyer_name_cell_html({"id": 2, "name": "A", "custom_fields": {},
+                                                         "home_phone": "+15555550199",
+                                                         "phones": [{"number": "+15555550199"}]},
+                                                        None, 0, show_contact=True))
 check("Company page buyer-name cell: link carries the buyer-link class", 'class="buyer-link"' in name_cell_html)
 check("Company page buyer-name cell: 'profile ->' suffix present",
       "profile" in name_cell_html and "buyer-link-suffix" in name_cell_html)
@@ -2651,6 +2671,20 @@ _firm_t2d3 = lf._buyer_about_firm_html("T2D3 Ventures", {
 check("About card: address = address_1, address_2, city, postal_code, country only",
       '<div class="buyer-page-row">2210 Peninsula Five, Business Bay, Dubai, 00000, United Arab Emirates</div>'
       in _firm_t2d3 and "POST BOX" not in _firm_t2d3 and "PO Box 1" not in _firm_t2d3)
+_firm_li = lf._buyer_about_firm_html("T2D3 Ventures", {
+    "id": 138490920, "web": "t2d3.capital", "linked_in_url": "linkedin.com/company/t2d3",
+    "twitter_url": "x.com/t2d3", "facebook_url": "facebook.com/t2d3",
+    "custom_fields": {lf.COMPANY_PITCHBOOK_FIELD: "pitchbook.com/profiles/t2d3",
+                      "custom_label_3064297": "crunchbase.com/organization/t2d3",
+                      "custom_label_3769275": "T2D3 Capital Ltd"}}, False)
+check("About card: LinkedIn from linked_in_url next to website (web), PitchBook, Crunchbase (3064297)",
+      'href="https://linkedin.com/company/t2d3"' in _firm_li and 'href="https://t2d3.capital"' in _firm_li
+      and 'href="https://pitchbook.com/profiles/t2d3"' in _firm_li
+      and 'href="https://crunchbase.com/organization/t2d3"' in _firm_li
+      and "Legal name: T2D3 Capital Ltd" in _firm_li)
+check("About card: empty linked_in_url -> no LinkedIn link",
+      "LinkedIn" not in lf._buyer_about_firm_html("X", {"id": 1, "city": "Dubai", "linked_in_url": "  ",
+                                                         "custom_fields": {}}, False))
 check("About card: only non-empty links render",
       "href" not in lf._buyer_about_firm_html("X", {"id": 1, "city": "Dubai", "web_url": " ",
                                                     "custom_fields": {lf.COMPANY_PITCHBOOK_FIELD: "",

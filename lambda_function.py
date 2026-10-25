@@ -2001,7 +2001,7 @@ def _cached_object_version(s3, key):
 # of band: event {"task": "rebuild_slim"} (see _task_rebuild_slim).
 PEOPLE_SLIM_KEY = "syndicate-dash/people-slim.json"
 PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name", "full_name", "company_id",
-                      "company_name", "title", "position", "phone", "phones", "mobile", "work_phone", "website", "linked_in_url",
+                      "company_name", "title", "position", "phone", "mobile", "website", "linked_in_url",
                       "work_country", "home_country", "work_city", "home_city", "updated_at", "created_at",
                       "won_deals_total", "custom_fields")
 # Every custom_label_N this file references (a test keeps this in sync).
@@ -3924,25 +3924,6 @@ def _person_email_text(rec):
     if not isinstance(email, str):
         return ""
     return email.strip()
-
-
-def _person_phone_text(rec):
-    """Best-effort phone extraction, mirroring _person_email_text's own
-    scalar/list fallback shape ("phone" / "phones" list) — no repo this
-    org's code lives in ever reads a phone field off a person record, so
-    this is implemented on trust and degrades to blank if the real shape
-    differs."""
-    if not isinstance(rec, dict):
-        return ""
-    phone = rec.get("phone")
-    if not phone:
-        phones = rec.get("phones") or []
-        if isinstance(phones, list) and phones:
-            first = phones[0]
-            phone = first.get("number") if isinstance(first, dict) else first
-    if not isinstance(phone, str):
-        return ""
-    return phone.strip()
 
 
 def get_my_sell_deals(person_id, company):
@@ -8783,8 +8764,9 @@ def _buyer_name_cell_html(primary, secondary, more_count, show_contact, link=Fal
     names_html = ", ".join(names) + more_html + after_name_html
     if not show_contact:
         return f'<div>{names_html}</div>'
-    bits = [b for b in (_person_email_text(primary), _person_phone_text(primary)) if b]
-    contact_html = f'<div class="buyer-contact">{_esc(" · ".join(bits))}</div>' if bits else ""
+    email = _person_email_text(primary)
+    bits = ([_esc(email)] if email else []) + _person_phone_links(primary)
+    contact_html = f'<div class="buyer-contact">{" · ".join(bits)}</div>' if bits else ""
     return f'<div>{names_html}</div>{contact_html}'
 
 
@@ -8794,7 +8776,7 @@ def _buyer_contact_detail_html(primary):
     (work_country, falling back to home_country) · website (linkified) ·
     LinkedIn (linkified). Unlike email/phone above, no sibling repo in
     this org has ever read these three native person fields, so — same
-    trust basis as _person_phone_text's own "phone" field — they're read
+    trust basis the phone fields once had — they're read
     via plain .get() and simply omitted (the whole line included) if
     absent or differently shaped; flag for confirmation against a real
     people.json snapshot. Only ever called for a disclosed buyer — the
@@ -14425,10 +14407,11 @@ def _person_tel_html(label, number):
 
 
 def _person_phone_links(rec):
-    """Mobile, then work phone (work_phone, else phone), as tel: links. The
-    home phone is never read."""
+    """Mobile ("mobile") then Work ("phone" -- Pipeline's "Work Phone"; there
+    is no work_phone key), as tel: links. home_phone and the "phones" list
+    are never read. Verified against live person 1309687264."""
     mobile = rec.get("mobile") if isinstance(rec.get("mobile"), str) else ""
-    work = next((v for v in (rec.get("work_phone"), rec.get("phone")) if isinstance(v, str) and v.strip()), "")
+    work = rec.get("phone") if isinstance(rec.get("phone"), str) else ""
     links = [_person_tel_html("Mobile", mobile)]
     if re.sub(r"\D", "", work) != re.sub(r"\D", "", mobile):
         links.append(_person_tel_html("Work", work))
@@ -14450,7 +14433,7 @@ def _buyer_header_html(rec, closer_kind, key=None, view_as=None, bio_edit_html="
     / ticket range (custom_label_3052210 map) / transactor type label
     (custom_label_3759163 map) -- the old separate near-empty "Capacity"
     card is gone. Every field renders only when present. title/city are
-    implemented on trust the same way phone was (_person_phone_text):
+    implemented on trust the same way phone once was:
     no repo in this org reads a person record's "title"/"work_city"/
     "home_city", but they follow the exact naming convention
     work_country/home_country already verified working in production.
@@ -14551,7 +14534,8 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     line, for tenants and admins alike -- unless _summary_looks_internal:
     then tenants see no text and Admin view (edit_mode) shows it with a
     red "Hidden from sellers" line. Then Legal name (custom_label_3769275),
-    address (one line), phone, website, Founded ("founded_year" verbatim),
+    address (one line), phone, website, LinkedIn ("linked_in_url"),
+    Founded ("founded_year" verbatim),
     PitchBook link (custom_label_3320818), Crunchbase link
     (custom_label_3064297), each only when present. Entity Tax ID /
     Beneficial Owner are never read. Returns "" when there's nothing to show."""
@@ -14567,6 +14551,7 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     address = ", ".join(p for p in (_first_text(company_rec, (k,)) for k in COMPANY_ADDRESS_KEYS) if p)
     phone = _first_text(company_rec, ("phone", "phone1", "phone_number"))
     website = _first_text(company_rec, ("website", "web", "web_url"))
+    company_linked_in = _first_text(company_rec, ("linked_in_url",))
     founded = company_rec.get("founded_year")
     founded_text = str(founded).strip() if founded else ""
     cf = company_rec.get("custom_fields") or {}
@@ -14598,6 +14583,10 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
         href_w = website if "://" in website else f"https://{website}"
         rows.append(f'<div class="buyer-page-row"><a href="{_esc(href_w)}" target="_blank" '
                     f'rel="noopener noreferrer">{_esc(website)}</a></div>')
+    if company_linked_in:
+        href_li = company_linked_in if "://" in company_linked_in else f"https://{company_linked_in}"
+        rows.append(f'<div class="buyer-page-row"><a href="{_esc(href_li)}" target="_blank" '
+                    f'rel="noopener noreferrer">LinkedIn &rarr;</a></div>')
     if founded_text:
         rows.append(f'<div class="buyer-page-row">Founded {_esc(founded_text)}</div>')
     if pitchbook_url:
