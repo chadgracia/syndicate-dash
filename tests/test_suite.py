@@ -1204,6 +1204,52 @@ check("override newer than Pipeline wins for the exemption",
                                  {"exemption_override": 7200027, "exemption_override_at": 4102444800}) == 7200027
       and lf._resolve_deal_exemption(dict(deal_future, custom_fields=_ex_cf),
                                      {"exemption_override": 7200027, "exemption_override_at": 1}) == 7200028)
+# --- Direct deals hide fund-only fields; Won cards get the green header
+_dir_cf = cf_sell({lf.STRUCTURE_FIELD: [lf.DIRECT_STRUCTURE_ID], lf.LAYERS_FIELD: [7000229],
+                   lf.TICKET_MAX_FIELD: 1000000, lf.EXEMPTION_FIELD: 7200028,
+                   lf.DEADLINE_FIELD: future_date.replace("-", "/")})
+_dir_live = dict(deal_future, custom_fields=_dir_cf)
+_dir_live_card = lf._deal_card_html(_dir_live, "Delta Co")
+_dir_live_edit = lf._deal_card_html(_dir_live, "Delta Co", edit_mode=True)
+check("Direct live card: no Exemption/Fees/layers, keeps Size/valuation/Net/Deadline/Structure",
+      all('dc-label">Exemption' not in c and 'dc-label">Fees' not in c and "dc-fees" not in c
+          and "2-Layer" not in c and "3(c)" not in c and "ei-exemption" not in c
+          and 'dc-label">Size' in c and 'dc-label">Net price' in c and 'dc-label">Deadline' in c
+          and 'dc-label">Structure</span><span class="dc-value">Direct</span>' in c
+          for c in (_dir_live_card, _dir_live_edit)))
+check("Direct live card: blank fees/exemption never flag terms incomplete",
+      lf._deal_terms_complete(_dir_live)
+      and not {"Fund Exemption", "One-Time Fee", "Mgmt Fee", "Carry", "Number of Layers"}
+      & set(lf._deal_terms_missing(_dir_live))
+      and lf._my_deal_visibility_state(_dir_live, None, False) == "live"
+      and "Provide deal terms" not in lf._my_deal_action_chip_html("902", "Delta Co", False, False, "live"))
+_dir_won = dict(_dir_live, deal_stage={"id": 111802}, closed_time="2026/03/31 12:00:00 -0400")
+_dir_won_card = lf._deal_card_html(_dir_won, "Delta Co")
+check("Direct + Won card: no exemption, fees or deadline; green Won header replaces the grey stage",
+      'dc-label">Exemption' not in _dir_won_card and 'dc-label">Fees' not in _dir_won_card
+      and 'dc-label">Deadline' not in _dir_won_card and "Not set" not in _dir_won_card
+      and '<div class="deal-card-won">&#10003; Won · Mar 31, 2026</div>' in _dir_won_card
+      and "deal-card-stage" not in _dir_won_card and "dc-closed-label" not in _dir_won_card
+      and "--won-green:" in page_company and ".deal-card-won {" in page_company
+      and "prefers-color-scheme: dark" in page_company)
+_fund_cf = cf_sell({lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID], lf.LAYERS_FIELD: [7000229],
+                    lf.TICKET_MAX_FIELD: 1000000})
+_fund_live = dict(deal_future, custom_fields=_fund_cf)
+_fund_card = lf._deal_card_html(_fund_live, "Delta Co")
+check("Fund/SPV card unchanged: Exemption + Fees render with 'Not set' when blank",
+      'dc-label">Exemption</span><span class="dc-value">' + lf.DC_NOT_SET_HTML in _fund_card
+      and 'dc-label">Fees</span>' in _fund_card and _fund_card.count(lf.DC_NOT_SET_HTML) >= 4
+      and "Fund · 2-Layer" in _fund_card and "deal-card-stage" in _fund_card
+      and not lf._deal_terms_complete(_fund_live)
+      and {"Fund Exemption", "One-Time Fee", "Mgmt Fee", "Carry"} <= set(lf._deal_terms_missing(_fund_live)))
+_fund_won_card = lf._deal_card_html(dict(_fund_live, deal_stage={"id": 111802},
+                                         closed_time="2026/03/31 12:00:00 -0400"), "Delta Co")
+check("Fund + Won card: Exemption/Fees stay, Deadline dropped, green Won header",
+      'dc-label">Exemption' in _fund_won_card and 'dc-label">Fees' in _fund_won_card
+      and 'dc-label">Deadline' not in _fund_won_card and "deal-card-won" in _fund_won_card)
+_lost_card = lf._deal_card_html(dict(_fund_live, deal_stage={"id": lf.OBSOLETE_STAGE_ID}), "Delta Co")
+check("closed-down card unchanged: grey stage label, Deadline kept, no green Won header",
+      "deal-card-stage" in _lost_card and 'dc-label">Deadline' in _lost_card and "deal-card-won" not in _lost_card)
 pipeline_calls.clear(); fake_table.updates.clear()
 resp_ex = lf.lambda_handler(post_event({"key": ADMIN_KEY, "deal_id": "900", "exemption": "7200027"}), None)
 check("admin exemption write -> 200, one Pipeline PUT of the int option id, Dynamo override, admin audit",
@@ -8076,7 +8122,7 @@ check("company page: closed-down cards have Reopen, Won card has no action",
       _ac_down_sec.count("Reopen &rarr;") == 2 and _AC_BTN not in _ac_down_sec
       and _AC_BTN not in _ac_won_sec and "Reopen" not in _ac_won_sec)
 check("company page: closed cards show close labels and no paperwork",
-      "Won Sep 3, 2026" in _ac_won_sec and "Closed Jul 1, 2026" in _ac_down_sec and "Closed Jul 2, 2026" in _ac_down_sec
+      "&#10003; Won · Sep 3, 2026" in _ac_won_sec and "Closed Jul 1, 2026" in _ac_down_sec and "Closed Jul 2, 2026" in _ac_down_sec
       and "id-status-badge" not in _ac_won_sec + _ac_down_sec
       and "engagement-badge" not in _ac_won_sec + _ac_down_sec
       and "Deadline passed" not in _ac_won_sec + _ac_down_sec)

@@ -437,6 +437,14 @@ LAYERS_MAP = {7000228: "1-Layer", 7000229: "2-Layer", 7000230: "3-Layer"}
 # SPV/Fund structure option id (STRUCTURE_FIELD) — named separately from
 # STRUCTURE_LABELS' bare literal for _deal_terms_missing's SPV-aware branch.
 SPV_STRUCTURE_ID = 5077906
+# Direct structure option id: fund-only terms (Fund Exemption, the three
+# fees, layers) do not apply -- hidden on the Deal Details card and never
+# counted as missing terms.
+DIRECT_STRUCTURE_ID = 6250090
+
+
+def _deal_is_direct(deal):
+    return DIRECT_STRUCTURE_ID in _deal_cf_option_ids(deal, STRUCTURE_FIELD)
 
 # Fund Exemption: no repo this org's code lives in reads
 # custom_label_4006089, but the field id and all three option labels were
@@ -8125,8 +8133,8 @@ def _deal_per_share_text(deal):
 
 def _deal_terms_complete(deal):
     """State 3's "terms incomplete" gate: a ticket-size bound (min OR max)
-    present, AND each of Mgmt Fee/Carry/Seller Fee individually carries a
-    defined numeric value. 0.0 counts as defined — _deal_cf_number
+    present, AND (non-Direct deals only) each of Mgmt Fee/Carry/Seller Fee
+    individually carries a defined numeric value. 0.0 counts as defined — _deal_cf_number
     already returns 0.0 (not None) for a scalar zero, and only returns
     None for a genuinely null/empty/absent field, which is exactly the
     distinction this gate needs."""
@@ -8134,6 +8142,8 @@ def _deal_terms_complete(deal):
                 or _deal_cf_number(deal, TICKET_MAX_FIELD) is not None)
     if not has_size:
         return False
+    if _deal_is_direct(deal):
+        return True
     return all(_deal_cf_number(deal, field) is not None
                for field in (MGMT_FEE_FIELD, CARRY_FIELD, SELLER_FEE_FIELD))
 
@@ -8594,8 +8604,10 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
         per_share_text = _deal_per_share_text(deal)
         per_share_html = f'<div class="dc-line dc-per-share">{_esc(per_share_text)}</div>' if per_share_text else ""
 
+    is_direct = _deal_is_direct(deal)
     struct_label = STRUCTURE_LABELS.get(next(iter(_deal_cf_option_ids(deal, STRUCTURE_FIELD)), None))
-    layer_label = LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
+    # Direct: layers are fund-only, never shown.
+    layer_label = None if is_direct else LAYERS_MAP.get(next(iter(_deal_cf_option_ids(deal, LAYERS_FIELD)), None))
     struct_parts = [p for p in (struct_label, layer_label) if p]
     structure_text = _dc_value_html(" · ".join(struct_parts))
 
@@ -8703,20 +8715,35 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
             footer_html = (f'<div class="dc-footer"><div class="dc-verify">{_esc(DC_VERIFY_TEXT)}</div>'
                            f'{action_html}</div>')
 
+    # Won: a green "✓ Won · <date>" status replaces the grey stage label
+    # (the date line below is folded into it) and DEADLINE is dropped.
+    is_won = _is_won_stage(resolved_sid)
+    if is_won:
+        won_dt = _deal_closed_dt(deal)
+        won_text = "&#10003; Won" + (f" · {_esc(_fmt_dt_short(won_dt))}" if won_dt else "")
+        head_html = (f'<div class="deal-card-won">{won_text}</div>'
+                     f'<div class="deal-card-head"><div class="deal-card-title">{name}</div></div>')
+        badge_html = action_html + reopen_html
+    else:
+        head_html = (f'<div class="deal-card-head"><div class="deal-card-title">{name}</div>'
+                     f'<div class="deal-card-stage">{stage}</div></div>')
+    cells = [_dc_cell_html("Size", size_text),
+             _dc_cell_html(price_label, price_html, "dc-price"),
+             _dc_cell_html(deal_price_label, deal_price_html, "dc-np-cell" if deal_price_info else "", deal_price_info)]
+    if not is_won:
+        cells.append(_dc_cell_html("Deadline", deadline_value_html))
+    cells.append(_dc_cell_html("Structure", structure_text))
+    # Direct: fund-only rows (EXEMPTION, FEES) are omitted entirely.
+    if not is_direct:
+        cells.append(_dc_cell_html("Exemption", exemption_value_html))
+        cells.append(_dc_cell_html("Fees", fees_html, "dc-cell-wide"))
+    cells_html = "\n        ".join(cells)
+
     return f"""<div class="{card_cls}">
       {overdue_html}
-      <div class="deal-card-head">
-        <div class="deal-card-title">{name}</div>
-        <div class="deal-card-stage">{stage}</div>
-      </div>
+      {head_html}
       <div class="deal-card-metrics">
-        {_dc_cell_html("Size", size_text)}
-        {_dc_cell_html(price_label, price_html, "dc-price")}
-        {_dc_cell_html(deal_price_label, deal_price_html, "dc-np-cell" if deal_price_info else "", deal_price_info)}
-        {_dc_cell_html("Deadline", deadline_value_html)}
-        {_dc_cell_html("Structure", structure_text)}
-        {_dc_cell_html("Exemption", exemption_value_html)}
-        {_dc_cell_html("Fees", fees_html, "dc-cell-wide")}
+        {cells_html}
       </div>
       {per_share_html}
       {badge_html}
@@ -13889,7 +13916,13 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     --qp: #1f7a4d;
     --accredited: #8a6d1f;
     --unknown: #6b7280;
+    --won-green: #1f7a4d;
+    --won-green-bg: rgba(31,122,77,0.12);
   }}
+  @media (prefers-color-scheme: dark) {{
+    :root:not([data-theme="light"]) {{ --won-green: #2f9163; --won-green-bg: rgba(47,145,99,0.16); }}
+  }}
+  :root[data-theme="dark"] {{ --won-green: #2f9163; --won-green-bg: rgba(47,145,99,0.16); }}
   * {{ box-sizing: border-box; }}
   body {{
     margin: 0;
@@ -14089,6 +14122,16 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
     margin-bottom: 16px;
   }}
   .deal-card-title {{ font-size: 20px; font-weight: 700; }}
+  .deal-card-won {{
+    display: inline-block;
+    font-size: 20px;
+    font-weight: 700;
+    color: var(--won-green);
+    background: var(--won-green-bg);
+    border-radius: 8px;
+    padding: 4px 12px;
+    margin-bottom: 10px;
+  }}
   .deal-card-stage {{
     font-size: 11px;
     font-weight: 600;
