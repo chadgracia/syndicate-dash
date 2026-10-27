@@ -11120,6 +11120,19 @@ _rg_nav_preview = lf._nav_html("mydeals", "Admin", key="K1", view_as="t@example.
 check("research gaps: admin nav has the Research gaps tab", "view=research_gaps" in _rg_nav_admin)
 check("research gaps: tab never in tenant sessions or the Tenant-view preview",
       "research_gaps" not in _rg_nav_tenant and "research_gaps" not in _rg_nav_preview)
+_TS = lf.TICKET_SIZE_FIELD
+_rg5_people = [{"id": 61, "custom_fields": {_TS: [5014561]}},   # $10M-$25M
+               {"id": 62, "custom_fields": {_TS: [5014570]}},   # $100M+
+               {"id": 63, "custom_fields": {}}]
+_rg5 = {r["company"]: r for r in lf.compute_research_gaps(_rg5_people,
+        {"Big Co": [61], "Many Co": [63, 64, 65, 66, 67], "Open Co": [62, 63]}, {}, 5)}
+check("research gaps: ticket sums (min/max, open-ended +, buyers with a ticket)",
+      (_rg5["Big Co"]["ticket_min"], _rg5["Big Co"]["ticket_max"]) == (10_000_000, 25_000_000)
+      and _rg5["Open Co"]["ticket_plus"] and _rg5["Open Co"]["with_ticket"] == 1
+      and _rg5["Many Co"]["with_ticket"] == 0)
+check("research gaps: one $10-25M buyer outranks five buyers with no ticket",
+      [r["company"] for r in lf.compute_research_gaps(_rg5_people,
+        {"Big Co": [61], "Many Co": [63, 64, 65, 66, 67]}, {}, 5)] == ["Big Co", "Many Co"])
 check("research gaps: Holding field kept in the slim index", lf.HOLDING_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
 
 print(f"\n{passed} passed, {failed} failed")

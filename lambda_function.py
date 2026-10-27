@@ -19076,12 +19076,57 @@ def _direct_blocked_company_keys():
     return out
 
 
+RESEARCH_NO_TICKET_IMPUTE = 100_000  # buyer with no ticket size counts as the smallest tier's floor
+
+
+def _research_ticket_stats(ids, ticket_by_id):
+    """Summed buyer ticket range plus a demand score for sorting.
+    Score per buyer: geometric mean of their range (sqrt(min*max)), or
+    1.5x min when unbounded, or RESEARCH_NO_TICKET_IMPUTE when no ticket
+    size is set — so a few big tickets outrank many tiny or unknown ones,
+    while buyer count still matters."""
+    t_min = t_max = 0
+    plus = False
+    with_ticket = 0
+    score = 0.0
+    for pid in set(ids):
+        lo, hi = ticket_by_id.get(str(pid), (None, None))
+        if lo is None:
+            score += RESEARCH_NO_TICKET_IMPUTE
+            continue
+        with_ticket += 1
+        t_min += lo
+        if hi is None:
+            plus = True
+            t_max += lo
+            score += lo * 1.5
+        else:
+            t_max += hi
+            score += (lo * hi) ** 0.5
+    return {"ticket_min": t_min, "ticket_max": t_max, "ticket_plus": plus,
+            "with_ticket": with_ticket, "demand_score": int(score)}
+
+
+def _research_ticket_text(r):
+    if not r["with_ticket"]:
+        return "—"
+    lo, hi = _fmt_money(r["ticket_min"]), _fmt_money(r["ticket_max"])
+    rng = lo if lo == hi and not r["ticket_plus"] else f"{lo} – {hi}{'+' if r['ticket_plus'] else ''}"
+    return f"{rng} ({r['with_ticket']} of {r['buyers']})"
+
+
 def _research_needs_linkedin(row):
     return "LinkedIn" in row["next_step"]
 
 
 def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_GAPS_DEFAULT_MAX, unmapped=None,
                           restricted=None, direct_blocked=None):
+    ticket_by_id = {}
+    for rec in people:
+        if rec.get("id") is not None:
+            lo, hi = get_person_ticket_range(rec.get("custom_fields") or {})
+            if lo is not None:
+                ticket_by_id[str(rec["id"])] = (lo, hi)
     """Rows for buy-interest companies with fewer than max_holders holders.
     Holding entries are matched to buy-list names loosely
     (_research_names_match); every matched Holding name is shown."""
@@ -19133,9 +19178,11 @@ def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_G
             step += RESEARCH_SENIOR_ONLY_SUFFIX
         rows.append({"company": name, "buyers": len(set(ids)), "holders": total, "natural": n,
                      "entity": e, "unknown": u, "next_step": step, "direct_blocked": blocked,
-                     "matched": ", ".join(matched)})
-    # LinkedIn-needed rows first, each group by demand (buyers) desc.
-    rows.sort(key=lambda r: (not _research_needs_linkedin(r), -r["buyers"], r["holders"], r["company"].lower()))
+                     "matched": ", ".join(matched), **_research_ticket_stats(ids, ticket_by_id)})
+    # LinkedIn-needed rows first; within each group by estimated dollar
+    # demand (demand_score), then buyers.
+    rows.sort(key=lambda r: (not _research_needs_linkedin(r), -r["demand_score"], -r["buyers"], r["holders"],
+                             r["company"].lower()))
     return rows
 
 
@@ -19176,9 +19223,12 @@ def _handle_research_gaps(query):
         diag += ". Name sources with errors: " + "; ".join(map_errors)
     for r in rows:
         r["pitchbook"] = _company_pitchbook_url(r["company"])
-    cols = ["Company", "Buyers", "Holders", "Natural-person holders", "Entity holders",
+    for r in rows:
+        r["tickets"] = _research_ticket_text(r)
+        r["est_demand"] = _fmt_money(r["demand_score"])
+    cols = ["Company", "Buyers", "Buyer tickets (sum)", "Est. demand", "Holders", "Natural-person holders", "Entity holders",
             "Unknown-type holders", "Next step", "PitchBook URL", "Holding names counted"]
-    keys = ["company", "buyers", "holders", "natural", "entity", "unknown", "next_step", "pitchbook", "matched"]
+    keys = ["company", "buyers", "tickets", "est_demand", "holders", "natural", "entity", "unknown", "next_step", "pitchbook", "matched"]
     if (query.get("format") or "").lower() == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)
@@ -19198,7 +19248,8 @@ def _handle_research_gaps(query):
         pb = (f'<a href="{_esc(r["pitchbook"])}" target="_blank" rel="noopener">PitchBook</a>'
               if r["pitchbook"] else "—")
         trs.append(f'<tr data-step="{_esc(r["next_step"])}"><td>{_esc(r["company"])}</td>'
-                   f'<td class="n">{r["buyers"]}</td><td class="n">{r["holders"]}</td>'
+                   f'<td class="n">{r["buyers"]}</td><td class="n">{_esc(r["tickets"])}</td>'
+                   f'<td class="n"><b>{_esc(r["est_demand"])}</b></td><td class="n">{r["holders"]}</td>'
                    f'<td class="n">{r["natural"]}</td><td class="n">{r["entity"]}</td>'
                    f'<td class="n">{r["unknown"]}</td><td>{_esc(r["next_step"])}</td><td>{pb}</td>'
                    f'<td class="muted">{_esc(r["matched"]) or "—"}</td></tr>')
@@ -19215,14 +19266,15 @@ button,select,a.btn{{font-size:14px;padding:6px 10px}} .muted{{color:#666}}
 </style></head><body>
 <p><a href="?key={_esc(urllib.parse.quote(query.get('key') or '', safe=''))}">&larr; Dashboard</a></p>
 <h1>Research gaps</h1>
-<p>{len(rows)} companies · client buy interest, fewer than {max_holders} holders in Holding · LinkedIn-needed first, then by buyers</p>
+<p>{len(rows)} companies · client buy interest, fewer than {max_holders} holders in Holding · LinkedIn-needed first, then by estimated demand</p>
+<p class="muted" style="font-size:12px">Buyer tickets = sum of each buyer's ticket-size range (how many buyers gave one). Est. demand = per buyer, the middle of their range (geometric), 1.5× the floor if open-ended, $100K if no ticket size — used for sorting.</p>
 <p class="muted">{summary}</p>
 <p class="muted" style="font-size:12px">{_esc(diag)}</p>
 <div class="bar"><label>Next step <select id="f"><option value="">All</option>{opts}</select></label>
 <button id="copy">Copy company names</button>
 <a class="btn" href="?key={_esc(query.get('key') or '')}&view=research_gaps&max={max_holders}&format=csv">Download CSV</a>
 <span id="msg" class="muted"></span></div>
-<table><thead><tr>{"".join(f"<th>{c}</th>" for c in ["Company", "Buyers", "Holders", "Natural", "Entity", "Unknown type", "Next step", "PitchBook", "Holding names counted"])}</tr></thead>
+<table><thead><tr>{"".join(f"<th>{c}</th>" for c in ["Company", "Buyers", "Buyer tickets", "Est. demand", "Holders", "Natural", "Entity", "Unknown type", "Next step", "PitchBook", "Holding names counted"])}</tr></thead>
 <tbody>{"".join(trs)}</tbody></table>
 <script>
 var f=document.getElementById('f');
