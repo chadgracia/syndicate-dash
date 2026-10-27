@@ -11114,6 +11114,12 @@ check("research gaps: blocks-direct company -> LinkedIn senior only",
       _rg4["Gamma Co"]["next_step"] == "LinkedIn employees" + lf.RESEARCH_SENIOR_ONLY_SUFFIX
       and _rg4["Gamma Co"]["direct_blocked"])
 check("research gaps: non-blocked company keeps the plain step", _rg4["Covenant"]["next_step"] == "PitchBook + LinkedIn")
+_rg_nav_admin = lf._nav_html("mydeals", "Admin", key="K1")
+_rg_nav_tenant = lf._nav_html("mydeals", "Tenant")
+_rg_nav_preview = lf._nav_html("mydeals", "Admin", key="K1", view_as="t@example.com", edit_flag=False)
+check("research gaps: admin nav has the Research gaps tab", "view=research_gaps" in _rg_nav_admin)
+check("research gaps: tab never in tenant sessions or the Tenant-view preview",
+      "research_gaps" not in _rg_nav_tenant and "research_gaps" not in _rg_nav_preview)
 check("research gaps: Holding field kept in the slim index", lf.HOLDING_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
 
 print(f"\n{passed} passed, {failed} failed")

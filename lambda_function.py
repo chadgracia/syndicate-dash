@@ -10646,6 +10646,12 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     mydeals_cls = "gg-tab active" if active_tab == "mydeals" else "gg-tab"
     intros_cls = "gg-tab active" if active_tab == "intros" else "gg-tab"
     demand_cls = "gg-tab active" if active_tab == "demand" else "gg-tab"
+    # Admin-only "Research gaps" tab (never in tenant sessions or the
+    # Tenant-view preview): links the read-only ?view=research_gaps page.
+    research_tab_html = ""
+    if key and (not view_as or edit_flag):
+        research_tab_html = (f'<a class="gg-tab" href="?key={urllib.parse.quote(key, safe="")}'
+                             f'&view=research_gaps">Research gaps</a>')
     # show_viewer=False (the company detail page) omits the viewer's own
     # name from the nav — that page's "no identities anywhere" rule is
     # unqualified except for section (a)'s deal names, so even the
@@ -10809,6 +10815,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
       </div>
       <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
+      {research_tab_html}
     </nav>
     {admin_badge_html}
     {tenant_search_html}
@@ -19206,6 +19213,7 @@ th{{background:#f6f6f6;position:sticky;top:0}} td.n{{text-align:right;font-varia
 .bar{{margin:12px 0;display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
 button,select,a.btn{{font-size:14px;padding:6px 10px}} .muted{{color:#666}}
 </style></head><body>
+<p><a href="?key={_esc(urllib.parse.quote(query.get('key') or '', safe=''))}">&larr; Dashboard</a></p>
 <h1>Research gaps</h1>
 <p>{len(rows)} companies · client buy interest, fewer than {max_holders} holders in Holding · LinkedIn-needed first, then by buyers</p>
 <p class="muted">{summary}</p>
