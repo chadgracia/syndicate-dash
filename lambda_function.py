@@ -2016,7 +2016,7 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name"
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
     1958, 3052210, 3064297, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163, 3769275,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
-    3998063, 4006089, 4006402, 4008329, 4009563, 4011458))
+    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 3900670))
 
 
 def _people_slim_schema():
@@ -18919,6 +18919,13 @@ RESEARCH_GAPS_DEFAULT_MAX = 5
 RESEARCH_GAPS_EXCLUDE_LOWER = {"openevidence"}
 RMS_RESTRICTED_FIELD = "custom_label_4011458"
 RMS_RESTRICTED_ID = 7217010
+# Company "Transfer" field; option 6888893 = "Company blocks direct transfers"
+# (same constants as portfolio-deploy's watchlist). For those companies
+# employee common can't move, so LinkedIn research targets only very senior
+# people who may hold preferred.
+COMPANY_TRANSFER_FIELD = "custom_label_3900670"
+COMPANY_DIRECT_BLOCKED_ID = 6888893
+RESEARCH_SENIOR_ONLY_SUFFIX = " (senior only — blocks direct)"
 _holding_names_cache = {"at": 0.0, "map": None, "errors": []}
 
 
@@ -19045,12 +19052,29 @@ def _rms_restricted_company_keys():
     return out
 
 
+def _direct_blocked_company_keys():
+    """Lowercased names of companies whose Transfer field says the company
+    blocks direct transfers (empty on any read failure)."""
+    try:
+        companies = _companies_list()
+    except Exception:
+        return set()
+    out = set()
+    for rec in companies if isinstance(companies, list) else []:
+        if isinstance(rec, dict) and COMPANY_DIRECT_BLOCKED_ID in cf_list(rec.get("custom_fields") or {},
+                                                                          COMPANY_TRANSFER_FIELD):
+            name = str(rec.get("name") or "").strip().lower()
+            if name:
+                out.add(name)
+    return out
+
+
 def _research_needs_linkedin(row):
     return "LinkedIn" in row["next_step"]
 
 
 def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_GAPS_DEFAULT_MAX, unmapped=None,
-                          restricted=None):
+                          restricted=None, direct_blocked=None):
     """Rows for buy-interest companies with fewer than max_holders holders.
     Holding entries are matched to buy-list names loosely
     (_research_names_match); every matched Holding name is shown."""
@@ -19096,8 +19120,12 @@ def compute_research_gaps(people, buy_map, holding_names, max_holders=RESEARCH_G
         total = n + e + u
         if total >= max_holders:
             continue
+        blocked = name.lower() in (direct_blocked or set())
+        step = _research_next_step(n, e, u)
+        if blocked and "LinkedIn" in step:
+            step += RESEARCH_SENIOR_ONLY_SUFFIX
         rows.append({"company": name, "buyers": len(set(ids)), "holders": total, "natural": n,
-                     "entity": e, "unknown": u, "next_step": _research_next_step(n, e, u),
+                     "entity": e, "unknown": u, "next_step": step, "direct_blocked": blocked,
                      "matched": ", ".join(matched)})
     # LinkedIn-needed rows first, each group by demand (buyers) desc.
     rows.sort(key=lambda r: (not _research_needs_linkedin(r), -r["buyers"], r["holders"], r["company"].lower()))
@@ -19128,7 +19156,8 @@ def _handle_research_gaps(query):
                               f"<p>Error: {_esc(str(e))}</p>", status=500)
     unmapped = {}
     rows = compute_research_gaps(_research_gap_people(), _interest_buy_map(), holding_names, max_holders, unmapped,
-                                 restricted=_rms_restricted_company_keys())
+                                 restricted=_rms_restricted_company_keys(),
+                                 direct_blocked=_direct_blocked_company_keys())
     map_errors = _holding_names_cache.get("errors") or []
     diag = (f"Holding names known: {len(holding_names)}. "
             f"Holding entries on people with no known name: {len(unmapped)} "

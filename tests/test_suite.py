@@ -11108,6 +11108,12 @@ check("research gaps: OpenEvidence and RMS Restricted companies removed",
       not ({"OpenEvidence", "Restricted Co"} & {r["company"] for r in _rg3}))
 check("research gaps: LinkedIn-needed rows first, each group by buyers desc",
       [r["company"] for r in _rg3] == ["Zed Co", "Yak Co", "Alpha Co"])
+_rg4 = {r["company"]: r for r in lf.compute_research_gaps([_rg_p(51, [904], _VC)],
+    {"Gamma Co": [1], "Covenant": [1, 2]}, _rg_names, 5, direct_blocked={"gamma co"})}
+check("research gaps: blocks-direct company -> LinkedIn senior only",
+      _rg4["Gamma Co"]["next_step"] == "LinkedIn employees" + lf.RESEARCH_SENIOR_ONLY_SUFFIX
+      and _rg4["Gamma Co"]["direct_blocked"])
+check("research gaps: non-blocked company keeps the plain step", _rg4["Covenant"]["next_step"] == "PitchBook + LinkedIn")
 check("research gaps: Holding field kept in the slim index", lf.HOLDING_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
 
 print(f"\n{passed} passed, {failed} failed")
