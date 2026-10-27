@@ -11090,17 +11090,24 @@ check("research gaps: entity-only holders -> LinkedIn employees", _rg["Gamma Co"
 check("research gaps: mixed holders -> both", _rg["Beta Co"]["next_step"] == "PitchBook + LinkedIn")
 check("research gaps: 5+ holders, public $ and empty buy lists excluded",
       not ({"Delta Co", "Public Inc$", "Empty Co"} & set(_rg)))
-check("research gaps: sorted by buyers desc",
-      [r["company"] for r in lf.compute_research_gaps(_rg_people, _rg_buy, _rg_names, 5)][0] == "Alpha Co")
+check("research gaps: LinkedIn-needed group comes first (Gamma, 2 buyers, before PitchBook-only Alpha, 3)",
+      [r["company"] for r in lf.compute_research_gaps(_rg_people, _rg_buy, _rg_names, 5)][0] == "Gamma Co")
 _rg_names2 = {801: "1X", 802: "Aalo", 803: "OpenAI", 804: "Open"}
 _rg_people2 = [_rg_p(31, [801], _NP), _rg_p(32, [802], _VC), _rg_p(33, [803], _VC)]
 _rg2 = {r["company"]: r for r in lf.compute_research_gaps(
-    _rg_people2, {"1X (US HoldCo)": [1], "Aalo Atomics": [1], "OpenEvidence": [1]}, _rg_names2, 5)}
+    _rg_people2, {"1X (US HoldCo)": [1], "Aalo Atomics": [1], "OpenRoad": [1]}, _rg_names2, 5)}
 check("research gaps: '1X' holding counts for '1X (US HoldCo)'", _rg2["1X (US HoldCo)"]["natural"] == 1
       and _rg2["1X (US HoldCo)"]["matched"] == "1X")
 check("research gaps: 'Aalo' holding counts for 'Aalo Atomics'", _rg2["Aalo Atomics"]["entity"] == 1)
-check("research gaps: no partial-word match (OpenAI/Open never count for OpenEvidence)",
-      _rg2["OpenEvidence"]["holders"] == 0)
+check("research gaps: no partial-word match (OpenAI/Open never count for OpenRoad)",
+      _rg2["OpenRoad"]["holders"] == 0)
+_rg3 = lf.compute_research_gaps([_rg_p(41, [902], _NP)],
+    {"OpenEvidence": [1, 2, 3, 4, 5, 6], "Restricted Co": [1, 2, 3], "Alpha Co": [1, 2, 3, 4, 5], "Zed Co": [1, 2], "Yak Co": [1]},
+    _rg_names, 5, restricted={"restricted co"})
+check("research gaps: OpenEvidence and RMS Restricted companies removed",
+      not ({"OpenEvidence", "Restricted Co"} & {r["company"] for r in _rg3}))
+check("research gaps: LinkedIn-needed rows first, each group by buyers desc",
+      [r["company"] for r in _rg3] == ["Zed Co", "Yak Co", "Alpha Co"])
 check("research gaps: Holding field kept in the slim index", lf.HOLDING_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
 
 print(f"\n{passed} passed, {failed} failed")
