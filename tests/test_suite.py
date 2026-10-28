@@ -2765,158 +2765,76 @@ check("guard: Admin view shows the text plus the red hidden-from-sellers line",
       and '<div class="firm-internal-flag">Hidden from sellers — looks internal. Edit the Summary in Pipeline.</div>'
       in _firm_int_a)
 
-# --- One-time Summary -> note migration (?view=summary_migrate)
-_sm_calls = []
-_sm_fail_note_for = set()
+# --- Firm card inline editor (Admin view) + ?action=save_company
+_ce_companies = {"companies": [{"id": 7101, "name": "Edit Co", "summary": "Old public text.",
+                                "custom_fields": {lf.COMPANY_LEGAL_NAME_FIELD: "Edit Co LLC"}}]}
+_ce_s3, _ce_table = use_fixture({lf.PEOPLE_KEY: {"people": []}, lf.INTEREST_KEY: {"buy": {}},
+                                 lf.DEALS_KEY: {"deals": []}, lf.COMPANIES_KEY: _ce_companies},
+                                last_modified={lf.COMPANIES_KEY: datetime.now(timezone.utc) - timedelta(minutes=30)})
+_ce_rec = lf._companies_list()[0]
+_ce_calls = []
+_ce_fail = {"on": False}
 
-def _sm_urlopen(req, timeout=15):
-    path = req.full_url.split("/api/v3")[1].split("?")[0]
-    _sm_calls.append((req.get_method(), path, json.loads(req.data.decode())))
-    if path == "/notes.json" and _sm_calls[-1][2]["note"]["company_id"] in _sm_fail_note_for:
+def _ce_urlopen(req, timeout=15):
+    _ce_calls.append((req.get_method(), req.full_url.split("/api/v3")[1].split("?")[0], json.loads(req.data.decode())))
+    if _ce_fail["on"]:
         raise lf.urllib.error.HTTPError(req.full_url, 500, "boom", {}, None)
     return FakeHTTPResponse(200)
 
-_, sm_table = use_fixture({lf.PEOPLE_KEY: {"people": []}, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": []}})
-_sm_saved_urlopen = lf.urllib.request.urlopen
-lf.urllib.request.urlopen = _sm_urlopen
-_sm_sleeps = []
-_sm_saved_sleep = lf._sm_sleep
-lf._sm_sleep = _sm_sleeps.append
+def _ce_post(body):
+    return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": "save_company"}, "body": json.dumps(body)}, None)
+
+_ce_saved_urlopen = lf.urllib.request.urlopen
+lf.urllib.request.urlopen = _ce_urlopen
 try:
-    _sm_body = json.dumps({"501": {"summary": "Public text.", "note": "Chad: internal stuff"},
-                           "502": {"summary": "", "note": "Other note"}})
-    _sm_fail_note_for.add(502)
-    _sm_resp = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
-                                  "queryStringParameters": {"key": ADMIN_KEY, "view": "summary_migrate"},
-                                  "body": lf.urllib.parse.urlencode({"entries": _sm_body})}, None)
-    check("migration: admin POST renders a results table",
-          _sm_resp["statusCode"] == 200 and "<th>company_id</th>" in _sm_resp["body"])
-    check("migration: note POST comes before the Summary PUT (company description) for the same company",
-          _sm_calls[0] == ("POST", "/notes.json", {"note": {"content": "Chad: internal stuff", "company_id": 501}})
-          and _sm_calls[1] == ("PUT", "/companies/501.json", {"company": {"description": "Public text."}}))
-    check("migration: failed note -> Summary PUT skipped for that company",
-          ("PUT", "/companies/502.json", {"company": {"description": ""}}) not in _sm_calls
-          and any(c[1] == "/notes.json" and c[2]["note"]["company_id"] == 502 for c in _sm_calls)
-          and "SKIPPED" in _sm_resp["body"])
-    check("migration: one audit item per entry; done marker only for the successful note",
-          sum(1 for it in sm_table.puts if str(it.get("sk", "")).startswith("audit#summary#")) == 2
-          and any(it.get("sk") == "done#501" and it.get("tenant") == "__summary_migration__" for it in sm_table.items)
-          and not any(it.get("sk") == "done#502" for it in sm_table.items))
-    _sm_calls.clear()
-    _sm_again = lf.migrate_company_summary("501", "Public text v2.", "Chad: internal stuff")
-    check("migration: resubmit after success skips the note and the Summary PUT (done#, summary_done# markers)",
-          _sm_calls == [] and _sm_again["note_ok"] == "skipped" and _sm_again["summary_ok"] == "skipped"
-          and any(it.get("sk") == "summary_done#501" for it in sm_table.items))
-    check("migration: bad batch rejected whole (400), >100 entries rejected, 100 accepted",
-          lf.validate_summary_migration_batch(json.dumps({"1": {"summary": "x", "note": "n"}, "x": {}}))[0] is None
-          and lf.validate_summary_migration_batch(json.dumps({str(i): {"summary": "", "note": "n"}
-                                                              for i in range(101)}))[0] is None
-          and len(lf.validate_summary_migration_batch(json.dumps({str(i): {"summary": "", "note": "n"}
-                                                                  for i in range(100)}))[0]) == 100)
-    check("migration: 0.6s pause before every Pipeline call; failed note (500) retried 2/4/8/16s then ERR",
-          lf.SUMMARY_MIGRATE_CALL_GAP_SECONDS == 0.6 and 0.6 in _sm_sleeps
-          and sum(1 for c in _sm_calls if c[1] == "/notes.json" and c[2]["note"]["company_id"] == 502) == 0)
-    _sm_calls.clear()
-    _sm_sleeps.clear()
-    _sm_r502 = lf.migrate_company_summary("502", "", "Other note")
-    check("migration: 5xx retried 4 times with 2/4/8/16s backoff, paced 0.6s, then ERR",
-          sum(1 for c in _sm_calls if c[1] == "/notes.json") == 5
-          and _sm_sleeps == [0.6, 2, 0.6, 4, 0.6, 8, 0.6, 16, 0.6]
-          and _sm_r502["note_ok"] is False and _sm_r502["summary_ok"] is None and not _sm_r502["rate_limited"])
-    _sm_calls.clear()
-    _sm_same = lf.migrate_company_summary("501", "Public text v2.", "Chad: internal stuff")
-    check("migration: resubmit with the same Summary already saved -> no note, no Summary PUT",
-          _sm_calls == [] and _sm_same["note_ok"] == "skipped" and _sm_same["summary_ok"] == "skipped")
-
-    # 429 handling: Retry-After honored (capped 30s), success on a later try
-    _sm_429 = {"left": 0, "retry_after": None, "always": set()}
-
-    def _sm_urlopen_429(req, timeout=15):
-        path = req.full_url.split("/api/v3")[1].split("?")[0]
-        body = json.loads(req.data.decode())
-        _sm_calls.append((req.get_method(), path, body))
-        cid = body.get("note", {}).get("company_id") if path == "/notes.json" else int(path.split("/")[2].split(".")[0])
-        if cid in _sm_429["always"] or _sm_429["left"] > 0:
-            _sm_429["left"] -= 1
-            hdrs = {"Retry-After": _sm_429["retry_after"]} if _sm_429["retry_after"] is not None else {}
-            raise lf.urllib.error.HTTPError(req.full_url, 429, "Too Many Requests", hdrs, lf.io.BytesIO(b"slow down"))
-        return FakeHTTPResponse(200)
-
-    lf.urllib.request.urlopen = _sm_urlopen_429
-    _sm_calls.clear(); _sm_sleeps.clear()
-    _sm_429.update(left=2, retry_after="45")
-    _sm_r601 = lf.migrate_company_summary("601", "S601", "N601")
-    check("migration: 429 retried, Retry-After honored but capped at 30s, then succeeds",
-          _sm_r601["note_ok"] is True and _sm_r601["summary_ok"] is True
-          and _sm_sleeps == [0.6, 30, 0.6, 30, 0.6, 0.6])
-    _sm_601_sks = [it.get("sk") for it in sm_table.puts if str(it.get("sk", "")).endswith("#601")
-                   and not str(it.get("sk", "")).startswith("audit#")]
-    check("migration: done# written right after the note POST, before the Summary PUT; then summary_done#",
-          _sm_601_sks == ["done#601", "summary_done#601"])
-    # Note saved but Summary rate-limited: resubmit skips the note, retries only the Summary
-    _sm_calls.clear(); _sm_sleeps.clear()
-    _sm_429.update(left=0, retry_after=None, always={602})
-    _sm_r602 = lf.migrate_company_summary("602", "S602", "N602")
-    check("migration: 429 after 4 retries -> ERR flagged rate_limited (note never posted twice)",
-          _sm_r602["note_ok"] is False and _sm_r602["rate_limited"] is True
-          and sum(1 for c in _sm_calls if c[1] == "/notes.json") == 5)
-    sm_table.items.append({"tenant": "__summary_migration__", "sk": "done#603", "note_done": True})
-    _sm_calls.clear()
-    _sm_429.update(always={603})
-    _sm_r603 = lf.migrate_company_summary("603", "S603", "N603")
-    check("migration: note already done + Summary 429 -> no note POST, Summary ERR, rate_limited",
-          not any(c[1] == "/notes.json" for c in _sm_calls) and _sm_r603["note_ok"] == "skipped"
-          and _sm_r603["summary_ok"] is False and _sm_r603["rate_limited"] is True)
-    _sm_calls.clear()
-    _sm_429.update(always=set())
-    _sm_r603b = lf.migrate_company_summary("603", "S603", "N603")
-    check("migration: resubmit after the Summary 429 -> only the Summary PUT",
-          _sm_calls == [("PUT", "/companies/603.json", {"company": {"description": "S603"}})]
-          and _sm_r603b["note_ok"] == "skipped" and _sm_r603b["summary_ok"] is True)
-
-    # Batch: 3 consecutive rate-limited entries stop the run; the rest are NOT RUN
-    _sm_calls.clear()
-    _sm_429.update(always={701, 702, 703})
-    _sm_res, _sm_stop = lf.run_summary_migration(
-        [("700", "a", "n"), ("701", "a", "n"), ("702", "a", "n"), ("703", "a", "n"), ("704", "a", "n"),
-         ("705", "a", "n")])
-    check("migration batch: 3 consecutive 429 entries stop the batch; remaining rows NOT RUN, never called",
-          _sm_stop == "rate_limited" and [r["note_ok"] for r in _sm_res] == [True, False, False, False, "not_run", "not_run"]
-          and not any(("/companies/704" in c[1]) or (c[1] == "/notes.json" and c[2]["note"]["company_id"] in (704, 705))
-                      for c in _sm_calls))
-    _sm_429.update(always={711, 712})
-    _sm_res2, _sm_stop2 = lf.run_summary_migration(
-        [("711", "a", "n"), ("712", "a", "n"), ("713", "a", "n"), ("714", "a", "n")])
-    check("migration batch: a success resets the consecutive-429 count",
-          _sm_stop2 == "" and [r["note_ok"] for r in _sm_res2] == [False, False, True, True])
-    _sm_429.update(always=set())
-
-    class _SmCtx:
-        def __init__(self, ms):
-            self.ms = list(ms)
-
-        def get_remaining_time_in_millis(self):
-            return self.ms.pop(0) if len(self.ms) > 1 else self.ms[0]
-
-    _sm_calls.clear()
-    _sm_res3, _sm_stop3 = lf.run_summary_migration(
-        [("721", "a", "n"), ("722", "a", "n"), ("723", "a", "n")], _SmCtx([500000, 89999]))
-    check("migration batch: < 90s remaining before an entry -> stop, remaining rows NOT RUN",
-          _sm_stop3 == "time" and [r["note_ok"] for r in _sm_res3] == [True, "not_run", "not_run"]
-          and not any(c[1] == "/notes.json" and c[2]["note"]["company_id"] in (722, 723) for c in _sm_calls))
-    _sm_page = lf.render_summary_migrate_page(ADMIN_KEY, results=_sm_res3, stop_reason="time")
-    check("migration page: NOT RUN rows, stop message, direct Lambda URL note with the request's key, 600s timeout note",
-          "NOT RUN" in _sm_page and "close to its time limit" in _sm_page
-          and lf.SUMMARY_MIGRATE_DIRECT_URL + "?key=" + lf.urllib.parse.quote(ADMIN_KEY, safe="") + "&amp;view=summary_migrate"
-          in _sm_page
-          and "ws4stw4iul75a7yx5dra2wmnq40kipav.lambda-url.us-east-1.on.aws" in lf.SUMMARY_MIGRATE_DIRECT_URL
-          and "not via desk.graciagroup.com" in _sm_page and "600 seconds" in _sm_page)
-    _sm_forb = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
-                                  "queryStringParameters": {"key": "nope", "view": "summary_migrate"}}, None)
-    check("migration: wrong key -> 403", _sm_forb["statusCode"] == 403)
+    _ce_admin_html = lf._buyer_about_firm_html("Edit Co", _ce_rec, True, key=ADMIN_KEY)
+    check("firm editor: Admin view (edit_mode + key) shows Summary textarea + Legal name input",
+          'id="company-edit-summary" data-company-id="7101"' in _ce_admin_html
+          and 'id="company-edit-legal"' in _ce_admin_html and 'value="Edit Co LLC"' in _ce_admin_html)
+    check("firm editor: tenants and admin Tenant view never get it",
+          "company-edit" not in lf._buyer_about_firm_html("Edit Co", _ce_rec, False, key=None)
+          and "company-edit" not in lf._buyer_about_firm_html("Edit Co", _ce_rec, False, key=ADMIN_KEY))
+    check("save_company: wrong key -> 403, nothing sent",
+          _ce_post({"key": "nope", "company_id": "7101", "summary": "x", "legal_name": "y"})["statusCode"] == 403
+          and _ce_calls == [])
+    _ce_fail["on"] = True
+    _ce_bad = _ce_post({"key": ADMIN_KEY, "company_id": "7101", "summary": "New text.", "legal_name": "Edit Co LLC"})
+    check("save_company: Pipeline failure -> 502 with the error, nothing written to Dynamo",
+          _ce_bad["statusCode"] == 502 and "Pipeline" in json.loads(_ce_bad["body"])["error"]
+          and _ce_table.puts == [])
+    _ce_fail["on"] = False
+    _ce_calls.clear()
+    _ce_ok = _ce_post({"key": ADMIN_KEY, "company_id": "7101", "summary": "New public text.", "legal_name": "Edit Co LLC"})
+    check("save_company: Pipeline PUT first with only the changed field (description)",
+          _ce_ok["statusCode"] == 200
+          and _ce_calls == [("PUT", "/companies/7101.json", {"company": {"description": "New public text."}})])
+    check("save_company: then Dynamo overlay + audit item",
+          any(it.get("tenant") == "__company_text__" and it.get("sk") == "company#7101"
+              and it.get("summary") == "New public text." for it in _ce_table.items)
+          and any(str(it.get("sk", "")).startswith("audit#company#7101#") for it in _ce_table.puts))
+    _ce_now = lf._buyer_about_firm_html("Edit Co", _ce_rec, False)
+    check("overlay: saved text shows immediately to tenants (newer than the snapshot)",
+          "New public text." in _ce_now and "Old public text." not in _ce_now)
+    _ce_snap_old = lf._s3_last_modified[lf.COMPANIES_KEY]
+    lf._s3_last_modified[lf.COMPANIES_KEY] = datetime.now(timezone.utc) + timedelta(minutes=5)
+    _ce_later = lf._buyer_about_firm_html("Edit Co", _ce_rec, False)
+    lf._s3_last_modified[lf.COMPANIES_KEY] = _ce_snap_old
+    check("overlay: a newer companies.json snapshot wins (Pipeline value shown)",
+          "Old public text." in _ce_later and "New public text." not in _ce_later)
+    _ce_calls.clear()
+    _ce_post({"key": ADMIN_KEY, "company_id": "7101", "summary": "New public text.", "legal_name": "Edit Co Holdings LLC"})
+    check("save_company: legal-name-only change PUTs only custom_label_3769275",
+          _ce_calls == [("PUT", "/companies/7101.json",
+                         {"company": {"custom_fields": {lf.COMPANY_LEGAL_NAME_FIELD: "Edit Co Holdings LLC"}}})])
+    _ce_post({"key": ADMIN_KEY, "company_id": "7101", "summary": "Chad met them in May.", "legal_name": "Edit Co Holdings LLC"})
+    check("save_company: internal-looking text is hidden from tenants and flagged for admin after save",
+          "Chad met" not in lf._buyer_about_firm_html("Edit Co", _ce_rec, False)
+          and "Hidden from sellers" in lf._buyer_about_firm_html("Edit Co", _ce_rec, True, key=ADMIN_KEY))
 finally:
-    lf.urllib.request.urlopen = _sm_saved_urlopen
-    lf._sm_sleep = _sm_saved_sleep
+    lf.urllib.request.urlopen = _ce_saved_urlopen
+    lf._s3_last_modified.pop(lf.COMPANIES_KEY, None)
+
 
 ABOUT_HEADING_RE = re.compile(r'<h2 class="buyer-section-heading">About\b')
 page_bob = lf.render_buyer_page(3, "Sella Seller", tenant_a, TENANT_A_EMAIL, key=None, view_as=None, edit_mode=False)

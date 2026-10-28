@@ -5434,6 +5434,162 @@ def _bio_edit_script_html(key):
 </script>"""
 
 
+# ── Firm card inline editor (Admin view) ────────────────────────────────
+# POST ?action=save_company: Pipeline company PUT of only the changed
+# fields first (Summary = the company "description" attribute, Legal Name
+# custom_label_3769275); on failure nothing else is written. Then a Dynamo
+# overlay (tenant="__company_text__", sk="company#<id>") + audit item that
+# bridges the hourly companies.json refresh, same rule as Public Bio.
+COMPANY_TEXT_PARTITION = "__company_text__"
+COMPANY_SUMMARY_MAX_LEN = 5000
+COMPANY_LEGAL_NAME_MAX_LEN = 300
+
+
+def _company_cf_text(company_rec, field):
+    raw = ((company_rec or {}).get("custom_fields") or {}).get(field)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    return str(raw).strip() if raw is not None else ""
+
+
+def _company_base_text(company_rec):
+    """(summary, legal_name) from the companies.json record alone."""
+    company = company_rec or {}
+    summary = str(company.get("summary") or "").strip() or str(company.get("description") or "").strip()
+    return summary, _company_cf_text(company, COMPANY_LEGAL_NAME_FIELD)
+
+
+def _get_company_text_item(company_id):
+    try:
+        table = _dynamo_table()
+        with _perf_timer("dynamo"):
+            resp = table.get_item(Key={"tenant": COMPANY_TEXT_PARTITION, "sk": f"company#{company_id}"})
+        return resp.get("Item")
+    except Exception:
+        return None
+
+
+def _company_overlay_is_current(updated_at):
+    """True when a dashboard save is newer than the companies.json snapshot
+    (_s3_last_modified[COMPANIES_KEY]); unknown snapshot time -> only within
+    BIO_DYNAMO_BRIDGE_SECONDS (90 min)."""
+    updated = _parse_bio_updated_at(updated_at)
+    if updated is None:
+        return False
+    snapshot = _s3_last_modified.get(COMPANIES_KEY)
+    if snapshot is not None:
+        if snapshot.tzinfo is None:
+            snapshot = snapshot.replace(tzinfo=timezone.utc)
+        return updated > snapshot
+    return (datetime.now(timezone.utc) - updated).total_seconds() <= BIO_DYNAMO_BRIDGE_SECONDS
+
+
+def _company_display_text(company_rec):
+    """(summary, legal_name) to display: the Dynamo overlay's saved values
+    while it is newer than the snapshot, else companies.json."""
+    summary, legal_name = _company_base_text(company_rec)
+    cid = (company_rec or {}).get("id")
+    item = _get_company_text_item(cid) if cid is not None else None
+    if item is not None and _company_overlay_is_current(item.get("updated_at")):
+        if "summary" in item:
+            summary = str(item.get("summary") or "")
+        if "legal_name" in item:
+            legal_name = str(item.get("legal_name") or "")
+    return summary, legal_name
+
+
+def _company_edit_html(company_id, summary, legal_name):
+    """Admin-view-only firm card editor; the server re-checks ADMIN_KEY."""
+    return (
+        '<div class="company-edit">'
+        f'<textarea class="bio-edit-text" id="company-edit-summary" data-company-id="{_esc(str(company_id))}" '
+        f'maxlength="{COMPANY_SUMMARY_MAX_LEN}" placeholder="Summary (shown to sellers)">{_esc(summary)}</textarea>'
+        f'<input type="text" class="company-edit-legal" id="company-edit-legal" maxlength="{COMPANY_LEGAL_NAME_MAX_LEN}" '
+        f'placeholder="Legal name" value="{_esc(legal_name)}">'
+        '<button type="button" id="company-edit-save">Save</button> <span class="ei-msg" id="company-edit-msg"></span>'
+        '</div>'
+    )
+
+
+def _company_edit_script_html(key):
+    key_json = json.dumps(key or "")
+    return f"""<script>
+(function() {{
+  var btn = document.getElementById('company-edit-save');
+  if (!btn) return;
+  btn.addEventListener('click', function() {{
+    var ta = document.getElementById('company-edit-summary');
+    var legal = document.getElementById('company-edit-legal');
+    var msg = document.getElementById('company-edit-msg');
+    msg.className = 'ei-msg saving'; msg.textContent = 'Saving…';
+    fetch('?action=save_company', {{
+      method: 'POST', headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ key: {key_json}, company_id: ta.getAttribute('data-company-id'),
+                              summary: ta.value, legal_name: legal.value }})
+    }}).then(function(r) {{ return r.json(); }}).then(function(d) {{
+      if (d && d.ok) {{ window.location.reload(); }}
+      else {{ msg.className = 'ei-msg error'; msg.textContent = (d && d.error) || 'Save failed'; }}
+    }}).catch(function(e) {{ msg.className = 'ei-msg error'; msg.textContent = 'Save failed: ' + e; }});
+  }});
+}})();
+</script>"""
+
+
+def _handle_save_company(event):
+    """POST ?action=save_company {key, company_id, summary, legal_name} --
+    admin-only. Pipeline PUT of only the changed fields first; on failure
+    502 and nothing else written. Then Dynamo overlay + audit."""
+    body = _parse_json_body(event)
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (admin_key and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+    company_id = str(body.get("company_id") or "").strip()
+    if not (company_id.isdigit() and company_id.isascii()):
+        return _json_response({"error": "company_id must be numeric"}, 400)
+    summary, legal_name = body.get("summary"), body.get("legal_name")
+    if not isinstance(summary, str) or not isinstance(legal_name, str):
+        return _json_response({"error": "summary and legal_name must be strings"}, 400)
+    summary, legal_name = summary.strip(), legal_name.strip()
+    if len(summary) > COMPANY_SUMMARY_MAX_LEN:
+        return _json_response({"error": f"summary over {COMPANY_SUMMARY_MAX_LEN} characters"}, 400)
+    if len(legal_name) > COMPANY_LEGAL_NAME_MAX_LEN:
+        return _json_response({"error": f"legal name over {COMPANY_LEGAL_NAME_MAX_LEN} characters"}, 400)
+    try:
+        companies = _companies_list()
+    except Exception:
+        companies = []
+    rec = next((c for c in companies or [] if isinstance(c, dict) and str(c.get("id")) == company_id), None)
+    if rec is None:
+        return _json_response({"error": "company not found"}, 404)
+    old_summary, old_legal = _company_display_text(rec)
+    changes = {}
+    if summary != old_summary:
+        changes["description"] = summary
+    if legal_name != old_legal:
+        changes["custom_fields"] = {COMPANY_LEGAL_NAME_FIELD: legal_name}
+    if not changes:
+        return _json_response({"ok": True, "unchanged": True})
+    ok, err, _status, _ra = _pipeline_send_json(f"/companies/{company_id}.json", "PUT", {"company": changes})
+    if not ok:
+        return _json_response({"error": f"Pipeline: {err}"}, 502)
+    now = datetime.now(timezone.utc)
+    try:
+        table = _dynamo_table()
+        table.put_item(Item={"tenant": COMPANY_TEXT_PARTITION, "sk": f"company#{company_id}",
+                             "summary": summary, "legal_name": legal_name,
+                             "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ")})
+        table.put_item(Item={"tenant": COMPANY_TEXT_PARTITION,
+                             "sk": f"audit#company#{company_id}#{int(now.timestamp() * 1000)}",
+                             "actor": "admin",
+                             "old": {"summary": old_summary, "legal_name": old_legal},
+                             "new": {"summary": summary, "legal_name": legal_name},
+                             "changed": sorted(changes)})
+    except Exception as e:
+        return _json_response({"error": f"Saved to Pipeline; dashboard copy failed ({type(e).__name__}: {e}). "
+                                        "It will show after the next hourly refresh."}, 502)
+    return _json_response({"ok": True, "hidden_from_sellers": _summary_looks_internal(summary)})
+
+
 def _handle_save_bio(event):
     """POST ?action=save_bio -- admin-only (ADMIN_KEY in the body), the
     inline editor's save. An empty bio is allowed here (clears it)."""
@@ -5623,29 +5779,6 @@ document.querySelectorAll('.cl-copy').forEach(function(btn) {{
 </body></html>"""
 
 
-# ── One-time Summary migration (?view=summary_migrate) ──────────────────
-# Moves internal text out of Pipeline company Summaries into company
-# notes: per entry, note POST first; the Summary PUT only after the note
-# succeeded. Progress per company lives in Dynamo
-# tenant=SUMMARY_MIGRATION_PARTITION: sk "done#<id>" = note done (written
-# right after the note POST succeeds; earlier batches wrote it too, so a
-# company with it never gets a second note) and sk "summary_done#<id>" after
-# a successful Summary PUT (a resubmit skips the PUT). Pipeline calls are paced (SUMMARY_MIGRATE_CALL_GAP_SECONDS) and
-# 429/5xx are retried with backoff; the batch stops early ("NOT RUN") after
-# 3 consecutive rate-limited entries or when < 90s of Lambda time remain.
-SUMMARY_MIGRATION_PARTITION = "__summary_migration__"
-SUMMARY_MIGRATE_MAX_ENTRIES = 100
-SUMMARY_MIGRATE_CALL_GAP_SECONDS = 0.6
-SUMMARY_MIGRATE_BACKOFF_SECONDS = (2, 4, 8, 16)
-SUMMARY_MIGRATE_RETRY_AFTER_CAP_SECONDS = 30
-SUMMARY_MIGRATE_MAX_CONSECUTIVE_RATE_LIMITED = 3
-SUMMARY_MIGRATE_MIN_REMAINING_MS = 90000
-# Direct Function URL (CloudFront in front of desk.graciagroup.com gives up
-# after ~30s, while a 40-entry batch can run for minutes).
-SUMMARY_MIGRATE_DIRECT_URL = "https://ws4stw4iul75a7yx5dra2wmnq40kipav.lambda-url.us-east-1.on.aws/"
-_sm_sleep = time.sleep  # tests swap this out
-
-
 def _pipeline_send_json(path, method, payload):
     """(ok, error, http_status|None, retry_after_seconds|None). Query-string auth."""
     if not (PIPELINE_API_KEY and PIPELINE_APP_KEY):
@@ -5669,229 +5802,6 @@ def _pipeline_send_json(path, method, payload):
         return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:300]}", e.code, retry_after
     except Exception as e:
         return False, f"{type(e).__name__}: {e}", None, None
-
-
-def _pipeline_post_json(path, method, payload):
-    """(ok, error, http_status). Paced: sleeps SUMMARY_MIGRATE_CALL_GAP_SECONDS
-    before every call; 429/5xx retried after 2/4/8/16s (Retry-After honored,
-    capped at 30s), then reported as the last error."""
-    attempts = len(SUMMARY_MIGRATE_BACKOFF_SECONDS) + 1
-    for attempt in range(attempts):
-        _sm_sleep(SUMMARY_MIGRATE_CALL_GAP_SECONDS)
-        ok, err, status, retry_after = _pipeline_send_json(path, method, payload)
-        if ok:
-            return True, None, status
-        retryable = status == 429 or (status is not None and 500 <= status < 600)
-        if not retryable or attempt == attempts - 1:
-            return False, err, status
-        wait = SUMMARY_MIGRATE_BACKOFF_SECONDS[attempt]
-        if retry_after is not None and retry_after >= 0:
-            wait = min(retry_after, SUMMARY_MIGRATE_RETRY_AFTER_CAP_SECONDS)
-        print(f"pipeline {method} {path} -> {status}, retry {attempt + 1} in {wait}s")
-        _sm_sleep(wait)
-    return False, "unreachable", None
-
-
-def _pipeline_create_company_note(company_id, content):
-    return _pipeline_post_json("/notes.json", "POST",
-                               {"note": {"content": content, "company_id": int(company_id)}})
-
-
-def _pipeline_update_company_summary(company_id, summary):
-    """Pipeline UI "Summary" = the company "description" attribute."""
-    return _pipeline_post_json(f"/companies/{company_id}.json", "PUT", {"company": {"description": summary}})
-
-
-def validate_summary_migration_batch(raw):
-    """(entries, error): [(company_id, summary, note)], whole batch rejected on any bad entry."""
-    try:
-        data = json.loads(raw or "")
-    except Exception:
-        return None, "JSON does not parse"
-    if not isinstance(data, dict):
-        return None, 'JSON must be an object: {"<company_id>": {"summary": "...", "note": "..."}}'
-    if not data:
-        return None, "No entries"
-    if len(data) > SUMMARY_MIGRATE_MAX_ENTRIES:
-        return None, f"Too many entries ({len(data)}); max {SUMMARY_MIGRATE_MAX_ENTRIES}"
-    entries = []
-    for k, v in data.items():
-        if not (isinstance(k, str) and k.isdigit() and k.isascii()):
-            return None, f"Key {k!r} is not a numeric company_id"
-        if not isinstance(v, dict) or not isinstance(v.get("summary"), str) or not isinstance(v.get("note"), str):
-            return None, f'Value for {k} must be {{"summary": "<string>", "note": "<string>"}}'
-        if not v["note"].strip():
-            return None, f"Note for {k} is empty"
-        entries.append((k, v["summary"].strip(), v["note"].strip()))
-    return entries, None
-
-
-def migrate_company_summary(company_id, summary, note):
-    """{"company_id", "note_ok" (True/False/"skipped"), "summary_ok" (True/False/"skipped"
-    = done before/None = not attempted), "error", "rate_limited"}."""
-    result = {"company_id": str(company_id), "note_ok": False, "summary_ok": None, "error": "",
-              "rate_limited": False}
-    note_key = {"tenant": SUMMARY_MIGRATION_PARTITION, "sk": f"done#{company_id}"}
-    summary_key = {"tenant": SUMMARY_MIGRATION_PARTITION, "sk": f"summary_done#{company_id}"}
-    table = None
-    note_done = summary_done = None
-    try:
-        table = _dynamo_table()
-        note_done = table.get_item(Key=note_key).get("Item")
-        summary_done = table.get_item(Key=summary_key).get("Item")
-    except Exception as e:
-        print(f"summary migration progress read failed for {company_id}: {type(e).__name__}: {e}")
-
-    def _now():
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    def _mark(key, **fields):
-        try:
-            (table or _dynamo_table()).put_item(Item=dict(key, **fields))
-        except Exception as e:
-            result["error"] = (result["error"] + "; " if result["error"] else "") + \
-                f"Dynamo progress: {type(e).__name__}: {e}"
-
-    if note_done:
-        result["note_ok"] = "skipped"
-    else:
-        ok, err, status = _pipeline_create_company_note(company_id, note)
-        result["note_ok"] = ok
-        if ok:
-            _mark(note_key, note_at=_now())
-        else:
-            result["error"] = f"Note: {err}"
-            result["rate_limited"] = status == 429
-    if result["note_ok"] is True or result["note_ok"] == "skipped":
-        if summary_done:
-            result["summary_ok"] = "skipped"
-        else:
-            ok, err, status = _pipeline_update_company_summary(company_id, summary)
-            result["summary_ok"] = ok
-            if ok:
-                _mark(summary_key, summary=summary, summary_at=_now())
-            else:
-                result["error"] = (result["error"] + "; " if result["error"] else "") + f"Summary: {err}"
-                result["rate_limited"] = status == 429
-    now = datetime.now(timezone.utc)
-    try:
-        table = table or _dynamo_table()
-        table.put_item(Item={
-            "tenant": SUMMARY_MIGRATION_PARTITION,
-            "sk": f"audit#summary#{company_id}#{int(now.timestamp() * 1000)}",
-            "actor": "admin",
-            "new": {"summary": summary, "note": note},
-            "note_ok": str(result["note_ok"]), "summary_ok": str(result["summary_ok"]),
-            "error": result["error"],
-        })
-    except Exception as e:
-        result["error"] = (result["error"] + "; " if result["error"] else "") + f"Dynamo: {type(e).__name__}: {e}"
-    return result
-
-
-def run_summary_migration(entries, context=None):
-    """(results, stop_reason). Entries after an early stop come back as
-    NOT RUN rows: stop_reason "rate_limited" (3 consecutive entries ended in
-    429 after retries) or "time" (< SUMMARY_MIGRATE_MIN_REMAINING_MS left
-    before starting an entry)."""
-    results, stop_reason, consecutive = [], "", 0
-    remaining = getattr(context, "get_remaining_time_in_millis", None)
-    for cid, summary, note in entries:
-        if not stop_reason and callable(remaining) and remaining() < SUMMARY_MIGRATE_MIN_REMAINING_MS:
-            stop_reason = "time"
-        if stop_reason:
-            results.append({"company_id": str(cid), "note_ok": "not_run", "summary_ok": "not_run",
-                            "error": "", "rate_limited": False})
-            continue
-        r = migrate_company_summary(cid, summary, note)
-        results.append(r)
-        consecutive = consecutive + 1 if r["rate_limited"] else 0
-        if consecutive >= SUMMARY_MIGRATE_MAX_CONSECUTIVE_RATE_LIMITED:
-            stop_reason = "rate_limited"
-    return results, stop_reason
-
-
-SUMMARY_MIGRATE_STOP_TEXT = {
-    "rate_limited": "Stopped early: 3 entries in a row hit Pipeline's rate limit (429) after retries. "
-                    "Wait a few minutes, then resubmit the same JSON — finished steps are skipped.",
-    "time": "Stopped early: the Lambda was close to its time limit. Resubmit the same JSON — "
-            "finished steps are skipped.",
-}
-
-
-def render_summary_migrate_page(key, raw="", error="", results=None, stop_reason=""):
-    """?key=ADMIN_KEY&view=summary_migrate -- one-time tool: GET form, POST same URL."""
-    key_qs = f"?key={urllib.parse.quote(key or '', safe='')}&view=summary_migrate"
-    action = key_qs
-    direct_url = SUMMARY_MIGRATE_DIRECT_URL + key_qs
-    error_html = f'<p class="bios-error">{_esc(error)}</p>' if error else ""
-    results_html = ""
-    if results is not None:
-        def _cell(v, done_before):
-            if v == "not_run":
-                return "NOT RUN"
-            if v == "skipped":
-                return done_before
-            return "SKIPPED" if v is None else _ok_err(v)
-        rows = "".join(
-            f'<tr><td>{_esc(r["company_id"])}</td><td>{_cell(r["note_ok"], "SKIPPED (done before)")}</td>'
-            f'<td>{_cell(r["summary_ok"], "SKIPPED (done before)")}</td>'
-            f'<td>{_esc(r["error"])}</td></tr>' for r in results)
-        stop_html = (f'<p class="bios-error">{_esc(SUMMARY_MIGRATE_STOP_TEXT[stop_reason])}</p>'
-                     if stop_reason in SUMMARY_MIGRATE_STOP_TEXT else "")
-        n_not_run = sum(1 for r in results if r["note_ok"] == "not_run")
-        n_err = sum(1 for r in results if r["note_ok"] is False or r["summary_ok"] is False)
-        n_done = len(results) - n_not_run - n_err
-        counts_html = (f'<p class="sm-counts">{n_done} done · {n_err} errors · {n_not_run} not run — '
-                       'resubmit the same batch to finish (already-done steps are skipped).</p>')
-        results_html = (stop_html + counts_html + '<table class="bios-results"><thead><tr><th>company_id</th><th>Note</th>'
-                        f'<th>Summary</th><th>Error</th></tr></thead><tbody>{rows}</tbody></table>')
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Summary migration · Gracia Group</title>
-<style>
-  body {{ margin: 0; background: #f4f2ee; color: #16181d; padding: 32px 24px 64px;
-         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
-  .wrap {{ max-width: 900px; margin: 0 auto; }}
-  h1 {{ font-size: 20px; }}
-  textarea {{ width: 100%; min-height: 320px; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
-             box-sizing: border-box; padding: 8px; }}
-  button {{ margin-top: 10px; padding: 6px 16px; font-size: 14px; }}
-  .bios-error {{ color: #b23b3b; font-weight: 600; }}
-  .sm-warn {{ background: #FDF0E9; color: #C2410C; padding: 10px 12px; border-radius: 6px; word-break: break-all; }}
-  .bios-results {{ margin-top: 18px; border-collapse: collapse; width: 100%; font-size: 13px; background: #fff; }}
-  .bios-results th, .bios-results td {{ border: 1px solid #e7e5e0; padding: 6px 8px; text-align: left; }}
-</style>
-</head>
-<body>
-<div class="wrap">
-<h1>Company Summaries — move internal text to notes</h1>
-<p class="sm-warn">Run this only from the direct Lambda URL: <a href="{_esc(direct_url)}">{_esc(direct_url)}</a> — not via desk.graciagroup.com, which times out after about 30 seconds while the batch keeps running. The Lambda timeout must be set to 600 seconds (Lambda console → Configuration → General configuration).</p>
-<p>JSON object {{"&lt;company_id&gt;": {{"summary": "&lt;new public summary, may be empty&gt;", "note": "&lt;text to save as a company note&gt;"}}}}, max {SUMMARY_MIGRATE_MAX_ENTRIES} entries. Each entry creates the Pipeline company note first; the Summary is replaced only if the note saved. Resubmitting is safe: a note already created is never created again, and a Summary already saved is not re-sent. Calls are paced and rate-limit errors retried; rows marked NOT RUN were not attempted. Changes show on buyer pages after the next hourly refresh.</p>
-{error_html}
-<form method="post" action="{_esc(action)}">
-<textarea name="entries">{_esc(raw)}</textarea>
-<button type="submit">Run</button>
-</form>
-{results_html}
-</div>
-</body>
-</html>"""
-
-
-def _handle_summary_migrate_view(event, method, key, context=None):
-    """Caller has already verified the admin key."""
-    if method == "GET":
-        return _html_response(render_summary_migrate_page(key))
-    raw = _parse_form_body(event).get("entries", "")
-    entries, error = validate_summary_migration_batch(raw)
-    if error:
-        return _html_response(render_summary_migrate_page(key, raw=raw, error=error), 400)
-    results, stop_reason = run_summary_migration(entries, context)
-    return _html_response(render_summary_migrate_page(key, raw=raw, results=results, stop_reason=stop_reason))
 
 
 def _handle_bios_view(event, method, key):
@@ -14607,7 +14517,7 @@ def _first_text(rec, keys):
     return ""
 
 
-def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
+def _buyer_about_firm_html(firm_name, company_rec, edit_mode, key=None):
     """LEFT column: "About <firm>". Text = the live Pipeline company
     Summary (companies.json "summary", else "description"), one <p> per
     line, for tenants and admins alike -- unless _summary_looks_internal:
@@ -14617,11 +14527,14 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
     Founded ("founded_year" verbatim),
     PitchBook link (custom_label_3320818), Crunchbase link
     (custom_label_3064297), each only when present. Entity Tax ID /
-    Beneficial Owner are never read. Returns "" when there's nothing to show."""
+    Beneficial Owner are never read. Summary/Legal name come from
+    _company_display_text (dashboard-save overlay while newer than the
+    snapshot). Admin view with a key (edit_mode and key) adds the inline
+    editor (_company_edit_html); never for tenants or Tenant view.
+    Returns "" when there's nothing to show."""
     if company_rec is None or not firm_name:
         return ""
-    summary = (str(company_rec.get("summary") or "").strip()
-               or str(company_rec.get("description") or "").strip())
+    summary, legal_name = _company_display_text(company_rec)
     internal = _summary_looks_internal(summary)
     # The company's own address only: address_1, address_2, city,
     # postal_code, country. Other address-like keys on the record ("address",
@@ -14642,7 +14555,6 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
         return str(raw).strip() if raw is not None else ""
 
     pitchbook_url = _cf_text(COMPANY_PITCHBOOK_FIELD)
-    legal_name = _cf_text(COMPANY_LEGAL_NAME_FIELD)
     crunchbase_url = _cf_text(COMPANY_CRUNCHBASE_FIELD)
 
     rows = []
@@ -14676,6 +14588,8 @@ def _buyer_about_firm_html(firm_name, company_rec, edit_mode):
         href_c = crunchbase_url if "://" in crunchbase_url else f"https://{crunchbase_url}"
         rows.append(f'<div class="buyer-page-row"><a href="{_esc(href_c)}" target="_blank" '
                     f'rel="noopener noreferrer">Crunchbase profile &rarr;</a></div>')
+    if edit_mode and key and company_rec.get("id") is not None:
+        rows.append(_company_edit_html(company_rec.get("id"), summary, legal_name))
 
     if not rows:
         return ""
@@ -15293,7 +15207,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 # order class so the narrow-screen single column reads
                 # header, bio, Deals with you, note inputs, firm, Notes
                 # history, client standing (see .bp-o* in the page CSS).
-                about_html = _buyer_about_firm_html(firm_name, company_rec, edit_mode) + deal_team_html
+                about_html = _buyer_about_firm_html(firm_name, company_rec, edit_mode, key=key) + deal_team_html
                 history_html = _buyer_notes_history_html(
                     _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode), edit_mode)
                 inputs_html = (_buyer_person_note_input_html(rec, buyer_id, anon_key_email)
@@ -15317,6 +15231,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                                                                tenant_email=anon_key_email if edit_mode else None)
                 if bio_edit_on:
                     edit_script_html += _bio_edit_script_html(key)
+                    edit_script_html += _company_edit_script_html(key)
             else:
                 body_html = _buyer_page_anonymized_html(rec, anon_key_email, buyer_id)
                 if key is not None:
@@ -15463,6 +15378,9 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .bio-points li:first-child {{ margin-top: 0; }}
   .bio-points li::before {{ content: "•"; color: var(--muted); margin-right: 8px; }}
   .bio-edit {{ margin-top: 12px; }}
+  .company-edit {{ margin-top: 12px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }}
+  .company-edit-legal {{ width: 100%; box-sizing: border-box; font-family: inherit; font-size: 13px;
+                        border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; }}
   .bio-edit-text {{ width: 100%; min-height: 90px; box-sizing: border-box; font-family: inherit; font-size: 13px;
                    border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; resize: vertical; }}
   .track-row {{ margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }}
@@ -20009,6 +19927,11 @@ def _lambda_handler_impl(event, context):
             return _json_response({"error": "POST only"}, 405)
         return _handle_save_bio(event)
 
+    if query.get("action") == "save_company":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_save_company(event)
+
     if query.get("action") == "save_standing":
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
@@ -20046,15 +19969,6 @@ def _lambda_handler_impl(event, context):
         if method not in ("GET", "POST"):
             return _forbidden()
         return _handle_bios_view(event, method, query.get("key"))
-
-    # One-time company Summary -> note migration; same gate as ?view=bios.
-    if query.get("view") == "summary_migrate":
-        sm_admin_key = os.environ.get("ADMIN_KEY")
-        if not (sm_admin_key and query.get("key") == sm_admin_key):
-            return _forbidden()
-        if method not in ("GET", "POST"):
-            return _forbidden()
-        return _handle_summary_migrate_view(event, method, query.get("key"), context)
 
     if method != "GET":
         return _forbidden()
