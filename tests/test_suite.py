@@ -11135,6 +11135,40 @@ check("research gaps: one $10-25M buyer outranks five buyers with no ticket",
         {"Big Co": [61], "Many Co": [63, 64, 65, 66, 67]}, {}, 5)] == ["Big Co", "Many Co"])
 check("research gaps: Holding field kept in the slim index", lf.HOLDING_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
 
+# Watchlist nav tab -> desk Portfolio & Watchlist
+def _wt_hrefs(html):
+    return re.findall(r'<a class="gg-tab" href="([^"]+)" target="_blank" rel="noopener">Watchlist</a>', html)
+
+
+_wt_email = "watch.tenant@example.com"
+_wt_tenant = lf._nav_html("overview", "Watch Tenant", account_email=_wt_email)
+_wt_th = _wt_hrefs(_wt_tenant)
+_wt_ok = False
+if len(_wt_th) == 1 and _wt_th[0].startswith("https://desk.graciagroup.com/?sso="):
+    _wt_tok = _ad_up.unquote(_wt_th[0].split("?sso=", 1)[1])
+    _wt_e, _wt_exp, _wt_sig = _ad_trades_verify(_wt_tok)
+    _wt_ok = _wt_e == _wt_email and _wt_sig and lf._verify_sso_handoff(_wt_tok) == _wt_email
+check("Watchlist: tenant nav has the tab with a desk ?sso= handoff for the viewer", _wt_ok)
+check("Watchlist: tab sits after Demand Board, never active",
+      _wt_tenant.index(">Demand Board<") < _wt_tenant.index(">Watchlist<")
+      and 'gg-tab active" href="https://desk' not in _wt_tenant)
+for _wt_label, _wt_nav in [
+        ("admin", lf._nav_html("mydeals", "Admin", key=ADMIN_KEY, edit_flag=True)),
+        ("admin view_as Admin view", lf._nav_html("overview", "Admin", key=ADMIN_KEY, view_as=_wt_email,
+                                                   edit_flag=True, account_email=_wt_email)),
+        ("admin view_as Tenant view", lf._nav_html("overview", "Admin", key=ADMIN_KEY, view_as=_wt_email,
+                                                    edit_flag=False, account_email=_wt_email))]:
+    _wt_h = _wt_hrefs(_wt_nav)
+    check(f"Watchlist: {_wt_label} nav has the plain link (no sso, no admin key)",
+          _wt_h == ["https://desk.graciagroup.com/"] and "sso=" not in _wt_h[0] and ADMIN_KEY not in _wt_h[0])
+check("Watchlist: company detail nav (show_viewer=False) still has the tab",
+      _wt_hrefs(lf._nav_html("overview", "X", show_viewer=False)) == ["https://desk.graciagroup.com/"])
+_wt_saved = lf.IDENTITY_SECRET
+lf.IDENTITY_SECRET = ""
+check("Watchlist: no IDENTITY_SECRET -> tenant nav keeps the tab with the plain URL",
+      _wt_hrefs(lf._nav_html("overview", "Watch Tenant", account_email=_wt_email)) == ["https://desk.graciagroup.com/"])
+lf.IDENTITY_SECRET = _wt_saved
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)

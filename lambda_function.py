@@ -1700,6 +1700,9 @@ def _make_handoff_token(email):
 ADD_DEAL_FORM_URL = "https://desk.graciagroup.com/update/?action=new"
 ADD_DEAL_HELP_TEXT = "New deals appear here within the hour."
 
+# "Watchlist" nav tab -> desk's Portfolio & Watchlist (chadgracia/portfolio-deploy).
+WATCHLIST_URL = "https://desk.graciagroup.com/"
+
 
 def _add_deal_email(key=None, view_as=None, account_email=None):
     """Whose email the Add deal handoff is minted for: admin (key set) ->
@@ -1715,6 +1718,19 @@ def _add_deal_url(email):
     if not token:
         return None
     return f"{ADD_DEAL_FORM_URL}&sso={urllib.parse.quote(token, safe='')}"
+
+
+def _watchlist_url(email):
+    """Desk Portfolio & Watchlist link. With a tenant email, append the same
+    trades-format ?sso= handoff _add_deal_url uses (desk's 1b SSO branch
+    verifies it against IDENTITY_SECRET, sets the desk session cookie, and
+    redirects to the watchlist). Without an email, or if _make_handoff_token
+    returns None, return the plain WATCHLIST_URL -- never a broken link,
+    never the admin key."""
+    token = _make_handoff_token(email) if email else None
+    if not token:
+        return WATCHLIST_URL
+    return f"{WATCHLIST_URL}?sso={urllib.parse.quote(token, safe='')}"
 
 
 def _add_deal_link_html(email, cls, is_admin=False, role=""):
@@ -10652,6 +10668,18 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     if key and (not view_as or edit_flag):
         research_tab_html = (f'<a class="gg-tab" href="?key={urllib.parse.quote(key, safe="")}'
                              f'&view=research_gaps">Research gaps</a>')
+    # "Watchlist" tab -> desk Portfolio & Watchlist. Real tenant session gets
+    # a signed ?sso= handoff for itself; admin (with or without &view_as, either
+    # toggle state) gets the plain link -- a token for the view_as tenant would
+    # replace the admin's own desk session with that client's. Never active,
+    # carries no identity, and never breaks the nav (falls back to plain URL).
+    try:
+        watchlist_href = (_watchlist_url(account_email) if key is None and account_email
+                          else WATCHLIST_URL)
+    except Exception:
+        watchlist_href = WATCHLIST_URL
+    watchlist_tab_html = (f'<a class="gg-tab" href="{_esc(watchlist_href)}" target="_blank" '
+                          f'rel="noopener">Watchlist</a>')
     # show_viewer=False (the company detail page) omits the viewer's own
     # name from the nav — that page's "no identities anywhere" rule is
     # unqualified except for section (a)'s deal names, so even the
@@ -10815,6 +10843,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
       </div>
       <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
+      {watchlist_tab_html}
       {research_tab_html}
     </nav>
     {admin_badge_html}
