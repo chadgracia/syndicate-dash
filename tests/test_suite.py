@@ -7996,6 +7996,37 @@ check("overview: Open deals row has the shared button (stacked variant)", _AC_ST
 check("overview: a past deadline in Open deals renders red with the 'Extend deadline' chip",
       '<span class="deadline-overdue">' in _ac_open and 'class="action-chip overdue"' in _ac_open
       and "Extend deadline &rarr;" in _ac_open)
+# --- Admin-only "deadline passed" nudge bell (_overview_deadline_html, NUDGE_KEY)
+_nb_saved = lf.NUDGE_KEY
+lf.NUDGE_KEY = "test-nudge-key&x"
+_nb_rows = lf._overview_model(lf.get_firm_sell_deals(2301), 2301, "ada@actcap.com")["rows"]
+_nb_over = [r for r in _nb_rows if r["deadline"] and lf._my_deal_is_overdue(r["deadline"], r["section"])]
+_nb_r = _nb_over[0]
+_nb_ok = [dict(_nb_r, deadline=(datetime.now(timezone.utc) + timedelta(days=30)).strftime("%Y/%m/%d"))]
+_nb_id = str(_nb_r["deal"].get("id"))
+_nb_html = lf._overview_deadline_html(_nb_r, ADMIN_KEY, None, edit_mode=True)
+check("nudge bell: overdue deal in admin edit_mode with NUDGE_KEY -> bell with msg=expired and the deal id",
+      'class="ov-expired-bell"' in _nb_html and "msg=expired" in _nb_html
+      and f"?deal_id={_nb_id}&amp;key=test-nudge-key%26x&amp;msg=expired" in _nb_html
+      and _nb_html.index('class="deadline-overdue"') < _nb_html.index("ov-expired-bell")
+      and lf.NUDGE_URL in _nb_html and 'target="_blank" rel="noopener"' in _nb_html)
+check("nudge bell: absent when edit_mode is False",
+      "ov-expired-bell" not in lf._overview_deadline_html(_nb_r, ADMIN_KEY, "ada@actcap.com"))
+check("nudge bell: absent for a non-overdue deal",
+      not lf._my_deal_is_overdue(_nb_ok[0]["deadline"], _nb_ok[0]["section"]) and all("ov-expired-bell" not in lf._overview_deadline_html(r, ADMIN_KEY, None, edit_mode=True)
+                           for r in _nb_ok))
+check("nudge bell: tenant Overview page never carries the bell or the key",
+      "ov-expired-bell" not in _ac_open and "test-nudge-key" not in body_only(_ac_get({"tab": "overview"})))
+lf._req_cache_reset()
+_nb_tv = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                            "queryStringParameters": {"tab": "overview", "key": ADMIN_KEY,
+                                                      "view_as": "ada@actcap.com"}}, None)["body"]
+check("nudge bell: admin Tenant view (key + view_as) never carries the bell or the key",
+      'class="deadline-overdue"' in _nb_tv and "ov-expired-bell" not in _nb_tv and "test-nudge-key" not in _nb_tv)
+lf.NUDGE_KEY = ""
+check("nudge bell: absent when NUDGE_KEY is empty",
+      "ov-expired-bell" not in lf._overview_deadline_html(_nb_r, ADMIN_KEY, None, edit_mode=True))
+lf.NUDGE_KEY = _nb_saved
 check("overview: Needs your attention row (Extend) also carries the shared button",
       "Extend deadline &rarr;" in _ac_att and _AC_STACK in _ac_att and "Reopen" not in _ac_att)
 _ac_all_closed = _ac_track[_ac_track.find("ov-all-closed"):]

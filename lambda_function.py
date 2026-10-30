@@ -1024,6 +1024,11 @@ CLOSED_DEALS_MULTIPART_THRESHOLD_BYTES = 5 * 1024 * 1024
 # repo code.
 IDENTITY_SECRET = os.environ.get("IDENTITY_SECRET", "")
 
+# deal-nudge Lambda: admin-only Overview bell ("deadline passed" email to the
+# client). Its GET only shows a confirm page; sending happens on its Send button.
+NUDGE_URL = "https://ak5zolfpynhrimrsuw5rbjchwu0ktexz.lambda-url.us-east-1.on.aws/"
+NUDGE_KEY = os.environ.get("NUDGE_KEY", "")
+
 SIGNIN_URL = "https://trades.graciagroup.com"
 
 # Auto-enrollment (see _resolve_tenant / _build_tenant_index below): a
@@ -12214,10 +12219,11 @@ def _overview_model(deals, person_id, anon_key_email, edit_mode=False):
             "pending_intros": pending_intros}
 
 
-def _overview_deadline_html(r, key=None, view_as=None):
+def _overview_deadline_html(r, key=None, view_as=None, edit_mode=False):
     """Open deals' Deadline cell, as My Deals renders it: a past deadline
     is red (.deadline-overdue) with the same red "Extend deadline ->"
-    chip (_my_deal_row_chip_html)."""
+    chip (_my_deal_row_chip_html). Admin edit_mode (with NUDGE_KEY set)
+    adds a deal-nudge bell after the red date; never in tenant views."""
     deadline = r["deadline"]
     if not deadline:
         return "—"
@@ -12227,7 +12233,15 @@ def _overview_deadline_html(r, key=None, view_as=None):
     chip = _my_deal_row_chip_html(r["deal"], r["company_name"], deadline, r["stats"], r["id_status"],
                                   r["section"], False, key=key, view_as=view_as)
     extend = "".join(c for c in RED_ACTION_CHIP_RE.findall(chip) if 'class="action-chip overdue"' in c)
-    return f'<span class="deadline-overdue">{text}</span>' + (f'<div>{extend}</div>' if extend else "")
+    bell = ""
+    if edit_mode and NUDGE_KEY:
+        href = (f'{NUDGE_URL}?deal_id={urllib.parse.quote(str(r["deal"].get("id")), safe="")}'
+                f'&key={urllib.parse.quote(NUDGE_KEY, safe="")}&msg=expired')
+        bell = (f'<a class="ov-expired-bell" href="{_esc(href)}" target="_blank" rel="noopener" '
+                'title="Email client: deadline passed — extend or cancel" '
+                'style="text-decoration:none;margin-left:6px;">🔔</a>')
+    return (f'<span class="deadline-overdue">{text}</span>{bell}'
+            + (f'<div>{extend}</div>' if extend else ""))
 
 
 def _overview_waiting_html(n, block_items):
@@ -12425,7 +12439,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
             f'<span class="ov-deal-id">#{_esc(str(r["deal"].get("id")))}</span></td>'
             f'<td>{_my_deal_visibility_badge_html(r["deal"], r["id_status"], r["section"] == "hold")}</td>'
             f'<td class="num">{r["buyer_count"]}</td><td class="num">{r["stats"]["non_terminal_count"] or "—"}</td>'
-            f'<td>{_overview_deadline_html(r, key, view_as)}</td>'
+            f'<td>{_overview_deadline_html(r, key, view_as, edit_mode=edit_mode)}</td>'
             f'<td class="ov-actions">{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], stacked=True, public=_deal_is_public(r["deal"]))}</td></tr>'
             for r in live_rows[:OVERVIEW_LIST_LIMIT])
         open_table = (('<table class="ov-table"><thead><tr><th>Deal</th><th>Status</th>'
