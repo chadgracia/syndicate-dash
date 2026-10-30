@@ -11129,6 +11129,326 @@ check("tenant picker hrefFor: only 'key' carried over from the current URL",
       and "window.location.origin + window.location.pathname" in _hf_fn
       and not any(f"'{p}'" in _hf_fn for p in ("company", "ref", "buyer", "photo", "edit", "debug")))
 
+# ======================================================================
+# Compare SPV offerings (?view=compare)
+# ======================================================================
+check("compare math: 4/0/0 at 5x/5yrs -> 4.80x", f"{lf.compare_net_multiple(4, 0, 0, 5, 5):.2f}" == "4.80")
+check("compare math: 7/0/15 at 5x/5yrs -> 4.10x", f"{lf.compare_net_multiple(7, 0, 15, 5, 5):.2f}" == "4.10")
+check("compare math: 4/0/0 at 2x -> 1.92x", f"{lf.compare_net_multiple(4, 0, 0, 2, 5):.2f}" == "1.92")
+check("compare math: 7/0/15 at 2x -> 1.73x", f"{lf.compare_net_multiple(7, 0, 15, 2, 5):.2f}" == "1.73")
+check("compare math: mgmt 2%/yr x 5 yrs at 5x, no fees otherwise -> (500-10-0)/100 = 4.90x",
+      abs(lf.compare_net_multiple(0, 2, 0, 5, 5) - 4.90) < 1e-9)
+check("compare math: blank fees = 0; carry never applies to a loss",
+      lf.compare_net_multiple(None, None, None, 2, 3) == 2.0
+      and abs(lf.compare_net_multiple(0, 0, 20, 1, 1) - 1.0) < 1e-9)
+check("compare math: row at 2x the reference valuation halves the exit; blank row valuation = reference",
+      abs(lf.compare_net_multiple(0, 0, 0, 5, 5, 5.0, 10.0) - 2.5) < 1e-9
+      and lf.compare_net_multiple(0, 0, 0, 5, 5, 5.0, None) == 5.0)
+check("compare ref valuation: most common, ties -> lowest, blanks/zeros ignored",
+      lf.compare_ref_valuation([5.0, 5.0, 8.0, None, 0]) == 5.0
+      and lf.compare_ref_valuation([8.0, 3.0]) == 3.0 and lf.compare_ref_valuation([None, 0]) is None)
+
+CMP_SELLER = "cmp-seller@example.com"
+CMP_OTHER = "cmp-other@example.com"
+CMP_BUYER = "cmp-buyer@example.org"
+_cmp_people = {"people": [
+    {"id": 501, "full_name": "Sally Seller", "email": CMP_SELLER, "company_id": 9001, "company_name": "Alpha Capital",
+     "custom_fields": {}},
+    {"id": 502, "full_name": "Otto Other", "email": CMP_OTHER, "company_id": 9002, "company_name": "Beta Partners",
+     "custom_fields": {}},
+    {"id": 503, "full_name": "Bea Buyer", "email": CMP_BUYER, "company_id": 9003, "company_name": "Buyer LLC",
+     "custom_fields": {}}]}
+
+
+def _cmp_deal(did, company, cid, pid, stage, extra):
+    cf = {lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID]}
+    cf.update(extra)
+    return {"id": did, "name": f"{company} deal {did}", "company": {"id": cid, "name": company},
+            "deal_stage": {"id": stage}, "custom_fields": cf_sell(cf), "people": [{"id": pid}],
+            "value": 99999, "value_in_cents": 9999900, "updated_at": "2026/10/20 09:00:00 -0400"}
+
+
+_cmp_d1 = _cmp_deal(6001, "Varda Space", 7001, 501, lf.STAGE_FIRM,
+                    {lf.SELLER_FEE_FIELD: 4, lf.MGMT_FEE_FIELD: 0, lf.CARRY_FIELD: 0, lf.EST_VAL_FIELD: 5.0,
+                     lf.NET_FIELD: 30, lf.GROSS_FIELD: 33, lf.SELLER_ROLE_FIELD: [7000231],
+                     lf.SHARE_CLASS_FIELD: [5077834], lf.EXEMPTION_FIELD: [7200028],
+                     lf.TICKET_MIN_FIELD: 100000, lf.TICKET_MAX_FIELD: 2000000})
+_cmp_d2 = _cmp_deal(6002, "Varda Space", 7001, 502, lf.STAGE_INQUIRY,
+                    {lf.SELLER_FEE_FIELD: 7, lf.MGMT_FEE_FIELD: 0, lf.CARRY_FIELD: 15, lf.EST_VAL_FIELD: 5.0,
+                     lf.LAYERS_FIELD: [7000229], lf.NET_FIELD: 31, lf.GROSS_FIELD: 34})
+_cmp_hold = _cmp_deal(6003, "Varda Space", 7001, 502, lf.STAGE_HOLD, {lf.SELLER_FEE_FIELD: 1})
+_cmp_direct = _cmp_deal(6004, "Varda Space", 7001, 502, lf.STAGE_FIRM, {lf.STRUCTURE_FIELD: [6250090]})
+_cmp_noval = _cmp_deal(6005, "Varda Space", 7001, 502, lf.STAGE_MATCHED,
+                       {lf.SELLER_ROLE_FIELD: [lf.SR_NEW_ALLOCATION_ID]})
+_cmp_restr1 = _cmp_deal(6006, "Secret Co", 7002, 502, lf.STAGE_FIRM, {})
+_cmp_restr2 = _cmp_deal(6007, "Secret Co", 7002, 501, lf.STAGE_FIRM, {})
+_cmp_public = _cmp_deal(6008, "Pubco$", 7003, 502, lf.STAGE_FIRM, {})
+_cmp_solo = _cmp_deal(6009, "Solo Co", 7004, 501, lf.STAGE_FIRM, {})
+_cmp_fresh_d2 = json.loads(json.dumps(_cmp_d2))
+_cmp_fresh_d2["custom_fields"][lf.SELLER_FEE_FIELD] = 6
+_cmp_fresh_d2["updated_at"] = "2026/10/29 09:00:00 -0400"
+
+
+class FakeS3List(FakeS3):
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        return {"Contents": [{"Key": k, "LastModified": datetime.now(timezone.utc)}
+                             for k in sorted(self.objs) if k.startswith(Prefix)], "IsTruncated": False}
+
+
+def _cmp_fixture():
+    objs = {"people.json": _cmp_people, "interest_people.json": {"buy": {}},
+            "companies.json": {"companies": [{"id": 7002, "name": "Secret Co", "custom_fields": {
+                lf.RMS_RESTRICTED_FIELD: [lf.RMS_RESTRICTED_ID]}}]},
+            "deals.json": {"deals": [_cmp_d1, _cmp_d2, _cmp_hold, _cmp_direct, _cmp_noval, _cmp_restr1,
+                                     _cmp_restr2, _cmp_public, _cmp_solo]},
+            "deal-fresh/6002.json": {"fetched_at": "2026-10-29T13:00:00+00:00", "deal": _cmp_fresh_d2}}
+    s3, table = use_fixture(objs, ses=FakeSES())
+    s3 = FakeS3List(objs)
+    FakeBoto3.S3 = s3
+    reset_caches()
+    return s3, table
+
+
+def _cmp_get(query, cookies=None):
+    lf._req_cache_reset()
+    return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": query, "cookies": cookies or []}, None)
+
+
+_cmp_s3, _cmp_table = _cmp_fixture()
+_cmp_admin_idx = _cmp_get({"key": ADMIN_KEY, "view": "compare"})["body"]
+check("compare index (admin): Varda Space with 4 offerings (Hold included), searchable",
+      "Varda Space" in _cmp_admin_idx and "4 offerings" in _cmp_admin_idx and 'id="cmp-search"' in _cmp_admin_idx)
+check("compare index: RMS Restricted and public ($) companies excluded; Direct deal not counted",
+      "Secret Co" not in _cmp_admin_idx and "Pubco" not in _cmp_admin_idx)
+_cmp_ten_idx = _cmp_get({"view": "compare"}, [tenant_cookie(CMP_SELLER)])["body"]
+check("compare index (tenant): Hold excluded -> 3 offerings; Solo Co '1 offering'; company link by id",
+      "3 offerings" in _cmp_ten_idx and "1 offering<" in _cmp_ten_idx
+      and "?view=compare&amp;company=7001" in _cmp_ten_idx)
+check("compare: nav carries the 'Compare SPVs' tab, active on this view",
+      '<a class="gg-tab active" href="?view=compare">Compare SPVs</a>' in _cmp_ten_idx)
+
+# Access gating: a non-tenant identity may open ONLY this view.
+_cmp_buyer_ck = [tenant_cookie(CMP_BUYER)]
+_cmp_b_idx = _cmp_get({"view": "compare"}, _cmp_buyer_ck)
+_cmp_b_page = _cmp_get({"view": "compare", "company": "7001"}, _cmp_buyer_ck)
+check("compare gating: non-tenant identity can open the index and company view (200)",
+      _cmp_b_idx["statusCode"] == 200 and "Varda Space" in _cmp_b_idx["body"]
+      and _cmp_b_page["statusCode"] == 200 and "Varda Space SPV offerings" in _cmp_b_page["body"])
+for _q in ({"tab": "overview"}, {"tab": "mydeals"}, {"tab": "demand"}, {"company": "Varda Space"}, {"buyer": "501"}):
+    _r = _cmp_get(_q, _cmp_buyer_ck)
+    check(f"compare gating: non-tenant identity still gets Not enabled on {_q}",
+          "Not enabled" in _r["body"] and "cmp-table" not in _r["body"] and "Offering A" not in _r["body"])
+_cmp_anon = _cmp_get({"view": "compare", "company": "7001"})
+check("compare gating: unidentified visitor -> existing sign-in prompt (403), returning to the compare view",
+      _cmp_anon["statusCode"] == 403 and "Sign in to your dashboard" in _cmp_anon["body"]
+      and "cmp-table" not in _cmp_anon["body"]
+      and lf._compare_return_qs({"view": "compare", "company": "7001"}) == "?view=compare&company=7001"
+      and lf._compare_return_qs({"tab": "demand"}) == "?tab=overview")
+_cmp_sso = lf._make_handoff_token(CMP_BUYER)
+if True:
+    _r = _cmp_get({"sso": _cmp_sso, "view": "compare", "company": "7001"})
+    check("compare: ?sso= handoff redirect keeps view=compare&company",
+          _r["statusCode"] == 302 and "view=compare" in _r["headers"]["Location"]
+          and "company=7001" in _r["headers"]["Location"])
+
+# Buyer view: anonymous, gross price, read-only, commission nudge.
+_cb = _cmp_b_page["body"]
+check("compare buyer view: rows labelled Offering A/B/C, no 'Your offering', no edit controls",
+      all(f">Offering {c}<" in _cb for c in "ABC") and ">Your offering<" not in _cb
+      and 'class="cmp-edit-btn"' not in _cb)
+check("compare buyer view: no deal ids, firm/person names, emails or deal value",
+      not any(s in _cb for s in ("6001", "6002", "6005", "Alpha Capital", "Beta Partners", "Sally", "Otto",
+                                 "@example.com", "99999", "Pipeline #", 'data-deal-id="', "data-key=")))
+check("compare buyer view: gross price shown, never net",
+      "$33.00" in _cb and "$30.00" not in _cb and "$31.00" not in _cb)
+check("compare buyer view: commission nudge with the tiers link, no commission figures",
+      "Chad's commission is charged on top of the offering terms. Gold and Platinum clients receive 15–20% off commission"
+      in _cb and 'href="https://desk.graciagroup.com/?view=commission-tiers"' in _cb)
+check("compare buyer view: Hold row hidden", ">Hold<" not in _cb and "6003" not in _cb)
+check("compare: Direct deal never listed; new allocation without valuation shows 'Not provided' + assumed note",
+      "Not provided" in _cb and "valuation assumed" in _cb)
+check("compare: fresh-copy overlay wins (offering 6002 upfront 7% -> 6% from deal-fresh)",
+      'data-upfront="6.0"' in _cb or 'data-upfront="6"' in _cb)
+check("compare: default sort = net multiple desc (5.00x, 4.80x, 4.14x), layers + labels rendered",
+      _cb.index(">5.00x<") < _cb.index(">4.80x<") < _cb.index(">4.14x<") and "2-Layer" in _cb and "Preferred" in _cb
+      and "3(c)(7)" in _cb and "GP — selling own units" in _cb and "Updated " in _cb)
+
+# Tenant view: own row highlighted + editable; others anonymous.
+_ct = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+check("compare tenant view: own firm row = 'Your offering' (highlighted) with a rank line",
+      _ct.count(">Your offering<") == 1 and 'class="cmp-own"' in _ct
+      and "Your offering ranks #2 of 3 at this outcome." in _ct)
+check("compare tenant view: net price (not gross), other sellers anonymous, no value",
+      "$30.00" in _ct and "$33.00" not in _ct and "Beta Partners" not in _ct and "6002" not in _ct
+      and "6005" not in _ct and "99999" not in _ct and "Otto" not in _ct)
+check("compare tenant view: edit controls only on own row (3 fee cells), own deal id only",
+      _ct.count('class="cmp-edit-btn"') == 3 and 'data-deal-id="6001"' in _ct and _ct.count("data-deal-id=") == 1)
+check("compare tenant view: Hold hidden, no buyer nudge", ">Hold<" not in _ct and "commission-tiers" not in _ct)
+
+# Admin: everything incl. Hold, firm names, Pipeline links.
+_ca = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+check("compare admin view: Hold row labelled, firm names and Pipeline links",
+      ">Hold<" in _ca and "Beta Partners" in _ca and "Alpha Capital" in _ca
+      and "https://app.pipelinecrm.com/deals/6003" in _ca and "99999" not in _ca)
+_cv = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "Varda Space", "view_as": CMP_SELLER})["body"]
+check("compare admin Tenant-view preview (&view_as): tenant view, company resolved by name, impersonated edits",
+      ">Your offering<" in _cv and ">Hold<" not in _cv and "Beta Partners" not in _cv[_cv.index('id="cmp-table"'):]
+      and f'data-view-as="{CMP_SELLER}"' in _cv)
+_cvb = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_BUYER})["body"]
+check("compare admin preview of a non-tenant email = buyer view",
+      "commission-tiers" in _cvb and 'class="cmp-edit-btn"' not in _cvb and ">Hold<" not in _cvb)
+
+# Entry points.
+check("compare entry: 'Compare all 3 Varda Space offerings' (non-Hold count) linking to the company view",
+      lf._compare_entry_html(_cmp_d1) == '<a class="cmp-entry-btn" href="?view=compare&amp;company=7001">'
+                                         'Compare all 3 Varda Space offerings</a>')
+check("compare entry: hidden when the company has fewer than 2 offerings", lf._compare_entry_html(_cmp_solo) == "")
+_cmd = _cmp_get({"tab": "mydeals"}, [tenant_cookie(CMP_SELLER)])["body"]
+check("compare entry: My Deals row shows the button for Varda, not Solo Co",
+      "Compare all 3 Varda Space offerings" in _cmd and "Solo Co offerings" not in _cmd)
+_ccp = _cmp_get({"company": "Varda Space"}, [tenant_cookie(CMP_SELLER)])["body"]
+check("compare entry: company page Deal Details card shows the button",
+      "Compare all 3 Varda Space offerings" in _ccp)
+
+# Inline fee edits.
+_cmp_pipe = []
+_cmp_put_fail = {"on": False}
+
+
+class _CmpResp:
+    def __init__(self, status, payload):
+        self.status, self.payload = status, payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode()
+
+
+def _cmp_urlopen(req, timeout=15):
+    m = re.search(r"/deals/(\d+)\.json", req.full_url)
+    did = m.group(1) if m else ""
+    method = req.get_method()
+    _cmp_pipe.append({"method": method, "id": did, "data": json.loads(req.data.decode()) if req.data else None})
+    if method == "PUT":
+        if _cmp_put_fail["on"]:
+            raise lf.urllib.error.HTTPError(req.full_url, 502, "boom", {}, None)
+        src = next(d for d in _cmp_live if str(d["id"]) == did)
+        src["custom_fields"].update(_cmp_pipe[-1]["data"]["deal"]["custom_fields"])
+        return _CmpResp(200, {})
+    src = next(d for d in _cmp_live if str(d["id"]) == did)
+    return _CmpResp(200, src)
+
+
+_cmp_live = [json.loads(json.dumps(d)) for d in (_cmp_d1, _cmp_d2, _cmp_hold)]
+lf.urllib.request.urlopen = _cmp_urlopen
+
+
+def _cmp_post(body, email=CMP_SELLER):
+    lf._req_cache_reset()
+    return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": "compare_fee"},
+                              "cookies": [tenant_cookie(email)] if email else [], "body": json.dumps(body)}, None)
+
+
+ses_calls.clear()
+_r = _cmp_post({"deal_id": "6001", "field": "upfront", "value": 5})
+check("compare fee: increase refused (409) with the Update deal link, no Pipeline write",
+      _r["statusCode"] == 409 and json.loads(_r["body"])["error"] == "To raise fees, use Update deal"
+      and "desk.graciagroup.com/update/?deal_id=6001" in json.loads(_r["body"])["update_url"]
+      and not any(c["method"] == "PUT" for c in _cmp_pipe) and not ses_calls)
+_cmp_pipe.clear(); _cmp_table.puts.clear(); _cmp_s3.put_calls.clear()
+_r = _cmp_post({"deal_id": "6001", "field": "upfront", "value": "3"})
+check("compare fee: decrease saves -> 200, ONE Pipeline PUT of only that field",
+      _r["statusCode"] == 200 and json.loads(_r["body"]).get("value") == 3.0
+      and [c for c in _cmp_pipe if c["method"] == "PUT"] == [
+          {"method": "PUT", "id": "6001", "data": {"deal": {"custom_fields": {lf.SELLER_FEE_FIELD: 3.0}}}}])
+check("compare fee: Dynamo audit (actor = authenticated email, old 4 -> new 3)",
+      len(_cmp_table.puts) == 1 and _cmp_table.puts[0]["actor"] == CMP_SELLER
+      and _cmp_table.puts[0]["sk"].startswith("audit#6001#")
+      and _cmp_table.puts[0]["old"] == {"upfront": lf.Decimal("4.0")}
+      and _cmp_table.puts[0]["new"] == {"upfront": lf.Decimal("3.0")})
+check("compare fee: deal-fresh overlay written with the new value",
+      [c["Key"] for c in _cmp_s3.put_calls] == ["deal-fresh/6001.json"]
+      and _cmp_s3.objs["deal-fresh/6001.json"]["deal"]["custom_fields"][lf.SELLER_FEE_FIELD] == 3.0
+      and "fetched_at" in _cmp_s3.objs["deal-fresh/6001.json"])
+check("compare fee: Chad emailed '<firm> lowered <company> upfront fee from 4% to 3%'",
+      len(ses_calls) == 1 and ses_calls[0]["Destination"]["ToAddresses"] == ["cgracia@rainmakersecurities.com"]
+      and "Alpha Capital lowered Varda Space upfront fee from 4% to 3%" in ses_calls[0]["Message"]["Body"]["Text"]["Data"])
+_ct2 = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+check("compare fee: the page reflects the saved value at once (overlay)", 'data-upfront="3.0"' in _ct2)
+_cmp_pipe.clear(); ses_calls.clear(); _cmp_table.puts.clear()
+_r_other = _cmp_post({"deal_id": "6002", "field": "upfront", "value": 1})
+_r_buyer = _cmp_post({"deal_id": "6001", "field": "upfront", "value": 1}, email=CMP_BUYER)
+_r_anon = _cmp_post({"deal_id": "6001", "field": "upfront", "value": 1}, email=None)
+_r_extra = _cmp_post({"deal_id": "6001", "field": "upfront", "value": 1, "carry": 0})
+check("compare fee: another firm's offering 403; buyer, anonymous and extra-key posts 403; nothing written",
+      _r_other["statusCode"] == 403 and _r_buyer["statusCode"] == 403 and _r_anon["statusCode"] == 403
+      and _r_extra["statusCode"] == 403 and not any(c["method"] == "PUT" for c in _cmp_pipe)
+      and not _cmp_table.puts and not ses_calls)
+_r_bad = _cmp_post({"deal_id": "6001", "field": "partner", "value": 1})
+_r_badv = _cmp_post({"deal_id": "6001", "field": "carry", "value": "abc"})
+check("compare fee: unknown field / bad value -> 400", _r_bad["statusCode"] == 400 and _r_badv["statusCode"] == 400)
+_cmp_put_fail["on"] = True
+_cmp_table.puts.clear(); _cmp_s3.put_calls.clear()
+_r = _cmp_post({"deal_id": "6001", "field": "mgmt", "value": 0}, email=CMP_SELLER)
+check("compare fee: setting a blank... (mgmt 0 == 0) is a no-op 200 without a PUT",
+      _r["statusCode"] == 200 and json.loads(_r["body"]).get("unchanged") is True)
+_r = _cmp_post({"deal_id": "6001", "field": "upfront", "value": 2})
+check("compare fee: Pipeline PUT failure -> 502, no audit, no overlay, no email",
+      _r["statusCode"] == 502 and not _cmp_table.puts and not _cmp_s3.put_calls and not ses_calls)
+_cmp_put_fail["on"] = False
+_cmp_live[0]["custom_fields"].pop(lf.CARRY_FIELD, None)
+ses_calls.clear()
+_r = _cmp_post({"deal_id": "6001", "field": "carry", "value": 10})
+check("compare fee: setting a blank fee to a number saves", _r["statusCode"] == 200 and len(ses_calls) == 1)
+ses_calls.clear(); _cmp_table.puts.clear()
+lf._req_cache_reset()
+_r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                        "queryStringParameters": {"action": "compare_fee"},
+                        "body": json.dumps({"key": ADMIN_KEY, "deal_id": "6002", "field": "carry", "value": 10})}, None)
+check("compare fee: admin may lower any offering; audited as admin, no email",
+      _r["statusCode"] == 200 and _cmp_table.puts[-1]["actor"] == "admin" and not ses_calls)
+_r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                        "queryStringParameters": {"action": "compare_fee"},
+                        "body": json.dumps({"key": ADMIN_KEY, "deal_id": "6002", "field": "carry", "value": 12})}, None)
+check("compare fee: admin increase also refused inline (409)", _r["statusCode"] == 409)
+ses_calls.clear(); _cmp_table.puts.clear()
+lf._req_cache_reset()
+_r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                        "queryStringParameters": {"action": "compare_fee"},
+                        "body": json.dumps({"key": ADMIN_KEY, "view_as": CMP_SELLER, "deal_id": "6001",
+                                            "field": "upfront", "value": 2})}, None)
+check("compare fee: admin Tenant-view save runs as the tenant, audited 'cgracia@… (as <tenant>)', no email",
+      _r["statusCode"] == 200 and not ses_calls
+      and _cmp_table.puts[-1]["actor"] == f"cgracia@rainmakersecurities.com (as {CMP_SELLER})")
+lf._req_cache_reset()
+_r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                        "queryStringParameters": {"action": "compare_fee"},
+                        "body": json.dumps({"key": ADMIN_KEY, "view_as": CMP_SELLER, "deal_id": "6002",
+                                            "field": "upfront", "value": 1})}, None)
+check("compare fee: admin Tenant-view cannot lower another firm's offering (403)", _r["statusCode"] == 403)
+check("compare entry button styled on every nav page (shared NAV_CSS)", ".cmp-entry-btn {" in lf.NAV_CSS)
+_r = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                        "queryStringParameters": {"action": "compare_fee"}}, None)
+check("compare fee: GET -> 405", _r["statusCode"] == 405)
+
+# Fail soft.
+_cmp_saved_off = lf._compare_offerings
+lf._compare_offerings = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 down"))
+_r = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])
+_r2 = _cmp_get({"view": "compare"}, [tenant_cookie(CMP_BUYER)])
+check("compare: data failure -> 'Offerings are being updated — please check back shortly.' (company + index)",
+      _r["statusCode"] == 200 and "Offerings are being updated — please check back shortly." in _r["body"]
+      and "Offerings are being updated — please check back shortly." in _r2["body"])
+check("compare: data failure never breaks the My Deals entry point", lf._compare_entry_html(_cmp_d1) == "")
+lf._compare_offerings = _cmp_saved_off
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)

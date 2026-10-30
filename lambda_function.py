@@ -158,6 +158,7 @@ def _req_cache_reset():
     _req_cache["manual_intro_calls"] = {}
     _req_cache["aggregate_scan"] = None
     _req_cache["standing"] = None
+    _req_cache["compare"] = {}
 
 
 def _perf_start(page):
@@ -1907,7 +1908,18 @@ def _signin_login_url(dest=None):
             f"&redirect_uri={COGNITO_REDIRECT_URI}&state={urllib.parse.quote(state, safe='')}")
 
 
-def _signin_page(base_url=None):
+def _compare_return_qs(query):
+    """Sign-in return path: the compare view comes back to itself, every
+    other route to Overview (unchanged)."""
+    if query.get("view") != "compare":
+        return "?tab=overview"
+    qs = "?view=compare"
+    if query.get("company"):
+        qs += f"&company={urllib.parse.quote(str(query['company']), safe='')}"
+    return qs
+
+
+def _signin_page(base_url=None, return_qs="?tab=overview"):
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1929,7 +1941,7 @@ def _signin_page(base_url=None):
 <body>
 <div class="gg-card">
   <h1>Sign in to your dashboard</h1>
-  <a class="gg-signin-btn" href="{_esc(_signin_login_url(f"{base_url or PUBLIC_BASE_URL}/?tab=overview"))}">Sign in</a>
+  <a class="gg-signin-btn" href="{_esc(_signin_login_url(f"{base_url or PUBLIC_BASE_URL}/{return_qs}"))}">Sign in</a>
 </div>
 </body>
 </html>"""
@@ -8516,7 +8528,7 @@ def _dc_cell_html(label, value_html, extra_cls="", label_extra_html=""):
 
 def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwork=None, reopen_html="",
                     tenant_deadline_edit=False, impersonation_key=None, impersonation_view_as=None,
-                    admin_key=None):
+                    admin_key=None, compare_html=""):
     """override_entry is this deal's Dynamo intro item (from
     get_intro_details, keyed by the deal's own linked tenant — see
     render_company_page), used to resolve any deadline_override. edit_mode
@@ -8682,6 +8694,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
       {per_share_html}
       {badge_html}
       {footer_html}
+      {compare_html if not (is_closed or is_public) else ""}
     </div>"""
 
 
@@ -10225,6 +10238,11 @@ NAV_CSS = """
   .ei-msg.saving { color: var(--muted); }
   .ei-msg.saved { color: var(--qp); }
   .ei-msg.error { color: #b23b3b; }
+  /* "Compare all N <Company> offerings" (My Deals rows, Deal Details card). */
+  .cmp-entry-btn { display: inline-block; margin-top: 8px; padding: 5px 12px; border-radius: 9999px;
+                   background: #3d5a73; color: #fff !important; font-size: 12px; font-weight: 600;
+                   line-height: 1.3; text-decoration: none; }
+  .cmp-entry-btn:hover { opacity: 0.9; text-decoration: none; }
 """
 
 # Shared click-driven dropdown helper -- the ONE toggle/close/keyboard
@@ -10580,6 +10598,8 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     mydeals_cls = "gg-tab active" if active_tab == "mydeals" else "gg-tab"
     intros_cls = "gg-tab active" if active_tab == "intros" else "gg-tab"
     demand_cls = "gg-tab active" if active_tab == "demand" else "gg-tab"
+    compare_href = f"?view=compare{suffix}"
+    compare_cls = "gg-tab active" if active_tab == "compare" else "gg-tab"
     # Admin-only "Research gaps" tab (never in tenant sessions or the
     # Tenant-view preview): links the read-only ?view=research_gaps page.
     research_tab_html = ""
@@ -10761,6 +10781,7 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
       </div>
       <a class="{intros_cls}" href="{intros_href}">Active Intros</a>
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
+      <a class="{compare_cls}" href="{compare_href}">Compare SPVs</a>
       {watchlist_tab_html}
       {research_tab_html}
     </nav>
@@ -12031,8 +12052,10 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
                     f'<div class="actions-stack">{_deal_action_html(deal_id, resolved_stage, stacked=True, public=_deal_is_public(deal))}</div>')
 
 
+    compare_html = "" if archived else _compare_entry_html(deal, key=key, view_as=view_as)
+
     return (
-        f'<tr data-deal-id="{_esc(deal_id)}"><td class="company">{company_link}{deal_id_sub}{via_html}</td>'
+        f'<tr data-deal-id="{_esc(deal_id)}"><td class="company">{company_link}{deal_id_sub}{via_html}{compare_html}</td>'
         f'<td>{badge_html}{per_share_html}</td>'
         f'<td>{created_html}</td>'
         f'<td class="num">{buyer_text}</td>'
@@ -13500,7 +13523,8 @@ def render_company_page(company, viewer_name, tenant, anon_key_email, ref, key=N
                                                       tenant_deadline_edit=tenant_view,
                                                       impersonation_key=(key if impersonating else None),
                                                       impersonation_view_as=(view_as if impersonating else None),
-                                                      admin_key=(key if edit_mode else None)))
+                                                      admin_key=(key if edit_mode else None),
+                                                      compare_html=_compare_entry_html(d, key=key, view_as=view_as)))
             deals_body = "".join(live_cards)
             if 'class="dc-dl-edit"' in deals_body:
                 deals_body += TENANT_DEADLINE_SCRIPT
@@ -19782,6 +19806,865 @@ WELCOME_CTA_URL = "https://trades.graciagroup.com/"
 WELCOME_CTA_LABEL = "While you wait, explore what's trading now →"
 
 
+# ── Compare SPV offerings (?view=compare) ────────────────────────────────
+# Role-gated comparison of every live SPV/Fund SELL deal per company.
+# Admin (key) sees everything incl. Hold rows, firm names and Pipeline
+# links; tenants see anonymous "Offering A/B/…" rows plus their own
+# firm's rows as "Your offering" (fee decreases editable inline); any
+# signed-in identity (gg_id / ?sso=) may open this view as a buyer --
+# the ONLY view a non-tenant identity may open. Never shown to a
+# non-admin: deal value (commission), other rows' deal ids, person or
+# firm names, emails.
+COMPARE_LIVE_STAGE_IDS = frozenset({STAGE_INQUIRY, STAGE_FIRM, STAGE_MATCHED, STAGE_CONFIRM})
+COMPARE_LAYER_LABELS = {7000228: "L1 SPV on cap table", 7000229: "2-Layer", 7000230: "3-Layer"}
+# Seller Role / Share Class option labels -- verbatim from
+# chadgracia/deal-update-form (_SR_LABELS / its Share class map).
+COMPARE_SELLER_ROLE_LABELS = {
+    7020357: "GP — syndicating new allocation", 7000232: "GP — facilitating LP sale",
+    7000231: "GP — selling own units", 7205050: "GP — selling entire SPV",
+    7000233: "LP — GP consent obtained", 7000234: "LP — GP consent needed", 7000235: "LP — platform holder",
+}
+COMPARE_SHARE_CLASS_LABELS = {5077831: "Common", 5077834: "Preferred", 5077912: "Mixed", 5077915: "Any"}
+COMPARE_OUTCOMES = (2, 5, 10)
+COMPARE_DEFAULT_OUTCOME = 5
+COMPARE_DEFAULT_YEARS = 5
+COMPARE_FEE_FIELDS = {"upfront": SELLER_FEE_FIELD, "mgmt": MGMT_FEE_FIELD, "carry": CARRY_FIELD}
+COMPARE_FEE_LABELS = {"upfront": "upfront fee", "mgmt": "management fee", "carry": "carry"}
+COMPARE_UNAVAILABLE_MSG = "Offerings are being updated — please check back shortly."
+COMPARE_RAISE_MSG = "To raise fees, use Update deal"
+COMMISSION_TIERS_URL = "https://desk.graciagroup.com/?view=commission-tiers"
+COMPARE_BUYER_NUDGE_HTML = (
+    "Chad's commission is charged on top of the offering terms. Gold and Platinum clients receive "
+    f'15–20% off commission — <a href="{COMMISSION_TIERS_URL}">see your standing</a>')
+
+# deal-fresh overlay: chadgracia/deal-update-form's publish_fresh_deal writes
+# s3://full-pipeline-cache/deal-fresh/<deal_id>.json = {"fetched_at", "deal"}
+# after every Pipeline write; this view (and the fee edit below) reads and
+# writes the same shape so a seller's change shows before the hourly
+# deals.json refresh.
+DEAL_FRESH_PREFIX = "deal-fresh/"
+DEAL_FRESH_FALLBACK_MAX = 60       # per-key GETs when the prefix can't be listed
+DEAL_FRESH_SNAPSHOT_SLACK_SECONDS = OVERRIDE_REFRESH_GRACE_SECONDS
+
+
+def compare_net_multiple(upfront_pct, mgmt_pct, carry_pct, outcome, years, ref_valuation=None, row_valuation=None):
+    """Net multiple per $100 committed (Chad's commission excluded -- it is
+    charged on top of every trade at the same tier). Percents are whole
+    numbers (4 = 4%), blank = 0. A row with no valuation uses the
+    reference valuation (ratio 1)."""
+    up = (upfront_pct or 0) / 100.0
+    mg = (mgmt_pct or 0) / 100.0
+    ca = (carry_pct or 0) / 100.0
+    ratio = 1.0
+    if ref_valuation and row_valuation and ref_valuation > 0 and row_valuation > 0:
+        ratio = ref_valuation / row_valuation
+    shares = 100.0 * (1 - up)
+    exit_value = shares * outcome * ratio
+    mgmt = 100.0 * mg * years
+    profit = exit_value - mgmt - 100.0
+    carry = ca * max(profit, 0.0)
+    return (exit_value - mgmt - carry) / 100.0
+
+
+def compare_ref_valuation(valuations):
+    """The most common positive valuation (ties -> lowest), else None."""
+    counts = {}
+    for v in valuations:
+        if v is not None and v > 0:
+            counts[v] = counts.get(v, 0) + 1
+    if not counts:
+        return None
+    best = max(counts.values())
+    return min(v for v, n in counts.items() if n == best)
+
+
+def _deal_company_id(deal):
+    cid = deal.get("company_id")
+    if cid in (None, ""):
+        company = deal.get("company")
+        cid = company.get("id") if isinstance(company, dict) else None
+    return None if cid in (None, "") else str(cid)
+
+
+def _compare_company_key(deal):
+    return _deal_company_id(deal) or "name:" + (_deal_company_name(deal) or "").strip().lower()
+
+
+def _compare_qualifies(deal, include_hold=False, restricted=frozenset()):
+    """Live SPV/Fund SELL deal (Hold only when include_hold), not a public
+    ("$") company, not RMS Restricted (_rms_restricted_company_keys)."""
+    if not isinstance(deal, dict) or deal.get("is_archived") or not _deal_is_sell(deal):
+        return False
+    sid = _deal_stage_id(deal)
+    if sid not in COMPARE_LIVE_STAGE_IDS and not (include_hold and sid == STAGE_HOLD):
+        return False
+    if not (_deal_is_spv(deal) or _deal_cf_option_ids(deal, LAYERS_FIELD) & set(COMPARE_LAYER_LABELS)):
+        return False
+    name = (_deal_company_name(deal) or "").strip()
+    return bool(name) and not _is_public_company(name) and name.lower() not in restricted
+
+
+def _deal_fresh_read(s3, key):
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+        data = json.loads(obj["Body"].read())
+    except Exception as e:
+        if "NoSuchKey" not in f"{type(e).__name__}: {e}":
+            print(f"deal-fresh: read {key} failed: {type(e).__name__}: {e}")
+        return None
+    deal = data.get("deal") if isinstance(data, dict) else None
+    if isinstance(deal, dict) and isinstance(deal.get("deal"), dict):
+        deal = deal["deal"]
+    return deal if isinstance(deal, dict) and deal.get("id") is not None else None
+
+
+def _deal_fresh_overlays(candidate_ids=()):
+    """{deal id: fresh deal} from deal-fresh/ objects written since the
+    current deals.json (one LIST, then parallel GETs of only the newer
+    keys). LIST unavailable -> per-key GETs of candidate_ids (at most
+    DEAL_FRESH_FALLBACK_MAX). Fails soft to {}. Memoized per request."""
+    memo = _req_cache.setdefault("compare", {})
+    if "fresh" in memo:
+        return memo["fresh"]
+    s3 = _s3_client()
+    keys = None
+    try:
+        snap_lm = _s3_last_modified.get(DEALS_KEY)
+        cutoff = snap_lm.timestamp() - DEAL_FRESH_SNAPSHOT_SLACK_SECONDS if snap_lm is not None else None
+        keys, token = [], None
+        with _perf_timer("s3_deal_fresh"):
+            while True:
+                kw = {"Bucket": BUCKET, "Prefix": DEAL_FRESH_PREFIX}
+                if token:
+                    kw["ContinuationToken"] = token
+                resp = s3.list_objects_v2(**kw)
+                for o in resp.get("Contents") or []:
+                    lm = o.get("LastModified")
+                    if cutoff is None or lm is None or lm.timestamp() >= cutoff:
+                        keys.append(o["Key"])
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")
+    except Exception as e:
+        print(f"deal-fresh: list failed ({type(e).__name__}: {e}); per-deal reads")
+        ids = [str(i) for i in candidate_ids][:DEAL_FRESH_FALLBACK_MAX]
+        keys = [f"{DEAL_FRESH_PREFIX}{i}.json" for i in ids]
+    out = {}
+    if keys:
+        _perf_count("s3_deal_fresh_get")
+        with _perf_timer("s3_deal_fresh"):
+            if len(keys) == 1:
+                results = [_deal_fresh_read(s3, keys[0])]
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(keys))) as pool:
+                    results = list(pool.map(lambda k: _deal_fresh_read(s3, k), keys))
+        for deal in results:
+            if deal is not None:
+                out[str(deal["id"])] = deal
+    memo["fresh"] = out
+    return out
+
+
+def _merge_deal_fresh(deals, overlays):
+    """Snapshot deals with each fresh copy swapped in when its Pipeline
+    updated_at is at/after the snapshot's (or the snapshot lacks the
+    deal, e.g. a just-created New Order)."""
+    by_id = {str(d.get("id")): d for d in deals if isinstance(d, dict)}
+    for did, fresh in overlays.items():
+        snap = by_id.get(did)
+        if snap is None:
+            by_id[did] = fresh
+            continue
+        f_ts = _parse_pipeline_ts(fresh.get("updated_at"))
+        s_ts = _parse_pipeline_ts(snap.get("updated_at"))
+        if f_ts is not None and (s_ts is None or f_ts >= s_ts):
+            by_id[did] = fresh
+    return list(by_id.values())
+
+
+def _compare_offerings(include_hold, use_overlay=True):
+    """{company key: {"company", "company_id", "deals": [...]}} over every
+    qualifying offering, deals sorted by id. Memoized per request."""
+    memo = _req_cache.setdefault("compare", {})
+    mkey = ("offerings", bool(include_hold), bool(use_overlay))
+    if mkey in memo:
+        return memo[mkey]
+    deals = _get_live_deals_list()
+    restricted = _rms_restricted_company_keys()
+    if use_overlay:
+        candidates = [d.get("id") for d in deals
+                      if isinstance(d, dict) and _deal_is_sell(d) and _deal_stage_id(d) in
+                      (COMPARE_LIVE_STAGE_IDS | {STAGE_HOLD})]
+        deals = _merge_deal_fresh(deals, _deal_fresh_overlays(candidates))
+    out = {}
+    for d in deals:
+        if not _compare_qualifies(d, include_hold=include_hold, restricted=restricted):
+            continue
+        ck = _compare_company_key(d)
+        entry = out.setdefault(ck, {"company": (_deal_company_name(d) or "").strip(),
+                                    "company_id": _deal_company_id(d), "deals": []})
+        entry["deals"].append(d)
+    for entry in out.values():
+        entry["deals"].sort(key=lambda d: (len(str(d.get("id"))), str(d.get("id"))))
+    memo[mkey] = out
+    return out
+
+
+def _compare_offering_count(deal):
+    """Non-Hold qualifying offerings for this deal's company (snapshot
+    only, no overlay -- the entry points never add S3 calls). 0 on any
+    failure."""
+    try:
+        entry = _compare_offerings(False, use_overlay=False).get(_compare_company_key(deal))
+    except Exception as e:
+        print(f"compare count failed (non-fatal): {type(e).__name__}: {e}")
+        return 0
+    return len(entry["deals"]) if entry else 0
+
+
+def _compare_href(company_param, key=None, view_as=None):
+    qs = "?view=compare"
+    if company_param:
+        qs += f"&company={urllib.parse.quote(str(company_param), safe='')}"
+    return qs + _tab_qs_suffix(key, view_as)
+
+
+def _compare_entry_html(deal, key=None, view_as=None):
+    """"Compare all N <Company> offerings" button (My Deals rows, company
+    page Deal Details card) -- only when the company has 2+ offerings."""
+    n = _compare_offering_count(deal)
+    if n < 2:
+        return ""
+    company = (_deal_company_name(deal) or "").strip()
+    param = _deal_company_id(deal) or company
+    return (f'<a class="cmp-entry-btn" href="{_esc(_compare_href(param, key, view_as))}">'
+            f'Compare all {n} {_esc(company)} offerings</a>')
+
+
+def _compare_letter(i):
+    s = ""
+    i += 1
+    while i:
+        i, r = divmod(i - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _compare_pct_text(v):
+    return "—" if v is None else _fmt_pct(v)
+
+
+def _compare_days_ago_text(deal, now=None):
+    dt = _parse_pipeline_ts(deal.get("updated_at"))
+    if dt is None:
+        return "—", None
+    days = max(0, ((now or datetime.now(timezone.utc)) - dt).days)
+    if days == 0:
+        return "Updated today", 0
+    return f"Updated {days} day{'s' if days != 1 else ''} ago", days
+
+
+def _compare_firm_text(deal):
+    """Admin only: the linked people's firm names (else full names)."""
+    by_id = _people_data()["by_id"]
+    names = []
+    for pid in _deal_linked_person_ids_ordered(deal):
+        rec = by_id.get(str(pid)) or {}
+        name = (rec.get("company_name") or rec.get("full_name") or rec.get("name") or "").strip()
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names) or "—"
+
+
+def _compare_rows(entry, role, scope=frozenset()):
+    """One dict per offering for `role` ("admin" | "tenant" | "buyer").
+    Own = a linked person in the tenant's firm/team scope."""
+    deals = entry["deals"]
+    vals = [_deal_cf_number(d, EST_VAL_FIELD) for d in deals if _deal_stage_id(d) != STAGE_HOLD]
+    ref = compare_ref_valuation(vals) or compare_ref_valuation(_deal_cf_number(d, EST_VAL_FIELD) for d in deals)
+    rows, letter_i = [], 0
+    for d in deals:
+        hold = _deal_stage_id(d) == STAGE_HOLD
+        if hold and role != "admin":
+            continue
+        if hold:
+            label = "Hold"
+        else:
+            label = f"Offering {_compare_letter(letter_i)}"
+            letter_i += 1
+        own = role == "tenant" and bool(_deal_linked_person_ids(d) & scope)
+        layers = [COMPARE_LAYER_LABELS[i] for i in sorted(_deal_cf_option_ids(d, LAYERS_FIELD))
+                  if i in COMPARE_LAYER_LABELS]
+        structure = layers[0] if layers else ("Fund" if _deal_is_spv(d) else "—")
+        role_ids = sorted(_deal_cf_option_ids(d, SELLER_ROLE_FIELD))
+        sc_ids = sorted(_deal_cf_option_ids(d, SHARE_CLASS_FIELD))
+        exemption = next(iter(_deal_cf_option_ids(d, EXEMPTION_FIELD) & set(EXEMPTION_SHORT_LABELS)), None)
+        val = _deal_cf_number(d, EST_VAL_FIELD)
+        val = val if val is not None and val > 0 else None
+        val_text = _fmt_valuation_billions(val) if val else None
+        if _deal_is_new_allocation(d):
+            val_text = f"Round – est. {val_text} (from news)" if val_text else None
+        net, gross = _deal_cf_number(d, NET_FIELD), _deal_cf_number(d, GROSS_FIELD)
+        if role == "buyer":
+            price_text = _fmt_price_2dp(gross)
+        elif role == "tenant":
+            price_text = _fmt_price_2dp(net)
+        else:
+            price_text = f"Net {_fmt_price_2dp(net)} · Gross {_fmt_price_2dp(gross)}"
+        updated_text, updated_days = _compare_days_ago_text(d)
+        row = {
+            "deal": d, "label": label, "own": own, "hold": hold,
+            "structure": structure,
+            "seller_role": (COMPARE_SELLER_ROLE_LABELS.get(role_ids[0], "—") if role_ids else "—"),
+            "share_class": (COMPARE_SHARE_CLASS_LABELS.get(sc_ids[0], "—") if sc_ids else "—"),
+            "exemption": EXEMPTION_SHORT_LABELS.get(exemption, "—"),
+            "valuation": val, "valuation_text": val_text or "Not provided", "valuation_assumed": val is None,
+            "price_text": price_text,
+            "upfront": _deal_cf_number(d, SELLER_FEE_FIELD), "mgmt": _deal_cf_number(d, MGMT_FEE_FIELD),
+            "carry": _deal_cf_number(d, CARRY_FIELD),
+            "min": _deal_cf_number(d, TICKET_MIN_FIELD), "max": _deal_cf_number(d, TICKET_MAX_FIELD),
+            "updated_text": updated_text, "updated_days": updated_days,
+        }
+        row["net_multiple"] = compare_net_multiple(row["upfront"], row["mgmt"], row["carry"],
+                                                   COMPARE_DEFAULT_OUTCOME, COMPARE_DEFAULT_YEARS, ref, val)
+        rows.append(row)
+    rows.sort(key=lambda r: -r["net_multiple"])
+    return rows, ref
+
+
+def _compare_rank_text(rank, total):
+    return f"Your offering ranks #{rank} of {total} at this outcome."
+
+
+COMPARE_CSS = """
+  .cmp-wrap { max-width: 1280px; margin: 28px auto 0; }
+  .cmp-wrap h1 { font-size: 24px; margin: 0 0 4px; }
+  .cmp-sub { color: var(--muted); margin: 0 0 18px; font-size: 14px; }
+  .cmp-controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin: 0 0 14px; font-size: 14px; }
+  .cmp-controls select { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
+  .cmp-scroll { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+  table.cmp-table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  .cmp-table th, .cmp-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  .cmp-table th { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
+                  cursor: pointer; white-space: nowrap; user-select: none; }
+  .cmp-table th[aria-sort]::after { content: " ▾"; }
+  .cmp-table th[aria-sort="ascending"]::after { content: " ▴"; }
+  .cmp-table td.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .cmp-table tr.cmp-own td { background: #eef5f0; }
+  .cmp-table tr.cmp-hold td { color: var(--muted); }
+  .cmp-label { font-weight: 600; white-space: nowrap; }
+  .cmp-rank { font-size: 12px; color: var(--qp); font-weight: 600; margin-top: 3px; }
+  .cmp-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  .cmp-nm { font-weight: 700; }
+  .cmp-admin { font-size: 12px; color: var(--muted); margin-top: 3px; }
+  .cmp-edit-btn { font: inherit; font-size: 11px; background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0 0 0 4px; }
+  .cmp-edit-form input { width: 56px; font: inherit; padding: 2px 4px; }
+  .cmp-edit-form button { font: inherit; font-size: 11px; margin-left: 2px; }
+  .cmp-msg { font-size: 11px; display: block; margin-top: 2px; white-space: normal; }
+  .cmp-msg.error { color: #B42318; }
+  .cmp-msg.warn { color: #C2410C; }
+  .cmp-nudge { margin: 14px 2px 0; font-size: 13px; color: var(--muted); }
+  .cmp-empty { padding: 24px; color: var(--muted); }
+  .cmp-search { width: 100%; max-width: 420px; font: inherit; padding: 8px 10px; border: 1px solid var(--line);
+                border-radius: 8px; margin: 0 0 14px; box-sizing: border-box; }
+  ul.cmp-index { list-style: none; margin: 0; padding: 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+  ul.cmp-index li { border-bottom: 1px solid var(--line); }
+  ul.cmp-index li:last-child { border-bottom: 0; }
+  ul.cmp-index a { display: flex; justify-content: space-between; gap: 12px; padding: 11px 14px; color: var(--ink); }
+  ul.cmp-index .cmp-count { color: var(--muted); white-space: nowrap; }
+  .cmp-buyer-head { display: flex; justify-content: space-between; align-items: center; max-width: 1280px; margin: 0 auto;
+                    font-size: 14px; }
+  .cmp-buyer-head .brand { font-weight: 700; }
+  @media (max-width: 640px) { body { padding: 16px 16px 48px; } }
+"""
+
+# The page's only script: re-rank on outcome/years, sortable columns, and
+# (own/admin rows only) the inline fee-decrease editor.
+COMPARE_SCRIPT = """<script>
+(function() {
+  var table = document.getElementById('cmp-table');
+  if (!table) return;
+  var tbody = table.tBodies[0];
+  var outcomeSel = document.getElementById('cmp-outcome');
+  var yearsSel = document.getElementById('cmp-years');
+  var ref = parseFloat(table.getAttribute('data-ref')) || 0;
+  var sortCol = 'nm', sortDir = -1;
+  function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
+  function netMultiple(tr, outcome, years) {
+    var up = (num(tr.getAttribute('data-upfront')) || 0) / 100;
+    var mg = (num(tr.getAttribute('data-mgmt')) || 0) / 100;
+    var ca = (num(tr.getAttribute('data-carry')) || 0) / 100;
+    var val = num(tr.getAttribute('data-val'));
+    var ratio = (ref > 0 && val && val > 0) ? ref / val : 1;
+    var exitValue = 100 * (1 - up) * outcome * ratio;
+    var mgmt = 100 * mg * years;
+    var profit = exitValue - mgmt - 100;
+    var carry = ca * Math.max(profit, 0);
+    return (exitValue - mgmt - carry) / 100;
+  }
+  function rows() { return Array.prototype.slice.call(tbody.rows); }
+  function cellVal(tr, col) {
+    var td = tr.querySelector('td[data-col="' + col + '"]');
+    if (!td) return null;
+    var v = td.getAttribute('data-v');
+    var n = num(v);
+    return n === null ? (v || '').toLowerCase() : n;
+  }
+  function sortRows() {
+    var list = rows();
+    list.sort(function(a, b) {
+      var x = cellVal(a, sortCol), y = cellVal(b, sortCol);
+      if (x === y) return 0;
+      if (x === null || x === '') return 1;
+      if (y === null || y === '') return -1;
+      return (x < y ? -1 : 1) * sortDir;
+    });
+    list.forEach(function(tr) { tbody.appendChild(tr); });
+    table.querySelectorAll('th[data-col]').forEach(function(th) {
+      if (th.getAttribute('data-col') === sortCol) th.setAttribute('aria-sort', sortDir > 0 ? 'ascending' : 'descending');
+      else th.removeAttribute('aria-sort');
+    });
+  }
+  function recompute() {
+    var outcome = parseFloat(outcomeSel.value), years = parseFloat(yearsSel.value);
+    var live = rows().filter(function(tr) { return tr.getAttribute('data-hold') !== '1'; });
+    live.forEach(function(tr) {
+      var nm = netMultiple(tr, outcome, years);
+      var td = tr.querySelector('td[data-col="nm"]');
+      td.setAttribute('data-v', nm.toFixed(4));
+      td.querySelector('.cmp-nm').textContent = nm.toFixed(2) + 'x';
+    });
+    var ranked = live.slice().sort(function(a, b) {
+      return parseFloat(b.querySelector('td[data-col="nm"]').getAttribute('data-v')) -
+             parseFloat(a.querySelector('td[data-col="nm"]').getAttribute('data-v'));
+    });
+    ranked.forEach(function(tr, i) {
+      var rank = tr.querySelector('.cmp-rank');
+      if (rank) rank.textContent = 'Your offering ranks #' + (i + 1) + ' of ' + ranked.length + ' at this outcome.';
+    });
+    sortRows();
+  }
+  outcomeSel.addEventListener('change', recompute);
+  yearsSel.addEventListener('change', recompute);
+  table.querySelectorAll('th[data-col]').forEach(function(th) {
+    th.addEventListener('click', function() {
+      var col = th.getAttribute('data-col');
+      if (col === sortCol) sortDir = -sortDir; else { sortCol = col; sortDir = (col === 'nm') ? -1 : 1; }
+      sortRows();
+    });
+  });
+  function fmtPct(v) { return (Math.round(v * 10) / 10) + '%'; }
+  table.addEventListener('click', function(ev) {
+    var btn = ev.target.closest('.cmp-edit-btn');
+    if (!btn) return;
+    ev.preventDefault();
+    var td = btn.closest('td'), tr = btn.closest('tr');
+    var field = td.getAttribute('data-field');
+    if (td.querySelector('.cmp-edit-form')) return;
+    var cur = tr.getAttribute('data-' + field);
+    var form = document.createElement('span');
+    form.className = 'cmp-edit-form';
+    form.innerHTML = '<input type="number" min="0" max="100" step="0.1" inputmode="decimal"><button type="button" data-a="save">Save</button><button type="button" data-a="cancel">Cancel</button><span class="cmp-msg"></span>';
+    var input = form.querySelector('input');
+    input.value = cur;
+    td.appendChild(form);
+    input.focus();
+    var msg = form.querySelector('.cmp-msg');
+    form.addEventListener('click', function(e2) {
+      var a = e2.target.getAttribute('data-a');
+      if (a === 'cancel') { form.remove(); return; }
+      if (a !== 'save') return;
+      var v = num(input.value);
+      if (v === null || v < 0 || v > 100) { msg.className = 'cmp-msg error'; msg.textContent = 'Enter a percent between 0 and 100.'; return; }
+      var old = num(cur);
+      if (old !== null && v > old) {
+        msg.className = 'cmp-msg warn';
+        var url = tr.getAttribute('data-update-url');
+        msg.innerHTML = url ? '<a href="' + url + '" target="_blank" rel="noopener">""" + COMPARE_RAISE_MSG + """</a>' : '""" + COMPARE_RAISE_MSG + """';
+        return;
+      }
+      var body = {deal_id: tr.getAttribute('data-deal-id'), field: field, value: v};
+      var key = table.getAttribute('data-key'), viewAs = table.getAttribute('data-view-as');
+      if (key) body.key = key;
+      if (viewAs) body.view_as = viewAs;
+      msg.className = 'cmp-msg'; msg.textContent = 'Saving…';
+      fetch('?action=compare_fee', {method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+        .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, d: d}; }); })
+        .then(function(res) {
+          if (!res.ok || !res.d.ok) {
+            msg.className = 'cmp-msg ' + (res.d.update_url ? 'warn' : 'error');
+            if (res.d.update_url) msg.innerHTML = '<a href="' + res.d.update_url + '" target="_blank" rel="noopener">' + res.d.error + '</a>';
+            else msg.textContent = res.d.error || 'Save failed.';
+            return;
+          }
+          tr.setAttribute('data-' + field, res.d.value);
+          td.setAttribute('data-v', res.d.value);
+          td.querySelector('.cmp-fee-v').textContent = fmtPct(res.d.value);
+          form.remove();
+          recompute();
+        })
+        .catch(function() { msg.className = 'cmp-msg error'; msg.textContent = 'Save failed — please try again.'; });
+    });
+  });
+})();
+</script>"""
+
+COMPARE_SEARCH_SCRIPT = """<script>
+(function() {
+  var box = document.getElementById('cmp-search');
+  var items = Array.prototype.slice.call(document.querySelectorAll('ul.cmp-index li'));
+  var none = document.getElementById('cmp-none');
+  if (!box) return;
+  box.addEventListener('input', function() {
+    var q = box.value.trim().toLowerCase(), shown = 0;
+    items.forEach(function(li) {
+      var hit = !q || li.getAttribute('data-name').indexOf(q) !== -1;
+      li.hidden = !hit;
+      if (hit) shown++;
+    });
+    if (none) none.hidden = shown !== 0;
+  });
+})();
+</script>"""
+
+
+def _compare_shell(title, header_html, body_html):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(title)} · Gracia Group</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤝</text></svg>">
+<style>
+{NAV_CSS}
+  :root {{
+    --bg: #f4f2ee; --card: #ffffff; --line: #e7e5e0; --ink: #16181d; --muted: #6b7280;
+    --accent: #3d5a73; --qp: #1f7a4d;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; background: var(--bg); color: var(--ink);
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; padding: 32px 24px 64px; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  a:hover {{ text-decoration: underline; }}
+{COMPARE_CSS}
+</style>
+</head>
+<body>
+{header_html}
+<div class="cmp-wrap">
+{body_html}
+</div>
+</body>
+</html>"""
+
+
+def _compare_buyer_header_html():
+    return (f'<header class="cmp-buyer-head"><span class="brand">Gracia Group</span>'
+            f'<a href="{_esc(_signout_url())}">Sign out</a></header>')
+
+
+def _compare_fee_cell_html(row, field, editable):
+    v = row[field]
+    edit = ('<button type="button" class="cmp-edit-btn" aria-label="Lower this fee">Edit</button>'
+            if editable else "")
+    suffix = " / yr" if field == "mgmt" and v is not None else ""
+    return (f'<td class="num" data-col="{field}" data-field="{field}" data-v="{"" if v is None else v}">'
+            f'<span class="cmp-fee-v">{_esc(_compare_pct_text(v))}</span>{suffix}{edit}</td>')
+
+
+def render_compare_index(role, header_html, key=None, view_as=None):
+    try:
+        offerings = _compare_offerings(include_hold=(role == "admin"))
+    except Exception as e:
+        print(f"compare index failed: {type(e).__name__}: {e}")
+        return _compare_shell("Compare SPVs", header_html,
+                              f'<h1>Compare SPV offerings</h1><p class="cmp-empty">{_esc(COMPARE_UNAVAILABLE_MSG)}</p>')
+    items = []
+    for ck, entry in sorted(offerings.items(), key=lambda kv: kv[1]["company"].lower()):
+        n = len(entry["deals"])
+        param = entry["company_id"] or entry["company"]
+        items.append(f'<li data-name="{_esc(entry["company"].lower())}"><a href="{_esc(_compare_href(param, key, view_as))}">'
+                     f'<span>{_esc(entry["company"])}</span>'
+                     f'<span class="cmp-count">{n} offering{"s" if n != 1 else ""}</span></a></li>')
+    list_html = (f'<ul class="cmp-index">{"".join(items)}</ul>'
+                 '<p class="cmp-empty" id="cmp-none" hidden>No matches</p>') if items else \
+        '<p class="cmp-empty">No SPV offerings are live right now.</p>'
+    body = ('<h1>Compare SPV offerings</h1>'
+            '<p class="cmp-sub">Every live SPV offering, grouped by company. Pick a company to compare terms.</p>'
+            '<input type="search" id="cmp-search" class="cmp-search" placeholder="Search companies" '
+            'autocomplete="off" autofocus>'
+            f'{list_html}{COMPARE_SEARCH_SCRIPT}')
+    return _compare_shell("Compare SPVs", header_html, body)
+
+
+def _compare_find_entry(offerings, company_param):
+    p = str(company_param or "").strip()
+    if not p:
+        return None
+    if p in offerings:
+        return offerings[p]
+    low = p.lower()
+    return next((e for e in offerings.values() if e["company"].lower() == low), None)
+
+
+def render_compare_company(company_param, role, header_html, scope=frozenset(), key=None, view_as=None,
+                           impersonating=False):
+    """role: "admin" (Admin view: everything, every row editable), "tenant"
+    (own firm/team rows = "Your offering", editable; impersonating = admin
+    Tenant-view preview), "buyer" (read-only, gross price, nudge line)."""
+    back = f'<p class="cmp-sub"><a href="{_esc(_compare_href(None, key, view_as))}">← All companies</a></p>'
+    try:
+        offerings = _compare_offerings(include_hold=(role == "admin"))
+        entry = _compare_find_entry(offerings, company_param)
+        rows, ref = _compare_rows(entry, role, scope) if entry else ([], None)
+    except Exception as e:
+        print(f"compare company failed: {type(e).__name__}: {e}")
+        return _compare_shell("Compare SPVs", header_html,
+                              f'{back}<h1>Compare SPV offerings</h1><p class="cmp-empty">{_esc(COMPARE_UNAVAILABLE_MSG)}</p>')
+    if not entry or not rows:
+        return _compare_shell("Compare SPVs", header_html,
+                              f'{back}<h1>Compare SPV offerings</h1>'
+                              '<p class="cmp-empty">No live SPV offerings for this company right now.</p>')
+    company = entry["company"]
+    live_rows = [r for r in rows if not r["hold"]]
+    ranks = {id(r): i + 1 for i, r in enumerate(live_rows)}
+    tr_html = []
+    for r in rows:
+        d = r["deal"]
+        deal_id = str(d.get("id"))
+        editable = (role == "admin" and not r["hold"]) or r["own"]
+        attrs = (f' data-upfront="{"" if r["upfront"] is None else r["upfront"]}"'
+                 f' data-mgmt="{"" if r["mgmt"] is None else r["mgmt"]}"'
+                 f' data-carry="{"" if r["carry"] is None else r["carry"]}"'
+                 f' data-val="{"" if r["valuation"] is None else r["valuation"]}"'
+                 f' data-hold="{"1" if r["hold"] else "0"}"')
+        if editable:
+            attrs += f' data-deal-id="{_esc(deal_id)}"'
+            upd = _deal_update_form_url(deal_id)
+            if upd:
+                attrs += f' data-update-url="{_esc(upd)}"'
+        cls = "cmp-own" if r["own"] else ("cmp-hold" if r["hold"] else "")
+        label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
+        if r["own"]:
+            label_html += f'<div class="cmp-rank">{_esc(_compare_rank_text(ranks[id(r)], len(live_rows)))}</div>'
+        if role == "admin":
+            label_html += (f'<div class="cmp-admin">{_esc(r["label"])} · {_esc(_compare_firm_text(d))} · '
+                           f'<a href="{_esc(PIPELINE_DEAL_URL.format(deal_id))}" target="_blank" rel="noopener">'
+                           f'Pipeline #{_esc(deal_id)}</a></div>')
+        val_html = _esc(r["valuation_text"])
+        if r["valuation_assumed"]:
+            val_html += '<div class="cmp-note">valuation assumed</div>'
+        nm = r["net_multiple"]
+        nm_html = ('<span class="cmp-nm">—</span>' if r["hold"] else f'<span class="cmp-nm">{nm:.2f}x</span>')
+        tr_html.append(
+            f'<tr class="{cls}"{attrs}>'
+            f'<td data-col="label" data-v="{_esc(r["label"])}">{label_html}</td>'
+            f'<td data-col="nm" class="num" data-v="{"" if r["hold"] else f"{nm:.4f}"}">{nm_html}</td>'
+            f'<td data-col="structure" data-v="{_esc(r["structure"])}">{_esc(r["structure"])}</td>'
+            f'<td data-col="role" data-v="{_esc(r["seller_role"])}">{_esc(r["seller_role"])}</td>'
+            f'<td data-col="class" data-v="{_esc(r["share_class"])}">{_esc(r["share_class"])}</td>'
+            f'<td data-col="exemption" data-v="{_esc(r["exemption"])}">{_esc(r["exemption"])}</td>'
+            f'<td data-col="valuation" class="num" data-v="{"" if r["valuation"] is None else r["valuation"]}">{val_html}</td>'
+            f'<td data-col="price" class="num" data-v="{_esc(r["price_text"])}">{_esc(r["price_text"])}</td>'
+            + _compare_fee_cell_html(r, "upfront", editable)
+            + _compare_fee_cell_html(r, "mgmt", editable)
+            + _compare_fee_cell_html(r, "carry", editable)
+            + f'<td data-col="min" class="num" data-v="{"" if r["min"] is None else r["min"]}">'
+              f'{_esc(_fmt_money(r["min"]))}</td>'
+            f'<td data-col="max" class="num" data-v="{"" if r["max"] is None else r["max"]}">'
+            f'{_esc(_fmt_money(r["max"]))}</td>'
+            f'<td data-col="updated" class="num" data-v="{"" if r["updated_days"] is None else r["updated_days"]}">'
+            f'{_esc(r["updated_text"])}</td></tr>')
+    price_head = {"buyer": "Price", "tenant": "Net price"}.get(role, "Price")
+    heads = [("label", "Offering"), ("nm", "Net multiple"), ("structure", "Structure"), ("role", "Seller role"),
+             ("class", "Share class"), ("exemption", "Fund exemption"), ("valuation", "Valuation"),
+             ("price", price_head), ("upfront", "Upfront fee"), ("mgmt", "Mgmt fee"), ("carry", "Carry"),
+             ("min", "Min ticket"), ("max", "Max ticket"), ("updated", "Updated")]
+    sort_attr = ' aria-sort="descending"'
+    th_html = "".join(f'<th data-col="{c}"{sort_attr if c == "nm" else ""}>{_esc(t)}</th>' for c, t in heads)
+    outcome_opts = "".join(f'<option value="{o}"{" selected" if o == COMPARE_DEFAULT_OUTCOME else ""}>{o}x</option>'
+                           for o in COMPARE_OUTCOMES)
+    years_opts = "".join(f'<option value="{y}"{" selected" if y == COMPARE_DEFAULT_YEARS else ""}>'
+                         f'{y} year{"s" if y != 1 else ""}</option>' for y in range(1, 11))
+    data_key = ""
+    if any(r["own"] or role == "admin" for r in rows) and key:
+        data_key = f' data-key="{_esc(key)}"' + (f' data-view-as="{_esc(view_as)}"' if impersonating and view_as else "")
+    n = len(live_rows)
+    nudge = f'<p class="cmp-nudge">{COMPARE_BUYER_NUDGE_HTML}</p>' if role == "buyer" else ""
+    body = (f'{back}<h1>{_esc(company)} SPV offerings</h1>'
+            f'<p class="cmp-sub">{n} live offering{"s" if n != 1 else ""}. Net multiple is per $100 committed, '
+            'after upfront, management and carry fees (commission excluded — it is the same on every offering). '
+            'Click a column to sort.</p>'
+            '<div class="cmp-controls">'
+            f'<label>Outcome <select id="cmp-outcome">{outcome_opts}</select></label>'
+            f'<label>Years to exit <select id="cmp-years">{years_opts}</select></label></div>'
+            f'<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"{data_key}>'
+            f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'
+            f'{nudge}{COMPARE_SCRIPT}')
+    return _compare_shell(f"{company} offerings", header_html, body)
+
+
+def render_compare_page(query, role, header_html, scope=frozenset(), key=None, view_as=None, impersonating=False):
+    company = query.get("company")
+    if company:
+        return render_compare_company(company, role, header_html, scope=scope, key=key, view_as=view_as,
+                                      impersonating=impersonating)
+    return render_compare_index(role, header_html, key=key, view_as=view_as)
+
+
+def _parse_fee_pct_input(raw):
+    """"4", "4.5", "4%" -> float in [0, 100] with at most 2 decimals, else None."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    s = str(raw).strip().rstrip("%").strip()
+    if not re.fullmatch(r"\d+(?:\.\d{1,2})?|\.\d{1,2}", s):
+        return None
+    v = float(s)
+    return v if 0 <= v <= 100 else None
+
+
+def _write_deal_fresh(deal):
+    """Same object deal-update-form's publish_fresh_deal writes. Best effort."""
+    try:
+        _s3_client().put_object(
+            Bucket=BUCKET, Key=f"{DEAL_FRESH_PREFIX}{deal.get('id')}.json", ContentType="application/json",
+            Body=json.dumps({"fetched_at": datetime.now(timezone.utc).isoformat(), "deal": deal}).encode("utf-8"))
+        return True
+    except Exception as e:
+        print(f"deal-fresh: write failed for deal {deal.get('id')}: {type(e).__name__}: {e}")
+        return False
+
+
+def _send_fee_lowered_email(firm, actor, deal, deal_id, field, old, new):
+    line = (f"{firm} lowered {_deal_company_name(deal) or _deal_title(deal)} {COMPARE_FEE_LABELS[field]} "
+            f"from {_compare_pct_text(old) if old is not None else 'blank'} to {_compare_pct_text(new)}")
+    body = (f"{line}\nBy: {actor}\nDeal: {_deal_title(deal)}\n{PIPELINE_DEAL_URL.format(deal_id)}\n"
+            f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n")
+    try:
+        boto3.client("ses", region_name="us-east-1").send_email(
+            Source=DEAL_STAGE_EMAIL_FROM, Destination={"ToAddresses": [DEAL_STAGE_EMAIL_TO]},
+            Message={"Subject": {"Data": f"[Dashboard] Fee lowered: {_deal_company_name(deal) or _deal_title(deal)}"},
+                     "Body": {"Text": {"Data": body}}})
+        return True
+    except Exception as e:
+        print(f"fee lowered email failed (non-fatal): {type(e).__name__}: {e}")
+        return False
+
+
+def _handle_compare_fee(event):
+    """POST ?action=compare_fee {deal_id, field upfront|mgmt|carry, value}
+    (+ key; + key/view_as for admin Tenant view). Decreases (or setting a
+    blank) only: Pipeline PUT first (abort on failure) -> Dynamo audit
+    (actor = authenticated email) -> deal-fresh overlay -> email Chad
+    (real seller sessions only, like every other self-edit). Increase ->
+    409 with the deal's update-form link."""
+    body = _parse_json_body(event)
+    admin_key = os.environ.get("ADMIN_KEY")
+    is_admin = bool(admin_key) and body.get("key") == admin_key
+    allowed = {"deal_id", "field", "value"}
+    impersonated_actor = None
+    identity = None
+    if is_admin and body.get("view_as") not in (None, ""):
+        identity = str(body.get("view_as")).strip().lower()
+        if set(body) - (allowed | {"key", "view_as"}) or _resolve_tenant(identity) is None:
+            return _json_response({"error": "forbidden"}, 403)
+        is_admin = False
+        impersonated_actor = f"{ADMIN_IMPERSONATION_EMAIL} (as {identity})"
+    elif is_admin:
+        if set(body) - (allowed | {"key"}):
+            return _json_response({"error": "forbidden"}, 403)
+    else:
+        email = _read_identity_email(event)
+        identity = email.strip().lower() if email else None
+        if not identity or _resolve_tenant(identity) is None or set(body) - allowed:
+            return _json_response({"error": "forbidden"}, 403)
+    field = body.get("field")
+    if field not in COMPARE_FEE_FIELDS:
+        return _json_response({"error": "invalid field"}, 400)
+    new = _parse_fee_pct_input(body.get("value"))
+    if new is None:
+        return _json_response({"error": "Enter a percent between 0 and 100."}, 400)
+    deal_id = str(body.get("deal_id") or "").strip()
+    if not deal_id.isdigit():
+        return _json_response({"error": "deal_id is required"}, 400)
+
+    restricted = _rms_restricted_company_keys()
+    snap = next((d for d in _get_live_deals_list() if str(d.get("id")) == deal_id), None)
+    live, err = _pipeline_get_deal(deal_id)
+    if live is None:
+        return _json_response({"error": f"Could not reach Pipeline: {err}"}, 502)
+    if not _compare_qualifies(live, include_hold=is_admin, restricted=restricted):
+        return _json_response({"error": "This offering can't be edited here."}, 409)
+    if not is_admin and not _tenant_can_act_on_deal(identity, live) and not (
+            snap is not None and _tenant_can_act_on_deal(identity, snap)):
+        return _json_response({"error": "forbidden"}, 403)
+
+    cf_key = COMPARE_FEE_FIELDS[field]
+    old = _deal_cf_number(live, cf_key)
+    if old is not None and new > old:
+        return _json_response({"error": COMPARE_RAISE_MSG, "update_url": _deal_update_form_url(deal_id)}, 409)
+    if old is not None and new == old:
+        return _json_response({"ok": True, "value": new, "unchanged": True})
+
+    ok, err, _, _ = _pipeline_send_json(f"/deals/{deal_id}.json", "PUT", {"deal": {"custom_fields": {cf_key: new}}})
+    if not ok:
+        return _json_response({"error": f"Could not save (Pipeline update failed: {err})."}, 502)
+
+    actor = "admin" if is_admin else (impersonated_actor or identity)
+    partition = _tenant_email_for_deal(live) or (snap is not None and _tenant_email_for_deal(snap)) or "__compare__"
+    now = time.time()
+    try:
+        _dynamo_table().put_item(Item={
+            "tenant": partition, "sk": f"audit#{deal_id}#{int(now * 1000)}", "actor": actor,
+            "source": "compare_fee",
+            "old": {field: None if old is None else Decimal(str(old))},
+            "new": {field: Decimal(str(new))},
+        })
+    except Exception as e:
+        print(f"compare_fee: audit write failed for deal {deal_id}: {type(e).__name__}: {e}")
+
+    fresh, _ = _pipeline_get_deal(deal_id)
+    if not isinstance(fresh, dict) or _deal_cf_number(fresh, cf_key) != new:
+        fresh = dict(live, custom_fields=dict(live.get("custom_fields") or {}, **{cf_key: new}))
+    _write_deal_fresh(fresh)
+    _req_cache.pop("compare", None)
+
+    if not is_admin and impersonated_actor is None:
+        tenant = _resolve_tenant(identity) or {}
+        team = _tenant_team(identity)
+        firm = (team or {}).get("name") or tenant.get("company_name") or identity
+        _send_fee_lowered_email(firm, actor, live, deal_id, field, old, new)
+    return _json_response({"ok": True, "value": new})
+
+
+def _handle_compare_view(query, is_admin_key, view_as, tenant, identity_email, edit_mode, viewer_name, cef_html):
+    """?view=compare after auth. Admin: Admin view (edit_mode) = everything;
+    &view_as a tenant without Admin view = that tenant's view (fee edits
+    impersonated); &view_as a non-tenant = buyer view. Tenant session =
+    tenant view. Non-tenant identity = buyer view (minimal header)."""
+    key = query.get("key") if is_admin_key else None
+    if is_admin_key and edit_mode:
+        role = "admin"
+    elif tenant is not None:
+        role = "tenant"
+    else:
+        role = "buyer"
+    scope = _firm_person_ids(tenant.get("person_id")) if role == "tenant" and tenant.get("person_id") is not None \
+        else frozenset()
+    if role == "buyer" and not is_admin_key:
+        header = _compare_buyer_header_html()
+    else:
+        header = _nav_html("compare", viewer_name, key=key, view_as=(view_as or None), edit_flag=edit_mode,
+                           cef_html=cef_html,
+                           person_id=(tenant.get("person_id") if tenant is not None else None),
+                           account_email=(None if is_admin_key else identity_email))
+    impersonating = bool(is_admin_key and view_as and role == "tenant")
+    return _html_response(render_compare_page(query, role, header, scope=scope, key=key,
+                                              view_as=(view_as or None), impersonating=impersonating))
+
+
 def _perf_infer_page(query):
     """A best-effort page label for the TIMING line, resolved from the raw
     query string alone -- before any of _lambda_handler_impl's own
@@ -19790,6 +20673,8 @@ def _perf_infer_page(query):
     the one that would have rendered), only useful for grouping."""
     if query.get("action"):
         return f"action:{query['action']}"
+    if query.get("view") == "compare":
+        return "compare"
     if query.get("photo"):
         return "photo"
     if query.get("buyer"):
@@ -19908,6 +20793,11 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_update_intro(event)
+
+    if query.get("action") == "compare_fee":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_compare_fee(event)
 
     if query.get("action") == "feature_request":
         if method != "POST":
@@ -20077,6 +20967,10 @@ def _lambda_handler_impl(event, context):
                 params.append(f"tab={urllib.parse.quote(tab, safe='')}")
             if query.get("welcome") == "1":
                 params.append("welcome=1")
+            if query.get("view") == "compare":
+                params.append("view=compare")
+                if query.get("company"):
+                    params.append(f"company={urllib.parse.quote(query['company'], safe='')}")
             if params:
                 location += "?" + "&".join(params)
             # Public arrival: the same HttpOnly .graciagroup.com cookie login
@@ -20116,6 +21010,9 @@ def _lambda_handler_impl(event, context):
     if is_admin_key:
         if view_as:
             tenant = _resolve_tenant(view_as)
+            if not tenant and query.get("view") == "compare":
+                # Compare view only: previewing a non-tenant = the buyer view.
+                return _handle_compare_view(query, True, view_as, None, None, False, "Admin", "")
             if not tenant:
                 return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True))
             viewer_name = tenant["name"]
@@ -20125,8 +21022,12 @@ def _lambda_handler_impl(event, context):
     else:
         identity_email = _read_identity_email(event)
         if not identity_email:
-            return _html_response(_signin_page(_request_base_url(event.get("rawPath"))), 403)
+            return _html_response(_signin_page(_request_base_url(event.get("rawPath")),
+                                               return_qs=_compare_return_qs(query)), 403)
         tenant = _resolve_tenant(identity_email)
+        if not tenant and query.get("view") == "compare":
+            # The ONLY view a signed-in non-tenant may open: buyer view.
+            return _handle_compare_view(query, False, "", None, identity_email, False, "", "")
         if not tenant:
             if query.get("welcome") == "1":
                 return _html_response(_message_page(WELCOME_TITLE, WELCOME_MESSAGE, show_signout=True,
@@ -20169,6 +21070,10 @@ def _lambda_handler_impl(event, context):
                 None, anon_key_email, tenant.get("person_id")) == "verified":
             own_cef = CEF_YES_ID
         cef_html = _cef_badge_html(own_cef, tenant["name"])
+
+    if query.get("view") == "compare":
+        return _handle_compare_view(query, is_admin_key, view_as, tenant, account_email, edit_mode,
+                                    viewer_name, cef_html)
 
     # Company detail page: same auth resolution as the tabs above, just a
     # different route param.
