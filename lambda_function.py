@@ -19830,12 +19830,16 @@ COMPARE_SELLER_ROLE_SHORT = {
     7205050: "GP – selling entire SPV", 7000233: "LP – consent obtained", 7000234: "LP – consent needed",
     7000235: "LP – platform holder",
 }
-# Blank (unset) fees are ranked at this ONE standard assumption; an explicit
-# 0 entered in Pipeline stays 0.
-ASSUMED_FEES = {"upfront": 5.0, "mgmt": 2.0, "carry": 20.0}
-COMPARE_ASSUMED_SUBTITLE = ("Blank fees are assumed at 5% upfront, 2%/yr management and 20% carry "
-                            "until the seller provides them.")
-COMPARE_ADD_FEES_PROMPT = "Add your actual fees to rank accurately."
+# Blank-fee rule (compare_fee_status): an explicit 0 counts as provided.
+# Some fees provided -> ranked with the blanks as 0 + PARTIAL note; none
+# provided -> unranked, listed below the divider with an Ask link.
+COMPARE_FEES_SUBTITLE = ("Offerings marked 'Full fees not confirmed' count missing fees as 0%; "
+                         "offerings with no fees provided are listed at the bottom.")
+COMPARE_PARTIAL_NOTE = "Full fees not confirmed"
+COMPARE_UNRANKED_DIVIDER = "Fees not yet provided"
+COMPARE_CONFIRM_FEES_PROMPT = "Confirm your remaining fees to rank accurately."
+COMPARE_ADD_FEES_PROMPT = "Add your fees to be ranked against the other offerings."
+COMPARE_ASK_URL = "https://trades.graciagroup.com/deal/{}"
 COMPARE_SHARE_CLASS_LABELS = {5077831: "Common", 5077834: "Preferred", 5077912: "Mixed", 5077915: "Any"}
 COMPARE_OUTCOMES = (2, 5, 10)
 COMPARE_DEFAULT_OUTCOME = 5
@@ -19862,10 +19866,12 @@ DEAL_FRESH_SNAPSHOT_SLACK_SECONDS = OVERRIDE_REFRESH_GRACE_SECONDS
 def compare_net_multiple(upfront_pct, mgmt_pct, carry_pct, outcome, years, ref_valuation=None, row_valuation=None):
     """Net multiple per $100 committed (Chad's commission excluded -- it is
     charged on top of every trade at the same tier). Percents are whole
-    numbers (4 = 4%); a blank (None) fee uses ASSUMED_FEES, an explicit 0
-    stays 0. A row with no valuation uses the reference valuation (ratio 1)."""
-    up, mg, ca = compare_effective_fees(upfront_pct, mgmt_pct, carry_pct)[0]
-    up, mg, ca = up / 100.0, mg / 100.0, ca / 100.0
+    numbers (4 = 4%); a blank (None) fee counts as 0 (rows with ALL fees
+    blank are never ranked -- see compare_fee_status). A row with no
+    valuation uses the reference valuation (ratio 1)."""
+    up = (upfront_pct or 0) / 100.0
+    mg = (mgmt_pct or 0) / 100.0
+    ca = (carry_pct or 0) / 100.0
     ratio = 1.0
     if ref_valuation and row_valuation and ref_valuation > 0 and row_valuation > 0:
         ratio = ref_valuation / row_valuation
@@ -19877,16 +19883,11 @@ def compare_net_multiple(upfront_pct, mgmt_pct, carry_pct, outcome, years, ref_v
     return (exit_value - mgmt - carry) / 100.0
 
 
-def compare_effective_fees(upfront_pct, mgmt_pct, carry_pct):
-    """((upfront, mgmt, carry) used for ranking, set of fields assumed)."""
-    vals, assumed = [], set()
-    for field, v in (("upfront", upfront_pct), ("mgmt", mgmt_pct), ("carry", carry_pct)):
-        if v is None or v == "":
-            assumed.add(field)
-            vals.append(ASSUMED_FEES[field])
-        else:
-            vals.append(float(v))
-    return tuple(vals), assumed
+def compare_fee_status(upfront_pct, mgmt_pct, carry_pct):
+    """"complete" (all three provided; an explicit 0 counts), "partial"
+    (some blank -> ranked with blanks as 0) or "none" (all blank -> unranked)."""
+    blanks = sum(1 for v in (upfront_pct, mgmt_pct, carry_pct) if v is None or v == "")
+    return "complete" if blanks == 0 else ("none" if blanks == 3 else "partial")
 
 
 def compare_ref_valuation(valuations):
@@ -20150,11 +20151,12 @@ def _compare_rows(entry, role, scope=frozenset()):
             "min": _deal_cf_number(d, TICKET_MIN_FIELD), "max": _deal_cf_number(d, TICKET_MAX_FIELD),
             "updated_text": updated_text, "updated_days": updated_days,
         }
-        row["assumed"] = compare_effective_fees(row["upfront"], row["mgmt"], row["carry"])[1]
+        row["fee_status"] = compare_fee_status(row["upfront"], row["mgmt"], row["carry"])
         row["net_multiple"] = compare_net_multiple(row["upfront"], row["mgmt"], row["carry"],
                                                    COMPARE_DEFAULT_OUTCOME, COMPARE_DEFAULT_YEARS, ref, val)
         rows.append(row)
-    rows.sort(key=lambda r: -r["net_multiple"])
+    # Ranked rows by net multiple, then the unranked (no fees) group by deal id.
+    rows.sort(key=lambda r: (r["fee_status"] == "none", 0 if r["fee_status"] == "none" else -r["net_multiple"]))
     return rows, ref
 
 
@@ -20185,10 +20187,12 @@ COMPARE_CSS = """
   .cmp-table tr.cmp-own td { background: #eef5f0; }
   .cmp-table tr.cmp-hold td { color: var(--muted); }
   .cmp-label { font-weight: 600; white-space: nowrap; }
-  .cmp-assumed { color: var(--muted); font-style: italic; }
-  .cmp-chip { display: inline-block; margin-top: 4px; padding: 1px 7px; border-radius: 9999px; font-size: 10.5px;
-              font-weight: 600; color: #C2410C; background: #FDF0E9; white-space: nowrap; }
+  .cmp-partial { font-size: 11px; color: var(--muted); margin-top: 3px; }
   .cmp-prompt { font-size: 11px; color: #C2410C; margin-top: 3px; }
+  .cmp-ask { display: inline-block; font-size: 11px; margin-top: 3px; white-space: nowrap; }
+  .cmp-table tr.cmp-divider td { position: static; width: auto; min-width: 0; max-width: none; font-size: 11px;
+                                 font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
+                                 background: var(--bg); }
   .cmp-rank { font-size: 12px; color: var(--qp); font-weight: 600; margin-top: 3px; }
   .cmp-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .cmp-nm { font-weight: 700; }
@@ -20224,18 +20228,15 @@ COMPARE_SCRIPT = """<script>
   var outcomeSel = document.getElementById('cmp-outcome');
   var yearsSel = document.getElementById('cmp-years');
   var ref = parseFloat(table.getAttribute('data-ref')) || 0;
-  var assumed = {};
-  try { assumed = JSON.parse(table.getAttribute('data-assumed') || '{}'); } catch (e) {}
+  var divider = tbody.querySelector('tr.cmp-divider');
   var isAdmin = table.getAttribute('data-admin') === '1';
   var FEES = ['upfront', 'mgmt', 'carry'];
   var sortCol = 'nm', sortDir = -1;
   function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
-  function fee(tr, f) {
-    var v = num(tr.getAttribute('data-' + f));
-    return v === null ? (assumed[f] || 0) : v;
-  }
-  function incomplete(tr) {
-    return FEES.some(function(f) { return num(tr.getAttribute('data-' + f)) === null; });
+  function fee(tr, f) { return num(tr.getAttribute('data-' + f)) || 0; }
+  function feeStatus(tr) {
+    var blanks = FEES.filter(function(f) { return num(tr.getAttribute('data-' + f)) === null; }).length;
+    return blanks === 0 ? 'complete' : (blanks === 3 ? 'none' : 'partial');
   }
   function netMultiple(tr, outcome, years) {
     var up = fee(tr, 'upfront') / 100;
@@ -20249,7 +20250,9 @@ COMPARE_SCRIPT = """<script>
     var carry = ca * Math.max(profit, 0);
     return (exitValue - mgmt - carry) / 100;
   }
-  function rows() { return Array.prototype.slice.call(tbody.rows); }
+  function rows() {
+    return Array.prototype.slice.call(tbody.rows).filter(function(tr) { return !tr.classList.contains('cmp-divider'); });
+  }
   function cellVal(tr, col) {
     var td = tr.querySelector('td[data-col="' + col + '"]');
     if (!td) return null;
@@ -20266,7 +20269,11 @@ COMPARE_SCRIPT = """<script>
       if (y === null || y === '') return -1;
       return (x < y ? -1 : 1) * sortDir;
     });
-    list.forEach(function(tr) { tbody.appendChild(tr); });
+    var ranked = list.filter(function(tr) { return tr.getAttribute('data-unranked') !== '1'; });
+    var unranked = list.filter(function(tr) { return tr.getAttribute('data-unranked') === '1'; });
+    ranked.forEach(function(tr) { tbody.appendChild(tr); });
+    if (divider) { tbody.appendChild(divider); divider.hidden = unranked.length === 0; }
+    unranked.forEach(function(tr) { tbody.appendChild(tr); });
     table.querySelectorAll('th[data-col]').forEach(function(th) {
       if (th.getAttribute('data-col') === sortCol) th.setAttribute('aria-sort', sortDir > 0 ? 'ascending' : 'descending');
       else th.removeAttribute('aria-sort');
@@ -20276,14 +20283,29 @@ COMPARE_SCRIPT = """<script>
     var outcome = parseFloat(outcomeSel.value), years = parseFloat(yearsSel.value);
     var live = rows().filter(function(tr) { return tr.getAttribute('data-hold') !== '1'; });
     live.forEach(function(tr) {
-      var nm = netMultiple(tr, outcome, years);
+      var st = feeStatus(tr);
       var td = tr.querySelector('td[data-col="nm"]');
-      td.setAttribute('data-v', nm.toFixed(4));
-      var inc = incomplete(tr);
-      td.querySelector('.cmp-nm').textContent = (inc ? '~' : '') + nm.toFixed(2) + 'x';
-      tr.querySelectorAll('.cmp-chip, .cmp-prompt').forEach(function(el) { el.hidden = !inc; });
+      tr.setAttribute('data-unranked', st === 'none' ? '1' : '0');
+      if (st === 'none') {
+        td.setAttribute('data-v', '');
+        td.querySelector('.cmp-nm').textContent = '\u2014';
+      } else {
+        var nm = netMultiple(tr, outcome, years);
+        td.setAttribute('data-v', nm.toFixed(4));
+        td.querySelector('.cmp-nm').textContent = nm.toFixed(2) + 'x';
+      }
+      FEES.forEach(function(f) {
+        if (num(tr.getAttribute('data-' + f)) !== null) return;
+        var fv = tr.querySelector('td[data-col="' + f + '"] .cmp-fee-v');
+        if (fv) fv.textContent = st === 'none' ? 'Not provided' : '\u2014';
+      });
+      var show = {'.cmp-partial': st === 'partial', '.cmp-prompt-confirm': st === 'partial',
+                  '.cmp-prompt-add': st === 'none', '.cmp-ask': st === 'none', '.cmp-rank': st !== 'none'};
+      Object.keys(show).forEach(function(sel) {
+        tr.querySelectorAll(sel).forEach(function(el) { el.hidden = !show[sel]; });
+      });
     });
-    var ranked = live.slice().sort(function(a, b) {
+    var ranked = live.filter(function(tr) { return tr.getAttribute('data-unranked') !== '1'; }).sort(function(a, b) {
       return parseFloat(b.querySelector('td[data-col="nm"]').getAttribute('data-v')) -
              parseFloat(a.querySelector('td[data-col="nm"]').getAttribute('data-v'));
     });
@@ -20351,7 +20373,6 @@ COMPARE_SCRIPT = """<script>
           td.setAttribute('data-v', res.d.value);
           var fv = td.querySelector('.cmp-fee-v');
           fv.textContent = fmtPct(res.d.value) + (field === 'mgmt' ? ' / yr' : '');
-          fv.classList.remove('cmp-assumed');
           form.remove();
           sortCol = 'nm'; sortDir = -1;
           recompute();
@@ -20417,25 +20438,20 @@ def _compare_buyer_header_html():
             f'<a href="{_esc(_signout_url())}">Sign out</a></header>')
 
 
-def _compare_fee_text(v, field, assumed=False):
-    """"4%", "2% / yr", "—"; a blank shows its assumption, e.g. "5% (assumed)"."""
-    if assumed:
-        v = ASSUMED_FEES[field]
+def _compare_fee_text(v, field, fee_status="complete"):
+    """"4%", "2% / yr"; a blank is "Not provided" when the row has no fees
+    at all, else "—"."""
     if v is None:
-        return "—"
-    text = _fmt_pct(v) + (" / yr" if field == "mgmt" else "")
-    return text + (" (assumed)" if assumed else "")
+        return "Not provided" if fee_status == "none" else "—"
+    return _fmt_pct(v) + (" / yr" if field == "mgmt" else "")
 
 
 def _compare_fee_cell_html(row, field, editable):
     v = row[field]
-    assumed = field in row.get("assumed", ())
     edit = ('<button type="button" class="cmp-edit-btn" aria-label="Edit this fee">Edit</button>'
             if editable else "")
-    eff = ASSUMED_FEES[field] if assumed else v
-    cls = "cmp-fee-v cmp-assumed" if assumed else "cmp-fee-v"
-    return (f'<td class="num" data-col="{field}" data-field="{field}" data-v="{"" if eff is None else eff}">'
-            f'<span class="{cls}">{_esc(_compare_fee_text(v, field, assumed))}</span>{edit}</td>')
+    return (f'<td class="num" data-col="{field}" data-field="{field}" data-v="{"" if v is None else v}">'
+            f'<span class="cmp-fee-v">{_esc(_compare_fee_text(v, field, row["fee_status"]))}</span>{edit}</td>')
 
 
 def render_compare_index(role, header_html, key=None, view_as=None):
@@ -20493,9 +20509,15 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                               '<p class="cmp-empty">No live SPV offerings for this company right now.</p>')
     company = entry["company"]
     live_rows = [r for r in rows if not r["hold"]]
-    ranks = {id(r): i + 1 for i, r in enumerate(live_rows)}
+    ranked_rows = [r for r in live_rows if r["fee_status"] != "none"]
+    ranks = {id(r): i + 1 for i, r in enumerate(ranked_rows)}
     tr_html = []
+    divider_done = False
     for r in rows:
+        unranked = r["fee_status"] == "none"
+        if unranked and not divider_done:
+            tr_html.append(f'<tr class="cmp-divider"><td colspan="14">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>')
+            divider_done = True
         d = r["deal"]
         deal_id = str(d.get("id"))
         editable = (role == "admin" and not r["hold"]) or r["own"]
@@ -20503,20 +20525,27 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                  f' data-mgmt="{"" if r["mgmt"] is None else r["mgmt"]}"'
                  f' data-carry="{"" if r["carry"] is None else r["carry"]}"'
                  f' data-val="{"" if r["valuation"] is None else r["valuation"]}"'
-                 f' data-hold="{"1" if r["hold"] else "0"}"')
+                 f' data-hold="{"1" if r["hold"] else "0"}"'
+                 f' data-unranked="{"1" if unranked else "0"}"')
         if editable:
             attrs += f' data-deal-id="{_esc(deal_id)}"'
             upd = _deal_update_form_url(deal_id)
             if upd:
                 attrs += f' data-update-url="{_esc(upd)}"'
         cls = "cmp-own" if r["own"] else ("cmp-hold" if r["hold"] else "")
-        incomplete = bool(r["assumed"])
+        partial = r["fee_status"] == "partial"
         label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
+        label_html += f'<div class="cmp-partial"{"" if partial else " hidden"}>{_esc(COMPARE_PARTIAL_NOTE)}</div>'
         if r["own"]:
-            label_html += f'<div class="cmp-rank">{_esc(_compare_rank_text(ranks[id(r)], len(live_rows)))}</div>'
-            label_html += (f'<div class="cmp-prompt"{"" if incomplete else " hidden"}>'
+            rank_text = _compare_rank_text(ranks[id(r)], len(ranked_rows)) if id(r) in ranks else ""
+            label_html += f'<div class="cmp-rank"{" hidden" if unranked else ""}>{_esc(rank_text)}</div>'
+            label_html += (f'<div class="cmp-prompt cmp-prompt-confirm"{"" if partial else " hidden"}>'
+                           f'{_esc(COMPARE_CONFIRM_FEES_PROMPT)}</div>')
+            label_html += (f'<div class="cmp-prompt cmp-prompt-add"{"" if unranked else " hidden"}>'
                            f'{_esc(COMPARE_ADD_FEES_PROMPT)}</div>')
-        label_html += f'<div class="cmp-chip"{"" if incomplete else " hidden"}>Terms incomplete</div>'
+        if unranked:
+            label_html += (f'<a class="cmp-ask" href="{_esc(COMPARE_ASK_URL.format(deal_id))}" target="_blank" '
+                           'rel="noopener">Ask about fees →</a>')
         if role == "admin":
             label_html += (f'<div class="cmp-admin">{_esc(r["label"])} · {_esc(_compare_firm_text(d))} · '
                            f'<a href="{_esc(PIPELINE_DEAL_URL.format(deal_id))}" target="_blank" rel="noopener">'
@@ -20527,12 +20556,12 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
         if r["valuation_assumed"]:
             val_html += '<div class="cmp-note">valuation assumed</div>'
         nm = r["net_multiple"]
-        nm_html = ('<span class="cmp-nm">—</span>' if r["hold"]
-                   else f'<span class="cmp-nm">{"~" if incomplete else ""}{nm:.2f}x</span>')
+        no_nm = r["hold"] or unranked
+        nm_html = '<span class="cmp-nm">—</span>' if no_nm else f'<span class="cmp-nm">{nm:.2f}x</span>'
         tr_html.append(
             f'<tr class="{cls}"{attrs}>'
             f'<td data-col="label" data-v="{_esc(r["label"])}">{label_html}</td>'
-            f'<td data-col="nm" class="num" data-v="{"" if r["hold"] else f"{nm:.4f}"}">{nm_html}</td>'
+            f'<td data-col="nm" class="num" data-v="{"" if no_nm else f"{nm:.4f}"}">{nm_html}</td>'
             f'<td data-col="structure" data-v="{_esc(r["structure"])}">{_esc(r["structure"])}</td>'
             f'<td data-col="role" data-v="{_esc(r["seller_role"])}">{_esc(r["seller_role"])}</td>'
             f'<td data-col="class" data-v="{_esc(r["share_class"])}">{_esc(r["share_class"])}</td>'
@@ -20562,14 +20591,16 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     data_key = ""
     if any(r["own"] or role == "admin" for r in rows) and key:
         data_key = f' data-key="{_esc(key)}"' + (f' data-view-as="{_esc(view_as)}"' if impersonating and view_as else "")
-    assumed_json = json.dumps(ASSUMED_FEES).replace('"', "&quot;")
-    data_key += f' data-assumed="{assumed_json}"' + (' data-admin="1"' if key else "")
+    if not divider_done:
+        # Always present so the page script can show it if a row loses its rank.
+        tr_html.append(f'<tr class="cmp-divider" hidden><td colspan="14">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>')
+    data_key += ' data-admin="1"' if key else ""
     n = len(live_rows)
     nudge = f'<p class="cmp-nudge">{COMPARE_BUYER_NUDGE_HTML}</p>' if role == "buyer" else ""
     body = (f'{back}<h1>{_esc(company)} SPV offerings</h1>'
             f'<p class="cmp-sub">{n} live offering{"s" if n != 1 else ""}. Net multiple is per $100 committed, '
             'after upfront, management and carry fees (commission excluded — it is the same on every offering). '
-            f'{_esc(COMPARE_ASSUMED_SUBTITLE)} Click a column to sort.</p>'
+            f'{_esc(COMPARE_FEES_SUBTITLE)} Click a column to sort.</p>'
             '<div class="cmp-controls">'
             f'<label>Outcome <select id="cmp-outcome">{outcome_opts}</select></label>'
             f'<label>Years to exit <select id="cmp-years">{years_opts}</select></label></div>'
