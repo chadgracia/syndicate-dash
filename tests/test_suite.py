@@ -11138,9 +11138,17 @@ check("compare math: 4/0/0 at 2x -> 1.92x", f"{lf.compare_net_multiple(4, 0, 0, 
 check("compare math: 7/0/15 at 2x -> 1.73x", f"{lf.compare_net_multiple(7, 0, 15, 2, 5):.2f}" == "1.73")
 check("compare math: mgmt 2%/yr x 5 yrs at 5x, no fees otherwise -> (500-10-0)/100 = 4.90x",
       abs(lf.compare_net_multiple(0, 2, 0, 5, 5) - 4.90) < 1e-9)
-check("compare math: blank fees = 0; carry never applies to a loss",
-      lf.compare_net_multiple(None, None, None, 2, 3) == 2.0
+check("compare math: explicit 0 fees stay 0; carry never applies to a loss",
+      lf.compare_net_multiple(0, 0, 0, 2, 3) == 2.0
       and abs(lf.compare_net_multiple(0, 0, 20, 1, 1) - 1.0) < 1e-9)
+check("compare ASSUMED_FEES: one constant, 5% upfront / 2%/yr mgmt / 20% carry",
+      lf.ASSUMED_FEES == {"upfront": 5.0, "mgmt": 2.0, "carry": 20.0})
+check("compare math: blank fees use ASSUMED_FEES (95 x 5 = 475, mgmt 10, carry 20% of 365 -> 3.92x)",
+      f"{lf.compare_net_multiple(None, None, None, 5, 5):.2f}" == "3.92"
+      and lf.compare_net_multiple(None, None, None, 5, 5) == lf.compare_net_multiple(5, 2, 20, 5, 5))
+check("compare effective fees: blanks flagged assumed, explicit 0 is NOT an assumption",
+      lf.compare_effective_fees(None, 0, "") == ((5.0, 0.0, 20.0), {"upfront", "carry"})
+      and lf.compare_effective_fees(0, 0, 0) == ((0.0, 0.0, 0.0), set()))
 check("compare math: row at 2x the reference valuation halves the exit; blank row valuation = reference",
       abs(lf.compare_net_multiple(0, 0, 0, 5, 5, 5.0, 10.0) - 2.5) < 1e-9
       and lf.compare_net_multiple(0, 0, 0, 5, 5, 5.0, None) == 5.0)
@@ -11270,21 +11278,56 @@ check("compare: Direct deal never listed; new allocation without valuation shows
       "Not provided" in _cb and "valuation assumed" in _cb)
 check("compare: fresh-copy overlay wins (offering 6002 upfront 7% -> 6% from deal-fresh)",
       'data-upfront="6.0"' in _cb or 'data-upfront="6"' in _cb)
-check("compare: default sort = net multiple desc (5.00x, 4.80x, 4.14x), layers + labels rendered",
-      _cb.index(">5.00x<") < _cb.index(">4.80x<") < _cb.index(">4.14x<") and "2-Layer" in _cb and "Preferred" in _cb
-      and "3(c)(7)" in _cb and "GP — selling own units" in _cb and "Updated " in _cb)
+check("compare: blank-fee row (Aalo-like) no longer ranks first: 4.80x, 4.14x, ~3.92x",
+      ">5.00x<" not in _cb and _cb.index(">4.80x<") < _cb.index(">4.14x<") < _cb.index(">~3.92x<"))
+check("compare: short labels — '2-Layer', 'GP – selling own units', 'L1 SPV' map; Updated column",
+      "2-Layer" in _cb and "Preferred" in _cb and "3(c)(7)" in _cb and "GP – selling own units" in _cb
+      and "GP — selling own units" not in _cb and lf.COMPARE_LAYER_LABELS[7000228] == "L1 SPV"
+      and ">Updated<" in _cb and re.search(r">\d+ days? ago<", _cb) is not None)
+_cb_c = _cb[_cb.rindex("<tr", 0, _cb.index(">Offering C<")):]
+_cb_c = _cb_c[:_cb_c.index("</tr>")]
+check("compare: blank fees render greyed/italic '5% (assumed)', '2% / yr (assumed)', '20% (assumed)'",
+      '<span class="cmp-fee-v cmp-assumed">5% (assumed)</span>' in _cb_c
+      and '<span class="cmp-fee-v cmp-assumed">2% / yr (assumed)</span>' in _cb_c
+      and '<span class="cmp-fee-v cmp-assumed">20% (assumed)</span>' in _cb_c
+      and ".cmp-assumed { color: var(--muted); font-style: italic; }" in _cb)
+check("compare: 'Terms incomplete' chip shown on the assumed row, hidden on complete rows",
+      '<div class="cmp-chip">Terms incomplete</div>' in _cb_c
+      and _cb.count('<div class="cmp-chip">Terms incomplete</div>') == 1
+      and _cb.count('<div class="cmp-chip" hidden>Terms incomplete</div>') == 2)
+check("compare: explicit 0 fees render as 0%, not assumed (Offering A 4% / 0% / 0%)",
+      '<span class="cmp-fee-v">0% / yr</span>' in _cb and '<span class="cmp-fee-v">0%</span>' in _cb)
+check("compare: subtitle explains the assumption",
+      "Blank fees are assumed at 5% upfront, 2%/yr management and 20% carry until the seller provides them." in _cb)
+check("compare: new allocation valuation 'Round est. $X' + grey 'from news' line",
+      lf._fmt_valuation_billions(2.25) == "$2.25B")
+check("compare: table scrolls horizontally with Offering + Net multiple sticky on the left",
+      ".cmp-scroll { overflow-x: auto;" in _cb and "position: sticky; left: 0;" in _cb
+      and "position: sticky; left: 142px;" in _cb and "white-space: nowrap; user-select: none;" in _cb)
 
 # Tenant view: own row highlighted + editable; others anonymous.
 _ct = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
 check("compare tenant view: own firm row = 'Your offering' (highlighted) with a rank line",
       _ct.count(">Your offering<") == 1 and 'class="cmp-own"' in _ct
-      and "Your offering ranks #2 of 3 at this outcome." in _ct)
+      and "Your offering ranks #1 of 3 at this outcome." in _ct)
 check("compare tenant view: net price (not gross), other sellers anonymous, no value",
       "$30.00" in _ct and "$33.00" not in _ct and "Beta Partners" not in _ct and "6002" not in _ct
       and "6005" not in _ct and "99999" not in _ct and "Otto" not in _ct)
 check("compare tenant view: edit controls only on own row (3 fee cells), own deal id only",
       _ct.count('class="cmp-edit-btn"') == 3 and 'data-deal-id="6001"' in _ct and _ct.count("data-deal-id=") == 1)
 check("compare tenant view: Hold hidden, no buyer nudge", ">Hold<" not in _ct and "commission-tiers" not in _ct)
+check("compare tenant view: complete own row -> prompt and chip present but hidden, no '~'",
+      '<div class="cmp-prompt" hidden>Add your actual fees to rank accurately.</div>' in _ct and ">~4.80x<" not in _ct)
+_cmp_blank_own = json.loads(json.dumps(_cmp_d1))
+_cmp_blank_own["custom_fields"].pop(lf.MGMT_FEE_FIELD)
+_cmp_blank_own["updated_at"] = "2026/10/29 10:00:00 -0400"
+_cmp_s3.objs["deal-fresh/6001.json"] = {"fetched_at": "2026-10-29T14:00:00+00:00", "deal": _cmp_blank_own}
+_ctb = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+check("compare tenant view: own row with an assumed fee -> 'Add your actual fees' prompt + chip + '~' multiple",
+      '<div class="cmp-prompt">Add your actual fees to rank accurately.</div>' in _ctb
+      and '<div class="cmp-chip">Terms incomplete</div>' in _ctb
+      and ">~4.70x<" in _ctb and '2% / yr (assumed)' in _ctb)
+del _cmp_s3.objs["deal-fresh/6001.json"]
 
 # Admin: everything incl. Hold, firm names, Pipeline links.
 _ca = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
@@ -11417,7 +11460,9 @@ check("compare fee: admin may lower any offering; audited as admin, no email",
 _r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
                         "queryStringParameters": {"action": "compare_fee"},
                         "body": json.dumps({"key": ADMIN_KEY, "deal_id": "6002", "field": "carry", "value": 12})}, None)
-check("compare fee: admin increase also refused inline (409)", _r["statusCode"] == 409)
+check("compare fee: admin can raise an entered fee (10 -> 12), Pipeline PUT, no email",
+      _r["statusCode"] == 200 and not ses_calls
+      and _cmp_live[1]["custom_fields"][lf.CARRY_FIELD] == 12.0)
 ses_calls.clear(); _cmp_table.puts.clear()
 lf._req_cache_reset()
 _r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
@@ -11432,7 +11477,14 @@ _r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath
                         "queryStringParameters": {"action": "compare_fee"},
                         "body": json.dumps({"key": ADMIN_KEY, "view_as": CMP_SELLER, "deal_id": "6002",
                                             "field": "upfront", "value": 1})}, None)
-check("compare fee: admin Tenant-view cannot lower another firm's offering (403)", _r["statusCode"] == 403)
+check("compare fee: admin Tenant-view preview may edit any row (admin rights), no email",
+      _r["statusCode"] == 200 and not ses_calls)
+lf._req_cache_reset()
+_r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                        "queryStringParameters": {"action": "compare_fee"},
+                        "body": json.dumps({"key": ADMIN_KEY, "view_as": CMP_SELLER, "deal_id": "6002",
+                                            "field": "upfront", "value": 9})}, None)
+check("compare fee: admin Tenant-view preview may raise (1 -> 9)", _r["statusCode"] == 200)
 check("compare entry button styled on every nav page (shared NAV_CSS)", ".cmp-entry-btn {" in lf.NAV_CSS)
 _r = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
                         "queryStringParameters": {"action": "compare_fee"}}, None)

@@ -19816,7 +19816,7 @@ WELCOME_CTA_LABEL = "While you wait, explore what's trading now →"
 # non-admin: deal value (commission), other rows' deal ids, person or
 # firm names, emails.
 COMPARE_LIVE_STAGE_IDS = frozenset({STAGE_INQUIRY, STAGE_FIRM, STAGE_MATCHED, STAGE_CONFIRM})
-COMPARE_LAYER_LABELS = {7000228: "L1 SPV on cap table", 7000229: "2-Layer", 7000230: "3-Layer"}
+COMPARE_LAYER_LABELS = {7000228: "L1 SPV", 7000229: "2-Layer", 7000230: "3-Layer"}
 # Seller Role / Share Class option labels -- verbatim from
 # chadgracia/deal-update-form (_SR_LABELS / its Share class map).
 COMPARE_SELLER_ROLE_LABELS = {
@@ -19824,6 +19824,18 @@ COMPARE_SELLER_ROLE_LABELS = {
     7000231: "GP — selling own units", 7205050: "GP — selling entire SPV",
     7000233: "LP — GP consent obtained", 7000234: "LP — GP consent needed", 7000235: "LP — platform holder",
 }
+# Short Seller Role labels for this view only (fits the table on screen).
+COMPARE_SELLER_ROLE_SHORT = {
+    7020357: "GP – new allocation", 7000232: "GP – facilitating LP sale", 7000231: "GP – selling own units",
+    7205050: "GP – selling entire SPV", 7000233: "LP – consent obtained", 7000234: "LP – consent needed",
+    7000235: "LP – platform holder",
+}
+# Blank (unset) fees are ranked at this ONE standard assumption; an explicit
+# 0 entered in Pipeline stays 0.
+ASSUMED_FEES = {"upfront": 5.0, "mgmt": 2.0, "carry": 20.0}
+COMPARE_ASSUMED_SUBTITLE = ("Blank fees are assumed at 5% upfront, 2%/yr management and 20% carry "
+                            "until the seller provides them.")
+COMPARE_ADD_FEES_PROMPT = "Add your actual fees to rank accurately."
 COMPARE_SHARE_CLASS_LABELS = {5077831: "Common", 5077834: "Preferred", 5077912: "Mixed", 5077915: "Any"}
 COMPARE_OUTCOMES = (2, 5, 10)
 COMPARE_DEFAULT_OUTCOME = 5
@@ -19850,11 +19862,10 @@ DEAL_FRESH_SNAPSHOT_SLACK_SECONDS = OVERRIDE_REFRESH_GRACE_SECONDS
 def compare_net_multiple(upfront_pct, mgmt_pct, carry_pct, outcome, years, ref_valuation=None, row_valuation=None):
     """Net multiple per $100 committed (Chad's commission excluded -- it is
     charged on top of every trade at the same tier). Percents are whole
-    numbers (4 = 4%), blank = 0. A row with no valuation uses the
-    reference valuation (ratio 1)."""
-    up = (upfront_pct or 0) / 100.0
-    mg = (mgmt_pct or 0) / 100.0
-    ca = (carry_pct or 0) / 100.0
+    numbers (4 = 4%); a blank (None) fee uses ASSUMED_FEES, an explicit 0
+    stays 0. A row with no valuation uses the reference valuation (ratio 1)."""
+    up, mg, ca = compare_effective_fees(upfront_pct, mgmt_pct, carry_pct)[0]
+    up, mg, ca = up / 100.0, mg / 100.0, ca / 100.0
     ratio = 1.0
     if ref_valuation and row_valuation and ref_valuation > 0 and row_valuation > 0:
         ratio = ref_valuation / row_valuation
@@ -19864,6 +19875,18 @@ def compare_net_multiple(upfront_pct, mgmt_pct, carry_pct, outcome, years, ref_v
     profit = exit_value - mgmt - 100.0
     carry = ca * max(profit, 0.0)
     return (exit_value - mgmt - carry) / 100.0
+
+
+def compare_effective_fees(upfront_pct, mgmt_pct, carry_pct):
+    """((upfront, mgmt, carry) used for ranking, set of fields assumed)."""
+    vals, assumed = [], set()
+    for field, v in (("upfront", upfront_pct), ("mgmt", mgmt_pct), ("carry", carry_pct)):
+        if v is None or v == "":
+            assumed.add(field)
+            vals.append(ASSUMED_FEES[field])
+        else:
+            vals.append(float(v))
+    return tuple(vals), assumed
 
 
 def compare_ref_valuation(valuations):
@@ -20060,8 +20083,8 @@ def _compare_days_ago_text(deal, now=None):
         return "—", None
     days = max(0, ((now or datetime.now(timezone.utc)) - dt).days)
     if days == 0:
-        return "Updated today", 0
-    return f"Updated {days} day{'s' if days != 1 else ''} ago", days
+        return "today", 0
+    return f"{days} day{'s' if days != 1 else ''} ago", days
 
 
 def _compare_firm_text(deal):
@@ -20102,29 +20125,32 @@ def _compare_rows(entry, role, scope=frozenset()):
         val = _deal_cf_number(d, EST_VAL_FIELD)
         val = val if val is not None and val > 0 else None
         val_text = _fmt_valuation_billions(val) if val else None
-        if _deal_is_new_allocation(d):
-            val_text = f"Round – est. {val_text} (from news)" if val_text else None
+        from_news = bool(val_text) and _deal_is_new_allocation(d)
+        if from_news:
+            val_text = f"Round est. {val_text}"
         net, gross = _deal_cf_number(d, NET_FIELD), _deal_cf_number(d, GROSS_FIELD)
         if role == "buyer":
             price_text = _fmt_price_2dp(gross)
         elif role == "tenant":
             price_text = _fmt_price_2dp(net)
         else:
-            price_text = f"Net {_fmt_price_2dp(net)} · Gross {_fmt_price_2dp(gross)}"
+            price_text = f"Net {_fmt_price_2dp(net)}\nGross {_fmt_price_2dp(gross)}"
         updated_text, updated_days = _compare_days_ago_text(d)
         row = {
             "deal": d, "label": label, "own": own, "hold": hold,
             "structure": structure,
-            "seller_role": (COMPARE_SELLER_ROLE_LABELS.get(role_ids[0], "—") if role_ids else "—"),
+            "seller_role": (COMPARE_SELLER_ROLE_SHORT.get(role_ids[0], "—") if role_ids else "—"),
             "share_class": (COMPARE_SHARE_CLASS_LABELS.get(sc_ids[0], "—") if sc_ids else "—"),
             "exemption": EXEMPTION_SHORT_LABELS.get(exemption, "—"),
             "valuation": val, "valuation_text": val_text or "Not provided", "valuation_assumed": val is None,
+            "from_news": from_news,
             "price_text": price_text,
             "upfront": _deal_cf_number(d, SELLER_FEE_FIELD), "mgmt": _deal_cf_number(d, MGMT_FEE_FIELD),
             "carry": _deal_cf_number(d, CARRY_FIELD),
             "min": _deal_cf_number(d, TICKET_MIN_FIELD), "max": _deal_cf_number(d, TICKET_MAX_FIELD),
             "updated_text": updated_text, "updated_days": updated_days,
         }
+        row["assumed"] = compare_effective_fees(row["upfront"], row["mgmt"], row["carry"])[1]
         row["net_multiple"] = compare_net_multiple(row["upfront"], row["mgmt"], row["carry"],
                                                    COMPARE_DEFAULT_OUTCOME, COMPARE_DEFAULT_YEARS, ref, val)
         rows.append(row)
@@ -20137,14 +20163,20 @@ def _compare_rank_text(rank, total):
 
 
 COMPARE_CSS = """
-  .cmp-wrap { max-width: 1280px; margin: 28px auto 0; }
+  .cmp-wrap { max-width: 1440px; margin: 28px auto 0; }
   .cmp-wrap h1 { font-size: 24px; margin: 0 0 4px; }
   .cmp-sub { color: var(--muted); margin: 0 0 18px; font-size: 14px; }
   .cmp-controls { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin: 0 0 14px; font-size: 14px; }
   .cmp-controls select { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: #fff; }
   .cmp-scroll { overflow-x: auto; background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
-  table.cmp-table { border-collapse: collapse; width: 100%; font-size: 13px; }
-  .cmp-table th, .cmp-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+  table.cmp-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12.5px; }
+  .cmp-table th, .cmp-table td { padding: 8px 7px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top;
+                                 background: var(--card); }
+  .cmp-table th:nth-child(1), .cmp-table td:nth-child(1) { position: sticky; left: 0; z-index: 2;
+                                 width: 142px; min-width: 142px; max-width: 142px; }
+  .cmp-table th:nth-child(2), .cmp-table td:nth-child(2) { position: sticky; left: 142px; z-index: 2;
+                                 box-shadow: inset -1px 0 0 var(--line); }
+  .cmp-table td.cmp-price { white-space: pre-line; }
   .cmp-table th { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
                   cursor: pointer; white-space: nowrap; user-select: none; }
   .cmp-table th[aria-sort]::after { content: " ▾"; }
@@ -20153,6 +20185,10 @@ COMPARE_CSS = """
   .cmp-table tr.cmp-own td { background: #eef5f0; }
   .cmp-table tr.cmp-hold td { color: var(--muted); }
   .cmp-label { font-weight: 600; white-space: nowrap; }
+  .cmp-assumed { color: var(--muted); font-style: italic; }
+  .cmp-chip { display: inline-block; margin-top: 4px; padding: 1px 7px; border-radius: 9999px; font-size: 10.5px;
+              font-weight: 600; color: #C2410C; background: #FDF0E9; white-space: nowrap; }
+  .cmp-prompt { font-size: 11px; color: #C2410C; margin-top: 3px; }
   .cmp-rank { font-size: 12px; color: var(--qp); font-weight: 600; margin-top: 3px; }
   .cmp-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
   .cmp-nm { font-weight: 700; }
@@ -20172,7 +20208,7 @@ COMPARE_CSS = """
   ul.cmp-index li:last-child { border-bottom: 0; }
   ul.cmp-index a { display: flex; justify-content: space-between; gap: 12px; padding: 11px 14px; color: var(--ink); }
   ul.cmp-index .cmp-count { color: var(--muted); white-space: nowrap; }
-  .cmp-buyer-head { display: flex; justify-content: space-between; align-items: center; max-width: 1280px; margin: 0 auto;
+  .cmp-buyer-head { display: flex; justify-content: space-between; align-items: center; max-width: 1440px; margin: 0 auto;
                     font-size: 14px; }
   .cmp-buyer-head .brand { font-weight: 700; }
   @media (max-width: 640px) { body { padding: 16px 16px 48px; } }
@@ -20188,12 +20224,23 @@ COMPARE_SCRIPT = """<script>
   var outcomeSel = document.getElementById('cmp-outcome');
   var yearsSel = document.getElementById('cmp-years');
   var ref = parseFloat(table.getAttribute('data-ref')) || 0;
+  var assumed = {};
+  try { assumed = JSON.parse(table.getAttribute('data-assumed') || '{}'); } catch (e) {}
+  var isAdmin = table.getAttribute('data-admin') === '1';
+  var FEES = ['upfront', 'mgmt', 'carry'];
   var sortCol = 'nm', sortDir = -1;
   function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
+  function fee(tr, f) {
+    var v = num(tr.getAttribute('data-' + f));
+    return v === null ? (assumed[f] || 0) : v;
+  }
+  function incomplete(tr) {
+    return FEES.some(function(f) { return num(tr.getAttribute('data-' + f)) === null; });
+  }
   function netMultiple(tr, outcome, years) {
-    var up = (num(tr.getAttribute('data-upfront')) || 0) / 100;
-    var mg = (num(tr.getAttribute('data-mgmt')) || 0) / 100;
-    var ca = (num(tr.getAttribute('data-carry')) || 0) / 100;
+    var up = fee(tr, 'upfront') / 100;
+    var mg = fee(tr, 'mgmt') / 100;
+    var ca = fee(tr, 'carry') / 100;
     var val = num(tr.getAttribute('data-val'));
     var ratio = (ref > 0 && val && val > 0) ? ref / val : 1;
     var exitValue = 100 * (1 - up) * outcome * ratio;
@@ -20232,7 +20279,9 @@ COMPARE_SCRIPT = """<script>
       var nm = netMultiple(tr, outcome, years);
       var td = tr.querySelector('td[data-col="nm"]');
       td.setAttribute('data-v', nm.toFixed(4));
-      td.querySelector('.cmp-nm').textContent = nm.toFixed(2) + 'x';
+      var inc = incomplete(tr);
+      td.querySelector('.cmp-nm').textContent = (inc ? '~' : '') + nm.toFixed(2) + 'x';
+      tr.querySelectorAll('.cmp-chip, .cmp-prompt').forEach(function(el) { el.hidden = !inc; });
     });
     var ranked = live.slice().sort(function(a, b) {
       return parseFloat(b.querySelector('td[data-col="nm"]').getAttribute('data-v')) -
@@ -20277,7 +20326,7 @@ COMPARE_SCRIPT = """<script>
       var v = num(input.value);
       if (v === null || v < 0 || v > 100) { msg.className = 'cmp-msg error'; msg.textContent = 'Enter a percent between 0 and 100.'; return; }
       var old = num(cur);
-      if (old !== null && v > old) {
+      if (!isAdmin && old !== null && v > old) {
         msg.className = 'cmp-msg warn';
         var url = tr.getAttribute('data-update-url');
         msg.innerHTML = url ? '<a href="' + url + '" target="_blank" rel="noopener">""" + COMPARE_RAISE_MSG + """</a>' : '""" + COMPARE_RAISE_MSG + """';
@@ -20300,8 +20349,11 @@ COMPARE_SCRIPT = """<script>
           }
           tr.setAttribute('data-' + field, res.d.value);
           td.setAttribute('data-v', res.d.value);
-          td.querySelector('.cmp-fee-v').textContent = fmtPct(res.d.value);
+          var fv = td.querySelector('.cmp-fee-v');
+          fv.textContent = fmtPct(res.d.value) + (field === 'mgmt' ? ' / yr' : '');
+          fv.classList.remove('cmp-assumed');
           form.remove();
+          sortCol = 'nm'; sortDir = -1;
           recompute();
         })
         .catch(function() { msg.className = 'cmp-msg error'; msg.textContent = 'Save failed — please try again.'; });
@@ -20365,13 +20417,25 @@ def _compare_buyer_header_html():
             f'<a href="{_esc(_signout_url())}">Sign out</a></header>')
 
 
+def _compare_fee_text(v, field, assumed=False):
+    """"4%", "2% / yr", "—"; a blank shows its assumption, e.g. "5% (assumed)"."""
+    if assumed:
+        v = ASSUMED_FEES[field]
+    if v is None:
+        return "—"
+    text = _fmt_pct(v) + (" / yr" if field == "mgmt" else "")
+    return text + (" (assumed)" if assumed else "")
+
+
 def _compare_fee_cell_html(row, field, editable):
     v = row[field]
-    edit = ('<button type="button" class="cmp-edit-btn" aria-label="Lower this fee">Edit</button>'
+    assumed = field in row.get("assumed", ())
+    edit = ('<button type="button" class="cmp-edit-btn" aria-label="Edit this fee">Edit</button>'
             if editable else "")
-    suffix = " / yr" if field == "mgmt" and v is not None else ""
-    return (f'<td class="num" data-col="{field}" data-field="{field}" data-v="{"" if v is None else v}">'
-            f'<span class="cmp-fee-v">{_esc(_compare_pct_text(v))}</span>{suffix}{edit}</td>')
+    eff = ASSUMED_FEES[field] if assumed else v
+    cls = "cmp-fee-v cmp-assumed" if assumed else "cmp-fee-v"
+    return (f'<td class="num" data-col="{field}" data-field="{field}" data-v="{"" if eff is None else eff}">'
+            f'<span class="{cls}">{_esc(_compare_fee_text(v, field, assumed))}</span>{edit}</td>')
 
 
 def render_compare_index(role, header_html, key=None, view_as=None):
@@ -20446,18 +20510,25 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             if upd:
                 attrs += f' data-update-url="{_esc(upd)}"'
         cls = "cmp-own" if r["own"] else ("cmp-hold" if r["hold"] else "")
+        incomplete = bool(r["assumed"])
         label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
         if r["own"]:
             label_html += f'<div class="cmp-rank">{_esc(_compare_rank_text(ranks[id(r)], len(live_rows)))}</div>'
+            label_html += (f'<div class="cmp-prompt"{"" if incomplete else " hidden"}>'
+                           f'{_esc(COMPARE_ADD_FEES_PROMPT)}</div>')
+        label_html += f'<div class="cmp-chip"{"" if incomplete else " hidden"}>Terms incomplete</div>'
         if role == "admin":
             label_html += (f'<div class="cmp-admin">{_esc(r["label"])} · {_esc(_compare_firm_text(d))} · '
                            f'<a href="{_esc(PIPELINE_DEAL_URL.format(deal_id))}" target="_blank" rel="noopener">'
                            f'Pipeline #{_esc(deal_id)}</a></div>')
         val_html = _esc(r["valuation_text"])
+        if r["from_news"]:
+            val_html += '<div class="cmp-note">from news</div>'
         if r["valuation_assumed"]:
             val_html += '<div class="cmp-note">valuation assumed</div>'
         nm = r["net_multiple"]
-        nm_html = ('<span class="cmp-nm">—</span>' if r["hold"] else f'<span class="cmp-nm">{nm:.2f}x</span>')
+        nm_html = ('<span class="cmp-nm">—</span>' if r["hold"]
+                   else f'<span class="cmp-nm">{"~" if incomplete else ""}{nm:.2f}x</span>')
         tr_html.append(
             f'<tr class="{cls}"{attrs}>'
             f'<td data-col="label" data-v="{_esc(r["label"])}">{label_html}</td>'
@@ -20467,7 +20538,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f'<td data-col="class" data-v="{_esc(r["share_class"])}">{_esc(r["share_class"])}</td>'
             f'<td data-col="exemption" data-v="{_esc(r["exemption"])}">{_esc(r["exemption"])}</td>'
             f'<td data-col="valuation" class="num" data-v="{"" if r["valuation"] is None else r["valuation"]}">{val_html}</td>'
-            f'<td data-col="price" class="num" data-v="{_esc(r["price_text"])}">{_esc(r["price_text"])}</td>'
+            f'<td data-col="price" class="num cmp-price" data-v="{_esc(r["price_text"])}">{_esc(r["price_text"])}</td>'
             + _compare_fee_cell_html(r, "upfront", editable)
             + _compare_fee_cell_html(r, "mgmt", editable)
             + _compare_fee_cell_html(r, "carry", editable)
@@ -20479,8 +20550,8 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f'{_esc(r["updated_text"])}</td></tr>')
     price_head = {"buyer": "Price", "tenant": "Net price"}.get(role, "Price")
     heads = [("label", "Offering"), ("nm", "Net multiple"), ("structure", "Structure"), ("role", "Seller role"),
-             ("class", "Share class"), ("exemption", "Fund exemption"), ("valuation", "Valuation"),
-             ("price", price_head), ("upfront", "Upfront fee"), ("mgmt", "Mgmt fee"), ("carry", "Carry"),
+             ("class", "Class"), ("exemption", "Exemption"), ("valuation", "Valuation"),
+             ("price", price_head), ("upfront", "Upfront"), ("mgmt", "Mgmt fee"), ("carry", "Carry"),
              ("min", "Min ticket"), ("max", "Max ticket"), ("updated", "Updated")]
     sort_attr = ' aria-sort="descending"'
     th_html = "".join(f'<th data-col="{c}"{sort_attr if c == "nm" else ""}>{_esc(t)}</th>' for c, t in heads)
@@ -20491,12 +20562,14 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     data_key = ""
     if any(r["own"] or role == "admin" for r in rows) and key:
         data_key = f' data-key="{_esc(key)}"' + (f' data-view-as="{_esc(view_as)}"' if impersonating and view_as else "")
+    assumed_json = json.dumps(ASSUMED_FEES).replace('"', "&quot;")
+    data_key += f' data-assumed="{assumed_json}"' + (' data-admin="1"' if key else "")
     n = len(live_rows)
     nudge = f'<p class="cmp-nudge">{COMPARE_BUYER_NUDGE_HTML}</p>' if role == "buyer" else ""
     body = (f'{back}<h1>{_esc(company)} SPV offerings</h1>'
             f'<p class="cmp-sub">{n} live offering{"s" if n != 1 else ""}. Net multiple is per $100 committed, '
             'after upfront, management and carry fees (commission excluded — it is the same on every offering). '
-            'Click a column to sort.</p>'
+            f'{_esc(COMPARE_ASSUMED_SUBTITLE)} Click a column to sort.</p>'
             '<div class="cmp-controls">'
             f'<label>Outcome <select id="cmp-outcome">{outcome_opts}</select></label>'
             f'<label>Years to exit <select id="cmp-years">{years_opts}</select></label></div>'
@@ -20567,10 +20640,11 @@ def _handle_compare_fee(event):
     impersonated_actor = None
     identity = None
     if is_admin and body.get("view_as") not in (None, ""):
+        # Admin Tenant-view preview: admin rights (any value, any row),
+        # audited as the impersonated save, no email.
         identity = str(body.get("view_as")).strip().lower()
-        if set(body) - (allowed | {"key", "view_as"}) or _resolve_tenant(identity) is None:
+        if set(body) - (allowed | {"key", "view_as"}):
             return _json_response({"error": "forbidden"}, 403)
-        is_admin = False
         impersonated_actor = f"{ADMIN_IMPERSONATION_EMAIL} (as {identity})"
     elif is_admin:
         if set(body) - (allowed | {"key"}):
@@ -20603,7 +20677,7 @@ def _handle_compare_fee(event):
 
     cf_key = COMPARE_FEE_FIELDS[field]
     old = _deal_cf_number(live, cf_key)
-    if old is not None and new > old:
+    if not is_admin and old is not None and new > old:
         return _json_response({"error": COMPARE_RAISE_MSG, "update_url": _deal_update_form_url(deal_id)}, 409)
     if old is not None and new == old:
         return _json_response({"ok": True, "value": new, "unchanged": True})
@@ -20612,7 +20686,7 @@ def _handle_compare_fee(event):
     if not ok:
         return _json_response({"error": f"Could not save (Pipeline update failed: {err})."}, 502)
 
-    actor = "admin" if is_admin else (impersonated_actor or identity)
+    actor = impersonated_actor or ("admin" if is_admin else identity)
     partition = _tenant_email_for_deal(live) or (snap is not None and _tenant_email_for_deal(snap)) or "__compare__"
     now = time.time()
     try:
