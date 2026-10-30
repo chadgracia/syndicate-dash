@@ -11087,6 +11087,17 @@ check("Watchlist: no IDENTITY_SECRET -> tenant nav keeps the tab with the plain 
       _wt_hrefs(lf._nav_html("overview", "Watch Tenant", account_email=_wt_email)) == ["https://desk.graciagroup.com/"])
 lf.IDENTITY_SECRET = _wt_saved
 
+# --- Tenant picker: hrefFor builds a clean URL (key + view_as + tab=overview only)
+_hf_html, _hf_js = lf._tenant_search_html(ADMIN_KEY, "alice@acmecap.com")
+_hf_fn = _hf_js[_hf_js.index("function hrefFor(email)"):_hf_js.index("function render(")]
+check("tenant picker hrefFor: no longer mutates the current URL", "new URL(window.location.href)" not in _hf_fn)
+check("tenant picker hrefFor: tenant selection sets tab=overview",
+      "params.set('view_as', email); params.set('tab', 'overview');" in _hf_fn)
+check("tenant picker hrefFor: only 'key' carried over from the current URL",
+      _hf_fn.count("cur.get(") == 1 and "cur.get('key')" in _hf_fn
+      and "window.location.origin + window.location.pathname" in _hf_fn
+      and not any(f"'{p}'" in _hf_fn for p in ("company", "ref", "buyer", "photo", "edit", "debug")))
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)

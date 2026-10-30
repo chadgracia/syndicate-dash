@@ -3620,9 +3620,12 @@ def _tenant_search_html(key, view_as):
   if (!wrap || !input || !results) return;
 
   function hrefFor(email) {{
-    var url = new URL(window.location.href);
-    if (email) {{ url.searchParams.set('view_as', email); }} else {{ url.searchParams.delete('view_as'); }}
-    return url.toString();
+    var cur = new URLSearchParams(window.location.search);
+    var params = new URLSearchParams();
+    if (cur.has('key')) {{ params.set('key', cur.get('key')); }}
+    if (email) {{ params.set('view_as', email); params.set('tab', 'overview'); }}
+    var qs = params.toString();
+    return window.location.origin + window.location.pathname + (qs ? '?' + qs : '');
   }}
 
   function render(list) {{
