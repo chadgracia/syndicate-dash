@@ -20387,7 +20387,12 @@ COMPARE_CSS = """
   .cmp-msg.error { color: #B42318; }
   .cmp-msg.warn { color: #C2410C; }
   .cmp-commission { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
-                    margin: 0 0 12px; font-size: 13.5px; }
+                    margin: 0 0 12px; font-size: 13.5px; display: flex; flex-wrap: wrap; align-items: center;
+                    gap: 10px 16px; }
+  .cmp-comm-body { flex: 1 1 420px; min-width: 0; }
+  .cmp-comm-btn { flex: 0 0 auto; margin-left: auto; padding: 8px 16px; border-radius: 9999px; background: var(--qp);
+                  color: #fff !important; font-weight: 700; font-size: 13px; white-space: nowrap; }
+  .cmp-comm-btn:hover { opacity: .9; text-decoration: none; }
   .cmp-comm-main { font-weight: 600; }
   .cmp-comm-nudge { margin-top: 4px; font-size: 13px; }
   .cmp-comm-note { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
@@ -20604,7 +20609,7 @@ COMPARE_SCRIPT = (r"""<script>
     var nudge = document.getElementById('cmp-comm-nudge');
     if (nudge) nudge.textContent = comm.higher.map(function(h) {
       return h.label + ' saves you ' + dollars(investment * (rate - commRate(investment, h.discount)) / 100);
-    }).join(' \u00b7 ') + ' \u2192';
+    }).join(' \u00b7 ');
   }
   function setInvestment(v, save) {
     investment = v;
@@ -20881,10 +20886,26 @@ def compare_commission_lines(investment, tier=None):
 
 
 def _compare_nudge_text(higher):
-    return " · ".join(f"{label} saves you ${amt:,.0f}" for label, amt in higher) + " →"
+    return " · ".join(f"{label} saves you ${amt:,.0f}" for label, amt in higher)
 
 
-def _compare_commission_html(mode, email=None, investment=COMPARE_DEFAULT_INVESTMENT):
+COMPARE_PROFILE_URL = f"{WATCHLIST_URL}?view=profile"
+COMPARE_REDUCE_LABEL = "Reduce your commission →"
+COMPARE_STANDING_LABEL = "View your standing →"
+
+
+def _compare_profile_url(email=None, admin_session=False):
+    """The buyer's own desk standing page, signed in exactly like the
+    Watchlist tab (_make_handoff_token) + view=profile. Admin sessions
+    (incl. view_as) and token failures get the plain, untokened link --
+    never a buyer's token for an admin."""
+    token = _make_handoff_token(email) if (email and not admin_session) else None
+    if not token:
+        return COMPARE_PROFILE_URL
+    return f"{WATCHLIST_URL}?sso={urllib.parse.quote(token, safe='')}&view=profile"
+
+
+def _compare_commission_html(mode, email=None, investment=COMPARE_DEFAULT_INVESTMENT, admin_session=False):
     """mode "seller" -> the one muted seller line; "buyer" -> the box at the
     viewer's tier; "admin" -> the box at the standard rate + preview note.
     Only the tier name ever appears -- no other standing detail."""
@@ -20897,12 +20918,16 @@ def _compare_commission_html(mode, email=None, investment=COMPARE_DEFAULT_INVEST
             "label": STANDING_TIER_LABELS[tier] if tier else "",
             "higher": [{"label": STANDING_TIER_LABELS[t], "discount": STANDING_DISCOUNT_PCT[t]}
                        for t in STANDING_TIERS[(STANDING_TIERS.index(tier) + 1 if tier else 0):]]}
-    nudge = (f'<div class="cmp-comm-nudge"><a href="{_esc(STANDING_TIERS_URL)}" id="cmp-comm-nudge">'
-             f'{_esc(_compare_nudge_text(higher))}</a></div>') if higher else ""
+    nudge = (f'<div class="cmp-comm-nudge"><span id="cmp-comm-nudge">{_esc(_compare_nudge_text(higher))}</span></div>'
+             if higher else "")
     admin_note = f' <span class="cmp-note">{_esc(COMPARE_ADMIN_COMMISSION_NOTE)}</span>' if mode == "admin" else ""
+    url = _compare_profile_url(email if mode == "buyer" else None, admin_session=admin_session or mode == "admin")
+    button = (f'<a class="cmp-comm-btn" href="{_esc(url)}" target="_blank" rel="noopener">'
+              f'{_esc(COMPARE_REDUCE_LABEL if higher else COMPARE_STANDING_LABEL)}</a>')
     return (f'<div class="cmp-commission" id="cmp-commission" data-comm="{_esc(json.dumps(data))}">'
-            f'<div class="cmp-comm-main"><span id="cmp-comm-line">{_esc(line1)}</span>{admin_note}</div>'
-            f'{nudge}<div class="cmp-comm-note">{_esc(COMPARE_COMMISSION_NOTE)}</div></div>')
+            f'<div class="cmp-comm-body"><div class="cmp-comm-main"><span id="cmp-comm-line">{_esc(line1)}</span>'
+            f'{admin_note}</div>{nudge}<div class="cmp-comm-note">{_esc(COMPARE_COMMISSION_NOTE)}</div></div>'
+            f'{button}</div>')
 
 
 def render_compare_company(company_param, role, header_html, scope=frozenset(), key=None, view_as=None,
@@ -21049,7 +21074,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             '<span class="cmp-msg error" id="cmp-inv-msg" hidden>Enter an amount like 300k or 1.5m</span>'
             f'<label>Outcome <select id="cmp-outcome">{outcome_opts}</select></label>'
             f'<label>Years to exit <select id="cmp-years">{years_opts}</select></label></div>'
-            f'{_compare_commission_html(commission[0], commission[1], investment)}'
+            f'{_compare_commission_html(commission[0], commission[1], investment, admin_session=key is not None)}'
             f'<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"'
             f' data-inv="{investment}"{data_key}>'
             f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'

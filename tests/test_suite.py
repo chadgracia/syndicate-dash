@@ -11384,7 +11384,7 @@ check("compare admin Tenant-view preview (&view_as): tenant view, company resolv
       and f'data-view-as="{CMP_SELLER}"' in _cv)
 _cvb = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_BUYER})["body"]
 check("compare admin preview of a non-tenant email = buyer view",
-      "commission-tiers" in _cvb and 'class="cmp-edit-btn"' not in _cvb and ">Hold<" not in _cvb)
+      'id="cmp-commission"' in _cvb and 'class="cmp-edit-btn"' not in _cvb and ">Hold<" not in _cvb)
 
 # Entry points.
 check("compare entry: 'Compare all 3 Varda Space offerings' (non-Hold count) linking to the company view",
@@ -11746,7 +11746,7 @@ check("compare commission nudge: only higher tiers; Platinum gets none",
       and lf.compare_commission_lines(1_000_000, "platinum")[1] == []
       and [t for t, _ in lf.compare_commission_lines(1_000_000)[1]] == ["Preferred", "Gold", "Platinum"]
       and lf._compare_nudge_text([("Gold", 2500), ("Platinum", 5000)])
-      == "Gold saves you $2,500 · Platinum saves you $5,000 →")
+      == "Gold saves you $2,500 · Platinum saves you $5,000")
 check("compare commission schedule is this module's own constant (not deal-update-form's helper)",
       lf.COMPARE_COMMISSION_BANDS == ((1_000_000, 5.0), (5_000_000, 4.0), (10_000_000, 3.5), (None, 2.5))
       and "commission_rate_for_size" not in _cmp_mod)
@@ -11763,8 +11763,7 @@ _cbc_box = _comm_box(_cbc)
 check("compare commission: buyer box between the controls and the table at the viewer's tier (Gold, $100K)",
       _cbc.index('id="cmp-years"') < _cbc.index('id="cmp-commission"') < _cbc.index('<div class="cmp-scroll">')
       and "Your RMS commission on $100K: 4.25% = $4,250 (Gold rate) · Total cash out $104,250" in _cbc_box
-      and '<a href="https://desk.graciagroup.com/?view=commission-tiers" id="cmp-comm-nudge">Platinum saves you $250 →</a>'
-          in _cbc_box
+      and '<span id="cmp-comm-nudge">Platinum saves you $250</span>' in _cbc_box
       and "RMS commission is added on top of your investment and is the same on every offering, so it does not "
           "change the ranking." in _cbc_box)
 check("compare commission: box shows no standing detail beyond the tier name",
@@ -11800,7 +11799,50 @@ check("compare commission: view_as a tenant -> seller line; view_as a buyer -> t
       and "(Platinum rate)" in _comm_box(_cvb))
 check("compare commission: plain admin -> standard box + '(standard — use view_as to preview a client)'",
       "(standard rate)" in _comm_box(_cva) and "(standard — use view_as to preview a client)" in _comm_box(_cva)
-      and "Preferred saves you $500 · Gold saves you $750 · Platinum saves you $1,000 →" in _comm_box(_cva))
+      and "Preferred saves you $500 · Gold saves you $750 · Platinum saves you $1,000" in _comm_box(_cva))
+# "Reduce your commission" button (signed desk profile link).
+def _btn(box):
+    m = re.search(r'<a class="cmp-comm-btn" href="([^"]*)" target="_blank" rel="noopener">([^<]*)</a>', box)
+    return (lf._html_unescape(m.group(1)) if hasattr(lf, "_html_unescape") else m.group(1).replace("&amp;", "&"),
+            m.group(2)) if m else (None, None)
+
+
+_cmp_s3.objs[lf.STANDING_KEY] = {"rev": 1, "updated_at": "", "clients": {"503": {"tier_floor": "gold"}}}
+lf._data_cache.clear()
+_rb_gold = _comm_box(_cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"])
+_rb_url, _rb_label = _btn(_rb_gold)
+_rb_tok = _rb_url.split("?sso=", 1)[1].split("&", 1)[0] if _rb_url and "?sso=" in _rb_url else ""
+check("compare 'Reduce your commission' button: buyer gets a signed ?sso=…&view=profile desk link (new tab)",
+      _rb_label == "Reduce your commission →" and _rb_url.startswith("https://desk.graciagroup.com/?sso=")
+      and _rb_url.endswith("&view=profile")
+      and lf._verify_sso_handoff(lf.urllib.parse.unquote(_rb_tok)) == CMP_BUYER
+      and _rb_gold.index('id="cmp-comm-nudge"') < _rb_gold.index('class="cmp-comm-btn"'))
+check("compare commission box: STANDING_TIERS_URL no longer used (no commission-tiers link)",
+      "commission-tiers" not in _rb_gold and "STANDING_TIERS_URL" not in
+      _cmp_mod[_cmp_mod.index("def _compare_commission_html"):_cmp_mod.index("def render_compare_company")])
+_cmp_s3.objs[lf.STANDING_KEY] = {"rev": 1, "updated_at": "", "clients": {"503": {"tier_floor": "platinum"}}}
+lf._data_cache.clear()
+_rb_plat = _comm_box(_cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"])
+check("compare button: Platinum viewer -> 'View your standing →' (same signed link), no savings line",
+      _btn(_rb_plat)[1] == "View your standing →" and "&view=profile" in _btn(_rb_plat)[0]
+      and "?sso=" in _btn(_rb_plat)[0] and "cmp-comm-nudge" not in _rb_plat)
+_rb_saved_secret = lf.IDENTITY_SECRET
+lf.IDENTITY_SECRET = ""
+check("compare button: token creation fails -> plain https://desk.graciagroup.com/?view=profile",
+      lf._compare_profile_url(CMP_BUYER) == "https://desk.graciagroup.com/?view=profile")
+lf.IDENTITY_SECRET = _rb_saved_secret
+_rb_admin = _comm_box(_cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"])
+_rb_va = _comm_box(_cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_BUYER})["body"])
+check("compare button: plain admin and admin view_as get the untokened link (no buyer token minted)",
+      _btn(_rb_admin)[0] == "https://desk.graciagroup.com/?view=profile"
+      and _btn(_rb_va)[0] == "https://desk.graciagroup.com/?view=profile" and "sso=" not in _rb_va
+      and _btn(_rb_va)[1] == "View your standing →")
+_rb_ten = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+check("compare button: tenants see no box and no button",
+      'class="cmp-comm-btn"' not in _rb_ten and 'id="cmp-commission"' not in _rb_ten)
+check("compare button: prominent, right end of the box, wraps below on narrow screens",
+      ".cmp-commission {" in lf.COMPARE_CSS and "flex-wrap: wrap;" in lf.COMPARE_CSS.split(".cmp-commission {")[1][:300]
+      and "margin-left: auto;" in lf.COMPARE_CSS.split(".cmp-comm-btn {")[1][:120])
 _cmp_s3.objs.pop(lf.STANDING_KEY, None)
 lf._data_cache.clear()
 
