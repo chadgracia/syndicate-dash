@@ -12051,6 +12051,65 @@ check("compare nudge: throttle window is 7 days",
       lf._compare_nudge_recent(_old) is None and lf._compare_nudge_recent(_recent) is not None)
 lf.urllib.request.urlopen = _nudge_saved_urlopen
 
+# Live-intro guard (buyer already introduced on this company).
+_li_banner = ("You've already been introduced on Varda Space. Please continue with your current counterparty; "
+              "contact Chad before considering other offerings.")
+_li_deals = _cmp_s3.objs["deals.json"]["deals"]
+
+
+def _li_buy(status_id, primary=True, stage=None, did=7101):
+    d = {"id": did, "name": "Varda buy", "company": {"id": 7001, "name": "Varda Space"},
+         "deal_stage": {"id": stage or lf.STAGE_MATCHED}, "custom_fields": cf_status(status_id),
+         "people": [{"id": 503}, {"id": 502}], "updated_at": "2026/10/30 09:00:00 -0400"}
+    if primary:
+        d["primary_contact_id"] = 503
+    return d
+
+
+def _li_page(buy, cookies=None, query=None):
+    _li_deals.append(buy)
+    try:
+        return _cmp_get(query or {"view": "compare", "company": "7001"},
+                        cookies if cookies is not None else [tenant_cookie(CMP_BUYER)])["body"]
+    finally:
+        _li_deals.remove(buy)
+
+
+_li_on = _li_page(_li_buy(lf.INTRO_STATUS_IDS["Introduced"] if hasattr(lf, "INTRO_STATUS_IDS") else 7207579))
+_li_b_row = _li_on[_li_on.rindex("<tr", 0, _li_on.index(">Offering B<")):]
+_li_b_row = _li_b_row[:_li_b_row.index("</tr>")]
+check("compare live-intro: buyer with a live (Introduced) intro sees the banner above the controls",
+      f'<div class="cmp-live-intro" role="status">{lf._esc(_li_banner)}</div>' in _li_on
+      and _li_on.index("cmp-live-intro\" role") < _li_on.index('<div class="cmp-controls">'))
+check("compare live-intro: 'Your current deal' chip on the matched offering only",
+      _li_on.count('<div class="cmp-current-chip">Your current deal</div>') == 1
+      and '<div class="cmp-current-chip">Your current deal</div>' in _li_b_row)
+check("compare live-intro: table, ranks and commission box stay; other-offering 'Ask about fees' hidden",
+      'id="cmp-table"' in _li_on and 'id="cmp-commission"' in _li_on and ">#1<" in _li_on
+      and 'class="cmp-ask"' not in _li_on and 'class="cmp-ask"' in _cmp_get(
+          {"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"])
+for _li_name, _li_sid, _li_stage in (("Closed", 7207587, None), ("Passed", 7207585, None),
+                                     ("Withdrawn", 7207586, None), ("Matched (not yet introduced)", 7207578, None),
+                                     ("Won stage", 7207579, sorted(lf.WON_STAGE_IDS)[0])):
+    check(f"compare live-intro: no banner for a terminal / pre-intro buy deal ({_li_name})",
+          "cmp-live-intro\" role" not in _li_page(_li_buy(_li_sid, stage=_li_stage)))
+check("compare live-intro: no banner without any intro, or for an unrelated tenant",
+      "cmp-live-intro\" role" not in _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
+      and "cmp-live-intro\" role" not in _li_page(_li_buy(7207579), [tenant_cookie(CMP_SELLER)]))
+check("compare live-intro: the seller linked to the buyer's deal never gets the banner (primary contact is the buyer)",
+      "cmp-live-intro\" role" not in _li_page(_li_buy(7207579), [tenant_cookie(CMP_OTHER)])
+      and "cmp-live-intro\" role" not in _li_page(_li_buy(7207579, primary=False), [tenant_cookie(CMP_OTHER)]))
+check("compare live-intro: without primary_contact_id the buyer is still detected (not a live seller here)",
+      "cmp-live-intro\" role" in _li_page(_li_buy(7207579, primary=False)))
+check("compare live-intro: admin without view_as sees no banner; admin view_as the buyer does",
+      "cmp-live-intro\" role" not in _li_page(_li_buy(7207579), [], {"key": ADMIN_KEY, "view": "compare", "company": "7001"})
+      and "cmp-live-intro\" role" in _li_page(_li_buy(7207579), [],
+                                              {"key": ADMIN_KEY, "view": "compare", "company": "7001",
+                                               "view_as": CMP_BUYER}))
+_li_solo = _li_page(_li_buy(7207579), None, {"view": "compare", "company": "7004"})
+check("compare live-intro: guard applies to that company only (Solo Co page unaffected)",
+      "cmp-live-intro\" role" not in _li_solo and "cmp-current-chip\">" not in _li_solo)
+
 # Fail soft.
 _cmp_saved_off = lf._compare_offerings
 lf._compare_offerings = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 down"))

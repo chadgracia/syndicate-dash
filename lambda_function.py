@@ -20397,6 +20397,10 @@ COMPARE_CSS = """
   .cmp-comm-nudge { margin-top: 4px; font-size: 13px; }
   .cmp-comm-note { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
   .cmp-fee-blank { color: var(--muted); }
+  .cmp-live-intro { margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; background: #FDF0E9; color: #C2410C;
+                    font-weight: 600; font-size: 13.5px; }
+  .cmp-current-chip { display: inline-block; margin-top: 4px; padding: 1px 8px; border-radius: 9999px; font-size: 11px;
+                      font-weight: 700; color: #fff; background: var(--accent); white-space: nowrap; }
   .cmp-update-btn { display: inline-block; margin-top: 5px; padding: 2px 9px; border: 1px solid var(--line);
                     border-radius: 9999px; font-size: 11px; font-weight: 600; color: var(--accent); background: #fff; }
   .cmp-update-btn:hover { border-color: var(--accent); text-decoration: none; }
@@ -20889,6 +20893,75 @@ def _compare_nudge_text(higher):
     return " · ".join(f"{label} saves you ${amt:,.0f}" for label, amt in higher)
 
 
+# Live-intro guard: a viewer already introduced on this company is asked to
+# stay with their current counterparty (banner + "Your current deal" chip;
+# the "Ask about fees" links to other offerings are hidden on that company).
+COMPARE_LIVE_INTRO_BANNER = ("You've already been introduced on {company}. Please continue with your current "
+                             "counterparty; contact Chad before considering other offerings.")
+COMPARE_CURRENT_DEAL_CHIP = "Your current deal"
+
+
+def _compare_viewer_ids(tenant=None, email=None):
+    """str person ids of the viewer's person + firm/team: a tenant via
+    _firm_person_ids; any other identity via the people-slim email match."""
+    try:
+        if tenant is not None and tenant.get("person_id") is not None:
+            return frozenset(str(p) for p in _firm_person_ids(tenant.get("person_id")))
+        pids = _people_lookup_index()["email"].get(str(email or "").strip().lower()) or []
+        out = set()
+        for pid in set(pids):
+            try:
+                out |= {str(p) for p in _firm_person_ids(int(pid))}
+            except (TypeError, ValueError):
+                out.add(str(pid))
+        return frozenset(out)
+    except Exception as e:
+        print(f"compare viewer ids failed (no live-intro guard): {type(e).__name__}: {e}")
+        return frozenset()
+
+
+def _compare_live_intro(entry, viewer_ids):
+    """(buy deal, matched offering deal id or None) when the viewer's person
+    or firm is the BUYER on a live intro for this company: a Buy-tagged,
+    non-terminal deal for the company, the viewer linked to it, intro
+    status active (_intro_is_active: Introduced or later, not Closed/
+    Passed/Withdrawn). Buyer, not seller: primary_contact_id (the buyer
+    _pipeline_create_buy_deal records) must be the viewer when present;
+    without it, a viewer who is linked to a live Sell deal for the company
+    is treated as its seller, not a buyer. Pipeline values only."""
+    vids = {str(v) for v in viewer_ids or ()}
+    if not vids or not entry:
+        return None
+    company = (entry["company"] or "").strip().lower()
+    deals = get_deals_list()
+    live_sellers = set()
+    for d in deals:
+        if (_deal_is_sell(d) and (_deal_company_name(d) or "").strip().lower() == company
+                and _deal_stage_id(d) not in TERMINAL_STAGE_IDS):
+            live_sellers |= {str(p) for p in _deal_linked_person_ids(d)}
+    for d in deals:
+        if not _deal_is_buy(d) or (_deal_company_name(d) or "").strip().lower() != company:
+            continue
+        if _deal_stage_id(d) in TERMINAL_STAGE_IDS:
+            continue
+        linked = {str(p) for p in _deal_linked_person_ids(d)}
+        if not linked & vids:
+            continue
+        pc = d.get("primary_contact_id")
+        if pc not in (None, ""):
+            if str(pc) not in vids:
+                continue
+        elif vids & live_sellers:
+            continue
+        if not _intro_is_active(_resolve_intro_status(d, None)):
+            continue
+        others = linked - vids
+        match = next((str(o.get("id")) for o in entry["deals"]
+                      if {str(p) for p in _deal_linked_person_ids(o)} & others), None)
+        return d, match
+    return None
+
+
 COMPARE_PROFILE_URL = f"{WATCHLIST_URL}?view=profile"
 COMPARE_REDUCE_LABEL = "Reduce your commission →"
 COMPARE_STANDING_LABEL = "View your standing →"
@@ -20931,7 +21004,7 @@ def _compare_commission_html(mode, email=None, investment=COMPARE_DEFAULT_INVEST
 
 
 def render_compare_company(company_param, role, header_html, scope=frozenset(), key=None, view_as=None,
-                           impersonating=False, commission=("admin", None)):
+                           impersonating=False, commission=("admin", None), viewer_ids=frozenset()):
     """role: "admin" (Admin view: everything, every row editable), "tenant"
     (own firm/team rows = "Your offering", editable; impersonating = admin
     Tenant-view preview), "buyer" (read-only, gross price, nudge line).
@@ -20952,6 +21025,12 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                               '<p class="cmp-empty">No live SPV offerings for this company right now.</p>')
     company = entry["company"]
     investment, outcome = COMPARE_DEFAULT_INVESTMENT, COMPARE_DEFAULT_OUTCOME
+    try:
+        live_intro = _compare_live_intro(entry, viewer_ids) if viewer_ids else None
+    except Exception as e:
+        print(f"compare live-intro check failed (no guard): {type(e).__name__}: {e}")
+        live_intro = None
+    current_deal_id = live_intro[1] if live_intro else None
     live_rows = [r for r in rows if not r["hold"]]
     n_ranked = sum(1 for r in rows if r["status"] == "ranked")
     nudge_state = _compare_nudge_states([str(r["deal"].get("id")) for r in rows]) if key is not None else {}
@@ -20986,6 +21065,8 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                                    "cmp-top" if top else "") if c)
         partial = r["fee_status"] == "partial"
         label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
+        if current_deal_id is not None and deal_id == current_deal_id:
+            label_html += f'<div class="cmp-current-chip">{_esc(COMPARE_CURRENT_DEAL_CHIP)}</div>'
         if r["updated_days"] is not None:
             label_html += f'<div class="cmp-updated">Updated {_esc(r["updated_text"])}</div>'
         label_html += f'<div class="cmp-partial"{"" if partial else " hidden"}>{_esc(COMPARE_PARTIAL_NOTE)}</div>'
@@ -20997,7 +21078,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                            f'{_esc(COMPARE_CONFIRM_FEES_PROMPT)}</div>')
             label_html += (f'<div class="cmp-prompt cmp-prompt-add"{"" if no_fees else " hidden"}>'
                            f'{_esc(COMPARE_ADD_FEES_PROMPT)}</div>')
-        if no_fees:
+        if no_fees and not live_intro:
             label_html += (f'<a class="cmp-ask" href="{_esc(COMPARE_ASK_URL.format(deal_id))}" target="_blank" '
                            'rel="noopener">Ask about fees →</a>')
         if r["own"] or key is not None:
@@ -21067,7 +21148,9 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     body = (f'{back}<h1>{_esc(company)} SPV offerings</h1>'
             f'<p class="cmp-sub">{n} live offering{"s" if n != 1 else ""}. {_esc(COMPARE_SUBTITLE_LEAD)} '
             f'{_esc(COMPARE_FEES_SUBTITLE)} Click a column to sort.</p>'
-            '<div class="cmp-controls">'
+            + (f'<div class="cmp-live-intro" role="status">'
+               f'{_esc(COMPARE_LIVE_INTRO_BANNER.format(company=company))}</div>' if live_intro else "")
+            + '<div class="cmp-controls">'
             f'<label>Investment <input id="cmp-inv" type="text" inputmode="decimal" autocomplete="off" '
             f'value="{_esc(compare_fmt_money(investment))}" aria-label="Investment amount"></label>'
             f'<span class="cmp-picks">{pick_html}</span>'
@@ -21084,11 +21167,11 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
 
 
 def render_compare_page(query, role, header_html, scope=frozenset(), key=None, view_as=None, impersonating=False,
-                        commission=("admin", None)):
+                        commission=("admin", None), viewer_ids=frozenset()):
     company = query.get("company")
     if company:
         return render_compare_company(company, role, header_html, scope=scope, key=key, view_as=view_as,
-                                      impersonating=impersonating, commission=commission)
+                                      impersonating=impersonating, commission=commission, viewer_ids=viewer_ids)
     return render_compare_index(role, header_html, key=key, view_as=view_as)
 
 
@@ -21499,9 +21582,17 @@ def _handle_compare_view(query, is_admin_key, view_as, tenant, identity_email, e
         commission = ("seller", None)
     else:
         commission = ("buyer", identity_email)
+    # Live-intro guard viewer: the previewed person (view_as), the tenant, or
+    # the buyer identity -- never plain admin.
+    if is_admin_key and not view_as:
+        viewer_ids = frozenset()
+    elif query.get("company"):
+        viewer_ids = _compare_viewer_ids(tenant, view_as if (is_admin_key and view_as) else identity_email)
+    else:
+        viewer_ids = frozenset()
     return _html_response(render_compare_page(query, role, header, scope=scope, key=key,
                                               view_as=(view_as or None), impersonating=impersonating,
-                                              commission=commission))
+                                              commission=commission, viewer_ids=viewer_ids))
 
 
 def _perf_infer_page(query):
