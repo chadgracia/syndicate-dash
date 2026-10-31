@@ -20348,6 +20348,12 @@ COMPARE_CSS = """
   .cmp-msg.error { color: #B42318; }
   .cmp-msg.warn { color: #C2410C; }
   .cmp-nudge { margin: 14px 2px 0; font-size: 13px; color: var(--muted); }
+  .cmp-commission { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
+                    margin: 0 0 12px; font-size: 13.5px; }
+  .cmp-comm-main { font-weight: 600; }
+  .cmp-comm-nudge { margin-top: 4px; font-size: 13px; }
+  .cmp-comm-note { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
+  .cmp-comm-seller { margin: 0 0 12px; font-size: 12.5px; color: var(--muted); }
   .cmp-empty { padding: 24px; color: var(--muted); }
   .cmp-search { width: 100%; max-width: 420px; font: inherit; padding: 8px 10px; border: 1px solid var(--line);
                 border-radius: 8px; margin: 0 0 14px; box-sizing: border-box; }
@@ -20522,8 +20528,34 @@ COMPARE_SCRIPT = (r"""<script>
     });
     sortRows();
   }
+  var commBox = document.getElementById('cmp-commission');
+  var comm = null;
+  try { comm = commBox ? JSON.parse(commBox.getAttribute('data-comm')) : null; } catch (e) { comm = null; }
+  function rateText(r) { return trimNum(r.toFixed(2)) + '%'; }
+  function dollars(v) { return '$' + Math.round(v).toLocaleString('en-US'); }
+  function commRate(inv, discount) {
+    var base = comm.bands[comm.bands.length - 1][1];
+    for (var i = 0; i < comm.bands.length; i++) {
+      if (comm.bands[i][0] === null || inv <= comm.bands[i][0]) { base = comm.bands[i][1]; break; }
+    }
+    return base * (1 - discount / 100);
+  }
+  function updateCommission() {
+    if (!comm) return;
+    var rate = commRate(investment, comm.discount);
+    var amt = Math.round(investment * rate / 100);
+    var line = document.getElementById('cmp-comm-line');
+    if (line) line.textContent = 'Your RMS commission on ' + fmtMoney(investment) + ': ' + rateText(rate) + ' = ' +
+      dollars(amt) + ' (' + (comm.label ? comm.label + ' rate' : 'standard rate') + ') \u00b7 Total cash out ' +
+      dollars(investment + amt);
+    var nudge = document.getElementById('cmp-comm-nudge');
+    if (nudge) nudge.textContent = comm.higher.map(function(h) {
+      return h.label + ' saves you ' + dollars(investment * (rate - commRate(investment, h.discount)) / 100);
+    }).join(' \u00b7 ') + ' \u2192';
+  }
   function setInvestment(v, save) {
     investment = v;
+    updateCommission();
     if (invMsg) invMsg.hidden = true;
     picks.forEach(function(b) { b.classList.toggle('active', num(b.getAttribute('data-v')) === v); });
     if (save) { try { window.localStorage.setItem(STORE, String(v)); } catch (e) {} }
@@ -20736,8 +20768,90 @@ def _compare_find_entry(offerings, company_param):
     return next((e for e in offerings.values() if e["company"].lower() == low), None)
 
 
+# RMS commission (buyer box above the compare table). Base rate by
+# investment size -- this view's own schedule (NOT deal-update-form's
+# size-based helper, which differs): (upper bound inclusive, rate %), last = above.
+COMPARE_COMMISSION_BANDS = ((1_000_000, 5.0), (5_000_000, 4.0), (10_000_000, 3.5), (None, 2.5))
+COMPARE_COMMISSION_NOTE = ("RMS commission is added on top of your investment and is the same on every "
+                           "offering, so it does not change the ranking.")
+COMPARE_SELLER_COMMISSION_LINE = ("Buyers pay a separate RMS commission on top, the same on every offering — "
+                                  "your fees are what set the ranking.")
+COMPARE_ADMIN_COMMISSION_NOTE = "(standard — use view_as to preview a client)"
+
+
+def compare_commission_base_rate(investment):
+    for upper, rate in COMPARE_COMMISSION_BANDS:
+        if upper is None or investment <= upper:
+            return rate
+    return COMPARE_COMMISSION_BANDS[-1][1]
+
+
+def compare_commission_rate(investment, tier=None):
+    """Base rate less the tier's STANDING_DISCOUNT_PCT (% off the rate)."""
+    return compare_commission_base_rate(investment) * (1 - STANDING_DISCOUNT_PCT.get(tier, 0) / 100.0)
+
+
+def _compare_rate_text(rate):
+    return f"{rate:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def _compare_viewer_tier(email):
+    """The viewer's standing tier (preferred|gold|platinum) or None: person
+    id by any email on a people-slim record (one match only), then
+    compute_client_standing; admin-hidden, no tier or any error -> None."""
+    try:
+        pids = _people_lookup_index()["email"].get(str(email or "").strip().lower()) or []
+        if len(set(pids)) != 1:
+            return None
+        cs = compute_client_standing(pids[0])
+        if cs is None or cs.get("hidden"):
+            return None
+        return cs.get("tier") if cs.get("tier") in STANDING_TIERS else None
+    except Exception as e:
+        print(f"compare commission tier lookup failed (standard rate): {type(e).__name__}: {e}")
+        return None
+
+
+def compare_commission_lines(investment, tier=None):
+    """(line 1, [(tier label, savings)] for every tier above the viewer's)."""
+    rate = compare_commission_rate(investment, tier)
+    amount = round(investment * rate / 100.0)
+    label = f"{STANDING_TIER_LABELS[tier]} rate" if tier else "standard rate"
+    line1 = (f"Your RMS commission on {compare_fmt_money(investment)}: {_compare_rate_text(rate)} = "
+             f"${amount:,.0f} ({label}) · Total cash out ${investment + amount:,.0f}")
+    start = STANDING_TIERS.index(tier) + 1 if tier else 0
+    higher = [(STANDING_TIER_LABELS[t], round(investment * (rate - compare_commission_rate(investment, t)) / 100.0))
+              for t in STANDING_TIERS[start:]]
+    return line1, higher
+
+
+def _compare_nudge_text(higher):
+    return " · ".join(f"{label} saves you ${amt:,.0f}" for label, amt in higher) + " →"
+
+
+def _compare_commission_html(mode, email=None, investment=COMPARE_DEFAULT_INVESTMENT):
+    """mode "seller" -> the one muted seller line; "buyer" -> the box at the
+    viewer's tier; "admin" -> the box at the standard rate + preview note.
+    Only the tier name ever appears -- no other standing detail."""
+    if mode == "seller":
+        return f'<p class="cmp-comm-seller">{_esc(COMPARE_SELLER_COMMISSION_LINE)}</p>'
+    tier = _compare_viewer_tier(email) if mode == "buyer" else None
+    line1, higher = compare_commission_lines(investment, tier)
+    data = {"bands": [[u, r] for u, r in COMPARE_COMMISSION_BANDS],
+            "discount": STANDING_DISCOUNT_PCT.get(tier, 0),
+            "label": STANDING_TIER_LABELS[tier] if tier else "",
+            "higher": [{"label": STANDING_TIER_LABELS[t], "discount": STANDING_DISCOUNT_PCT[t]}
+                       for t in STANDING_TIERS[(STANDING_TIERS.index(tier) + 1 if tier else 0):]]}
+    nudge = (f'<div class="cmp-comm-nudge"><a href="{_esc(STANDING_TIERS_URL)}" id="cmp-comm-nudge">'
+             f'{_esc(_compare_nudge_text(higher))}</a></div>') if higher else ""
+    admin_note = f' <span class="cmp-note">{_esc(COMPARE_ADMIN_COMMISSION_NOTE)}</span>' if mode == "admin" else ""
+    return (f'<div class="cmp-commission" id="cmp-commission" data-comm="{_esc(json.dumps(data))}">'
+            f'<div class="cmp-comm-main"><span id="cmp-comm-line">{_esc(line1)}</span>{admin_note}</div>'
+            f'{nudge}<div class="cmp-comm-note">{_esc(COMPARE_COMMISSION_NOTE)}</div></div>')
+
+
 def render_compare_company(company_param, role, header_html, scope=frozenset(), key=None, view_as=None,
-                           impersonating=False):
+                           impersonating=False, commission=("admin", None)):
     """role: "admin" (Admin view: everything, every row editable), "tenant"
     (own firm/team rows = "Your offering", editable; impersonating = admin
     Tenant-view preview), "buyer" (read-only, gross price, nudge line).
@@ -20872,6 +20986,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             '<span class="cmp-msg error" id="cmp-inv-msg" hidden>Enter an amount like 300k or 1.5m</span>'
             f'<label>Outcome <select id="cmp-outcome">{outcome_opts}</select></label>'
             f'<label>Years to exit <select id="cmp-years">{years_opts}</select></label></div>'
+            f'{_compare_commission_html(commission[0], commission[1], investment)}'
             f'<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"'
             f' data-inv="{investment}"{data_key}>'
             f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'
@@ -20879,11 +20994,12 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     return _compare_shell(f"{company} offerings", header_html, body)
 
 
-def render_compare_page(query, role, header_html, scope=frozenset(), key=None, view_as=None, impersonating=False):
+def render_compare_page(query, role, header_html, scope=frozenset(), key=None, view_as=None, impersonating=False,
+                        commission=("admin", None)):
     company = query.get("company")
     if company:
         return render_compare_company(company, role, header_html, scope=scope, key=key, view_as=view_as,
-                                      impersonating=impersonating)
+                                      impersonating=impersonating, commission=commission)
     return render_compare_index(role, header_html, key=key, view_as=view_as)
 
 
@@ -21035,8 +21151,18 @@ def _handle_compare_view(query, is_admin_key, view_as, tenant, identity_email, e
                            person_id=(tenant.get("person_id") if tenant is not None else None),
                            account_email=(None if is_admin_key else identity_email))
     impersonating = bool(is_admin_key and view_as and role == "tenant")
+    # Commission box: what the viewer (or the previewed person) would see.
+    if is_admin_key and view_as:
+        commission = ("seller", None) if tenant is not None else ("buyer", view_as)
+    elif is_admin_key:
+        commission = ("admin", None)
+    elif tenant is not None:
+        commission = ("seller", None)
+    else:
+        commission = ("buyer", identity_email)
     return _html_response(render_compare_page(query, role, header, scope=scope, key=key,
-                                              view_as=(view_as or None), impersonating=impersonating))
+                                              view_as=(view_as or None), impersonating=impersonating,
+                                              commission=commission))
 
 
 def _perf_infer_page(query):

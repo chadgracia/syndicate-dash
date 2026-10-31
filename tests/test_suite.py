@@ -11669,7 +11669,8 @@ check("compare amount warning: '$1M', '1,000,000', '1m' and the quick picks pars
       and lf.parse_investment_amount("abc") is None)
 check("compare amount warning: starts hidden, cleared on every successful parse/quick pick, shown only on failure",
       '<span class="cmp-msg error" id="cmp-inv-msg" hidden>' in _cb2
-      and "function setInvestment(v, save) {\n    investment = v;\n    if (invMsg) invMsg.hidden = true;" in lf.COMPARE_SCRIPT
+      and "function setInvestment(v, save) {\n    investment = v;\n    updateCommission();\n    if (invMsg) invMsg.hidden = true;"
+          in lf.COMPARE_SCRIPT
       and "if (v === null) { if (invMsg && invInput.value.trim()) invMsg.hidden = false; return; }" in lf.COMPARE_SCRIPT
       and "setInvestment(v, true);" in lf.COMPARE_SCRIPT.split("picks.forEach(function(b) {\n    b.addEventListener")[1][:300]
       and "var t = String(raw || '').trim().toLowerCase().replace(/[$,\\s]/g, '');" in lf.COMPARE_SCRIPT)
@@ -11721,6 +11722,83 @@ _ca2_h = _ca2[_ca2.rindex("<tr", 0, _ca2.index(">Hold<")):]
 _ca2_h = _ca2_h[:_ca2_h.index("</tr>")]
 check("compare page: admin Hold row never ranked (rank '—', group 1)",
       '<span class="cmp-rank-v">—</span>' in _ca2_h and 'data-group="1"' in _ca2_h and "cmp-best\">" not in _ca2_h)
+
+# RMS commission box (buyers) / seller line (tenants).
+check("compare commission bands: $1,000,000 -> 5%, $1,000,001 -> 4%, $5M -> 4%, $5,000,001 -> 3.5%, "
+      "$10M -> 3.5%, $10,000,001 -> 2.5%",
+      [lf.compare_commission_base_rate(v) for v in (1_000_000, 1_000_001, 5_000_000, 5_000_001, 10_000_000,
+                                                     10_000_001, 50_000)] == [5.0, 4.0, 4.0, 3.5, 3.5, 2.5, 5.0])
+check("compare commission discounts: $1M Preferred 4.5% / Gold 4.25% = $42,500 / Platinum 4%",
+      lf.compare_commission_lines(1_000_000, "preferred")[0]
+      == "Your RMS commission on $1M: 4.5% = $45,000 (Preferred rate) · Total cash out $1,045,000"
+      and lf.compare_commission_lines(1_000_000, "gold")[0]
+      == "Your RMS commission on $1M: 4.25% = $42,500 (Gold rate) · Total cash out $1,042,500"
+      and lf._compare_rate_text(lf.compare_commission_rate(1_000_000, "platinum")) == "4%"
+      and lf.compare_commission_lines(100_000)[0]
+      == "Your RMS commission on $100K: 5% = $5,000 (standard rate) · Total cash out $105,000")
+check("compare commission nudge: only higher tiers; Platinum gets none",
+      lf.compare_commission_lines(1_000_000, "preferred")[1] == [("Gold", 2500), ("Platinum", 5000)]
+      and lf.compare_commission_lines(1_000_000, "gold")[1] == [("Platinum", 2500)]
+      and lf.compare_commission_lines(1_000_000, "platinum")[1] == []
+      and [t for t, _ in lf.compare_commission_lines(1_000_000)[1]] == ["Preferred", "Gold", "Platinum"]
+      and lf._compare_nudge_text([("Gold", 2500), ("Platinum", 5000)])
+      == "Gold saves you $2,500 · Platinum saves you $5,000 →")
+check("compare commission schedule is this module's own constant (not deal-update-form's helper)",
+      lf.COMPARE_COMMISSION_BANDS == ((1_000_000, 5.0), (5_000_000, 4.0), (10_000_000, 3.5), (None, 2.5))
+      and "commission_rate_for_size" not in _cmp_mod)
+
+
+def _comm_box(html):
+    i = html.find('<div class="cmp-commission"')
+    return "" if i < 0 else html[i:html.index('<div class="cmp-scroll">', i)]
+
+
+_cmp_s3.objs[lf.STANDING_KEY] = {"rev": 1, "updated_at": "", "clients": {"503": {"tier_floor": "gold"}}}
+_cbc = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
+_cbc_box = _comm_box(_cbc)
+check("compare commission: buyer box between the controls and the table at the viewer's tier (Gold, $100K)",
+      _cbc.index('id="cmp-years"') < _cbc.index('id="cmp-commission"') < _cbc.index('<div class="cmp-scroll">')
+      and "Your RMS commission on $100K: 4.25% = $4,250 (Gold rate) · Total cash out $104,250" in _cbc_box
+      and '<a href="https://desk.graciagroup.com/?view=commission-tiers" id="cmp-comm-nudge">Platinum saves you $250 →</a>'
+          in _cbc_box
+      and "RMS commission is added on top of your investment and is the same on every offering, so it does not "
+          "change the ranking." in _cbc_box)
+check("compare commission: box shows no standing detail beyond the tier name",
+      not any(w in _cbc_box.lower() for w in ("trade", "volume", "referral", "good standing", "repair", "missed",
+                                                "onboarding", "qualification")))
+check("compare commission: client script recalculates the box on every investment change",
+      "function setInvestment(v, save) {\n    investment = v;\n    updateCommission();" in lf.COMPARE_SCRIPT
+      and "'Your RMS commission on ' + fmtMoney(investment)" in lf.COMPARE_SCRIPT)
+_cmp_s3.objs[lf.STANDING_KEY] = {"rev": 1, "updated_at": "",
+                                 "clients": {"503": {"tier_floor": "gold", "hidden": True}}}
+lf._data_cache.clear()
+_cbh_box = _comm_box(_cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"])
+check("compare commission: admin-hidden standing -> standard rate, no tier name",
+      re.search(r'<span id="cmp-comm-line">Your RMS commission on \$100K: 5% = \$5,000 \(standard rate\) · '
+                r'Total cash out \$105,000</span>', _cbh_box) is not None
+      and "&quot;label&quot;: &quot;&quot;" in _cbh_box and " rate)" not in _cbh_box.replace("(standard rate)", ""))
+_cmp_s3.objs[lf.STANDING_KEY] = {"rev": 1, "updated_at": "", "clients": {"503": {"tier_floor": "platinum"}}}
+lf._data_cache.clear()
+_cbp_box = _comm_box(_cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"])
+check("compare commission: Platinum viewer gets no nudge line", "(Platinum rate)" in _cbp_box
+      and "cmp-comm-nudge" not in _cbp_box)
+_cts = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+check("compare commission: tenant/seller view -> no box, no commission figures, the muted seller line",
+      'id="cmp-commission"' not in _cts and 'id="cmp-comm-line"' not in _cts and 'id="cmp-comm-nudge"' not in _cts
+      and "Total cash out" not in _cts.replace(lf.COMPARE_SCRIPT, "")
+      and '<p class="cmp-comm-seller">Buyers pay a separate RMS commission on top, the same on every offering — '
+          'your fees are what set the ranking.</p>' in _cts)
+_cvs = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_SELLER})["body"]
+_cvb = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_BUYER})["body"]
+_cva = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+check("compare commission: view_as a tenant -> seller line; view_as a buyer -> their tier box",
+      'id="cmp-commission"' not in _cvs and "cmp-comm-seller" in _cvs.split("<style>")[0] + _cvs.split("</style>")[1]
+      and "(Platinum rate)" in _comm_box(_cvb))
+check("compare commission: plain admin -> standard box + '(standard — use view_as to preview a client)'",
+      "(standard rate)" in _comm_box(_cva) and "(standard — use view_as to preview a client)" in _comm_box(_cva)
+      and "Preferred saves you $500 · Gold saves you $750 · Platinum saves you $1,000 →" in _comm_box(_cva))
+_cmp_s3.objs.pop(lf.STANDING_KEY, None)
+lf._data_cache.clear()
 
 # Fail soft.
 _cmp_saved_off = lf._compare_offerings
