@@ -1847,7 +1847,20 @@ def _invalid_login_link_response():
     return _html_response(body, 403, disclosure=False)
 
 
-def _handle_login_link(token, via_public):
+def _login_link_destination(query):
+    """Optional post-login destination on a login link -- allowlisted to the
+    compare view only: ?next=compare[&company=<digits>]. Anything else ->
+    None (the normal Overview landing)."""
+    query = query or {}
+    if query.get("next") != "compare":
+        return None
+    company = str(query.get("company") or "").strip()
+    if company and not re.fullmatch(r"\d{1,20}", company):
+        return None
+    return "?view=compare" + (f"&company={company}" if company else "")
+
+
+def _handle_login_link(token, via_public, query=None):
     """GET /dashboard/login/<token>: valid -> set the gg_id identity cookie
     (the one shared with trades, IDENTITY_SECRET) and 302 to the clean
     Overview URL, so the token never stays in the address bar. Invalid ->
@@ -1855,12 +1868,13 @@ def _handle_login_link(token, via_public):
     email = _verify_tenant_link_token(token)
     if not email or not IDENTITY_SECRET:
         return _invalid_login_link_response()
+    dest = _login_link_destination(query) or "?tab=overview"
     if via_public:
         cookie = _make_identity_cookie(email, domain=PUBLIC_COOKIE_DOMAIN)
-        location = f"{PUBLIC_BASE_URL}/?tab=overview"
+        location = f"{PUBLIC_BASE_URL}/{dest}"
     else:  # direct Function URL: a .graciagroup.com cookie wouldn't stick there
         cookie = _make_identity_cookie(email)
-        location = "/?tab=overview"
+        location = f"/{dest}"
     return {"statusCode": 302, "headers": {"Location": location, "Cache-Control": "no-store"},
             "cookies": [cookie], "body": ""}
 
@@ -2050,7 +2064,7 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name"
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
     1958, 3052210, 3064297, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163, 3769275,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
-    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 3900670))
+    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 3900670, 2447206))
 
 
 def _people_slim_schema():
@@ -20377,6 +20391,20 @@ COMPARE_CSS = """
   .cmp-comm-main { font-weight: 600; }
   .cmp-comm-nudge { margin-top: 4px; font-size: 13px; }
   .cmp-comm-note { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
+  .cmp-fee-blank { color: var(--muted); }
+  .cmp-update-btn { display: inline-block; margin-top: 5px; padding: 2px 9px; border: 1px solid var(--line);
+                    border-radius: 9999px; font-size: 11px; font-weight: 600; color: var(--accent); background: #fff; }
+  .cmp-update-btn:hover { border-color: var(--accent); text-decoration: none; }
+  .cmp-bell { margin-left: 6px; padding: 1px 6px; border: 1px solid var(--line); border-radius: 6px; background: #fff;
+              font-size: 12px; cursor: pointer; vertical-align: 1px; }
+  .cmp-bell[disabled] { cursor: default; opacity: .55; }
+  .cmp-bell-sent { font-size: 11px; color: var(--muted); margin-left: 4px; }
+  .cmp-modal-bg { position: fixed; inset: 0; background: rgba(0,0,0,.35); z-index: 100; display: flex;
+                  align-items: center; justify-content: center; padding: 16px; }
+  .cmp-modal { background: #fff; border-radius: 10px; max-width: 640px; width: 100%; max-height: 85vh; overflow: auto;
+               padding: 18px 20px; font-size: 13px; }
+  .cmp-modal pre { white-space: pre-wrap; font: inherit; background: var(--bg); padding: 10px; border-radius: 6px; }
+  .cmp-modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 12px; }
   .cmp-info-note { margin: 8px 2px 0; font-size: 12px; color: var(--muted); }
   .cmp-comm-seller { margin: 0 0 12px; font-size: 12.5px; color: var(--muted); }
   .cmp-empty { padding: 24px; color: var(--muted); }
@@ -20511,7 +20539,7 @@ COMPARE_SCRIPT = (r"""<script>
       FEES.forEach(function(f) {
         if (num(tr.getAttribute('data-' + f)) !== null) return;
         var fv = tr.querySelector('td[data-col="' + f + '"] .cmp-fee-v');
-        if (fv) fv.textContent = st === 'none' ? 'Not provided' : '—';
+        if (fv) { fv.textContent = '\u2014'; fv.classList.toggle('cmp-fee-blank', st === 'none'); }
       });
       var show = {'.cmp-partial': fs === 'partial', '.cmp-prompt-confirm': fs === 'partial',
                   '.cmp-prompt-add': st === 'none', '.cmp-ask': st === 'none', '.cmp-rank': st !== 'none'};
@@ -20667,6 +20695,7 @@ COMPARE_SCRIPT = (r"""<script>
           td.setAttribute('data-v', res.d.value);
           var fv = td.querySelector('.cmp-fee-v');
           fv.textContent = fmtPct(res.d.value) + (field === 'mgmt' ? '/yr' : '');
+          fv.classList.remove('cmp-fee-blank');
           form.remove();
           sortCol = 'rank'; sortDir = 1;
           recompute();
@@ -20733,10 +20762,9 @@ def _compare_buyer_header_html():
 
 
 def _compare_fee_text(v, field, fee_status="complete"):
-    """"4%", "2% / yr"; a blank is "Not provided" when the row has no fees
-    at all, else "—"."""
+    """"4%", "2%/yr"; a blank is "—" (muted in the no-fees group)."""
     if v is None:
-        return "Not provided" if fee_status == "none" else "—"
+        return "—"
     return _fmt_pct(v) + ("/yr" if field == "mgmt" else "")
 
 
@@ -20744,8 +20772,9 @@ def _compare_fee_cell_html(row, field, editable):
     v = row[field]
     edit = ('<button type="button" class="cmp-edit-btn" aria-label="Edit this fee">Edit</button>'
             if editable else "")
+    muted = " cmp-fee-blank" if v is None and row["fee_status"] == "none" else ""
     return (f'<td class="num cmp-fee" data-col="{field}" data-field="{field}" data-v="{"" if v is None else v}">'
-            f'<span class="cmp-fee-v">{_esc(_compare_fee_text(v, field, row["fee_status"]))}</span>{edit}</td>')
+            f'<span class="cmp-fee-v{muted}">{_esc(_compare_fee_text(v, field, row["fee_status"]))}</span>{edit}</td>')
 
 
 def _compare_vehicle_html(row):
@@ -20900,6 +20929,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     investment, outcome = COMPARE_DEFAULT_INVESTMENT, COMPARE_DEFAULT_OUTCOME
     live_rows = [r for r in rows if not r["hold"]]
     n_ranked = sum(1 for r in rows if r["status"] == "ranked")
+    nudge_state = _compare_nudge_states([str(r["deal"].get("id")) for r in rows]) if key is not None else {}
     divider_row = f'<tr class="cmp-divider"{{hidden}}><td colspan="9">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>'
     tr_html = []
     divider_done = False
@@ -20945,6 +20975,14 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
         if no_fees:
             label_html += (f'<a class="cmp-ask" href="{_esc(COMPARE_ASK_URL.format(deal_id))}" target="_blank" '
                            'rel="noopener">Ask about fees →</a>')
+        if r["own"] or key is not None:
+            upd_url = _deal_update_form_url(deal_id)
+            if upd_url:
+                label_html += (f'<div><a class="cmp-update-btn" href="{_esc(upd_url)}" target="_blank" '
+                               f'rel="noopener">Update deal</a>'
+                               f'{_compare_bell_html(r, nudge_state, company) if key is not None else ""}</div>')
+            elif key is not None:
+                label_html += f'<div>{_compare_bell_html(r, nudge_state, company)}</div>'
         if role == "admin":
             label_html += (f'<div class="cmp-admin">{_esc(r["label"])} · {_esc(_compare_firm_text(d))} · '
                            f'<a href="{_esc(PIPELINE_DEAL_URL.format(deal_id))}" target="_blank" rel="noopener">'
@@ -20997,7 +21035,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     years_opts = "".join(f'<option value="{y}"{" selected" if y == COMPARE_DEFAULT_YEARS else ""}>'
                          f'{y} year{"s" if y != 1 else ""}</option>' for y in range(1, 11))
     data_key = ""
-    if any(r["own"] or role == "admin" for r in rows) and key:
+    if key:
         data_key = f' data-key="{_esc(key)}"' + (f' data-view-as="{_esc(view_as)}"' if impersonating and view_as else "")
     data_key += ' data-admin="1"' if key else ""
     n = len(live_rows)
@@ -21016,7 +21054,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f' data-inv="{investment}"{data_key}>'
             f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'
             f'<p class="cmp-info-note">{_esc(COMPARE_INFO_NOTE)}</p>'
-            f'{COMPARE_SCRIPT}')
+            f'{COMPARE_SCRIPT}{COMPARE_NUDGE_SCRIPT if key is not None else ""}')
     return _compare_shell(f"{company} offerings", header_html, body)
 
 
@@ -21153,6 +21191,267 @@ def _handle_compare_fee(event):
         firm = (team or {}).get("name") or tenant.get("company_name") or identity
         _send_fee_lowered_email(firm, actor, live, deal_id, field, old, new)
     return _json_response({"ok": True, "value": new})
+
+
+# ── Admin "nudge seller" bell (compare view) ──────────────────────────────
+# Product-law exception (Chad, explicit): this ONE admin-confirmed email goes
+# to the deal's seller(s) from Chad, Reply-To + BCC cgracia@rainmakersecurities.com,
+# at most once per deal per COMPARE_NUDGE_THROTTLE_DAYS. No Pipeline writes.
+EMAIL_STATUS_FIELD = "custom_label_2447206"
+EMAIL_STATUS_LABELS = {5141011: "Functioning", 3940558: "Bouncing", 4943722: "Blocked", 3940678: "Needed",
+                       7214691: "Unavailable", 3948784: "Unnecessary", 4781320: "Unsubscribed",
+                       4923706: "In Progress"}
+EMAIL_STATUS_SKIP_IDS = frozenset({3940558, 4943722, 3940678, 7214691, 4781320})
+COMPARE_NUDGE_FROM = '"Chad Gracia" <cgracia@graciagroup.com>'
+COMPARE_NUDGE_REPLY_TO = "cgracia@rainmakersecurities.com"
+COMPARE_NUDGE_BCC = "cgracia@rainmakersecurities.com"
+COMPARE_NUDGE_PARTITION = "__compare_nudge__"
+COMPARE_NUDGE_THROTTLE_DAYS = 7
+COMPARE_NUDGE_NO_EMAIL = "No seller email on file"
+
+
+def _compare_nudge_recipients(deal):
+    """[{person_id, first_name, email}] for the deal's linked people who are
+    Blockbook tenants with a usable email: not TENANT_BLOCKLIST, Email
+    Status (custom_label_2447206) not Bouncing/Blocked/Needed/Unavailable/
+    Unsubscribed (blank is allowed)."""
+    by_id = _people_data()["by_id"]
+    out, seen = [], set()
+    for pid in _deal_linked_person_ids_ordered(deal):
+        rec = by_id.get(str(pid))
+        if not rec:
+            continue
+        if set(cf_list(rec.get("custom_fields") or {}, EMAIL_STATUS_FIELD)) & EMAIL_STATUS_SKIP_IDS:
+            continue
+        email = next((e for e in _person_all_emails(rec)
+                      if e not in TENANT_BLOCKLIST and _resolve_tenant(e) is not None), None)
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        first = (rec.get("first_name") or "").strip() or \
+            ((rec.get("full_name") or rec.get("name") or "").strip().split(" ") or [""])[0] or "there"
+        out.append({"person_id": str(pid), "first_name": first, "email": email})
+    return out
+
+
+def _compare_nudge_states(deal_ids):
+    """{deal_id: stored nudge item} via ONE BatchGetItem (fail soft -> {})."""
+    if not deal_ids:
+        return {}
+    try:
+        got = _dynamo_batch_get([{"tenant": COMPARE_NUDGE_PARTITION, "sk": f"nudge#{d}"} for d in deal_ids])
+    except Exception as e:
+        print(f"compare nudge state read failed: {type(e).__name__}: {e}")
+        return {}
+    return {sk.split("#", 1)[1]: item for (_t, sk), item in got.items()}
+
+
+def _compare_nudge_recent(item, now=None):
+    """The sent datetime when the stored nudge is inside the throttle window."""
+    if not item:
+        return None
+    try:
+        sent = datetime.fromtimestamp(float(item.get("sent_epoch")), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
+    now = now or datetime.now(timezone.utc)
+    return sent if now - sent < timedelta(days=COMPARE_NUDGE_THROTTLE_DAYS) else None
+
+
+def _compare_sent_label(dt):
+    return f"Sent {dt.strftime('%b')} {dt.day}"
+
+
+def _compare_nudge_link(email, company_id):
+    base = _tenant_link_url(email)
+    if not base:
+        return None
+    return base + "?next=compare" + (f"&company={company_id}" if company_id and str(company_id).isdigit() else "")
+
+
+def _compare_nudge_rank(deal):
+    """(rank, total) as buyers see it at $100K / 5x / 5 yrs, or (None, total)."""
+    entry = _compare_offerings(False).get(_compare_company_key(deal))
+    if not entry:
+        return None, 0
+    rows, _ = _compare_rows(entry, "buyer")
+    total = sum(1 for r in rows if r["status"] == "ranked")
+    row = next((r for r in rows if str(r["deal"].get("id")) == str(deal.get("id"))), None)
+    return (row["rank"] if row and row["status"] == "ranked" else None), total
+
+
+def _compare_nudge_email(first_name, company, link, rank, total):
+    """(subject, plain-text body) -- disclosure under the signature."""
+    subject = f"{company}: see how your SPV terms compare"
+    if rank:
+        rank_line = (f"At a $100K investment, 5x outcome and 5 years, your offering currently ranks "
+                     f"#{rank} of {total}. You can update your fees directly on the page.")
+    else:
+        rank_line = "Your offering isn't ranked yet — add your fees to see where it stands."
+    body = (f"Hi {first_name},\n\n"
+            f"Buyers can now compare every {company} SPV offering side by side. Please visit this page to "
+            f"compare competing SPVs and see where yours ranks:\n{link}\n\n"
+            f"{rank_line}\n\n"
+            "Best wishes,\nChad Gracia\n\n---\n" + "\n\n".join(RMS_DISCLOSURE_PARAGRAPHS) + "\n")
+    return subject, body
+
+
+def _compare_nudge_preview(deal, company):
+    """[{to, subject, body}] -- exactly what Send would deliver."""
+    rank, total = _compare_nudge_rank(deal)
+    out = []
+    for rcp in _compare_nudge_recipients(deal):
+        link = _compare_nudge_link(rcp["email"], _deal_company_id(deal))
+        if not link:
+            continue
+        subject, body = _compare_nudge_email(rcp["first_name"], company, link, rank, total)
+        out.append({"to": rcp["email"], "subject": subject, "body": body})
+    return out
+
+
+def _compare_bell_html(row, nudge_state, company):
+    """Admin-only bell; live rows only (never Hold)."""
+    if row["hold"]:
+        return ""
+    deal = row["deal"]
+    deal_id = str(deal.get("id"))
+    sent = _compare_nudge_recent(nudge_state.get(deal_id))
+    if sent is not None:
+        label = _compare_sent_label(sent)
+        return (f'<button type="button" class="cmp-bell" disabled title="{_esc(label)}">🔔</button>'
+                f'<span class="cmp-bell-sent">{_esc(label)}</span>')
+    try:
+        preview = _compare_nudge_preview(deal, company)
+    except Exception as e:
+        print(f"compare nudge preview failed for deal {deal_id}: {type(e).__name__}: {e}")
+        preview = []
+    if not preview:
+        return (f'<button type="button" class="cmp-bell" disabled title="{_esc(COMPARE_NUDGE_NO_EMAIL)}" '
+                f'aria-label="{_esc(COMPARE_NUDGE_NO_EMAIL)}">🔔</button>')
+    return (f'<button type="button" class="cmp-bell" title="Nudge seller" aria-label="Nudge seller" '
+            f'data-nudge-deal="{_esc(deal_id)}" data-nudge="{_esc(json.dumps(preview))}">🔔</button>')
+
+
+COMPARE_NUDGE_SCRIPT = """<script>
+(function() {
+  var table = document.getElementById('cmp-table');
+  if (!table) return;
+  table.addEventListener('click', function(ev) {
+    var bell = ev.target.closest('.cmp-bell');
+    if (!bell || bell.disabled) return;
+    ev.preventDefault();
+    var preview = [];
+    try { preview = JSON.parse(bell.getAttribute('data-nudge') || '[]'); } catch (e) { preview = []; }
+    if (!preview.length) return;
+    var bg = document.createElement('div');
+    bg.className = 'cmp-modal-bg';
+    var box = document.createElement('div');
+    box.className = 'cmp-modal';
+    var h = document.createElement('h3'); h.textContent = 'Nudge seller \u2014 send this email?'; box.appendChild(h);
+    var to = document.createElement('p');
+    to.textContent = 'To: ' + preview.map(function(p) { return p.to; }).join(', ') +
+      ' \u00b7 BCC cgracia@rainmakersecurities.com';
+    box.appendChild(to);
+    preview.forEach(function(p) {
+      var sub = document.createElement('p'); sub.textContent = 'Subject: ' + p.subject; box.appendChild(sub);
+      var pre = document.createElement('pre'); pre.textContent = p.body; box.appendChild(pre);
+    });
+    var msg = document.createElement('p'); msg.className = 'cmp-msg'; box.appendChild(msg);
+    var acts = document.createElement('div'); acts.className = 'cmp-modal-actions';
+    var cancel = document.createElement('button'); cancel.type = 'button'; cancel.textContent = 'Cancel';
+    var send = document.createElement('button'); send.type = 'button'; send.textContent = 'Send';
+    acts.appendChild(cancel); acts.appendChild(send); box.appendChild(acts);
+    bg.appendChild(box); document.body.appendChild(bg);
+    cancel.addEventListener('click', function() { bg.remove(); });
+    send.addEventListener('click', function() {
+      send.disabled = true; msg.className = 'cmp-msg'; msg.textContent = 'Sending\u2026';
+      var body = {deal_id: bell.getAttribute('data-nudge-deal'), confirm: true, key: table.getAttribute('data-key')};
+      var viewAs = table.getAttribute('data-view-as');
+      if (viewAs) body.view_as = viewAs;
+      fetch('?action=compare_nudge', {method: 'POST', credentials: 'same-origin',
+        headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+        .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, d: d}; }); })
+        .then(function(res) {
+          if (!res.ok || !res.d.ok) {
+            send.disabled = false; msg.className = 'cmp-msg error'; msg.textContent = res.d.error || 'Send failed.';
+            return;
+          }
+          bell.disabled = true;
+          bell.title = res.d.sent_label;
+          var tag = document.createElement('span'); tag.className = 'cmp-bell-sent'; tag.textContent = res.d.sent_label;
+          bell.parentNode.insertBefore(tag, bell.nextSibling);
+          bg.remove();
+        })
+        .catch(function() { send.disabled = false; msg.className = 'cmp-msg error'; msg.textContent = 'Send failed \u2014 please try again.'; });
+    });
+  });
+})();
+</script>"""
+
+
+def _handle_compare_nudge(event):
+    """POST ?action=compare_nudge {key, deal_id, confirm: true} (+view_as from
+    an admin preview). Admin key only; confirm required; live qualifying
+    Sell deal; one nudge per deal per 7 days; one email per recipient; then
+    the throttle record + audit item. Never writes Pipeline."""
+    body = _parse_json_body(event)
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (admin_key and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+    if set(body) - {"key", "view_as", "deal_id", "confirm"}:
+        return _json_response({"error": "forbidden"}, 403)
+    if body.get("confirm") is not True:
+        return _json_response({"error": "Confirm required — nothing was sent."}, 400)
+    deal_id = str(body.get("deal_id") or "").strip()
+    if not deal_id.isdigit():
+        return _json_response({"error": "deal_id is required"}, 400)
+    entry_deal = None
+    for entry in _compare_offerings(False).values():
+        entry_deal = next((d for d in entry["deals"] if str(d.get("id")) == deal_id), None)
+        if entry_deal is not None:
+            company = entry["company"]
+            break
+    if entry_deal is None:
+        return _json_response({"error": "Not a live offering on the compare page."}, 404)
+    try:
+        state = _compare_nudge_states([deal_id]).get(deal_id)
+    except Exception:
+        state = None
+    sent_before = _compare_nudge_recent(state)
+    if sent_before is not None:
+        return _json_response({"error": f"Already nudged — {_compare_sent_label(sent_before)}.",
+                               "sent_label": _compare_sent_label(sent_before)}, 409)
+    preview = _compare_nudge_preview(entry_deal, company)
+    if not preview:
+        return _json_response({"error": COMPARE_NUDGE_NO_EMAIL}, 400)
+    sent = []
+    ses = boto3.client("ses", region_name="us-east-1")
+    for m in preview:
+        try:
+            ses.send_email(
+                Source=COMPARE_NUDGE_FROM,
+                Destination={"ToAddresses": [m["to"]], "BccAddresses": [COMPARE_NUDGE_BCC]},
+                ReplyToAddresses=[COMPARE_NUDGE_REPLY_TO],
+                Message={"Subject": {"Data": m["subject"]}, "Body": {"Text": {"Data": m["body"]}}})
+            sent.append(m["to"])
+        except Exception as e:
+            print(f"compare nudge email failed for deal {deal_id} -> {m['to']}: {type(e).__name__}: {e}")
+    if not sent:
+        return _json_response({"error": "Email send failed — nothing was sent."}, 502)
+    now = datetime.now(timezone.utc)
+    actor = (f"{ADMIN_IMPERSONATION_EMAIL} (as {str(body.get('view_as')).strip().lower()})"
+             if body.get("view_as") else "admin")
+    try:
+        table = _dynamo_table()
+        table.put_item(Item={"tenant": COMPARE_NUDGE_PARTITION, "sk": f"nudge#{deal_id}",
+                             "deal_id": deal_id, "company": company, "sent_at": now.isoformat(),
+                             "sent_epoch": Decimal(str(int(now.timestamp()))), "recipients": sent, "actor": actor})
+        table.put_item(Item={"tenant": COMPARE_NUDGE_PARTITION,
+                             "sk": f"audit#compare_nudge#{deal_id}#{int(now.timestamp() * 1000)}",
+                             "deal_id": deal_id, "actor": actor, "recipients": sent, "sent_at": now.isoformat()})
+    except Exception as e:
+        print(f"compare nudge record write failed for deal {deal_id}: {type(e).__name__}: {e}")
+    return _json_response({"ok": True, "sent": sent, "sent_label": _compare_sent_label(now)})
 
 
 def _handle_compare_view(query, is_admin_key, view_as, tenant, identity_email, edit_mode, viewer_name, cef_html):
@@ -21308,7 +21607,7 @@ def _lambda_handler_impl(event, context):
     if path.startswith("/login/"):
         if method != "GET":
             return _forbidden()
-        return _handle_login_link(path[len("/login/"):], via_public)
+        return _handle_login_link(path[len("/login/"):], via_public, query)
 
     if path.rstrip("/") == "/signout":
         return _handle_signout(event.get("rawPath"))
@@ -21319,6 +21618,11 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_update_intro(event)
+
+    if query.get("action") == "compare_nudge":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_compare_nudge(event)
 
     if query.get("action") == "compare_fee":
         if method != "POST":

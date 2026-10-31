@@ -11292,9 +11292,11 @@ check("compare: short labels — '2-Layer', 'GP – selling own units', 'L1 SPV'
       and re.search(r'<div class="cmp-updated">Updated \d+ days? ago</div>', _cb) is not None)
 _cb_c = _cb[_cb.rindex("<tr", 0, _cb.index(">Offering C<")):]
 _cb_c = _cb_c[:_cb_c.index("</tr>")]
-check("compare: all-blank row -> Net multiple '—', fee cells 'Not provided', unranked flag, Ask link (new tab)",
+check("compare: all-blank row -> Net multiple '—', fee cells muted '—' (not 'Not provided'), unranked, Ask link",
       'data-unranked="1"' in _cb_c and '<div class="cmp-nm" data-v=""></div>' in _cb_c
-      and _cb_c.count('<span class="cmp-fee-v">Not provided</span>') == 3
+      and _cb_c.count('<span class="cmp-fee-v cmp-fee-blank">—</span>') == 3 and "Not provided</span>" not in _cb_c
+      and ".cmp-fee-blank { color: var(--muted); }" in _cb
+      and ".cmp-table td.cmp-fee .cmp-edit-btn { display: block;" in _cb
       and '<a class="cmp-ask" href="https://trades.graciagroup.com/deal/6005" target="_blank" rel="noopener">'
           'Ask about fees →</a>' in _cb_c
       and '<div class="cmp-partial" hidden>' in _cb_c)
@@ -11870,6 +11872,130 @@ _cn_admin = _req({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body
 check("compare info note: buyer, seller and admin, directly under the table (below the commission box)",
       all(h.count(_cmp_note) == 1 and h.index("</table></div>" + _cmp_note) > 0 for h in (_cn_buyer, _cn_seller, _cn_admin))
       and _cn_buyer.index('id="cmp-commission"') < _cn_buyer.index(_cmp_note))
+
+# Seller "Update deal" button + admin nudge bell.
+_ud_seller = _req({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+_ud_other = _req({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_OTHER)])["body"]
+_ud_buyer = _req({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
+_ud_admin = _req({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+check("compare 'Update deal': only on the tenant's own-firm row, signed update-form link (shared helper)",
+      _ud_seller.count('class="cmp-update-btn"') == 1
+      and f'href="{lf._esc(lf._deal_update_form_url("6001"))}" target="_blank" rel="noopener">Update deal</a>' in _ud_seller
+      and _ud_other.count('class="cmp-update-btn"') == 2 and "deal_id=6001" not in _ud_other)
+check("compare 'Update deal': on every admin row (incl. Hold); never for buyers",
+      _ud_admin.count('class="cmp-update-btn"') == 4 and 'class="cmp-update-btn"' not in _ud_buyer)
+check("compare bell: admin only, live rows only (no Hold row), script only for admin",
+      _ud_admin.count('<button type="button" class="cmp-bell"') == 3
+      and not any('<button type="button" class="cmp-bell"' in h for h in (_ud_seller, _ud_other, _ud_buyer))
+      and "action=compare_nudge" in _ud_admin and "action=compare_nudge" not in _ud_buyer + _ud_seller)
+_hold_tr = [tr for tr in _cmp_rows_html(_ud_admin) if ">Hold<" in tr][0]
+check("compare bell: none on the Hold row", "cmp-bell" not in _hold_tr)
+
+# Recipient filtering (Email Status custom_label_2447206, tenants only, blocklist).
+_rf_people = {
+    "1": {"id": 1, "first_name": "Ann", "email": "ann@example.com", "custom_fields": {}},
+    "2": {"id": 2, "first_name": "Bo", "email": "bo@example.com",
+          "custom_fields": {lf.EMAIL_STATUS_FIELD: [3940558]}},           # Bouncing
+    "3": {"id": 3, "first_name": "Cy", "email": "cy@example.com",
+          "custom_fields": {lf.EMAIL_STATUS_FIELD: 5141011}},             # Functioning
+    "4": {"id": 4, "first_name": "Di", "email": "di@example.com",
+          "custom_fields": {lf.EMAIL_STATUS_FIELD: [4781320]}},           # Unsubscribed
+    "5": {"id": 5, "first_name": "Ed", "email": "ed@example.com", "custom_fields": {}},   # not a tenant
+    "6": {"id": 6, "first_name": "Fa", "email": "fa@blocked.example", "custom_fields": {}},
+    "7": {"id": 7, "first_name": "Gu", "email": "gu@example.com",
+          "custom_fields": {lf.EMAIL_STATUS_FIELD: [4923706]}},           # In Progress -> allowed
+    "8": {"id": 8, "first_name": "Ha", "email": "ha@example.com",
+          "custom_fields": {lf.EMAIL_STATUS_FIELD: [3940678]}},           # Needed
+}
+_rf_saved = (lf._people_data, lf._resolve_tenant, set(lf.TENANT_BLOCKLIST))
+lf._people_data = lambda: {"people": list(_rf_people.values()), "by_id": _rf_people}
+lf._resolve_tenant = lambda e: None if e == "ed@example.com" else {"person_id": 1}
+lf.TENANT_BLOCKLIST.add("fa@blocked.example")
+_rf = lf._compare_nudge_recipients({"people": [{"id": i} for i in range(1, 9)]})
+lf._people_data, lf._resolve_tenant = _rf_saved[0], _rf_saved[1]
+lf.TENANT_BLOCKLIST.clear(); lf.TENANT_BLOCKLIST.update(_rf_saved[2])
+check("compare bell recipients: tenants only; skip Bouncing/Blocked/Needed/Unavailable/Unsubscribed and blocklist; "
+      "blank / Functioning / In Progress allowed",
+      [r["email"] for r in _rf] == ["ann@example.com", "cy@example.com", "gu@example.com"]
+      and lf.EMAIL_STATUS_SKIP_IDS == {3940558, 4943722, 3940678, 7214691, 4781320}
+      and lf.EMAIL_STATUS_FIELD in lf.PEOPLE_SLIM_CUSTOM_FIELDS)
+check("compare bell: disabled with 'No seller email on file' when nobody qualifies",
+      lf._compare_bell_html({"hold": False, "deal": {"id": 9, "people": []}}, {}, "X")
+      == '<button type="button" class="cmp-bell" disabled title="No seller email on file" '
+         'aria-label="No seller email on file">🔔</button>')
+
+# Email text, rank / unranked variants, disclosure.
+_ns, _nb = lf._compare_nudge_email("Sally", "Varda Space", "https://L", 1, 2)
+check("compare nudge email: subject, greeting, link, rank sentence, signature, disclosure",
+      _ns == "Varda Space: see how your SPV terms compare"
+      and _nb.startswith("Hi Sally,\n\nBuyers can now compare every Varda Space SPV offering side by side. Please "
+                         "visit this page to compare competing SPVs and see where yours ranks:\nhttps://L\n\n")
+      and "At a $100K investment, 5x outcome and 5 years, your offering currently ranks #1 of 2. You can update "
+          "your fees directly on the page." in _nb
+      and "Best wishes,\nChad Gracia" in _nb and all(t in _nb for t in lf.RMS_DISCLOSURE_PARAGRAPHS)
+      and _nb.index("Chad Gracia\n") < _nb.index(lf.RMS_DISCLOSURE_PARAGRAPHS[0]))
+check("compare nudge email: unranked variant",
+      "Your offering isn't ranked yet — add your fees to see where it stands."
+      in lf._compare_nudge_email("Bo", "X", "L", None, 2)[1]
+      and "currently ranks" not in lf._compare_nudge_email("Bo", "X", "L", None, 2)[1])
+
+# Personal login link lands on the compare page (allowlisted destination only).
+_nl = lf._compare_nudge_link(CMP_SELLER, "7001")
+_nl_tok = _nl.split("/login/", 1)[1].split("?", 1)[0]
+_r_l = _req({"next": "compare", "company": "7001"}, path=f"/dashboard/login/{_nl_tok}")
+_r_bad1 = _req({"next": "https://evil.example"}, path=f"/dashboard/login/{_nl_tok}")
+_r_bad2 = _req({"next": "compare", "company": "7001&key=x"}, path=f"/dashboard/login/{_nl_tok}")
+check("compare nudge link: login link + ?next=compare&company=<id> -> signed in on that compare page",
+      _nl.startswith(lf.PUBLIC_BASE_URL + "/login/") and _nl.endswith("?next=compare&company=7001")
+      and _r_l["statusCode"] == 302 and _r_l["headers"]["Location"] == f"{lf.PUBLIC_BASE_URL}/?view=compare&company=7001"
+      and any(c.startswith("gg_id=") for c in _r_l["cookies"]))
+check("compare nudge link: any other destination falls back to Overview",
+      _r_bad1["headers"]["Location"].endswith("/?tab=overview") and _r_bad2["headers"]["Location"].endswith("/?tab=overview")
+      and _req({}, path=f"/dashboard/login/{_nl_tok}")["headers"]["Location"].endswith("/?tab=overview"))
+
+# POST ?action=compare_nudge: admin only, confirm required, sends, throttles; no Pipeline writes.
+_nudge_pipe = []
+_nudge_saved_urlopen = lf.urllib.request.urlopen
+lf.urllib.request.urlopen = lambda req, timeout=15: _nudge_pipe.append(req.full_url) or _CmpResp(200, {})
+ses_calls.clear(); _cmp_table.puts.clear()
+_rn0 = _req({"action": "compare_nudge"}, method="POST", body={"key": ADMIN_KEY, "deal_id": "6001"})
+_rn_t = _req({"action": "compare_nudge"}, [tenant_cookie(CMP_SELLER)], method="POST",
+             body={"deal_id": "6001", "confirm": True})
+_rn_bad = _req({"action": "compare_nudge"}, method="POST", body={"key": "wrong", "deal_id": "6001", "confirm": True})
+check("compare nudge POST: without confirm -> 400; tenant / wrong key -> 403; nothing sent",
+      _rn0["statusCode"] == 400 and _rn_t["statusCode"] == 403 and _rn_bad["statusCode"] == 403
+      and not ses_calls and not _cmp_table.puts)
+_rn1 = _req({"action": "compare_nudge"}, method="POST", body={"key": ADMIN_KEY, "deal_id": "6001", "confirm": True})
+_m = ses_calls[-1] if ses_calls else {}
+check("compare nudge POST: one email per recipient — From Chad, Reply-To + BCC cgracia@rainmakersecurities.com",
+      _rn1["statusCode"] == 200 and json.loads(_rn1["body"])["sent"] == [CMP_SELLER] and len(ses_calls) == 1
+      and _m["Source"] == '"Chad Gracia" <cgracia@graciagroup.com>'
+      and _m["ReplyToAddresses"] == ["cgracia@rainmakersecurities.com"]
+      and _m["Destination"] == {"ToAddresses": [CMP_SELLER], "BccAddresses": ["cgracia@rainmakersecurities.com"]})
+_mb = _m.get("Message", {}).get("Body", {}).get("Text", {}).get("Data", "")
+check("compare nudge POST: subject, rank sentence, personal compare link, disclosure in the sent email",
+      _m["Message"]["Subject"]["Data"] == "Varda Space: see how your SPV terms compare"
+      and _mb.startswith("Hi Sally,") and "your offering currently ranks #1 of 2." in _mb
+      and "/login/" in _mb and "?next=compare&company=7001" in _mb and lf.RMS_DISCLOSURE_PARAGRAPHS[-1] in _mb)
+_nrec = [p for p in _cmp_table.puts if p.get("sk") == "nudge#6001"]
+check("compare nudge POST: throttle record (sent_at, recipients, actor) + audit item; no Pipeline writes",
+      len(_nrec) == 1 and _nrec[0]["tenant"] == "__compare_nudge__" and _nrec[0]["recipients"] == [CMP_SELLER]
+      and _nrec[0]["actor"] == "admin" and _nrec[0]["sent_at"]
+      and any(str(p.get("sk", "")).startswith("audit#compare_nudge#6001#") for p in _cmp_table.puts)
+      and not _nudge_pipe)
+ses_calls.clear()
+_rn2 = _req({"action": "compare_nudge"}, method="POST", body={"key": ADMIN_KEY, "deal_id": "6001", "confirm": True})
+_ud_admin2 = _req({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+_sent_lbl = lf._compare_sent_label(datetime.now(timezone.utc))
+check("compare nudge: 7-day throttle — second send 409, bell disabled showing 'Sent <Mon D>'",
+      _rn2["statusCode"] == 409 and not ses_calls
+      and f'<button type="button" class="cmp-bell" disabled title="{_sent_lbl}">🔔</button>'
+          f'<span class="cmp-bell-sent">{_sent_lbl}</span>' in _ud_admin2)
+_old = {"sent_epoch": time.time() - 8 * 86400}
+_recent = {"sent_epoch": time.time() - 6 * 86400}
+check("compare nudge: throttle window is 7 days",
+      lf._compare_nudge_recent(_old) is None and lf._compare_nudge_recent(_recent) is not None)
+lf.urllib.request.urlopen = _nudge_saved_urlopen
 
 # Fail soft.
 _cmp_saved_off = lf._compare_offerings
