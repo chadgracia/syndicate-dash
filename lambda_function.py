@@ -1844,7 +1844,7 @@ def _invalid_login_link_response():
             '<body style="font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Arial,sans-serif;'
             'max-width:560px;margin:80px auto;padding:0 16px;color:#16181d">'
             f'<p>{_esc(INVALID_LOGIN_LINK_TEXT)}</p></body></html>')
-    return _html_response(body, 403)
+    return _html_response(body, 403, disclosure=False)
 
 
 def _handle_login_link(token, via_public):
@@ -1928,7 +1928,7 @@ def _signin_page(base_url=None, return_qs="?tab=overview"):
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sign in · Gracia Group</title>
 <style>
-  body {{ margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+  body {{ margin: 0; min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center;
          background: #f4f2ee; color: #16181d; padding: 24px; box-sizing: border-box;
          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
   .gg-card {{ background: #ffffff; border: 1px solid #e3ded4; border-radius: 12px; padding: 32px;
@@ -15601,6 +15601,7 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
     margin: 0;
     min-height: 100vh;
     display: flex;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
     background: #f4f2ee;
@@ -18456,12 +18457,40 @@ def _forbidden():
     }
 
 
-def _html_response(body, status=200):
+# RMS disclosure: the ONE shared footer on every HTML page this Lambda serves
+# (_html_response injects it before </body>; login-link responses opt out).
+RMS_DISCLOSURE_PARAGRAPHS = (
+    'DISCLOSURE: Chad Gracia (“Gracia”) is a principal of The Gracia Group, LLC (“Gracia Group”) and a registered agent of Rainmaker Securities, LLC (“RMS”). Gracia Group is a consulting firm and outside business activity of Gracia. Gracia Group is not affiliated with RMS. Rainmaker Securities, LLC (“RMS”) is a FINRA registered broker-dealer and SIPC member. Find this broker-dealer and its agents on BrokerCheck. Our relationship summary can be found on the RMS website.',
+    "RMS is engaged by its clients to make referrals to buyers or sellers of private securities (“Securities”). If such client closes a Securities transaction with a buyer or seller so referred, RMS is entitled to a success fee from the client. Such success fee may be in the form of cash or in warrants to purchase securities of the client or client's affiliate. RMS or RMS representatives may hold equity in its issuer clients or in the issuers of securities purchased or sold by the parties to a transaction.",
+    'This communication is confidential and is addressed only to its intended recipient. This communication does not represent an offer or solicitation to buy or sell Securities. Such an offer must be made via definitive legal documentation by the seller of securities.',
+    'Investments in the Securities are speculative and involve a high degree of risk. An investor in the Securities should have little to no need for liquidity in the foreseeable future and have sufficient finances to withstand the loss of the entire investment.',
+    'RMS does not recommend the purchase or sale of Securities. Potential buyers or sellers of the Securities should seek professional counsel prior to entering into any transaction.',
+    'Chad Gracia is a registered agent of Rainmaker Securities, LLC (“RMS”) and a principal of Gracia Group. RMS is a FINRA registered broker-dealer and SIPC member. Find RMS and its agents on BrokerCheck. The RMS relationship summary can be found on the RMS website. RMS is not an affiliate of Gracia Group. All securities transactions conducted by Chad Gracia will be conducted via RMS.',
+)
+RMS_DISCLOSURE_MARKER = 'class="rms-disclosure"'
+
+
+def _rms_disclosure_html():
+    paras = "".join(f'<p style="margin:0 0 8px">{_esc(t)}</p>' for t in RMS_DISCLOSURE_PARAGRAPHS)
+    return ('<footer class="rms-disclosure" style="box-sizing:border-box;width:100%;max-width:1000px;'
+            'margin:48px auto 0;padding:14px 24px 0;border-top:1px solid #e3ded4;color:#6b7280;'
+            'font-size:11.5px;line-height:1.5;text-align:left">' + paras + '</footer>')
+
+
+def _with_rms_disclosure(body):
+    """body with the disclosure footer before its last </body> (once)."""
+    if not isinstance(body, str) or RMS_DISCLOSURE_MARKER in body or "</body>" not in body:
+        return body
+    i = body.rfind("</body>")
+    return body[:i] + _rms_disclosure_html() + body[i:]
+
+
+def _html_response(body, status=200, disclosure=True):
     return {
         "statusCode": status,
         # Per-viewer pages behind CloudFront: never a shared cache entry.
         "headers": {"Content-Type": "text/html; charset=utf-8", "Cache-Control": "private, no-store"},
-        "body": body,
+        "body": _with_rms_disclosure(body) if disclosure else body,
     }
 
 
@@ -20353,6 +20382,7 @@ COMPARE_CSS = """
   .cmp-comm-main { font-weight: 600; }
   .cmp-comm-nudge { margin-top: 4px; font-size: 13px; }
   .cmp-comm-note { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
+  .cmp-info-note { margin: 8px 2px 0; font-size: 12px; color: var(--muted); }
   .cmp-comm-seller { margin: 0 0 12px; font-size: 12.5px; color: var(--muted); }
   .cmp-empty { padding: 24px; color: var(--muted); }
   .cmp-search { width: 100%; max-width: 420px; font: inherit; padding: 8px 10px; border: 1px solid var(--line);
@@ -20777,6 +20807,7 @@ COMPARE_COMMISSION_NOTE = ("RMS commission is added on top of your investment an
 COMPARE_SELLER_COMMISSION_LINE = ("Buyers pay a separate RMS commission on top, the same on every offering — "
                                   "your fees are what set the ranking.")
 COMPARE_ADMIN_COMMISSION_NOTE = "(standard — use view_as to preview a client)"
+COMPARE_INFO_NOTE = "For informational purposes only. Actual fees may vary during onboarding."
 
 
 def compare_commission_base_rate(investment):
@@ -20990,6 +21021,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f'<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"'
             f' data-inv="{investment}"{data_key}>'
             f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'
+            f'<p class="cmp-info-note">{_esc(COMPARE_INFO_NOTE)}</p>'
             f'{nudge}{COMPARE_SCRIPT}')
     return _compare_shell(f"{company} offerings", header_html, body)
 

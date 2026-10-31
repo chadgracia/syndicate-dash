@@ -10043,6 +10043,7 @@ check("anonymous surfaces: no buyer names or ids leak with the star on",
       "Bob Pending" not in _st_anon and "Bob Pending" not in _st_pend and "Ivy Interest" not in _st_tiles
       and not re.search(r'gs-star[^>]*(data-|pid|person)', _st_anon + _st_pend + _st_tiles))
 for _name, _html in _st_pages.items():
+    _html = _html.replace(lf._rms_disclosure_html(), "")  # fixed legal text ("referrals" etc.), not standing data
     _low = _html.lower()
     check(f"tenant HTML ({_name}): no repair/trade/floor/referral/notes/history values, no tier/discount, no 'CEF'",
           "7654321" not in _html and "7,654,321" not in _html and "1234567" not in _html and "ZZMANUALTRADE" not in _html
@@ -11799,6 +11800,75 @@ check("compare commission: plain admin -> standard box + '(standard — use view
       and "Preferred saves you $500 · Gold saves you $750 · Platinum saves you $1,000 →" in _comm_box(_cva))
 _cmp_s3.objs.pop(lf.STANDING_KEY, None)
 lf._data_cache.clear()
+
+# RMS disclosure footer on every HTML page; compare info note.
+def _req(query, cookies=None, method="GET", body=None, path="/"):
+    lf._req_cache_reset()
+    ev = {"requestContext": {"http": {"method": method}}, "rawPath": path,
+          "queryStringParameters": query, "cookies": cookies or []}
+    if body is not None:
+        ev["body"] = json.dumps(body)
+    return lf.lambda_handler(ev, None)
+
+
+check("disclosure: six paragraphs in RMS_DISCLOSURE_PARAGRAPHS, one escaped <p> each, curly quotes kept",
+      len(lf.RMS_DISCLOSURE_PARAGRAPHS) == 6
+      and lf.RMS_DISCLOSURE_PARAGRAPHS[0].startswith("DISCLOSURE: Chad Gracia (“Gracia”) is a principal")
+      and lf.RMS_DISCLOSURE_PARAGRAPHS[-1].endswith("will be conducted via RMS.")
+      and lf._rms_disclosure_html().count("<p ") == 6
+      and all(lf._esc(t) in lf._rms_disclosure_html() for t in lf.RMS_DISCLOSURE_PARAGRAPHS)
+      and "client or client's affiliate." in lf._rms_disclosure_html()
+      and "(“RMS”)" in lf._rms_disclosure_html())
+check("disclosure: small, muted, thin divider above, content-width",
+      all(x in lf._rms_disclosure_html() for x in ("font-size:11.5px", "color:#6b7280", "border-top:1px solid",
+                                                   "max-width:1000px", "margin:48px auto 0")))
+_seller_ck, _buyer_ck = [tenant_cookie(CMP_SELLER)], [tenant_cookie(CMP_BUYER)]
+_html_routes = {
+    "tenant overview": ({"tab": "overview"}, _seller_ck), "tenant my deals": ({"tab": "mydeals"}, _seller_ck),
+    "tenant active intros": ({"tab": "intros"}, _seller_ck), "tenant demand board": ({"tab": "demand"}, _seller_ck),
+    "tenant company page": ({"company": "Varda Space"}, _seller_ck),
+    "tenant buyer page": ({"buyer": "503"}, _seller_ck),
+    "tenant compare index": ({"view": "compare"}, _seller_ck),
+    "tenant compare company": ({"view": "compare", "company": "7001"}, _seller_ck),
+    "buyer compare index": ({"view": "compare"}, _buyer_ck),
+    "buyer compare company": ({"view": "compare", "company": "7001"}, _buyer_ck),
+    "non-tenant not-enabled page": ({"tab": "overview"}, _buyer_ck),
+    "sign-in page": ({"tab": "overview"}, []),
+    "admin my deals": ({"key": ADMIN_KEY}, []), "admin overview": ({"key": ADMIN_KEY, "tab": "overview"}, []),
+    "admin compare": ({"key": ADMIN_KEY, "view": "compare", "company": "7001"}, []),
+    "admin client links": ({"key": ADMIN_KEY, "view": "client_links"}, []),
+    "admin standing": ({"key": ADMIN_KEY, "view": "standing"}, []),
+    "admin view_as overview": ({"key": ADMIN_KEY, "view_as": CMP_SELLER, "tab": "overview"}, []),
+    "admin view_as compare": ({"key": ADMIN_KEY, "view_as": CMP_SELLER, "view": "compare", "company": "7001"}, []),
+    "admin view_as buyer compare": ({"key": ADMIN_KEY, "view_as": CMP_BUYER, "view": "compare", "company": "7001"}, []),
+}
+for _rn, (_q, _ck) in _html_routes.items():
+    _r = _req(_q, _ck)
+    _b = _r.get("body") or ""
+    check(f"disclosure footer exactly once, inside <body>: {_rn}",
+          _r["headers"]["Content-Type"].startswith("text/html") and _b.count(lf.RMS_DISCLOSURE_MARKER) == 1
+          and _b.index(lf.RMS_DISCLOSURE_MARKER) < _b.rindex("</body>"))
+for _rn, (_q, _ck, _m, _bd) in {
+        "tenants list": ({"key": ADMIN_KEY, "tenants": "list"}, [], "GET", None),
+        "demand list": ({"key": ADMIN_KEY, "demand": "list"}, [], "GET", None),
+        "standing json": ({"key": ADMIN_KEY, "view": "standing_json", "pid": "503"}, [], "GET", None),
+        "compare_fee POST": ({"action": "compare_fee"}, _seller_ck, "POST", {"deal_id": "1", "field": "x", "value": 1}),
+        "update_intro POST": ({"action": "update_intro"}, _seller_ck, "POST", {}),
+}.items():
+    _r = _req(_q, _ck, _m, _bd)
+    check(f"disclosure: JSON endpoint has no footer: {_rn}",
+          _r["headers"].get("Content-Type", "").startswith("application/json")
+          and lf.RMS_DISCLOSURE_MARKER not in (_r.get("body") or ""))
+_r_bad_login = _req({}, [], path="/login/not-a-valid-token")
+check("disclosure: login-link handler response carries no footer",
+      lf.RMS_DISCLOSURE_MARKER not in (_r_bad_login.get("body") or ""))
+_cmp_note = '<p class="cmp-info-note">For informational purposes only. Actual fees may vary during onboarding.</p>'
+_cn_buyer = _req({"view": "compare", "company": "7001"}, _buyer_ck)["body"]
+_cn_seller = _req({"view": "compare", "company": "7001"}, _seller_ck)["body"]
+_cn_admin = _req({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+check("compare info note: buyer, seller and admin, directly under the table (below the commission box)",
+      all(h.count(_cmp_note) == 1 and h.index("</table></div>" + _cmp_note) > 0 for h in (_cn_buyer, _cn_seller, _cn_admin))
+      and _cn_buyer.index('id="cmp-commission"') < _cn_buyer.index(_cmp_note))
 
 # Fail soft.
 _cmp_saved_off = lf._compare_offerings
