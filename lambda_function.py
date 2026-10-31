@@ -559,7 +559,7 @@ def _next_step_html(kind, chip_html, seller_name="You"):
 
 def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibility_state,
                                key=None, view_as=None, terms_missing=None, archived=False,
-                               paperwork_items=None, awaiting=False, seller_name="You"):
+                               paperwork_items=None, awaiting=False, seller_name="You", admin=False):
     """Next Steps column: every applicable item, each with its owner line
     (_next_step_html). Archived row -> the red "Reopen ->" (update form;
     never on a Won/"sold" row). Otherwise, in order: paperwork (amber
@@ -571,7 +571,8 @@ def _my_deal_action_chip_html(deal_id, company_name, is_overdue, stalled, visibi
     paperwork in order)."""
     update_url = _deal_update_form_url(deal_id)
     if archived:
-        if not update_url or visibility_state == "sold":
+        # Closed deals are a read-only archive for tenants: Reopen is admin-only.
+        if not admin or not update_url or visibility_state == "sold":
             return ""
         return _next_step_html("reopen", _reopen_chip_html(update_url), seller_name)
     items = []
@@ -614,6 +615,14 @@ STACKED_ACTION_CSS = """
 """
 
 
+CLOSED_DEAL_READ_ONLY_MSG = "This deal is closed — it's kept for reference only and can't be changed."
+
+
+def _deal_is_closed_archive(stage_id):
+    """Won, Lost, Obsolete or Trade Broken: a read-only archive for tenants."""
+    return _is_won_stage(stage_id) or _is_closed_down_stage(stage_id)
+
+
 def _is_closed_down_stage(stage_id):
     """Closed-down (archived, not won): Obsolete, Lost, Trade Broken. The
     one shared archived-stage test -- My Deals' Archived section and the
@@ -626,7 +635,7 @@ def _reopen_chip_html(update_url):
             'rel="noopener noreferrer">Reopen &rarr;</a>')
 
 
-def _deal_action_html(deal_id, stage_id, stacked=False, public=False):
+def _deal_action_html(deal_id, stage_id, stacked=False, public=False, admin=False):
     """THE per-deal action, shared by every place a sell deal renders (My
     Deals, Overview Open deals / Needs your attention / All closed deals,
     company-page Deal Details cards, Active Intros' company link): a live
@@ -636,14 +645,16 @@ def _deal_action_html(deal_id, stage_id, stacked=False, public=False):
     "" when FORM_HMAC_SECRET isn't configured. stacked=True (every table cell)
     renders the same single link compact, "Update" / "Pause" / "Cancel"
     on three centered lines, so it fits its fixed-width column; cards keep
-    the one-line label. public=True (_deal_is_public) -> an em dash, no action."""
+    the one-line label. public=True (_deal_is_public) -> an em dash, no action.
+    CLOSED DEALS ARE A READ-ONLY ARCHIVE: a closed-down deal gets "Reopen ->"
+    only for admin (Admin view, admin=True); tenants get nothing."""
     if public:
         return "—"
     url = _deal_update_form_url(deal_id)
     if not url or _is_won_stage(stage_id):
         return ""
     if _is_closed_down_stage(stage_id):
-        return _reopen_chip_html(url)
+        return _reopen_chip_html(url) if admin else ""
     if stacked:
         return (f'<a class="update-cancel-btn stacked" href="{url}" target="_blank" rel="noopener noreferrer" '
                 f'aria-label="{_esc(DEAL_ACTION_LABEL)}" title="{_esc(DEAL_ACTION_LABEL)}">'
@@ -1251,6 +1262,114 @@ def _deal_linked_person_ids_ordered(deal):
             seen.add(pid)
             out.append(pid)
     return out
+
+
+# ── Sell-deal ownership (Chad's convention, Oct 31) ─────────────────────
+# A seller's allocation is a Sell deal with the SELLER as primary contact,
+# always. A found buyer gets a separate Buy trade deal with the BUYER as
+# primary contact; in 1:1 cases the buyer is linked to the seller's Sell
+# deal but the seller stays primary. Never co-sellers from different firms
+# on one Sell deal. OWNERSHIP_RULE env var: "legacy" (default -- every
+# person linked to a Sell deal owns it) or "primary" (owners =
+# sell_deal_owner_person_ids). Every ownership read goes through
+# _deal_owner_ids; Buy deals never make anyone an owner.
+OWNERSHIP_RULE_ENV = "OWNERSHIP_RULE"
+
+
+def _ownership_rule():
+    v = (os.environ.get(OWNERSHIP_RULE_ENV) or "legacy").strip().lower()
+    return "primary" if v == "primary" else "legacy"
+
+
+def _deal_primary_contact_id(deal):
+    """primary_contact_id, else primary_contact.id (both carried by
+    deals.json records and Pipeline API records), as an int, or None."""
+    raw = deal.get("primary_contact_id")
+    if raw in (None, ""):
+        pc = deal.get("primary_contact")
+        raw = pc.get("id") if isinstance(pc, dict) else None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _person_firm_key(rec):
+    """("id", company_id), else ("name", lowercased company_name), else None."""
+    rec = rec or {}
+    if rec.get("company_id") is not None:
+        return ("id", rec.get("company_id"))
+    name = (rec.get("company_name") or "").strip().lower()
+    return ("name", name) if name else None
+
+
+def _person_corporate_domains(rec):
+    """Corporate (team-eligible) email domains on a person record: the
+    domain-team rules (_is_corporate_domain; free mail stays individual),
+    blocklisted emails skipped."""
+    if not rec:
+        return set()
+    out = set()
+    for e in _person_all_emails(rec):
+        if e in TENANT_BLOCKLIST:
+            continue
+        dom = _email_domain(e)
+        if _is_corporate_domain(dom):
+            out.add(dom)
+    return out
+
+
+def sell_deal_owner_person_ids(deal):
+    """Owners of a SELL deal under the primary-contact rule: the primary
+    contact plus linked people at the primary's firm (company_id, else
+    company_name) or sharing a corporate email domain with the primary.
+    Every other linked person is a counterparty. Buy/untagged deals -> no
+    owners. A Sell deal with no primary contact on its record falls back
+    to every linked person (legacy)."""
+    if not _deal_is_sell(deal):
+        return frozenset()
+    linked = _deal_linked_person_ids(deal)
+    primary = _deal_primary_contact_id(deal)
+    if primary is None:
+        return frozenset(linked)
+    by_id = _people_data()["by_id"]
+    prec = by_id.get(str(primary))
+    owners = {primary}
+    pfirm = _person_firm_key(prec)
+    pdoms = _person_corporate_domains(prec)
+    for pid in linked:
+        if pid == primary:
+            continue
+        rec = by_id.get(str(pid))
+        if pfirm is not None and _person_firm_key(rec) == pfirm:
+            owners.add(pid)
+        elif pdoms and pdoms & _person_corporate_domains(rec):
+            owners.add(pid)
+    return frozenset(owners)
+
+
+def _deal_owner_ids(deal):
+    """THE owner set every tenancy/write check reads for a Sell deal:
+    "legacy" -> every linked person; "primary" -> sell_deal_owner_person_ids.
+    Non-Sell deals -> empty under both rules."""
+    if not _deal_is_sell(deal):
+        return frozenset()
+    if _ownership_rule() == "primary":
+        return sell_deal_owner_person_ids(deal)
+    return frozenset(_deal_linked_person_ids(deal))
+
+
+def _buy_deal_side_ids(deal):
+    """Linked people on a Buy deal who may be its SELL side: under
+    "primary" the Buy deal's primary contact (the buyer) is always
+    dropped (a buyer's own order with no seller linked has no sell side);
+    "legacy" keeps everyone."""
+    linked = _deal_linked_person_ids(deal)
+    if _ownership_rule() == "primary":
+        primary = _deal_primary_contact_id(deal)
+        if primary is not None:
+            return linked - {primary}
+    return linked
 
 
 def _select_primary_buyer(deal, buyer_recs):
@@ -2220,11 +2339,15 @@ def _build_table():
             continue
         sellers_by_company[company] = sellers_by_company.get(company, 0) + 1
 
+    trade_sellers = _trade_deal_sellers_by_company(deals_list)
     table = []
     for company, ids in buy.items():
         if not isinstance(ids, list) or not ids:
             continue
         if company.strip().lower() in _EXCLUDED_COMPANIES_LOWER:
+            continue
+        ids = _interest_buyer_ids(company, ids, trade_sellers)
+        if not ids:
             continue
         counts = {"qp": 0, "accredited": 0, "unknown": 0}
         ticket_min_sum = 0
@@ -2957,7 +3080,8 @@ def get_my_deals(person_id):
     if person_id in _req_cache["my_deals"]:
         return _req_cache["my_deals"][person_id]
     deals = get_deals_list()
-    mine = [d for d in deals if person_id in _deal_linked_person_ids(d)]
+    mine = [d for d in deals if person_id in (_deal_owner_ids(d) if _deal_is_sell(d)
+                                              else _deal_linked_person_ids(d))]
     mine.sort(key=lambda d: d.get("updated_at") or "", reverse=True)
     mine = _dedupe_buy_deals_by_company_and_buyer(mine, person_id)
     _req_cache["my_deals"][person_id] = mine
@@ -2991,7 +3115,7 @@ def get_firm_deals(person_id):
     out = []
     for d in get_deals_list():
         if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
-            if _deal_linked_person_ids(d) & firm_person_ids:
+            if _deal_owner_ids(d) & firm_person_ids:
                 out.append(d)
         elif _is_firm_intro_buy_deal(d, person_id, firm_person_ids, sellers_by_company):
             out.append(d)
@@ -3047,6 +3171,45 @@ def get_firm_closed_out_buy_deals(person_id, company=None):
     return out
 
 
+def _trade_deal_sellers_by_company(deals=None):
+    """{company_lower: {str person_id}} -- the SELL side linked to Buy trade
+    deals (Chad's convention: a Buy deal's primary contact is the buyer;
+    anyone else linked is the seller). A person who is the primary contact
+    of any Buy deal for that company is a genuine buyer and is never in
+    the set. Used to keep sellers out of every interest-based buyer count
+    (Demand Board, Buyer Demand tiles, Interested buyers)."""
+    linked_non_primary, primaries = {}, {}
+    for d in (deals if deals is not None else get_deals_list()):
+        if not _deal_is_buy(d):
+            continue
+        primary = _deal_primary_contact_id(d)
+        if primary is None:
+            continue
+        company = (_deal_company_name(d) or "").strip().lower()
+        if not company:
+            continue
+        primaries.setdefault(company, set()).add(str(primary))
+        linked_non_primary.setdefault(company, set()).update(
+            str(p) for p in _deal_linked_person_ids(d) if p != primary)
+    return {c: ids - primaries.get(c, set()) for c, ids in linked_non_primary.items()}
+
+
+def _interest_buyer_ids(company, ids, trade_sellers=None):
+    """The interest list's buyer ids for one company, each person ONCE
+    (str-compared, first occurrence kept) and never a trade-deal seller."""
+    if trade_sellers is None:
+        trade_sellers = _trade_deal_sellers_by_company()
+    skip = trade_sellers.get((company or "").strip().lower(), set())
+    out, seen = [], set()
+    for pid in ids or []:
+        k = str(pid)
+        if k in seen or k in skip:
+            continue
+        seen.add(k)
+        out.append(pid)
+    return out
+
+
 def get_company_buyer_details(company):
     """Tier/ticket-range/updated_at for every person with Buy Interest in
     one company, per interest_people.json + people.json. Pulls both from
@@ -3060,7 +3223,7 @@ def get_company_buyer_details(company):
     person_ids = []
     for name, ids in buy.items():
         if isinstance(ids, list) and name.strip().lower() == target:
-            person_ids = ids
+            person_ids = _interest_buyer_ids(name, ids)
             break
     if not person_ids:
         return []
@@ -3211,7 +3374,7 @@ def _build_tenant_index():
     seller_person_ids = set()
     for deal in get_deals_list():
         if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
-            seller_person_ids.update(_deal_linked_person_ids(deal))
+            seller_person_ids.update(_deal_owner_ids(deal))
     seller_person_ids_str = {str(pid) for pid in seller_person_ids}
 
     # Domain teams (see FREE_MAIL_DOMAINS/_is_corporate_domain). A tenant
@@ -3508,7 +3671,7 @@ def _firm_sell_person_ids_by_company(firm_person_ids):
         for d in get_deals_list():
             if DEAL_SIDE_SELL_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
                 continue
-            linked = _deal_linked_person_ids(d) & firm_person_ids
+            linked = _deal_owner_ids(d) & firm_person_ids
             if not linked:
                 continue
             company = (_deal_company_name(d) or "").strip().lower()
@@ -3545,7 +3708,7 @@ def _is_firm_intro_buy_deal(deal, person_id, firm_person_ids, sellers_by_company
     natoli@mangustacap.com's view)."""
     if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
         return False
-    linked = _deal_linked_person_ids(deal)
+    linked = _buy_deal_side_ids(deal)
     if person_id in linked:
         return True
     company = (_deal_company_name(deal) or "").strip().lower()
@@ -3564,10 +3727,11 @@ def _deal_colleague_owner(deal, tenant_person_id, firm_person_ids, people_by_id)
     linked (callers already batch-fetch across the full firm_person_ids
     set -- see get_people_by_ids call sites in the render_* functions
     below)."""
-    if tenant_person_id in _deal_linked_person_ids(deal):
+    side = _deal_owner_ids(deal) if _deal_is_sell(deal) else _buy_deal_side_ids(deal)
+    if tenant_person_id in side:
         return None
     for pid in _deal_linked_person_ids_ordered(deal):
-        if pid in firm_person_ids and pid != tenant_person_id:
+        if pid in firm_person_ids and pid in side and pid != tenant_person_id:
             return people_by_id.get(pid)
     return None
 
@@ -4027,7 +4191,7 @@ def get_firm_closed_sell_deals(person_id):
         return []
     all_linked_ids = set()
     for d in won_sell_deals:
-        all_linked_ids |= _deal_linked_person_ids(d)
+        all_linked_ids |= _deal_owner_ids(d)
     people_by_id = get_people_by_ids(all_linked_ids)
 
     def _shares_company(rec):
@@ -4040,7 +4204,8 @@ def get_firm_closed_sell_deals(person_id):
 
     out = []
     for d in won_sell_deals:
-        linked_ordered = _deal_linked_person_ids_ordered(d)
+        owners = _deal_owner_ids(d)
+        linked_ordered = [pid for pid in _deal_linked_person_ids_ordered(d) if pid in owners]
         if person_id in linked_ordered:
             continue
         colleague = next((people_by_id.get(pid) for pid in linked_ordered
@@ -5714,6 +5879,137 @@ def render_bios_page(key, raw="", error="", results=None):
 </html>"""
 
 
+# ── Ownership retag list + rule preview (?key=ADMIN_KEY&view=ownership) ──
+# Read-only. Always computed under the "primary" rule
+# (sell_deal_owner_person_ids), whatever OWNERSHIP_RULE says.
+OWNERSHIP_LIVE_STAGE_IDS = LIVE_SELL_STAGE_IDS | {STAGE_ROFR}
+OWNERSHIP_RETAG_HEADER = ("Likely trade deals. Retag as Buy with the buyer as primary, or leave as Sell "
+                          "if this is a 1:1 deal with the seller as primary.")
+OWNERSHIP_REASON = "not primary / not at primary's firm"
+
+
+def _ownership_person_info(rec, pid):
+    rec = rec or {}
+    emails = [e for e in _person_all_emails(rec) if e not in TENANT_BLOCKLIST]
+    return {"person_id": pid, "name": _person_display_name(rec) or str(pid),
+            "email": emails[0] if emails else "", "firm": (rec.get("company_name") or "").strip()}
+
+
+def ownership_report():
+    """{"retag": [...], "access": [...]} for the ownership page.
+    retag: every live Sell deal (OWNERSHIP_LIVE_STAGE_IDS, not archived)
+    with linked people from 2+ firms -- i.e. someone linked who is not
+    the primary contact or at the primary's firm/corporate domain (no
+    primary on the record: 2+ distinct firm keys). access: every person
+    who owns a live Sell deal today (legacy: linked + has a usable email)
+    but would not under the primary rule, one row per (person, deal)."""
+    by_id = _people_data()["by_id"]
+    live = [d for d in get_deals_list()
+            if _deal_is_sell(d) and not d.get("is_archived")
+            and _deal_stage_id(d) in OWNERSHIP_LIVE_STAGE_IDS]
+    # Who owns >= 1 Sell deal (any stage) under the primary rule.
+    primary_owners_any = set()
+    for d in get_deals_list():
+        if _deal_is_sell(d):
+            primary_owners_any |= sell_deal_owner_person_ids(d)
+    retag, access = [], []
+    for d in sorted(live, key=lambda d: ((_deal_company_name(d) or "").lower(), str(d.get("id")))):
+        linked = _deal_linked_person_ids_ordered(d)
+        owners = sell_deal_owner_person_ids(d)
+        primary = _deal_primary_contact_id(d)
+        if primary is not None:
+            others = [pid for pid in linked if pid not in owners]
+            multi = bool(others)
+        else:
+            others = [pid for pid in linked if pid != (linked[0] if linked else None)]
+            keys = {(_person_firm_key(by_id.get(str(pid))) or ("person", pid)) for pid in linked}
+            multi = len(keys) >= 2
+        deal_info = {"deal_id": str(d.get("id")), "deal_name": _deal_title(d),
+                     "company": _deal_company_name(d) or "",
+                     "stage": _deal_stage_label(_deal_stage_id(d)),
+                     "url": PIPELINE_DEAL_URL.format(d.get("id"))}
+        if multi:
+            prec = by_id.get(str(primary)) if primary is not None else None
+            retag.append(dict(deal_info,
+                              primary=(_ownership_person_info(prec, primary) if primary is not None else None),
+                              others=[_ownership_person_info(by_id.get(str(pid)), pid) for pid in others]))
+        for pid in linked:
+            if pid in owners:
+                continue
+            rec = by_id.get(str(pid))
+            info = _ownership_person_info(rec, pid)
+            if not info["email"]:
+                continue  # no usable email -> never a tenant today
+            access.append(dict(info, deal=deal_info, reason=OWNERSHIP_REASON,
+                               keeps_tenancy=pid in primary_owners_any))
+    return {"retag": retag, "access": access}
+
+
+def render_ownership_page():
+    rep = ownership_report()
+
+    def _person(p):
+        if not p:
+            return '<span class="ow-muted">No primary contact on record</span>'
+        bits = [f'<strong>{_esc(p["name"])}</strong>']
+        if p["email"]:
+            bits.append(f'<span class="ow-muted">{_esc(p["email"])}</span>')
+        if p["firm"]:
+            bits.append(_esc(p["firm"]))
+        return "<br>".join(bits)
+
+    def _deal_cell(di):
+        return (f'<a href="{_esc(di["url"])}" target="_blank" rel="noopener noreferrer">{_esc(di["deal_name"])}</a>'
+                f'<br><span class="ow-muted">#{_esc(di["deal_id"])} · {_esc(di["stage"])}</span>')
+
+    retag_rows = "".join(
+        f'<tr><td>{_esc(r["company"])}</td><td>{_deal_cell(r)}</td><td>{_person(r["primary"])}</td>'
+        f'<td>{"<hr>".join(_person(o) for o in r["others"]) or "—"}</td></tr>'
+        for r in rep["retag"])
+    access_rows = "".join(
+        f'<tr><td>{_person(a)}</td><td>{_esc(a["deal"]["company"])}<br>{_deal_cell(a["deal"])}</td>'
+        f'<td>{_esc(a["reason"])}</td>'
+        f'<td>{"Keeps tenancy via own Sell deal(s)" if a["keeps_tenancy"] else "Loses tenancy"}</td></tr>'
+        for a in rep["access"])
+    n_people = len({a["person_id"] for a in rep["access"]})
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deal ownership · Gracia Group</title>
+<style>
+  body {{ margin: 0; background: #f4f2ee; color: #16181d; padding: 32px 16px 64px;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
+  .wrap {{ max-width: 1100px; margin: 0 auto; }}
+  h1 {{ font-size: 20px; }}
+  h2 {{ font-size: 16px; margin: 28px 0 4px; }}
+  p.ow-lead {{ margin: 0 0 10px; color: #374151; font-size: 13px; }}
+  .ow-scroll {{ overflow-x: auto; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13px; background: #fff; }}
+  th, td {{ text-align: left; padding: 8px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }}
+  th {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #6b7280; }}
+  td hr {{ border: 0; border-top: 1px dashed #e5e7eb; margin: 6px 0; }}
+  .ow-muted {{ color: #6b7280; font-size: 12px; }}
+</style>
+</head>
+<body><div class="wrap">
+<h1>Deal ownership</h1>
+<p class="ow-lead">Computed under the primary-contact rule. Current rule: <strong>{_esc(_ownership_rule())}</strong>
+(env OWNERSHIP_RULE). Read-only.</p>
+<h2 id="ow-retag">Live Sell deals to retag ({len(rep["retag"])})</h2>
+<p class="ow-lead">{_esc(OWNERSHIP_RETAG_HEADER)}</p>
+<div class="ow-scroll"><table><thead><tr><th>Company</th><th>Deal</th><th>Primary contact</th>
+<th>Other linked people</th></tr></thead>
+<tbody>{retag_rows or '<tr><td colspan="4" class="ow-muted">None.</td></tr>'}</tbody></table></div>
+<h2 id="ow-access">Access changes when the switch is on ({n_people} people, {len(rep["access"])} deal links)</h2>
+<p class="ow-lead">People who own a live Sell deal today but would not under the rule.</p>
+<div class="ow-scroll"><table><thead><tr><th>Person</th><th>Deal</th><th>Reason</th><th>After the switch</th>
+</tr></thead>
+<tbody>{access_rows or '<tr><td colspan="4" class="ow-muted">None.</td></tr>'}</tbody></table></div>
+</div></body></html>"""
+
+
 def render_client_links_page():
     """?key=ADMIN_KEY&view=client_links -- one row per eligible tenant
     email (grouped by domain team, else firm) with a fresh permanent login
@@ -6591,7 +6887,7 @@ def _tenant_can_act_on_deal(identity_email, deal):
         return False
     scope = _firm_person_ids(tenant.get("person_id"))
     if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
-        return bool(_deal_linked_person_ids(deal) & scope)
+        return bool(_deal_owner_ids(deal) & scope)
     owner = _tenant_email_for_deal(deal)
     if owner is None:
         return False
@@ -6659,6 +6955,14 @@ def _handle_deal_stage(event):
 
     if _deal_is_public(deal):
         return _json_response({"error": PUBLIC_COMPANY_REFUSAL}, 409)
+
+    # Closed Sell deals (Won/Lost/Obsolete/Trade Broken, resolved stage) are
+    # a read-only archive for tenants: every stage write, Re-Open included,
+    # is refused. Admin keeps every action.
+    if not is_admin and _deal_is_sell(deal):
+        _own_entry = get_intro_details(tenant_email, expand_team=False)[0].get(deal_id)
+        if _deal_is_closed_archive(_resolve_deal_stage(deal, _own_entry)):
+            return _json_response({"error": CLOSED_DEAL_READ_ONLY_MSG}, 409)
 
     old_stage_id = _deal_stage_id(deal)
 
@@ -7650,8 +7954,9 @@ def _handle_photo_request(person_id_raw, tenant, anon_key_email, edit_mode):
 def _tenant_email_for_deal(deal):
     """The auto-enrolled tenant email whose person_id is linked to this
     deal, or None if no tenant maps to it — writes are rejected outright
-    in that case."""
-    linked = _deal_linked_person_ids(deal)
+    in that case. Sell deal -> its owners (_deal_owner_ids); Buy deal ->
+    its sell side (_buy_deal_side_ids: under "primary" never the buyer)."""
+    linked = _deal_owner_ids(deal) if _deal_is_sell(deal) else _buy_deal_side_ids(deal)
     if not linked:
         return None
     # Sellers only: the index also holds non-seller domain-team members,
@@ -8654,7 +8959,7 @@ def _deal_card_html(deal, company, override_entry=None, edit_mode=False, paperwo
     # (it covers the agent agreement too, so it replaces the older
     # Engaged badge). None only when there's no tenant context.
     is_public = _deal_is_public(deal)
-    action_html = _deal_action_html(deal_id, resolved_sid, public=is_public)
+    action_html = _deal_action_html(deal_id, resolved_sid, public=is_public, admin=edit_mode)
     footer_html = ""
     if is_public:
         reopen_html = ""
@@ -10221,6 +10526,7 @@ NAV_CSS = """
   .gg-admin-strip .gg-view-toggle-btn { color: rgba(255,255,255,0.85); padding: 3px 10px; }
   .gg-admin-strip .gg-view-toggle-btn.active { background: #ffffff; color: #7a1f1f; }
   .gg-admin-strip .gg-view-toggle-btn:not(.active):hover { color: #ffffff; }
+  .gg-admin-strip .gg-admin-strip-link { color: #ffffff; font-size: 12px; text-decoration: underline; }
   .gg-admin-strip .gg-copy-link-btn { color: #ffffff; border-color: rgba(255,255,255,0.5); padding: 4px 10px; }
   .gg-admin-strip .gg-copy-link-btn:hover { border-color: #ffffff; }
   /* Click/focus-driven only, via the shared GGDropdown helper -- see the
@@ -10810,7 +11116,9 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     if key is not None:
         admin_strip_html = (f'<div class="gg-admin-strip" id="gg-admin-strip"><div class="gg-admin-strip-inner">'
                             f'{admin_badge_html}<div class="gg-admin-strip-controls">'
-                            f'{tenant_search_html}{view_toggle_html}{copy_link_html}</div></div></div>\n')
+                            f'{tenant_search_html}{view_toggle_html}{copy_link_html}'
+                            f'<a class="gg-admin-strip-link" href="?key={_esc(urllib.parse.quote(str(key)))}&amp;view=ownership" '
+                            f'target="_blank" rel="noopener noreferrer">Ownership</a></div></div></div>\n')
     return f"""{admin_strip_html}<header class="gg-nav">
   <div class="gg-nav-inner">
     <nav class="gg-tabs">
@@ -10896,8 +11204,10 @@ def _reopen_deal_button_html(deal, stage, key=None):
     """"Re-Open Deal" button (POST ?action=deal_stage target=reopen ->
     Inquiry) for a closed-down (Obsolete/Lost/Trade Broken) Sell deal;
     "" for Won (transacted) or anything live. key is the admin key only
-    under edit_mode (never leaked into a view_as preview)."""
-    if deal is None or not _is_closed_down_stage(stage) or _deal_is_public(deal):
+    under edit_mode (never leaked into a view_as preview). CLOSED DEALS ARE
+    A READ-ONLY ARCHIVE for tenants: no key (tenant sessions, admin Tenant
+    view) -> nothing; only admin Admin view renders the button."""
+    if not key or deal is None or not _is_closed_down_stage(stage) or _deal_is_public(deal):
         return ""
     key_attr = f' data-key="{_esc(key)}"' if key else ""
     return (f'<button type="button" class="reopen-deal-btn" data-deal-id="{_esc(str(deal.get("id")))}" '
@@ -11945,7 +12255,7 @@ def _my_deal_is_overdue(deadline, section):
 
 
 def _my_deal_row_chip_html(deal, company_name, deadline, stats, paperwork, section, archived, key=None,
-                           view_as=None, seller_name="You"):
+                           view_as=None, seller_name="You", admin=False):
     """The exact Next Steps cell a My Deals row renders -- shared with the
     Overview tab's "Needs your attention" list so both show the same red
     chips with the same targets. Public company -> an em dash only."""
@@ -11960,7 +12270,8 @@ def _my_deal_row_chip_html(deal, company_name, deadline, stats, paperwork, secti
     return _my_deal_action_chip_html(str(deal.get("id")), company_name, _my_deal_is_overdue(deadline, section),
                                       stats["stalled"], visibility_state, key=key, view_as=view_as,
                                       terms_missing=_deal_terms_missing(deal), archived=archived,
-                                      paperwork_items=paperwork_items, awaiting=awaiting, seller_name=seller_name)
+                                      paperwork_items=paperwork_items, awaiting=awaiting, seller_name=seller_name,
+                                      admin=admin)
 
 
 RED_ACTION_CHIP_RE = re.compile(r'<a class="action-chip (?:overdue|reopen)"[^>]*>.*?</a>', re.S)
@@ -12063,7 +12374,8 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
             deadline_html = "—"
 
     action_chip_html = _my_deal_row_chip_html(deal, company_name, deadline, stats, cef_state, section,
-                                               archived, key=key, view_as=view_as, seller_name=seller_name)
+                                               archived, key=key, view_as=view_as, seller_name=seller_name,
+                                               admin=edit_mode)
     # created_at is "YYYY/MM/DD HH:MM:SS +ZZZZ" -- parsed by _deal_listed_dt first.
     created_dt = _deal_listed_dt(deal)
     created_text = _fmt_short_date(created_dt.isoformat()) if created_dt else None
@@ -12085,7 +12397,7 @@ def _my_deal_row_html(deal, company_name, deadline, stats, buyer_count, cef_stat
     # see. Archived rows get none -- their "Reopen ->" chip links to the
     # same form.
     actions_html = ("" if archived else
-                    f'<div class="actions-stack">{_deal_action_html(deal_id, resolved_stage, stacked=True, public=_deal_is_public(deal))}</div>')
+                    f'<div class="actions-stack">{_deal_action_html(deal_id, resolved_stage, stacked=True, public=_deal_is_public(deal), admin=edit_mode)}</div>')
 
 
     compare_html = "" if archived else _compare_entry_html(deal, key=key, view_as=view_as)
@@ -12563,7 +12875,7 @@ def render_overview_page(viewer_name, deals=None, tenant_picker=False, key=None,
                 f'<td>{_esc("Won" if id(r) in won_ids else _deal_stage_label(r["resolved_stage"]))}</td>'
                 f'<td>{_esc(_fmt_dt_short(_deal_listed_dt(r["deal"])))}</td>'
                 f'<td>{_esc(_deal_closed_label(r["deal"], r["resolved_stage"]) if r["section"] in ("closed", "cancelled") else "—")}</td>'
-                f'<td>{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], public=_deal_is_public(r["deal"]))}</td></tr>'
+                f'<td>{_deal_action_html(str(r["deal"].get("id")), r["resolved_stage"], public=_deal_is_public(r["deal"]), admin=edit_mode)}</td></tr>'
                 for r in archived_rows)
             all_closed_html = (
                 '<details class="closed-out-section ov-all-closed">'
@@ -18801,6 +19113,15 @@ def _handle_update_intro(event):
         return _json_response({"error": "Net price can be edited on Sell deals only."}, 403)
 
     if has_status_intent and not is_admin:
+        # Intros on a closed Sell deal (the firm's Sell deals for the
+        # company are all Won/closed-down: the "paused" rows) are a
+        # read-only archive for tenants.
+        if _deal_is_buy(deal):
+            _owner_pid = (_resolve_tenant(tenant_email) or {}).get("person_id")
+            _paused, _sd, _ss = _company_intros_paused(
+                _owner_pid, _deal_company_name(deal) or "", get_intro_details(tenant_email)[0])
+            if _paused:
+                return _json_response({"error": CLOSED_DEAL_READ_ONLY_MSG}, 409)
         if not old_resolved["disclosed"]:
             # CAREFUL MODE fix: a clear inline message, not a bare
             # "forbidden" -- this UI shouldn't normally offer status
@@ -19389,7 +19710,7 @@ def _handle_duplicate_report():
         if DEAL_SIDE_BUY_ID not in _deal_cf_option_ids(d, DEAL_SIDE_FIELD):
             continue
         linked = _deal_linked_person_ids(d)
-        tenant_pid = next((pid for pid in linked if pid in person_to_tenant), None)
+        tenant_pid = next((pid for pid in _buy_deal_side_ids(d) if pid in person_to_tenant), None)
         if tenant_pid is None:
             continue
         buyer_ids = tuple(sorted(pid for pid in linked if pid != tenant_pid))
@@ -20265,7 +20586,7 @@ def _compare_rows(entry, role, scope=frozenset()):
         else:
             label = f"Offering {_compare_letter(letter_i)}"
             letter_i += 1
-        own = role == "tenant" and bool(_deal_linked_person_ids(d) & scope)
+        own = role == "tenant" and bool(_deal_owner_ids(d) & scope)
         layers = [COMPARE_LAYER_LABELS[i] for i in sorted(_deal_cf_option_ids(d, LAYERS_FIELD))
                   if i in COMPARE_LAYER_LABELS]
         structure = layers[0] if layers else ("Fund" if _deal_is_spv(d) else "—")
@@ -20945,7 +21266,7 @@ def _compare_live_intro(entry, viewer_ids):
     for d in deals:
         if (_deal_is_sell(d) and (_deal_company_name(d) or "").strip().lower() == company
                 and _deal_stage_id(d) not in TERMINAL_STAGE_IDS):
-            live_sellers |= {str(p) for p in _deal_linked_person_ids(d)}
+            live_sellers |= {str(p) for p in _deal_owner_ids(d)}
     for d in deals:
         if not _deal_is_buy(d) or (_deal_company_name(d) or "").strip().lower() != company:
             continue
@@ -20964,7 +21285,7 @@ def _compare_live_intro(entry, viewer_ids):
             continue
         others = linked - vids
         match = next((str(o.get("id")) for o in entry["deals"]
-                      if {str(p) for p in _deal_linked_person_ids(o)} & others), None)
+                      if {str(p) for p in _deal_owner_ids(o)} & others), None)
         return d, match
     return None
 
@@ -21347,7 +21668,10 @@ def _compare_nudge_recipients(deal):
     Unsubscribed (blank is allowed)."""
     by_id = _people_data()["by_id"]
     out, seen = [], set()
+    owners = _deal_owner_ids(deal)
     for pid in _deal_linked_person_ids_ordered(deal):
+        if pid not in owners:
+            continue  # counterparties (OWNERSHIP_RULE=primary) are never nudged
         rec = by_id.get(str(pid))
         if not rec:
             continue
@@ -21862,6 +22186,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_lookup_company_buyers(lookup_company_buyers_param)
+
+    if query.get("view") == "ownership":
+        if not is_admin_key:
+            return _forbidden()
+        return _html_response(render_ownership_page())
 
     if query.get("view") == "client_links":
         if not is_admin_key:

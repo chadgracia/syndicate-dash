@@ -741,8 +741,10 @@ check("paperwork missing: amber paperwork chips come first in Next Steps, then E
       < _pw_row_chip.find("Extend deadline")
       and "ID required" not in _pw_row_chip)
 
-chip = lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, view_as=None, archived=True)
-check("archived -> only the red 'Reopen ->' chip, to the update form",
+check("archived (tenant) -> no Next Steps at all (closed deals are a read-only archive)",
+      lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, view_as=None, archived=True) == "")
+chip = lf._my_deal_action_chip_html("1", "Co", True, True, "live", key=None, view_as=None, archived=True, admin=True)
+check("archived (admin) -> only the red 'Reopen ->' chip, to the update form",
       chip.count("action-chip") == 1 and 'class="action-chip reopen"' in chip and "Reopen &rarr;" in chip
       and lf.DEAL_UPDATE_FORM_URL in chip)
 
@@ -960,7 +962,8 @@ check("Closed row: green 'Sold' badge", 'class="visibility-badge sold"' in row_w
 check("Closed (Won, archived) row: no Reopen chip (Reopen is Lost/Obsolete/Trade Broken only)",
       "Reopen" not in row_won_a and "action-chip" not in row_won_a)
 _row_lost_reopen = row_for(page, "604") or ""
-check("Lost (archived) row still gets the red 'Reopen ->' chip", "Reopen &rarr;" in _row_lost_reopen)
+check("Lost (archived) row: no Reopen for tenants (read-only archive)", "Reopen" not in _row_lost_reopen
+      and "action-chip" not in _row_lost_reopen)
 check("Closed row: no Update/Hold/Cancel/Reactivate", 'data-target="hold"' not in row_won_a
       and 'data-target="cancel"' not in row_won_a and 'data-target="reactivate"' not in row_won_a
       and "update-cancel-btn" not in row_won_a)
@@ -7405,8 +7408,8 @@ check("archive: section is collapsed by default and titled 'Archived deals (2)'"
       in arch_page and "mydeals-archived\" open" not in arch_page)
 check("archive: archived rows have no Update/Hold/Cancel", "update-cancel-btn" not in arch_sec
       and "deal-stage-btn" not in arch_sec)
-check("archive: every archived row carries the red 'Reopen ->' chip to the update form",
-      arch_sec.count("Reopen &rarr;") == 2 and lf.DEAL_UPDATE_FORM_URL + "?deal_id=54779050" in arch_sec)
+check("archive: archived rows carry no Reopen chip and no update-form link for tenants",
+      "Reopen" not in arch_sec and lf.DEAL_UPDATE_FORM_URL not in arch_sec)
 check("archive: ▸ marker comes from the shared closed-out-section style",
       'details.closed-out-section summary::before { content: "\\25B8 "' in _md_get("alice@harkcap.com", {})["body"])
 arch_summary = arch_page[arch_page.find('class="mydeals-summary"'):]
@@ -7912,7 +7915,8 @@ _dt_md = body_only(lf.lambda_handler({"requestContext": {"http": {"method": "GET
                                        "queryStringParameters": {"tab": "mydeals"},
                                        "cookies": [tenant_cookie("dee@dtcap.com")]}, None)["body"])
 check("reopen: no Reopen chip on the Won archived row", "Reopen" not in (row_for(_dt_md, "99102") or "x Reopen"))
-check("reopen: Reopen chip on the Obsolete archived row", "Reopen &rarr;" in (row_for(_dt_md, "99103") or ""))
+check("reopen: no Reopen chip on the Obsolete archived row for tenants",
+      "Reopen" not in (row_for(_dt_md, "99103") or "Reopen"))
 check("reopen: never in Overview's Needs your attention",
       "Reopen" not in _dt_page[_dt_page.find('class="ov-section ov-attention"'):_dt_page.find('class="ov-section ov-track"')])
 
@@ -7968,8 +7972,9 @@ check("action helper: live stage -> the 'Update, Pause or Cancel' button to the 
       _AC_BTN in lf._deal_action_html("99201", lf.STAGE_FIRM)
       and lf._deal_update_form_url("99201") in lf._deal_action_html("99201", lf.STAGE_FIRM))
 check("action helper: Hold is live -> the button", _AC_BTN in lf._deal_action_html("99201", lf.HOLD_STAGE_ID))
-check("action helper: Obsolete / Lost / Trade Broken -> Reopen, no button",
-      all("Reopen &rarr;" in lf._deal_action_html("1", sid) and _AC_BTN not in lf._deal_action_html("1", sid)
+check("action helper: Obsolete / Lost / Trade Broken -> nothing for tenants, Reopen for admin, never the button",
+      all(lf._deal_action_html("1", sid) == "" and "Reopen &rarr;" in lf._deal_action_html("1", sid, admin=True)
+          and _AC_BTN not in lf._deal_action_html("1", sid, admin=True)
           for sid in (lf.OBSOLETE_STAGE_ID, 111801, 2379322, lf.STAGE_TRADE_BROKEN)))
 check("action helper: Won -> no action at all",
       lf._deal_action_html("1", 111802) == "" and lf._deal_action_html("1", 2379321) == "")
@@ -7977,8 +7982,8 @@ check("action helper: Won -> no action at all",
 # --- My Deals
 _ac_md = body_only(_ac_get({"tab": "mydeals"}))
 check("my deals: live row has the shared button (stacked variant)", _AC_STACK in (row_for(_ac_md, "99201") or ""))
-check("my deals: Obsolete/Lost rows have Reopen and no button",
-      all("Reopen &rarr;" in (row_for(_ac_md, i) or "") and _AC_BTN not in (row_for(_ac_md, i) or "x")
+check("my deals: Obsolete/Lost rows have no Reopen and no button (tenant)",
+      all("Reopen" not in (row_for(_ac_md, i) or "Reopen") and _AC_BTN not in (row_for(_ac_md, i) or "x")
           for i in ("99203", "99204")))
 check("my deals: Won row has no action",
       _AC_BTN not in (row_for(_ac_md, "99202") or _AC_BTN) and "Reopen" not in (row_for(_ac_md, "99202") or "Reopen"))
@@ -8032,8 +8037,8 @@ lf.NUDGE_KEY = _nb_saved
 check("overview: Needs your attention row (Extend) also carries the shared button",
       "Extend deadline &rarr;" in _ac_att and _AC_STACK in _ac_att and "Reopen" not in _ac_att)
 _ac_all_closed = _ac_track[_ac_track.find("ov-all-closed"):]
-check("overview: All closed deals -> Reopen on Obsolete and Lost, nothing on Won",
-      _ac_all_closed.count("Reopen &rarr;") == 2 and _AC_BTN not in _ac_track)
+check("overview: All closed deals -> no actions for tenants (read-only archive)",
+      "Reopen" not in _ac_all_closed and _AC_BTN not in _ac_track)
 _ac_model = lf._overview_model(lf.get_firm_sell_deals(2301), 2301, "ada@actcap.com")
 _ac_bk = lf._intro_buckets(2301, "ada@actcap.com", lf.get_intro_details("ada@actcap.com")[0])
 check("overview: Active intros tile = uncapped Active bucket (12)",
@@ -8069,8 +8074,8 @@ check("company page: Obsolete and Lost appear ONLY inside Closed down",
       and "Act obsolete block" not in _ac_dd[:_ac_i_down] and "Act lost block" not in _ac_dd[:_ac_i_down])
 check("company page: live card has the shared button",
       _AC_BTN in _ac_dd[_ac_i_live:_ac_i_won])
-check("company page: closed-down cards have Reopen, Won card has no action",
-      _ac_down_sec.count("Reopen &rarr;") == 2 and _AC_BTN not in _ac_down_sec
+check("company page: closed-down and Won cards have no action for tenants",
+      "Reopen" not in _ac_down_sec and _AC_BTN not in _ac_down_sec
       and _AC_BTN not in _ac_won_sec and "Reopen" not in _ac_won_sec)
 check("company page: closed cards show close labels and no paperwork",
       "&#10003; Won · Sep 3, 2026" in _ac_won_sec and "Closed Jul 1, 2026" in _ac_down_sec and "Closed Jul 2, 2026" in _ac_down_sec
@@ -8717,10 +8722,10 @@ check("deal preference: chip and company-page Deal Details lead with the same (l
       bool(_cards) and _cards[0] == _chips[0] == "950001")
 
 _c, _p, _cards, _chips = _pref_scenario([_pref_old])
-check("deal preference: only archived Sell deals -> chip still 'Reopen ->'",
-      "Reopen &rarr;" in _c and _chips == ["950002"])
-check("deal preference: archived-only chip and company-page card select the same deal",
-      bool(_cards) and _cards[0] == _chips[0] == "950002")
+check("deal preference: only archived Sell deals -> no chip for tenants (read-only archive)",
+      _c == "" and _chips == [] and _cards == [])
+check("deal preference: archived-only -> the preferred deal is still the archived one",
+      str(lf._preferred_sell_deal(PREF_TENANT_PID, "Pref Co")[0]["id"]) == "950002")
 _pref_won = dict(_pref_old, id=950004, deal_stage={"id": 111802},
                  updated_at="2026-07-01T00:00:00Z")
 check("deal preference: helper falls back to the newest-updated archived deal",
@@ -8832,16 +8837,16 @@ check("paused: Active Intros header excludes paused rows (1 pending = Liveish Co
       and "Pending (1)" in _ro_main and "Active (0)" in _ro_main)
 check("paused: paused rows carry the 'Paused — deal closed' chip",
       _ro_closed.count(lf.PAUSED_INTRO_TEXT) == 2)
-check("paused: Re-Open Deal button on the Obsolete company's paused row, targeting its sell deal",
-      'class="reopen-deal-btn" data-deal-id="960001"' in _ro_closed and "Re-Open Deal" in _ro_closed)
+check("paused: no Re-Open Deal button for tenants (closed deals are a read-only archive)",
+      'class="reopen-deal-btn"' not in _ro_closed)
 _ro_done = _ro_completed(_ro_intros)
 check("Paused section: '<summary>Paused (2)', holding exactly the paused rows (no Won/Lost rows)",
       '<summary>Paused <span class="count">(2)</span></summary>' in _ro_closed
       and "Zzz Won Co" not in _ro_closed and "status-chip exit" not in _ro_closed)
 check("Paused rows: no old 'Reopen ->' update-form chip, the Re-Open Deal button is the one reopen affordance",
       "Reopen &rarr;" not in _ro_closed and "company-update-link" not in _ro_closed)
-check("Reopen chip stays everywhere else: company-page Deal Details Closed-down card keeps 'Reopen ->'",
-      "Reopen &rarr;" in _ro_deal_details(_ro_comps["Paused Co"]))
+check("tenant company-page Deal Details Closed-down card has no 'Reopen ->' either",
+      "Reopen" not in _ro_deal_details(_ro_comps["Paused Co"]))
 check("Completed section: '<summary>Completed (2)' with the Won row above the Lost row (status chips unchanged)",
       '<summary>Completed <span class="count">(2)</span></summary>' in _ro_done
       and 0 <= _ro_done.find("Zzz Won Co") < _ro_done.find("?company=Liveish%20Co")
@@ -8852,11 +8857,10 @@ check("Completed section: '<summary>Completed (2)' with the Won row above the Lo
 check("Active Intros page no longer says 'Closed out' anywhere", "Closed out" not in _ro_intros_full())
 _ro_paused_rows = [r for r in _intro_rows(_ro_closed) if lf.PAUSED_INTRO_TEXT in r]
 _ro_done_rows = _intro_rows(_ro_done)
-check("Paused rows: Re-Open Deal button lives in the ACTIONS (last) cell, not the Status or company cell",
+check("Paused rows (tenant): no Re-Open Deal button in any cell; status cell is the paused chip",
       len(_ro_paused_rows) == 2
       and all(len(_row_cells(r)) == 7 for r in _ro_paused_rows)
-      and any('class="reopen-deal-btn" data-deal-id="960001"' in _row_cells(r)[-1] for r in _ro_paused_rows)
-      and all("reopen-deal-btn" not in c for r in _ro_paused_rows for c in _row_cells(r)[:-1])
+      and all("reopen-deal-btn" not in c for r in _ro_paused_rows for c in _row_cells(r))
       and all(_row_cells(r)[4] == f'<td><span class="status-chip paused">{lf.PAUSED_INTRO_TEXT}</span></td>'
               for r in _ro_paused_rows))
 check("Paused/Completed rows: 7 cells with a full-cell company link, columns aligned with the live table",
@@ -8871,8 +8875,8 @@ check("Active Intros write paths untouched: tenant page still wires the update_i
       "fetch('?action=' + (action || 'update_intro')" in page_repeat_full
       and all(re.search(r'<textarea class="ei-notes" data-deal-id="94000[23]"', _row_cells(r)[5]) for r in _lay_rows)
       and "fetch('?action=deal_stage'" in _ro_intros_full() and "target: 'reopen'" in _ro_intros_full())
-check("Company page paused block unchanged: Re-Open Deal still in its status cell",
-      'class="reopen-deal-btn" data-deal-id="960001"' in _ro_comps["Paused Co"])
+check("Company page paused block: no Re-Open Deal button for tenants",
+      'class="reopen-deal-btn"' not in _ro_comps["Paused Co"])
 _ro_fixture([d for d in _ro_deals if d["id"] in (960001, 960002)])
 check("empty state: only Paused non-empty -> 'see Paused below'",
       "No live introductions right now — see Paused below for past ones." in _ro_intros_full())
@@ -8898,9 +8902,13 @@ check("paused company page: THIS COMPANY 'Active intros' shows 0 with no '+N pen
       '<span>Active intros</span><span class="cd-stat-num">0</span>' in _ro_pc and "cd-stat-pending" not in _ro_card(_ro_pc))
 check("paused company page: Interested buyers count unchanged (demand is real)",
       '<span>Interested buyers</span><span class="cd-stat-num">1</span>' in _ro_pc)
-check("paused company page: Deal Details 'Closed down' card carries the Re-Open Deal button",
-      'class="reopen-deal-btn" data-deal-id="960001"' in _ro_deal_details(_ro_pc)
+check("paused company page: Deal Details 'Closed down' card has no Re-Open Deal button for tenants",
+      'class="reopen-deal-btn"' not in _ro_deal_details(_ro_pc)
       and "cd-closed-down" in _ro_deal_details(_ro_pc))
+_ro_pc_admin = lf.render_company_page("Paused Co", "Admin", lf._resolve_tenant(RO_EMAIL), RO_EMAIL, "intros",
+                                      key=ADMIN_KEY, view_as=RO_EMAIL, edit_mode=True)
+check("paused company page (admin Admin view): Closed down card keeps the Re-Open Deal button",
+      'class="reopen-deal-btn" data-deal-id="960001"' in _ro_deal_details(_ro_pc_admin))
 _ro_lc = _ro_comps["Liveish Co"]
 check("live sell deal: company page fully unaffected (Pending section, +1 pending, no pause, no Re-Open)",
       "Pending introductions" in _ro_buyers(_ro_lc) and "+1 pending" in _ro_card(_ro_lc)
@@ -8921,13 +8929,21 @@ def _ro_pipe_ok(deal_id, stage_id):
 lf._pipeline_update_deal_stage = _ro_pipe_ok
 lf._read_identity_email = lambda event: RO_EMAIL
 _ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen"})})
+check("reopen: tenant POST on a closed deal -> 409 read-only, nothing written",
+      _ro_resp["statusCode"] == 409 and json.loads(_ro_resp["body"])["error"] == lf.CLOSED_DEAL_READ_ONLY_MSG
+      and _ro_pipe_calls == [] and not _ro_table.updates and not _ro_table.puts)
+for _ro_tgt in ("hold", "cancel", "reactivate"):
+    check(f"closed deal: tenant {_ro_tgt} -> 409, no Pipeline call",
+          lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": _ro_tgt})})["statusCode"] == 409
+          and _ro_pipe_calls == [])
+_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen", "key": ADMIN_KEY})})
 _ro_audit = [it for it in _ro_table.puts if str(it.get("sk", "")).startswith("audit#960001#")]
-check("reopen: tenant POST -> 200, Pipeline PUT to Inquiry (2109142) before any Dynamo write",
+check("reopen: admin POST -> 200, Pipeline PUT to Inquiry (2109142) before any Dynamo write",
       _ro_resp["statusCode"] == 200 and _ro_pipe_calls == [("960001", lf.STAGE_INQUIRY, 0, 0)])
-check("reopen: Dynamo stage override (Inquiry) in the owner's partition + audit item with actor = authenticated email",
+check("reopen: Dynamo stage override (Inquiry) in the owner's partition + audit item with actor 'admin'",
       any(u["Key"] == {"tenant": RO_EMAIL, "sk": "intro#960001"}
           and u["ExpressionAttributeValues"][":s"] == lf.STAGE_INQUIRY for u in _ro_table.updates)
-      and len(_ro_audit) == 1 and _ro_audit[0]["actor"] == RO_EMAIL
+      and len(_ro_audit) == 1 and _ro_audit[0]["actor"] == "admin"
       and _ro_audit[0]["old"] == {"stage": lf.OBSOLETE_STAGE_ID} and _ro_audit[0]["new"] == {"stage": lf.STAGE_INQUIRY})
 _ro_intros2, _ro_comps2 = _ro_pages()
 _ro_main2, _ro_closed2 = _ro_split(_ro_intros2)
@@ -8950,7 +8966,7 @@ check("reopen: a Won deal is refused (409), no Pipeline call", _ro_resp["statusC
 _ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960011", "target": "reopen"})})
 check("reopen: a live deal is refused (409), no Pipeline call", _ro_resp["statusCode"] == 409 and _ro_pipe_calls == [])
 lf._pipeline_update_deal_stage = lambda deal_id, stage_id: (False, "HTTP 500")
-_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen"})})
+_ro_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen", "key": ADMIN_KEY})})
 check("reopen: Pipeline failure aborts everything (502, no Dynamo write, no audit)",
       _ro_resp["statusCode"] == 502 and not _ro_table.updates and not _ro_table.puts)
 lf._pipeline_update_deal_stage = _ro_pipe_ok
@@ -8993,8 +9009,8 @@ check("public live deal: no Update/Pause/Cancel button, no owner line, 'Public c
 _np_arch = _ro_sell(960053, "Rocket Co", lf.OBSOLETE_STAGE_ID)
 _np_arch_row = lf._my_deal_row_html(_np_arch, "Rocket Co", None, _pub_stats, 0, None, "cancelled",
                                     archived=True, resolved_stage=lf.OBSOLETE_STAGE_ID)
-check("non-public archived deal: Reopen chip still renders exactly as before",
-      lf._reopen_chip_html(lf._deal_update_form_url("960053")) in _np_arch_row
+check("non-public archived deal: no Reopen chip for tenants",
+      "Reopen" not in _np_arch_row
       and "Public company" not in _np_arch_row)
 check("My Deals row: Created column shows created_at via _fmt_short_date",
       "<td><span class=\"mydeals-created\">Mar 5, '26</span></td>" in _pub_arch_row)
@@ -10960,7 +10976,7 @@ lf._pipeline_update_deal_stage = lambda deal_id, stage_id: (_an_calls.append((de
                                                            or (True, None))
 lf._read_identity_email = lambda event: RO_EMAIL
 ses_calls.clear()
-_an_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960061", "target": "reopen"})})
+_an_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960061", "target": "reopen", "key": ADMIN_KEY})})
 _an_audit = [it for it in _an_table.puts if str(it.get("sk", "")).startswith("audit#960061#")]
 check("Anthropic Re-Open: Pipeline PUT to Hold (not Inquiry) before any Dynamo write",
       _an_resp["statusCode"] == 200 and _an_calls == [("960061", lf.HOLD_STAGE_ID, 0)])
@@ -10971,7 +10987,7 @@ check("Anthropic Re-Open: Hold override + audit, tenant message, Chad's email no
       and json.loads(_an_resp["body"]) == {"ok": True, "message": "Received — we'll review and confirm before listing."}
       and len(ses_calls) == 1 and "Anthropic sell: kept on Hold" in ses_calls[0]["Message"]["Body"]["Text"]["Data"])
 _an_calls.clear()
-_an_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen"})})
+_an_resp = lf._handle_deal_stage({"body": json.dumps({"deal_id": "960001", "target": "reopen", "key": ADMIN_KEY})})
 check("non-Anthropic Re-Open still goes to Inquiry with a plain ok",
       [c[:2] for c in _an_calls] == [("960001", lf.STAGE_INQUIRY)] and json.loads(_an_resp["body"]) == {"ok": True})
 lf._pipeline_update_deal_stage, lf._read_identity_email = _an_saved
@@ -10980,8 +10996,10 @@ lf._pipeline_update_deal_stage, lf._read_identity_email = _an_saved
 # ======================================================================
 # SECTION: Re-Open confirmation wording (Anthropic -> review, others -> Inquiry)
 # ======================================================================
-_rc_an = lf._reopen_deal_button_html(_ro_sell(960071, "Anthropic PBC", lf.OBSOLETE_STAGE_ID), lf.OBSOLETE_STAGE_ID)
-_rc_other = lf._reopen_deal_button_html(_ro_sell(960072, "Paused Co", lf.OBSOLETE_STAGE_ID), lf.OBSOLETE_STAGE_ID)
+_rc_an = lf._reopen_deal_button_html(_ro_sell(960071, "Anthropic PBC", lf.OBSOLETE_STAGE_ID), lf.OBSOLETE_STAGE_ID,
+                                     key=ADMIN_KEY)
+_rc_other = lf._reopen_deal_button_html(_ro_sell(960072, "Paused Co", lf.OBSOLETE_STAGE_ID), lf.OBSOLETE_STAGE_ID,
+                                        key=ADMIN_KEY)
 check("Re-Open confirm: Anthropic deal says it goes to Gracia Group for review, never Inquiry",
       'data-confirm="Re-open Anthropic PBC block? This sends the deal to Gracia Group for review before it&#x27;s '
       'listed again."' in _rc_an.replace("it's", "it&#x27;s") and "Inquiry" not in _rc_an)
@@ -11953,7 +11971,8 @@ _rf_saved = (lf._people_data, lf._resolve_tenant, set(lf.TENANT_BLOCKLIST))
 lf._people_data = lambda: {"people": list(_rf_people.values()), "by_id": _rf_people}
 lf._resolve_tenant = lambda e: None if e == "ed@example.com" else {"person_id": 1}
 lf.TENANT_BLOCKLIST.add("fa@blocked.example")
-_rf = lf._compare_nudge_recipients({"people": [{"id": i} for i in range(1, 9)]})
+_rf = lf._compare_nudge_recipients({"people": [{"id": i} for i in range(1, 9)],
+                                    "custom_fields": {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_SELL_ID]}})
 lf._people_data, lf._resolve_tenant = _rf_saved[0], _rf_saved[1]
 lf.TENANT_BLOCKLIST.clear(); lf.TENANT_BLOCKLIST.update(_rf_saved[2])
 check("compare bell recipients: tenants only; skip Bouncing/Blocked/Needed/Unavailable/Unsubscribed and blocklist; "
@@ -12231,6 +12250,253 @@ check("admin strip: CSS — slim dark-red bar that wraps; tabs one line, wrappin
 check("admin strip: Research gaps stays in the tab row (Admin view)",
       ">Research gaps</a>" in _hdr(_as_admin_only) and "Research gaps" not in
       _as_admin_only[:_as_admin_only.index('<header class="gg-nav">')])
+
+
+# ======================================================================
+# SECTION: Sell-deal ownership (OWNERSHIP_RULE), closed-deal archive,
+# ?view=ownership, Demand Board with Buy trade deals
+# ======================================================================
+OW_SAM, OW_SUE, OW_DOM, OW_RAY, OW_BOB, OW_GAIL, OW_GUS, OW_BEA, OW_OMAR = (
+    801, 802, 803, 804, 806, 807, 808, 809, 810)
+_ow_people = {"people": [
+    # Ray first, so index order alone would make him the "owner" of anything he's linked to.
+    {"id": OW_RAY, "full_name": "Ray Buyer", "email": "ray@raycap.com", "company_id": 9002,
+     "company_name": "Ray Cap", "custom_fields": {}},
+    {"id": OW_SAM, "full_name": "Sam Seller", "email": "sam@sellcap.com", "company_id": 9001,
+     "company_name": "Sell Cap", "custom_fields": {}},
+    {"id": OW_SUE, "full_name": "Sue Colleague", "email": "sue@othermail.io", "company_id": 9001,
+     "company_name": "Sell Cap", "custom_fields": {}},
+    {"id": OW_DOM, "full_name": "Dom Domain", "email": "dom@sellcap.com", "custom_fields": {}},
+    {"id": OW_BOB, "full_name": "Bob Buyer", "email": "bob@gmail.com", "custom_fields": {}},
+    {"id": OW_GAIL, "full_name": "Gail Gmail", "email": "gail@gmail.com", "custom_fields": {}},
+    {"id": OW_GUS, "full_name": "Gus Gmail", "email": "gus@gmail.com", "custom_fields": {}},
+    {"id": OW_BEA, "full_name": "Bea Buyonly", "email": "bea@beacap.com", "company_id": 9003,
+     "company_name": "Bea Cap", "custom_fields": {}},
+    {"id": OW_OMAR, "full_name": "Omar Buyer", "email": "omar@omarcap.com", "company_id": 9004,
+     "company_name": "Omar Cap", "custom_fields": {}},
+]}
+
+
+def _ow_deal(did, company, stage, side, people, primary, status=None):
+    cf = {lf.DEAL_SIDE_FIELD: [side]}
+    if status is not None:
+        cf[lf.INTRO_STATUS_FIELD] = status
+    return {"id": did, "name": f"{company} block", "company": {"name": company}, "deal_stage": {"id": stage},
+            "custom_fields": cf, "people": [{"id": p} for p in people], "primary_contact_id": primary,
+            "primary_contact": {"id": primary}, "updated_at": "2026-08-01T00:00:00Z",
+            "created_at": "2026/03/02 10:00:00 -0500"}
+
+
+S, B = lf.DEAL_SIDE_SELL_ID, lf.DEAL_SIDE_BUY_ID
+_ow_live = [
+    _ow_deal(9101, "Alpha Co", lf.STAGE_FIRM, S, [OW_SAM, OW_SUE, OW_DOM, OW_RAY], OW_SAM),
+    _ow_deal(9102, "Ray Own Co", lf.STAGE_FIRM, S, [OW_RAY], OW_RAY),
+    _ow_deal(9103, "Beta Co", lf.STAGE_FIRM, S, [OW_SAM, OW_BOB], OW_SAM),            # 1:1 deal, Bob linked
+    _ow_deal(9104, "Alpha Co", lf.STAGE_MATCHED, B, [OW_RAY, OW_SAM], OW_RAY, 7207579),  # Buy trade deal
+    _ow_deal(9105, "Alpha Co", lf.STAGE_MATCHED, B, [OW_RAY], OW_RAY),                 # Ray's original Buy order
+    _ow_deal(9106, "Gamma Co", lf.STAGE_FIRM, S, [OW_GAIL, OW_GUS], OW_GAIL),          # free mail: individual
+    _ow_deal(9110, "Delta Co", lf.STAGE_MATCHED, B, [OW_BEA, OW_SAM], OW_BEA, 7207579),  # Bea only ever buys
+    _ow_deal(9109, "Omega Co", lf.STAGE_MATCHED, B, [OW_OMAR, OW_SAM], OW_OMAR, 7207579),
+]
+# Closed Sell deals come from the closed-deals list (deals.json is live-only).
+_ow_closed = [
+    _ow_deal(9107, "Zeta Co", 111802, S, [OW_SAM], OW_SAM),
+    _ow_deal(9108, "Omega Co", lf.OBSOLETE_STAGE_ID, S, [OW_SAM], OW_SAM),
+]
+_ow_saved_urlopen = lf.urllib.request.urlopen
+
+
+def _ow_fixture(rule, interest=None):
+    if rule is None:
+        os.environ.pop("OWNERSHIP_RULE", None)
+    else:
+        os.environ["OWNERSHIP_RULE"] = rule
+    s3, table = use_fixture({lf.PEOPLE_KEY: _ow_people,
+                             lf.INTEREST_KEY: {"buy": interest if interest is not None else {}},
+                             lf.DEALS_KEY: {"deals": _ow_live},
+                             lf.CLOSED_DEALS_KEY: {"deals": _ow_closed, "last_updated": cd_iso(0)}},
+                            ses=FakeSES())
+    lf._closed_deals_cache["fetched_at"] = None
+    lf._closed_deals_cache["deals"] = None
+    lf.urllib.request.urlopen = _cd_raise
+    lf._req_cache_reset()
+    return s3, table
+
+
+def _ow_deal_by_id(did):
+    return next(d for d in lf.get_deals_list() if d["id"] == did)
+
+
+def _ow_sell_ids(pid):
+    return sorted(d["id"] for d in lf.get_firm_sell_deals(pid))
+
+
+# --- the helper itself (rule-independent)
+_ow_fixture(None)
+check("ownership: closed Sell deals come from the closed-deals list in this fixture",
+      {9107, 9108} <= {d["id"] for d in lf.get_deals_list()}
+      and not any(d["id"] in (9107, 9108) for d in _ow_live))
+check("ownership helper: Sell primary + firm colleague (company_id) + same corporate domain are owners; "
+      "the linked buyer is a counterparty",
+      lf.sell_deal_owner_person_ids(_ow_deal_by_id(9101)) == {OW_SAM, OW_SUE, OW_DOM})
+check("ownership helper: 1:1 Sell deal -> only the seller owns it",
+      lf.sell_deal_owner_person_ids(_ow_deal_by_id(9103)) == {OW_SAM})
+check("ownership helper: free-mail people stay individual (gmail co-linked person is a counterparty)",
+      lf.sell_deal_owner_person_ids(_ow_deal_by_id(9106)) == {OW_GAIL})
+check("ownership helper: Buy deals never make anyone an owner",
+      lf.sell_deal_owner_person_ids(_ow_deal_by_id(9104)) == frozenset()
+      and lf._deal_owner_ids(_ow_deal_by_id(9104)) == frozenset())
+check("ownership helper: primary_contact.id alone is enough; no primary at all -> every linked person",
+      lf._deal_primary_contact_id({"primary_contact": {"id": "804"}}) == OW_RAY
+      and lf.sell_deal_owner_person_ids(dict(_ow_deal_by_id(9101), primary_contact_id=None, primary_contact=None))
+      == {OW_SAM, OW_SUE, OW_DOM, OW_RAY})
+
+# --- legacy (default): old behavior
+check("ownership: OWNERSHIP_RULE unset -> 'legacy'", lf._ownership_rule() == "legacy")
+check("legacy: every linked person owns a Sell deal (Ray, Bob, Gus are tenants)",
+      all(lf._resolve_tenant(e) is not None for e in ("ray@raycap.com", "bob@gmail.com", "gus@gmail.com")))
+check("legacy: Ray sees Alpha Co's Sell deal in his book and may act on it",
+      9101 in _ow_sell_ids(OW_RAY) and lf._tenant_can_act_on_deal("ray@raycap.com", _ow_deal_by_id(9101)))
+check("legacy: Buy-deal-only person is never a tenant", lf._resolve_tenant("bea@beacap.com") is None)
+
+# --- primary rule
+_ow_fixture("primary")
+check("primary: rule read from the env var", lf._ownership_rule() == "primary")
+check("primary: seller + firm colleague + domain teammate are tenants and own Alpha Co",
+      all(lf._resolve_tenant(e) is not None for e in ("sam@sellcap.com", "sue@othermail.io", "dom@sellcap.com"))
+      and 9101 in _ow_sell_ids(OW_SAM) and 9101 in _ow_sell_ids(OW_SUE)
+      and lf._tenant_can_act_on_deal("sue@othermail.io", _ow_deal_by_id(9101)))
+check("primary: linked buyer on a 1:1 Sell deal is a counterparty -- not a tenant, no owner views/actions",
+      lf._resolve_tenant("bob@gmail.com") is None
+      and not lf._tenant_can_act_on_deal("bob@gmail.com", _ow_deal_by_id(9103))
+      and lf._tenant_email_for_deal(_ow_deal_by_id(9103)) == "sam@sellcap.com")
+check("primary: free-mail co-linked person gets no tenancy from someone else's Sell deal",
+      lf._resolve_tenant("gus@gmail.com") is None and lf._resolve_tenant("gail@gmail.com") is not None)
+check("primary: Ray-like buyer keeps tenancy for his own Sell deal only",
+      lf._resolve_tenant("ray@raycap.com") is not None and _ow_sell_ids(OW_RAY) == [9102]
+      and not lf._tenant_can_act_on_deal("ray@raycap.com", _ow_deal_by_id(9101)))
+check("primary: Ray's Buy deals never show as his firm's intros (he's the buyer)",
+      not any(d["id"] in (9104, 9105) for d in lf.get_firm_deals(OW_RAY)))
+check("primary: the seller's firm sees the Buy trade deal as its intro, not Ray's original order",
+      [d["id"] for d in lf.get_firm_matched_buy_deals(OW_SAM, "Alpha Co")] == [9104])
+check("primary: Buy trade deal storage resolves to the seller, never the buyer (even though Ray indexes first)",
+      lf._tenant_email_for_deal(_ow_deal_by_id(9104)) == "sam@sellcap.com"
+      and lf._tenant_email_for_deal(_ow_deal_by_id(9101)) == "sam@sellcap.com")
+check("primary: Buy deals grant no ownership -- Buy-only person is not a tenant",
+      lf._resolve_tenant("bea@beacap.com") is None)
+check("primary: compare 'Your offering' / nudge list use owners only (Ray excluded)",
+      "ray@raycap.com" not in [r["email"] for r in lf._compare_nudge_recipients(_ow_deal_by_id(9101))]
+      and "sam@sellcap.com" in [r["email"] for r in lf._compare_nudge_recipients(_ow_deal_by_id(9101))])
+_ow_stage_calls = []
+_ow_saved_stage = lf._pipeline_update_deal_stage, lf._read_identity_email
+lf._pipeline_update_deal_stage = lambda deal_id, stage_id: (_ow_stage_calls.append((deal_id, stage_id)) or (True, None))
+lf._read_identity_email = lambda event: "ray@raycap.com"
+check("primary: counterparty Hold on the seller's live deal -> 403, no Pipeline call",
+      lf._handle_deal_stage({"body": json.dumps({"deal_id": "9101", "target": "hold"})})["statusCode"] == 403
+      and _ow_stage_calls == [])
+lf._pipeline_update_deal_stage, lf._read_identity_email = _ow_saved_stage
+
+# --- legacy again: Ray's old view is back
+_ow_fixture("legacy")
+check("legacy (explicit): Ray is treated as Alpha Co's owner exactly as before",
+      9101 in _ow_sell_ids(OW_RAY) and lf._resolve_tenant("bob@gmail.com") is not None)
+
+# --- closed Sell deals: read-only archive (both rules)
+for _ow_rule in ("legacy", "primary"):
+    _ow_s3, _ow_table = _ow_fixture(_ow_rule)
+    _ow_stage_calls.clear()
+    lf._pipeline_update_deal_stage = lambda deal_id, stage_id: (_ow_stage_calls.append((deal_id, stage_id))
+                                                               or (True, None))
+    lf._read_identity_email = lambda event: "sam@sellcap.com"
+    _ow_codes = {(did, tgt): lf._handle_deal_stage({"body": json.dumps({"deal_id": did, "target": tgt})})["statusCode"]
+                 for did in ("9107", "9108") for tgt in ("hold", "cancel", "reactivate", "reopen")}
+    check(f"closed ({_ow_rule}): tenant stage writes / Re-Open on Won + Obsolete (closed-list) deals -> 409, "
+          "nothing written",
+          set(_ow_codes.values()) == {409} and _ow_stage_calls == [] and not _ow_table.updates)
+    _ow_dl = lf._handle_update_intro({"body": json.dumps({"deal_id": "9108", "deadline": "2030-01-01"})})
+    check(f"closed ({_ow_rule}): tenant deadline edit on a closed deal -> 409", _ow_dl["statusCode"] == 409)
+    _ow_saved_status = lf._pipeline_update_deal_status
+    _ow_status_calls = []
+    lf._pipeline_update_deal_status = lambda *a, **k: (_ow_status_calls.append(a) or (True, None))
+    _ow_in = lf._handle_update_intro({"body": json.dumps({"deal_id": "9109", "flag": "stalled"})})
+    check(f"closed ({_ow_rule}): tenant intro status write on an intro of a closed Sell deal -> 409, no Pipeline call",
+          _ow_in["statusCode"] == 409 and json.loads(_ow_in["body"])["error"] == lf.CLOSED_DEAL_READ_ONLY_MSG
+          and _ow_status_calls == [])
+    lf._read_identity_email = lambda event: None
+    _ow_adm = lf._handle_deal_stage({"body": json.dumps({"deal_id": "9108", "target": "reopen", "key": ADMIN_KEY})})
+    check(f"closed ({_ow_rule}): admin Re-Open still works (200, Pipeline PUT to Inquiry)",
+          _ow_adm["statusCode"] == 200 and _ow_stage_calls == [("9108", lf.STAGE_INQUIRY)])
+    _ow_adm_in = lf._handle_update_intro({"body": json.dumps({"deal_id": "9109", "flag": "stalled", "key": ADMIN_KEY})})
+    check(f"closed ({_ow_rule}): admin intro status write on the same intro is not blocked",
+          _ow_adm_in["statusCode"] == 200)
+    lf._pipeline_update_deal_status = _ow_saved_status
+    lf._pipeline_update_deal_stage, lf._read_identity_email = _ow_saved_stage
+
+_ow_fixture("primary")
+_ow_t = lf._resolve_tenant("sam@sellcap.com")
+_ow_md = body_only(lf.render_my_deals_page("Sam", deals=lf.get_firm_deals(OW_SAM), key=None, view_as=None,
+                                           edit_mode=False, person_id=OW_SAM, anon_key_email="sam@sellcap.com"))
+_ow_arch = _ow_md.split('<details class="closed-out-section mydeals-archived">')[1].split("</details>")[0]
+check("closed UI: My Deals archived rows (closed-list deals) carry no Update/Reopen/update-form link",
+      "Zeta Co" in _ow_arch and "Omega Co" in _ow_arch and "Reopen" not in _ow_arch
+      and lf.DEAL_UPDATE_FORM_URL not in _ow_arch and "update-cancel-btn" not in _ow_arch)
+_ow_cp = lf.render_company_page("Omega Co", "Sam", _ow_t, "sam@sellcap.com", "mydeals")
+check("closed UI: tenant company page of a closed deal has no Re-Open, Reopen, update link or editors",
+      'class="reopen-deal-btn"' not in _ow_cp and "Reopen &rarr;" not in _ow_cp
+      and "?deal_id=9108" not in _ow_cp and "dc-deadline-edit" not in _ow_cp and "dc-net-edit" not in _ow_cp)
+_ow_cp_admin = lf.render_company_page("Omega Co", "Admin", _ow_t, "sam@sellcap.com", "mydeals",
+                                      key=ADMIN_KEY, view_as="sam@sellcap.com", edit_mode=True)
+check("closed UI: admin Admin view keeps Re-Open Deal and Reopen on the same card",
+      'class="reopen-deal-btn" data-deal-id="9108"' in _ow_cp_admin and "Reopen &rarr;" in _ow_cp_admin)
+
+# --- ?view=ownership
+_ow_fixture("legacy")
+_ow_rep = lf.ownership_report()
+check("ownership page: computed under the primary rule even while the flag is legacy -- retag lists the "
+      "live Sell deals with 2+ firms (Alpha, Beta, Gamma), never Ray's own, Buy deals or closed deals",
+      [r["deal_id"] for r in _ow_rep["retag"]] == ["9101", "9103", "9106"])
+_ow_alpha = _ow_rep["retag"][0]
+check("ownership page: retag row carries company, deal name, Pipeline link, primary and the other linked people",
+      _ow_alpha["company"] == "Alpha Co" and _ow_alpha["url"] == "https://app.pipelinecrm.com/deals/9101"
+      and _ow_alpha["primary"]["email"] == "sam@sellcap.com"
+      and [(o["name"], o["email"], o["firm"]) for o in _ow_alpha["others"]] == [("Ray Buyer", "ray@raycap.com", "Ray Cap")])
+check("ownership page: access changes = Ray (keeps own tenancy), Bob and Gus (lose it), with the reason",
+      sorted((a["person_id"], a["deal"]["deal_id"], a["keeps_tenancy"]) for a in _ow_rep["access"])
+      == [(OW_RAY, "9101", True), (OW_BOB, "9103", False), (OW_GUS, "9106", False)]
+      and all(a["reason"] == "not primary / not at primary's firm" for a in _ow_rep["access"]))
+_ow_page = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": {"key": ADMIN_KEY, "view": "ownership"}}, None)
+check("ownership page: admin GET renders both sections with the exact retag header, read-only",
+      _ow_page["statusCode"] == 200 and "Live Sell deals to retag (3)" in _ow_page["body"]
+      and lf.OWNERSHIP_RETAG_HEADER.replace("'", "&#x27;") in _ow_page["body"].replace("'", "&#x27;")
+      and "Access changes when the switch is on (3 people, 3 deal links)" in _ow_page["body"]
+      and "<form" not in _ow_page["body"] and "fetch(" not in _ow_page["body"])
+check("ownership page: non-admin -> 403",
+      lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                         "queryStringParameters": {"view": "ownership"},
+                         "cookies": [tenant_cookie("sam@sellcap.com")]}, None)["statusCode"] == 403)
+check("ownership page: linked from the admin strip only",
+      "view=ownership" in lf._nav_html("overview", "Admin", key=ADMIN_KEY)
+      and "view=ownership" not in lf._nav_html("overview", "Sam", account_email="sam@sellcap.com"))
+
+# --- Demand Board with a Buy trade deal present
+_ow_fixture("primary", interest={"Alpha Co": [OW_RAY]})
+_ow_row = next(r for r in lf._build_table() if r["company"] == "Alpha Co")
+check("demand: buyer with an original Buy order AND a Buy trade deal counts once (Demand Board total)",
+      _ow_row["total"] == 1)
+check("demand: Buyer Demand tiles list the buyer once", [b["person_id"] for b in lf.get_company_buyer_details("Alpha Co")]
+      == [OW_RAY])
+_ow_fixture("primary", interest={"Alpha Co": [OW_RAY, OW_RAY, OW_SAM]})
+_ow_row = next(r for r in lf._build_table() if r["company"] == "Alpha Co")
+check("demand: duplicate interest ids count once and the seller linked to the Buy trade deal is never a buyer",
+      _ow_row["total"] == 1 and [b["person_id"] for b in lf.get_company_buyer_details("Alpha Co")] == [OW_RAY]
+      and lf._trade_deal_sellers_by_company()["alpha co"] == {str(OW_SAM)})
+check("demand: a buyer who is primary on a Buy deal is never dropped as a 'seller'",
+      str(OW_RAY) not in lf._trade_deal_sellers_by_company().get("alpha co", set()))
+
+os.environ.pop("OWNERSHIP_RULE", None)
+lf.urllib.request.urlopen = _ow_saved_urlopen
+reset_caches()
 
 print(f"\n{passed} passed, {failed} failed")
 if failed:
