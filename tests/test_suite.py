@@ -11300,6 +11300,21 @@ check("compare: explicit 0 fees render 0% with no 'Full fees not confirmed' note
 check("compare: subtitle states the new blank-fee rule",
       "Offerings marked 'Full fees not confirmed' count missing fees as 0%; offerings with no fees provided are listed at the bottom." in _cb
       and "assumed at 5%" not in _cb)
+_cb_a = _cb[_cb.rindex("<tr", 0, _cb.index(">Offering A<")):]
+_cb_a = _cb_a[:_cb_a.index("</tr>")]
+_cb_tbody = _cb[_cb.index("<tbody>"):_cb.index("</tbody>")]
+check("compare: paperwork ignored — deal with no agent agreement / no ID and all fees ranks normally, no note",
+      lf.AGENT_AGREEMENT_FIELD not in _cmp_d1["custom_fields"]
+      and not _cmp_people["people"][0]["custom_fields"].get(lf.CEF_FIELD)
+      and ">4.80x<" in _cb_a and 'data-unranked="0"' in _cb_a and '<div class="cmp-partial" hidden>' in _cb_a
+      and not any(w in _cb_tbody for w in ("agreement", "Agreement", "ID needed", "FINRA", "paperwork",
+                                           "awaiting deal terms", "Terms incomplete", "deal terms")))
+_cmp_src = open(lf.__file__).read()
+_cmp_mod = _cmp_src[_cmp_src.index("# ── Compare SPV offerings"):_cmp_src.index("def _perf_infer_page")]
+check("compare module never reads paperwork / terms-completeness helpers",
+      not any(h in _cmp_mod for h in ("deal_paperwork_status", "AGENT_AGREEMENT", "CEF_FIELD", "_deal_id_status",
+                                      "_deal_terms_missing", "_deal_terms_complete", "_my_deal_visibility_state",
+                                      "_pending_block_items", "_tenant_cef_state")))
 check("compare script: unranked rows stay below the divider under every sort (ranked/unranked partition)",
       "var unranked = list.filter(function(tr) { return tr.getAttribute('data-unranked') === '1'; });" in lf.COMPARE_SCRIPT
       and "if (divider) { tbody.appendChild(divider); divider.hidden = unranked.length === 0; }" in lf.COMPARE_SCRIPT
