@@ -11309,16 +11309,16 @@ check("compare: subtitle states the new blank-fee rule",
 _cb_a = _cb[_cb.rindex("<tr", 0, _cb.index(">Offering A<")):]
 _cb_a = _cb_a[:_cb_a.index("</tr>")]
 _cb_tbody = _cb[_cb.index("<tbody>"):_cb.index("</tbody>")]
-check("compare: paperwork ignored — deal with no agent agreement / no ID and all fees ranks normally, no note",
+check("compare: paperwork never affects ranking — no agent agreement / no ID still ranks normally, no note",
       lf.AGENT_AGREEMENT_FIELD not in _cmp_d1["custom_fields"]
       and not _cmp_people["people"][0]["custom_fields"].get(lf.CEF_FIELD)
       and ">4.80x<" in _cb_a and 'data-unranked="0"' in _cb_a and '<div class="cmp-partial" hidden>' in _cb_a
-      and not any(w in _cb_tbody for w in ("agreement", "Agreement", "ID needed", "FINRA", "paperwork",
-                                           "awaiting deal terms", "Terms incomplete", "deal terms")))
+      and not any(w in _cb_tbody for w in ("ID needed", "FINRA", "paperwork", "awaiting deal terms",
+                                           "Terms incomplete", "deal terms")))
 _cmp_src = open(lf.__file__).read()
 _cmp_mod = _cmp_src[_cmp_src.index("# ── Compare SPV offerings"):_cmp_src.index("def _perf_infer_page")]
 check("compare module never reads paperwork / terms-completeness helpers",
-      not any(h in _cmp_mod for h in ("deal_paperwork_status", "AGENT_AGREEMENT", "CEF_FIELD", "_deal_id_status",
+      not any(h in _cmp_mod for h in ("deal_paperwork_status", "CEF_FIELD", "_deal_id_status",
                                       "_deal_terms_missing", "_deal_terms_complete", "_my_deal_visibility_state",
                                       "_pending_block_items", "_tenant_cef_state")))
 check("compare script: unranked rows stay below the divider under every sort (ranked/unranked partition)",
@@ -12051,16 +12051,16 @@ check("compare nudge: throttle window is 7 days",
       lf._compare_nudge_recent(_old) is None and lf._compare_nudge_recent(_recent) is not None)
 lf.urllib.request.urlopen = _nudge_saved_urlopen
 
-# Live-intro guard (buyer already introduced on this company).
-_li_banner = ("You've already been introduced on Varda Space. Please continue with your current counterparty; "
-              "contact Chad before considering other offerings.")
+# Live-intro guard: buyer sees ONLY their introduced offering (server-side filtering).
+_li_note = "You&#x27;re already in a deal on Varda Space. Other offerings are hidden while it&#x27;s in progress."
+_li_note_raw = "You're already in a deal on Varda Space. Other offerings are hidden while it's in progress."
 _li_deals = _cmp_s3.objs["deals.json"]["deals"]
 
 
-def _li_buy(status_id, primary=True, stage=None, did=7101):
+def _li_buy(status_id, primary=True, stage=None, did=7101, people=(503, 502)):
     d = {"id": did, "name": "Varda buy", "company": {"id": 7001, "name": "Varda Space"},
          "deal_stage": {"id": stage or lf.STAGE_MATCHED}, "custom_fields": cf_status(status_id),
-         "people": [{"id": 503}, {"id": 502}], "updated_at": "2026/10/30 09:00:00 -0400"}
+         "people": [{"id": p} for p in people], "updated_at": "2026/10/30 09:00:00 -0400"}
     if primary:
         d["primary_contact_id"] = 503
     return d
@@ -12075,40 +12075,92 @@ def _li_page(buy, cookies=None, query=None):
         _li_deals.remove(buy)
 
 
-_li_on = _li_page(_li_buy(lf.INTRO_STATUS_IDS["Introduced"] if hasattr(lf, "INTRO_STATUS_IDS") else 7207579))
-_li_b_row = _li_on[_li_on.rindex("<tr", 0, _li_on.index(">Offering B<")):]
-_li_b_row = _li_b_row[:_li_b_row.index("</tr>")]
-check("compare live-intro: buyer with a live (Introduced) intro sees the banner above the controls",
-      f'<div class="cmp-live-intro" role="status">{lf._esc(_li_banner)}</div>' in _li_on
-      and _li_on.index("cmp-live-intro\" role") < _li_on.index('<div class="cmp-controls">'))
-check("compare live-intro: 'Your current deal' chip on the matched offering only",
-      _li_on.count('<div class="cmp-current-chip">Your current deal</div>') == 1
-      and '<div class="cmp-current-chip">Your current deal</div>' in _li_b_row)
-check("compare live-intro: table, ranks and commission box stay; other-offering 'Ask about fees' hidden",
-      'id="cmp-table"' in _li_on and 'id="cmp-commission"' in _li_on and ">#1<" in _li_on
-      and 'class="cmp-ask"' not in _li_on and 'class="cmp-ask"' in _cmp_get(
-          {"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"])
+def _has_note(html):
+    return _li_note in html or _li_note_raw in html
+
+
+_li_on = _li_page(_li_buy(7207579))
+_li_rows = _cmp_rows_html(_li_on)
+check("compare live-intro: buyer sees ONLY the introduced offering, with the 'Your current deal' chip",
+      len(_li_rows) == 1 and '<div class="cmp-current-chip">Your current deal</div>' in _li_rows[0]
+      and ('data-upfront="6.0"' in _li_rows[0] or 'data-upfront="7.0"' in _li_rows[0]))
+check("compare live-intro: muted line under the table; no old banner; no offering count in the subtitle",
+      _has_note(_li_on) and _li_on.index("</table>") < _li_on.index('class="cmp-hidden-note"')
+      and "already been introduced" not in _li_on and "cmp-live-intro" not in _li_on
+      and not re.search(r"\d+ live offering", _li_on))
+check("compare live-intro: no other offering's terms anywhere in the response (server-side, not CSS)",
+      not any(x in _li_on for x in ('data-upfront="4.0"', ">4.80x<", "$480K", "· Preferred", "3(c)(7)",
+                                    "GP – selling own units", "Gross $33.00", "Round est.", "Offering C",
+                                    'data-unranked="1"', "6001", "6005")))
+_li_full = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
 for _li_name, _li_sid, _li_stage in (("Closed", 7207587, None), ("Passed", 7207585, None),
                                      ("Withdrawn", 7207586, None), ("Matched (not yet introduced)", 7207578, None),
                                      ("Won stage", 7207579, sorted(lf.WON_STAGE_IDS)[0])):
-    check(f"compare live-intro: no banner for a terminal / pre-intro buy deal ({_li_name})",
-          "cmp-live-intro\" role" not in _li_page(_li_buy(_li_sid, stage=_li_stage)))
-check("compare live-intro: no banner without any intro, or for an unrelated tenant",
-      "cmp-live-intro\" role" not in _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
-      and "cmp-live-intro\" role" not in _li_page(_li_buy(7207579), [tenant_cookie(CMP_SELLER)]))
-check("compare live-intro: the seller linked to the buyer's deal never gets the banner (primary contact is the buyer)",
-      "cmp-live-intro\" role" not in _li_page(_li_buy(7207579), [tenant_cookie(CMP_OTHER)])
-      and "cmp-live-intro\" role" not in _li_page(_li_buy(7207579, primary=False), [tenant_cookie(CMP_OTHER)]))
-check("compare live-intro: without primary_contact_id the buyer is still detected (not a live seller here)",
-      "cmp-live-intro\" role" in _li_page(_li_buy(7207579, primary=False)))
-check("compare live-intro: admin without view_as sees no banner; admin view_as the buyer does",
-      "cmp-live-intro\" role" not in _li_page(_li_buy(7207579), [], {"key": ADMIN_KEY, "view": "compare", "company": "7001"})
-      and "cmp-live-intro\" role" in _li_page(_li_buy(7207579), [],
-                                              {"key": ADMIN_KEY, "view": "compare", "company": "7001",
-                                               "view_as": CMP_BUYER}))
+    _li_t = _li_page(_li_buy(_li_sid, stage=_li_stage))
+    check(f"compare live-intro: terminal / pre-intro buy deal ({_li_name}) -> full table, no note",
+          len(_cmp_rows_html(_li_t)) == len(_cmp_rows_html(_li_full)) == 3 and not _has_note(_li_t))
+check("compare live-intro: unmatched intro -> the line alone with 'Contact Chad about your current deal.'",
+      (lambda h: _has_note(h) and "Contact Chad about your current deal." in h and 'id="cmp-table"' not in h
+       and "Offering A" not in h and "$480K" not in h)(_li_page(_li_buy(7207579, people=(503,)))))
+check("compare live-intro: seller (own-firm view) and unrelated tenant unaffected",
+      len(_cmp_rows_html(_li_page(_li_buy(7207579), [tenant_cookie(CMP_OTHER)]))) == 3
+      and len(_cmp_rows_html(_li_page(_li_buy(7207579), [tenant_cookie(CMP_SELLER)]))) == 3
+      and not _has_note(_li_page(_li_buy(7207579), [tenant_cookie(CMP_SELLER)])))
+_li_adm = _li_page(_li_buy(7207579), [], {"key": ADMIN_KEY, "view": "compare", "company": "7001"})
+_li_va = _li_page(_li_buy(7207579), [], {"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_BUYER})
+check("compare live-intro: admin without view_as unaffected; admin view_as the buyer sees the filtered view",
+      len(_cmp_rows_html(_li_adm)) == 4 and not _has_note(_li_adm)
+      and len(_cmp_rows_html(_li_va)) == 1 and _has_note(_li_va))
+check("compare live-intro: index still lists the company normally",
+      "Varda Space" in _li_page(_li_buy(7207579), None, {"view": "compare"})
+      and "3 offerings" in _li_page(_li_buy(7207579), None, {"view": "compare"}))
 _li_solo = _li_page(_li_buy(7207579), None, {"view": "compare", "company": "7004"})
-check("compare live-intro: guard applies to that company only (Solo Co page unaffected)",
-      "cmp-live-intro\" role" not in _li_solo and "cmp-current-chip\">" not in _li_solo)
+check("compare live-intro: other companies unaffected", not _has_note(_li_solo) and "cmp-current-chip\">" not in _li_solo)
+
+# "Buy-side agreement required" marker (buyer/admin only; never ranking).
+_bsa_chip = '<div class="cmp-bsa-chip">Buy-side agreement required</div>'
+_bsa_note = ("The seller hasn&#x27;t signed with RMS. To proceed, you&#x27;d sign a buy-side agreement with us.",
+             "The seller hasn't signed with RMS. To proceed, you'd sign a buy-side agreement with us.")
+
+
+def _bsa_rows(html):
+    return {re.search(r'data-v="([^"]+)"', tr).group(1): tr for tr in _cmp_rows_html(html)}
+
+
+_bsa_sell = json.loads(json.dumps(_cmp_d1))
+_bsa_sell["custom_fields"][lf.AGENT_AGREEMENT_FIELD] = [6354277]
+_bsa_sell["updated_at"] = "2026/10/31 10:00:00 -0400"
+_bsa_buy = json.loads(json.dumps(_cmp_d2))
+_bsa_buy["custom_fields"][lf.AGENT_AGREEMENT_FIELD] = [6354274]
+_bsa_buy["updated_at"] = "2026/10/31 10:00:00 -0400"
+_bsa_none = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
+_cmp_s3.objs["deal-fresh/6001.json"] = {"fetched_at": "2026-10-31T14:00:00+00:00", "deal": _bsa_sell}
+_cmp_s3.objs["deal-fresh/6002.json"] = {"fetched_at": "2026-10-31T14:00:00+00:00", "deal": _bsa_buy}
+_bsa_b = _bsa_rows(_cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"])
+_bsa_a = _bsa_rows(_cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"])
+_bsa_s = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+_bsa_o = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_OTHER)])["body"]
+_bsa_vs = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_SELLER})["body"]
+check("compare BSA chip: buyer sees it on the unsigned row (with the muted line), not on 6354277 / 6354274 rows",
+      _bsa_chip in _bsa_b["Offering C"] and any(n in _bsa_b["Offering C"] for n in _bsa_note)
+      and _bsa_chip not in _bsa_b["Offering A"] and _bsa_chip not in _bsa_b["Offering B"])
+check("compare BSA chip: admin sees it on unsigned live rows only (not Hold, not signed)",
+      _bsa_chip in _bsa_a["Offering C"] and _bsa_chip not in _bsa_a["Offering A"]
+      and _bsa_chip not in _bsa_a["Offering B"] and _bsa_chip not in _bsa_a["Hold"])
+check("compare BSA chip: sellers / tenant views never see it", all(
+      _bsa_chip not in h and "Buy-side agreement required" not in h.replace(lf.COMPARE_CSS, "")
+      for h in (_bsa_s, _bsa_o, _bsa_vs)))
+_bsa_unsigned_all = _bsa_rows(_bsa_none)
+check("compare BSA chip: a #1 row can carry it; ranks / Best / values identical with and without the chip",
+      _bsa_chip in _bsa_unsigned_all["Offering A"] and ">#1<" in _bsa_unsigned_all["Offering A"]
+      and all(re.findall(r'cmp-rank-v">([^<]*)<', _bsa_unsigned_all[k]) == re.findall(r'cmp-rank-v">([^<]*)<', _bsa_b[k])
+              and re.findall(r'cmp-back">([^<]*)<', _bsa_unsigned_all[k]) == re.findall(r'cmp-back">([^<]*)<', _bsa_b[k])
+              for k in ("Offering A", "Offering B", "Offering C"))
+      and [re.findall(r'cmp-rank-v">([^<]*)<', tr) for tr in _cmp_rows_html(_bsa_none)]
+          == [re.findall(r'cmp-rank-v">([^<]*)<', tr) for tr in _cmp_rows_html(
+              _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"])])
+for _k in ("deal-fresh/6001.json", "deal-fresh/6002.json"):
+    _cmp_s3.objs.pop(_k, None)
 
 # Fail soft.
 _cmp_saved_off = lf._compare_offerings

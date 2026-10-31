@@ -20397,8 +20397,10 @@ COMPARE_CSS = """
   .cmp-comm-nudge { margin-top: 4px; font-size: 13px; }
   .cmp-comm-note { margin-top: 4px; font-size: 11.5px; color: var(--muted); }
   .cmp-fee-blank { color: var(--muted); }
-  .cmp-live-intro { margin: 0 0 12px; padding: 10px 14px; border-radius: 10px; background: #FDF0E9; color: #C2410C;
-                    font-weight: 600; font-size: 13.5px; }
+  .cmp-hidden-note { margin: 8px 2px 0; font-size: 12.5px; color: var(--muted); }
+  .cmp-bsa-chip { display: inline-block; margin-top: 4px; padding: 1px 8px; border-radius: 9999px; font-size: 11px;
+                  font-weight: 700; color: #B42318; background: #FDECEC; white-space: normal; }
+  .cmp-bsa-note { font-size: 11px; color: var(--muted); margin-top: 2px; white-space: normal; }
   .cmp-current-chip { display: inline-block; margin-top: 4px; padding: 1px 8px; border-radius: 9999px; font-size: 11px;
                       font-weight: 700; color: #fff; background: var(--accent); white-space: nowrap; }
   .cmp-update-btn { display: inline-block; margin-top: 5px; padding: 2px 9px; border: 1px solid var(--line);
@@ -20893,12 +20895,17 @@ def _compare_nudge_text(higher):
     return " · ".join(f"{label} saves you ${amt:,.0f}" for label, amt in higher)
 
 
-# Live-intro guard: a viewer already introduced on this company is asked to
-# stay with their current counterparty (banner + "Your current deal" chip;
-# the "Ask about fees" links to other offerings are hidden on that company).
-COMPARE_LIVE_INTRO_BANNER = ("You've already been introduced on {company}. Please continue with your current "
-                             "counterparty; contact Chad before considering other offerings.")
+# Live-intro guard: a buyer already introduced on this company sees ONLY the
+# offering(s) they were introduced on (filtered server-side -- no other
+# offering's terms or count reach the page), with the "Your current deal"
+# chip and one muted line under the table.
 COMPARE_CURRENT_DEAL_CHIP = "Your current deal"
+COMPARE_HIDDEN_NOTE = "You're already in a deal on {company}. Other offerings are hidden while it's in progress."
+COMPARE_HIDDEN_UNMATCHED = "Contact Chad about your current deal."
+# Buyer/admin marker only (never ranking): the seller hasn't signed with RMS.
+COMPARE_BSA_SIGNED_IDS = frozenset({AGENT_AGREEMENT_SELL_SIGNED_ID, AGENT_AGREEMENT_BUY_SIGNED_ID})
+COMPARE_BSA_CHIP = "Buy-side agreement required"
+COMPARE_BSA_NOTE = "The seller hasn't signed with RMS. To proceed, you'd sign a buy-side agreement with us."
 
 
 def _compare_viewer_ids(tenant=None, email=None):
@@ -21031,6 +21038,17 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
         print(f"compare live-intro check failed (no guard): {type(e).__name__}: {e}")
         live_intro = None
     current_deal_id = live_intro[1] if live_intro else None
+    # Sellers viewing their own firm's offerings are never filtered.
+    hide_others = bool(live_intro) and not any(r["own"] for r in rows)
+    if hide_others:
+        keep = [d for d in entry["deals"] if str(d.get("id")) == current_deal_id] if current_deal_id else []
+        rows, ref = _compare_rows({**entry, "deals": keep}, role, scope) if keep else ([], None)
+        if not rows:
+            return _compare_shell(f"{company} offerings", header_html,
+                                  f'{back}<h1>{_esc(company)} SPV offerings</h1>'
+                                  f'<p class="cmp-hidden-note">{_esc(COMPARE_HIDDEN_NOTE.format(company=company))} '
+                                  f'{_esc(COMPARE_HIDDEN_UNMATCHED)}</p>')
+    show_bsa = role in ("buyer", "admin")
     live_rows = [r for r in rows if not r["hold"]]
     n_ranked = sum(1 for r in rows if r["status"] == "ranked")
     nudge_state = _compare_nudge_states([str(r["deal"].get("id")) for r in rows]) if key is not None else {}
@@ -21067,6 +21085,9 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
         label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
         if current_deal_id is not None and deal_id == current_deal_id:
             label_html += f'<div class="cmp-current-chip">{_esc(COMPARE_CURRENT_DEAL_CHIP)}</div>'
+        if show_bsa and not r["hold"] and not (_deal_cf_option_ids(d, AGENT_AGREEMENT_FIELD) & COMPARE_BSA_SIGNED_IDS):
+            label_html += (f'<div class="cmp-bsa-chip">{_esc(COMPARE_BSA_CHIP)}</div>'
+                           f'<div class="cmp-bsa-note">{_esc(COMPARE_BSA_NOTE)}</div>')
         if r["updated_days"] is not None:
             label_html += f'<div class="cmp-updated">Updated {_esc(r["updated_text"])}</div>'
         label_html += f'<div class="cmp-partial"{"" if partial else " hidden"}>{_esc(COMPARE_PARTIAL_NOTE)}</div>'
@@ -21145,12 +21166,13 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
         data_key = f' data-key="{_esc(key)}"' + (f' data-view-as="{_esc(view_as)}"' if impersonating and view_as else "")
     data_key += ' data-admin="1"' if key else ""
     n = len(live_rows)
+    count_text = "" if hide_others else f'{n} live offering{"s" if n != 1 else ""}. '
+    hidden_note = (f'<p class="cmp-hidden-note">{_esc(COMPARE_HIDDEN_NOTE.format(company=company))}</p>'
+                   if hide_others else "")
     body = (f'{back}<h1>{_esc(company)} SPV offerings</h1>'
-            f'<p class="cmp-sub">{n} live offering{"s" if n != 1 else ""}. {_esc(COMPARE_SUBTITLE_LEAD)} '
+            f'<p class="cmp-sub">{count_text}{_esc(COMPARE_SUBTITLE_LEAD)} '
             f'{_esc(COMPARE_FEES_SUBTITLE)} Click a column to sort.</p>'
-            + (f'<div class="cmp-live-intro" role="status">'
-               f'{_esc(COMPARE_LIVE_INTRO_BANNER.format(company=company))}</div>' if live_intro else "")
-            + '<div class="cmp-controls">'
+            '<div class="cmp-controls">'
             f'<label>Investment <input id="cmp-inv" type="text" inputmode="decimal" autocomplete="off" '
             f'value="{_esc(compare_fmt_money(investment))}" aria-label="Investment amount"></label>'
             f'<span class="cmp-picks">{pick_html}</span>'
@@ -21161,7 +21183,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f'<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"'
             f' data-inv="{investment}"{data_key}>'
             f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'
-            f'<p class="cmp-info-note">{_esc(COMPARE_INFO_NOTE)}</p>'
+            f'{hidden_note}<p class="cmp-info-note">{_esc(COMPARE_INFO_NOTE)}</p>'
             f'{COMPARE_SCRIPT}{COMPARE_NUDGE_SCRIPT if key is not None else ""}')
     return _compare_shell(f"{company} offerings", header_html, body)
 
