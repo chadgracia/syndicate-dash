@@ -19631,7 +19631,7 @@ def _handle_research_gaps(query):
     steps = sorted(counts)
     opts = "".join(f'<option value="{_esc(s)}">{_esc(s)}</option>' for s in steps)
     body = f"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Research gaps</title><style>
+<title>Research gaps</title><link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🔍</text></svg>"><style>
 body{{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px;color:#1a1a1a;background:#fff}}
 table{{border-collapse:collapse;width:100%;max-width:1100px;font-size:14px}}
 th,td{{border-bottom:1px solid #e5e5e5;padding:6px 8px;text-align:left;vertical-align:top}}
