@@ -20240,12 +20240,12 @@ def _compare_rows(entry, role, scope=frozenset()):
         if from_news:
             val_text = f"Round est. {val_text}"
         net, gross = _deal_cf_number(d, NET_FIELD), _deal_cf_number(d, GROSS_FIELD)
-        if role == "buyer":
-            price_text = _fmt_price_2dp(gross)
-        elif role == "tenant":
-            price_text = _fmt_price_2dp(net)
-        else:
-            price_text = f"Net {_fmt_price_2dp(net)}\nGross {_fmt_price_2dp(gross)}"
+        price_parts = []
+        if role in ("tenant", "admin") and net is not None:
+            price_parts.append(f"Net {_fmt_price_2dp(net)}")
+        if role in ("buyer", "admin") and gross is not None:
+            price_parts.append(f"Gross {_fmt_price_2dp(gross)}")
+        price_text = " · ".join(price_parts)
         updated_text, updated_days = _compare_days_ago_text(d)
         row = {
             "deal": d, "label": label, "own": own, "hold": hold,
@@ -20290,6 +20290,8 @@ def _compare_limit_text(status, row):
 
 
 COMPARE_CSS = """
+  /* [hidden] always wins: .cmp-best / .cmp-msg / .cmp-ask set their own display. */
+  .cmp-wrap [hidden] { display: none !important; }
   .cmp-wrap { max-width: 1440px; margin: 28px auto 0; }
   .cmp-wrap h1 { font-size: 24px; margin: 0 0 4px; }
   .cmp-sub { color: var(--muted); margin: 0 0 18px; font-size: 14px; }
@@ -20303,7 +20305,12 @@ COMPARE_CSS = """
                                  width: 142px; min-width: 142px; max-width: 142px; }
   .cmp-table th:nth-child(2), .cmp-table td:nth-child(2) { position: sticky; left: 142px; z-index: 2;
                                  box-shadow: inset -1px 0 0 var(--line); }
-  .cmp-table td.cmp-price { white-space: pre-line; }
+  .cmp-table th.cmp-th-static { cursor: default; }
+  .cmp-table td.cmp-fee { width: 64px; min-width: 64px; max-width: 72px; white-space: normal; }
+  .cmp-table td.cmp-fee .cmp-edit-btn { display: block; padding: 2px 0 0; }
+  .cmp-table td.cmp-vehicle { white-space: nowrap; }
+  .cmp-table td.cmp-valuation { white-space: nowrap; }
+  .cmp-updated, .cmp-price-line, .cmp-nm { font-size: 11px; color: var(--muted); margin-top: 2px; font-weight: 400; }
   .cmp-table th { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
                   cursor: pointer; white-space: nowrap; user-select: none; }
   .cmp-table th[aria-sort]::after { content: " ▾"; }
@@ -20333,7 +20340,6 @@ COMPARE_CSS = """
                                  background: var(--bg); }
   .cmp-rank { font-size: 12px; color: var(--qp); font-weight: 600; margin-top: 3px; }
   .cmp-note { font-size: 11px; color: var(--muted); margin-top: 2px; }
-  .cmp-nm { font-weight: 700; }
   .cmp-admin { font-size: 12px; color: var(--muted); margin-top: 3px; }
   .cmp-edit-btn { font: inherit; font-size: 11px; background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0 0 0 4px; }
   .cmp-edit-form input { width: 56px; font: inherit; padding: 2px 4px; }
@@ -20457,20 +20463,20 @@ COMPARE_SCRIPT = (r"""<script>
       tr.__st = st;
       tr.setAttribute('data-group', st === 'ranked' ? '0' : (st === 'none' ? '2' : '1'));
       tr.setAttribute('data-unranked', st === 'none' ? '1' : '0');
-      var nmTd = cell(tr, 'nm'), backTd = cell(tr, 'back'), costTd = cell(tr, 'fees');
+      var nmEl = tr.querySelector('.cmp-nm'), backTd = cell(tr, 'back'), costTd = cell(tr, 'fees');
       if (st === 'none') {
-        setCell(nmTd, '', '—'); setCell(backTd, '', '—'); setCell(costTd, '', '—');
+        nmEl.textContent = ''; setCell(backTd, '', '—'); setCell(costTd, '', '—');
       } else {
         var nm = netMultiple(tr, outcome, years);
         var back = investment * nm;
         var cost = investment * outcome * ratio(tr) - back;
         tr.__back = back;
-        setCell(nmTd, nm.toFixed(4), nm.toFixed(2) + 'x');
+        nmEl.textContent = nm.toFixed(2) + 'x';
         setCell(backTd, back.toFixed(2), fmtMoney(back));
         setCell(costTd, cost.toFixed(2), fmtMoney(cost));
         if (st === 'ranked') ranked.push(tr);
       }
-      [nmTd, backTd, costTd].forEach(function(td) { td.classList.toggle('cmp-dim', st !== 'ranked'); });
+      [backTd, costTd].forEach(function(td) { td.classList.toggle('cmp-dim', st !== 'ranked'); });
       FEES.forEach(function(f) {
         if (num(tr.getAttribute('data-' + f)) !== null) return;
         var fv = tr.querySelector('td[data-col="' + f + '"] .cmp-fee-v');
@@ -20547,7 +20553,7 @@ COMPARE_SCRIPT = (r"""<script>
     th.addEventListener('click', function() {
       var col = th.getAttribute('data-col');
       if (col === sortCol) sortDir = -sortDir;
-      else { sortCol = col; sortDir = (col === 'nm' || col === 'back') ? -1 : 1; }
+      else { sortCol = col; sortDir = col === 'back' ? -1 : 1; }
       sortRows();
     });
   });
@@ -20603,7 +20609,7 @@ COMPARE_SCRIPT = (r"""<script>
           tr.setAttribute('data-' + field, res.d.value);
           td.setAttribute('data-v', res.d.value);
           var fv = td.querySelector('.cmp-fee-v');
-          fv.textContent = fmtPct(res.d.value) + (field === 'mgmt' ? ' / yr' : '');
+          fv.textContent = fmtPct(res.d.value) + (field === 'mgmt' ? '/yr' : '');
           form.remove();
           sortCol = 'rank'; sortDir = 1;
           recompute();
@@ -20674,15 +20680,25 @@ def _compare_fee_text(v, field, fee_status="complete"):
     at all, else "—"."""
     if v is None:
         return "Not provided" if fee_status == "none" else "—"
-    return _fmt_pct(v) + (" / yr" if field == "mgmt" else "")
+    return _fmt_pct(v) + ("/yr" if field == "mgmt" else "")
 
 
 def _compare_fee_cell_html(row, field, editable):
     v = row[field]
     edit = ('<button type="button" class="cmp-edit-btn" aria-label="Edit this fee">Edit</button>'
             if editable else "")
-    return (f'<td class="num" data-col="{field}" data-field="{field}" data-v="{"" if v is None else v}">'
+    return (f'<td class="num cmp-fee" data-col="{field}" data-field="{field}" data-v="{"" if v is None else v}">'
             f'<span class="cmp-fee-v">{_esc(_compare_fee_text(v, field, row["fee_status"]))}</span>{edit}</td>')
+
+
+def _compare_vehicle_html(row):
+    """Line 1 "L1 SPV · Preferred · 3(c)(1)" (blanks skipped), line 2 the
+    muted short seller-role label."""
+    parts = [x for x in (row["structure"], row["share_class"], row["exemption"]) if x and x != "—"]
+    html = _esc(" · ".join(parts) or "—")
+    if row["seller_role"] and row["seller_role"] != "—":
+        html += f'<div class="cmp-note">{_esc(row["seller_role"])}</div>'
+    return html
 
 
 def render_compare_index(role, header_html, key=None, view_as=None):
@@ -20744,7 +20760,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     investment, outcome = COMPARE_DEFAULT_INVESTMENT, COMPARE_DEFAULT_OUTCOME
     live_rows = [r for r in rows if not r["hold"]]
     n_ranked = sum(1 for r in rows if r["status"] == "ranked")
-    divider_row = f'<tr class="cmp-divider"{{hidden}}><td colspan="17">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>'
+    divider_row = f'<tr class="cmp-divider"{{hidden}}><td colspan="9">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>'
     tr_html = []
     divider_done = False
     for r in rows:
@@ -20775,6 +20791,8 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                                    "cmp-top" if top else "") if c)
         partial = r["fee_status"] == "partial"
         label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
+        if r["updated_days"] is not None:
+            label_html += f'<div class="cmp-updated">Updated {_esc(r["updated_text"])}</div>'
         label_html += f'<div class="cmp-partial"{"" if partial else " hidden"}>{_esc(COMPARE_PARTIAL_NOTE)}</div>'
         if r["own"]:
             line = (_compare_rank_text(r["rank"], n_ranked, investment, outcome) if st == "ranked"
@@ -20796,14 +20814,16 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             val_html += '<div class="cmp-note">from news</div>'
         if r["valuation_assumed"]:
             val_html += '<div class="cmp-note">valuation assumed</div>'
+        if r["price_text"]:
+            val_html += f'<div class="cmp-price-line">{_esc(r["price_text"])}</div>'
         limit = _compare_limit_text(st, r)
         rank_html = (f'<span class="cmp-rank-v">{"#" + str(r["rank"]) if r["rank"] else "—"}</span>'
                      f'<span class="cmp-best"{"" if top else " hidden"}>Best</span>'
                      f'<div class="cmp-limit"{"" if limit else " hidden"}>{_esc(limit)}</div>')
         dim = "" if st == "ranked" else " cmp-dim"
         if no_fees:
-            nm_v = back_v = cost_v = ""
-            nm_t = back_t = cost_t = "—"
+            nm_v = back_v = cost_v = nm_t = ""
+            back_t = cost_t = "—"
         else:
             nm_v, nm_t = f'{r["net_multiple"]:.4f}', f'{r["net_multiple"]:.2f}x'
             back_v, back_t = f'{r["proceeds"]:.2f}', compare_fmt_money(r["proceeds"])
@@ -20812,35 +20832,24 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f'<tr class="{cls}"{attrs}>'
             f'<td data-col="label" data-v="{_esc(r["label"])}">{label_html}</td>'
             f'<td data-col="rank" class="num" data-v="{r["rank"] or ""}">{rank_html}</td>'
-            f'<td data-col="back" class="num{dim}" data-v="{back_v}"><span class="cmp-back">{_esc(back_t)}</span></td>'
+            f'<td data-col="back" class="num{dim}" data-v="{back_v}"><span class="cmp-back">{_esc(back_t)}</span>'
+            f'<div class="cmp-nm" data-v="{nm_v}">{_esc(nm_t)}</div></td>'
             f'<td data-col="fees" class="num{dim}" data-v="{cost_v}"><span>{_esc(cost_t)}</span></td>'
-            f'<td data-col="nm" class="num{dim}" data-v="{nm_v}"><span class="cmp-nm">{_esc(nm_t)}</span></td>'
-            f'<td data-col="structure" data-v="{_esc(r["structure"])}">{_esc(r["structure"])}</td>'
-            f'<td data-col="role" data-v="{_esc(r["seller_role"])}">{_esc(r["seller_role"])}</td>'
-            f'<td data-col="class" data-v="{_esc(r["share_class"])}">{_esc(r["share_class"])}</td>'
-            f'<td data-col="exemption" data-v="{_esc(r["exemption"])}">{_esc(r["exemption"])}</td>'
-            f'<td data-col="valuation" class="num" data-v="{"" if r["valuation"] is None else r["valuation"]}">{val_html}</td>'
-            f'<td data-col="price" class="num cmp-price" data-v="{_esc(r["price_text"])}">{_esc(r["price_text"])}</td>'
             + _compare_fee_cell_html(r, "upfront", editable)
             + _compare_fee_cell_html(r, "mgmt", editable)
             + _compare_fee_cell_html(r, "carry", editable)
-            + f'<td data-col="min" class="num" data-v="{"" if r["min"] is None else r["min"]}">'
-              f'{_esc(_fmt_money(r["min"]))}</td>'
-            f'<td data-col="max" class="num" data-v="{"" if r["max"] is None else r["max"]}">'
-            f'{_esc(_fmt_money(r["max"]))}</td>'
-            f'<td data-col="updated" class="num" data-v="{"" if r["updated_days"] is None else r["updated_days"]}">'
-            f'{_esc(r["updated_text"])}</td></tr>')
+            + f'<td data-col="vehicle" class="cmp-vehicle">{_compare_vehicle_html(r)}</td>'
+            f'<td data-col="valuation" class="num cmp-valuation">{val_html}</td></tr>')
     if not divider_done:
         # Always present so the page script can show it if a row loses its fees group.
         tr_html.append(divider_row.replace("{hidden}", " hidden"))
-    price_head = {"buyer": "Price", "tenant": "Net price"}.get(role, "Price")
-    heads = [("label", "Offering"), ("rank", "Rank"), ("back", "You get back"), ("fees", "Fees cost"),
-             ("nm", "Net multiple"), ("structure", "Structure"), ("role", "Seller role"),
-             ("class", "Class"), ("exemption", "Exemption"), ("valuation", "Valuation"),
-             ("price", price_head), ("upfront", "Upfront"), ("mgmt", "Mgmt fee"), ("carry", "Carry"),
-             ("min", "Min ticket"), ("max", "Max ticket"), ("updated", "Updated")]
+    # (column, header, sortable)
+    heads = [("label", "Offering", False), ("rank", "Rank", True), ("back", "You get back", True),
+             ("fees", "Fees cost", True), ("upfront", "Upfront", True), ("mgmt", "Mgmt fee", True),
+             ("carry", "Carry", True), ("vehicle", "Vehicle", False), ("valuation", "Valuation", False)]
     sort_attr = ' aria-sort="ascending"'
-    th_html = "".join(f'<th data-col="{c}"{sort_attr if c == "rank" else ""}>{_esc(t)}</th>' for c, t in heads)
+    th_html = "".join((f'<th data-col="{c}"{sort_attr if c == "rank" else ""}>{_esc(t)}</th>' if sortable
+                       else f'<th class="cmp-th-static">{_esc(t)}</th>') for c, t, sortable in heads)
     pick_html = "".join(f'<button type="button" class="cmp-pick{" active" if v == investment else ""}" '
                         f'data-v="{v}">{_esc(compare_fmt_money(v))}</button>' for v in COMPARE_INVESTMENT_PICKS)
     outcome_opts = "".join(f'<option value="{o}"{" selected" if o == COMPARE_DEFAULT_OUTCOME else ""}>{o}x</option>'

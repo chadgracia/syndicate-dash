@@ -11282,22 +11282,22 @@ check("compare: Direct deal never listed; new allocation without valuation shows
 check("compare: fresh-copy overlay wins (offering 6002 upfront 7% -> 6% from deal-fresh)",
       'data-upfront="6.0"' in _cb or 'data-upfront="6"' in _cb)
 check("compare: ranked rows by net multiple (4.80x, 4.14x); all-blank row unranked below the divider",
-      _cb.index(">4.80x<") < _cb.index(">4.14x<") < _cb.index('<tr class="cmp-divider"><td colspan="17">Fees not yet provided</td></tr>')
+      _cb.index(">4.80x<") < _cb.index(">4.14x<") < _cb.index('<tr class="cmp-divider"><td colspan="9">Fees not yet provided</td></tr>')
       < _cb.index(">Offering C<") and "~" not in _cb[_cb.index("<tbody>"):_cb.index("</tbody>")])
 check("compare: short labels — '2-Layer', 'GP – selling own units', 'L1 SPV' map; Updated column",
       "2-Layer" in _cb and "Preferred" in _cb and "3(c)(7)" in _cb and "GP – selling own units" in _cb
       and "GP — selling own units" not in _cb and lf.COMPARE_LAYER_LABELS[7000228] == "L1 SPV"
-      and ">Updated<" in _cb and re.search(r">\d+ days? ago<", _cb) is not None)
+      and re.search(r'<div class="cmp-updated">Updated \d+ days? ago</div>', _cb) is not None)
 _cb_c = _cb[_cb.rindex("<tr", 0, _cb.index(">Offering C<")):]
 _cb_c = _cb_c[:_cb_c.index("</tr>")]
 check("compare: all-blank row -> Net multiple '—', fee cells 'Not provided', unranked flag, Ask link (new tab)",
-      'data-unranked="1"' in _cb_c and '<span class="cmp-nm">—</span>' in _cb_c
+      'data-unranked="1"' in _cb_c and '<div class="cmp-nm" data-v=""></div>' in _cb_c
       and _cb_c.count('<span class="cmp-fee-v">Not provided</span>') == 3
       and '<a class="cmp-ask" href="https://trades.graciagroup.com/deal/6005" target="_blank" rel="noopener">'
           'Ask about fees →</a>' in _cb_c
       and '<div class="cmp-partial" hidden>' in _cb_c)
 check("compare: explicit 0 fees render 0% with no 'Full fees not confirmed' note (Offering A 4% / 0% / 0%)",
-      '<span class="cmp-fee-v">0% / yr</span>' in _cb and '<span class="cmp-fee-v">0%</span>' in _cb
+      '<span class="cmp-fee-v">0%/yr</span>' in _cb and '<span class="cmp-fee-v">0%</span>' in _cb
       and '<div class="cmp-partial">' not in _cb)
 check("compare: subtitle states the new blank-fee rule",
       "Offerings marked 'Full fees not confirmed' count missing fees as 0%; offerings with no fees provided are listed at the bottom." in _cb
@@ -11542,7 +11542,7 @@ _ctf = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLE
 check("compare: filling the last blank fee removes the 'Full fees not confirmed' note",
       '<div class="cmp-partial">Full fees not confirmed</div>' in _ctp and _r["statusCode"] == 200
       and '<div class="cmp-partial">Full fees not confirmed</div>' not in _ctf.split(">Your offering<")[1].split("</tr>")[0]
-      and ">1% / yr<" in _ctf)
+      and ">1%/yr<" in _ctf)
 _cmp_live.append(json.loads(json.dumps(_cmp_noval)))
 _r = _cmp_post({"deal_id": "6005", "field": "upfront", "value": 3}, email=CMP_OTHER)
 _cbf = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
@@ -11607,10 +11607,12 @@ check("compare page: Investment control before Outcome, $100K default, quick pic
       and all(f'data-v="{v}">{t}</button>' in _cb2 for v, t in ((50000, "$50K"), (100000, "$100K"),
                                                             (250000, "$250K"), (500000, "$500K"), (1000000, "$1M")))
       and "localStorage" in lf.COMPARE_SCRIPT and "try { window.localStorage.setItem" in lf.COMPARE_SCRIPT)
-check("compare page: columns Offering, Rank, You get back, Fees cost, Net multiple; default sort Rank ascending",
-      re.search(r'<th data-col="label">Offering</th><th data-col="rank" aria-sort="ascending">Rank</th>'
-                r'<th data-col="back">You get back</th><th data-col="fees">Fees cost</th>'
-                r'<th data-col="nm">Net multiple</th>', _cb2) is not None)
+check("compare page: columns Offering | Rank | You get back | Fees cost | Upfront | Mgmt fee | Carry | Vehicle | "
+      "Valuation; default sort Rank ascending; only the six numeric columns sortable",
+      '<thead><tr><th class="cmp-th-static">Offering</th><th data-col="rank" aria-sort="ascending">Rank</th>'
+      '<th data-col="back">You get back</th><th data-col="fees">Fees cost</th><th data-col="upfront">Upfront</th>'
+      '<th data-col="mgmt">Mgmt fee</th><th data-col="carry">Carry</th><th class="cmp-th-static">Vehicle</th>'
+      '<th class="cmp-th-static">Valuation</th></tr></thead>' in _cb2)
 _cb2_a = _cb2[_cb2.rindex("<tr", 0, _cb2.index(">Offering A<")):]
 _cb2_a = _cb2_a[:_cb2_a.index("</tr>")]
 check("compare page: #1 row gets the green highlight + 'Best' chip, You get back $480K, Fees cost $20K",
@@ -11622,6 +11624,86 @@ check("compare page: subtitle leads with the new ranking sentence",
 check("compare page: all-blank row stays below the divider with no rank or calculation",
       _cb2.index("Fees not yet provided") < _cb2.index(">Offering C<")
       and re.search(r'data-group="2"[^>]*>.*?<span class="cmp-rank-v">—</span>', _cb2) is not None)
+# Best chip / green highlight only on rank #1 (incl. ties); [hidden] always wins in CSS.
+def _cmp_rows_html(html):
+    tb = html[html.index("<tbody>"):html.index("</tbody>")]
+    return [r for r in re.findall(r"<tr[^>]*>.*?</tr>", tb, flags=re.S) if "cmp-divider" not in r]
+
+
+def _best_ok(html):
+    ok = True
+    for tr in _cmp_rows_html(html):
+        top = '<span class="cmp-rank-v">#1</span>' in tr
+        ok &= (('<span class="cmp-best">Best</span>' in tr) == top) and (("cmp-top" in tr.split(">", 1)[0]) == top)
+        ok &= top or '<span class="cmp-best" hidden>Best</span>' in tr
+    return ok
+
+
+check("compare Best chip: server render puts chip + highlight only on #1 rows; hidden elsewhere",
+      _best_ok(_cb2) and _cb2.count('<span class="cmp-best">Best</span>') == 1)
+check("compare Best chip: [hidden] beats the chip/warning/Ask display rules in CSS",
+      ".cmp-wrap [hidden] { display: none !important; }" in lf.COMPARE_CSS)
+check("compare Best chip: client script applies chip/highlight only to rank 1 (ranked rows only)",
+      "var r = tr.__st === 'ranked' ? tr.__rank : null;" in lf.COMPARE_SCRIPT
+      and "td.querySelector('.cmp-best').hidden = r !== 1;" in lf.COMPARE_SCRIPT
+      and "tr.classList.toggle('cmp-top', r === 1);" in lf.COMPARE_SCRIPT)
+_cmp_tie = json.loads(json.dumps(_cmp_d2))
+_cmp_tie["custom_fields"].update({lf.SELLER_FEE_FIELD: 4, lf.MGMT_FEE_FIELD: 0, lf.CARRY_FIELD: 0})
+_cmp_tie["updated_at"] = "2026/10/31 10:00:00 -0400"
+_cmp_s3.objs["deal-fresh/6002.json"] = {"fetched_at": "2026-10-31T14:00:00+00:00", "deal": _cmp_tie}
+_cbt = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
+_cat = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+_cat_hold = [tr for tr in _cmp_rows_html(_cat) if ">Hold<" in tr][0]
+_cbt_none = [tr for tr in _cmp_rows_html(_cbt) if 'data-group="2"' in tr][0]
+check("compare Best chip: a #1 tie shows the chip on both tied rows (and only those)",
+      _best_ok(_cbt) and _cbt.count('<span class="cmp-best">Best</span>') == 2 and _cbt.count(">#1<") == 2)
+check("compare Best chip: never on admin Hold or all-blank rows",
+      _best_ok(_cat) and '<span class="cmp-best" hidden>Best</span>' in _cat_hold and "cmp-top" not in _cat_hold.split(">", 1)[0]
+      and '<span class="cmp-best" hidden>Best</span>' in _cbt_none and "cmp-top" not in _cbt_none.split(">", 1)[0])
+_cmp_s3.objs.pop("deal-fresh/6002.json", None)
+
+# Investment warning only when the input fails to parse.
+check("compare amount warning: '$1M', '1,000,000', '1m' and the quick picks parse; 'abc' does not",
+      [lf.parse_investment_amount(v) for v in ("$1M", "1,000,000", "1m")] == [1_000_000] * 3
+      and all(lf.parse_investment_amount(v) == v for v in lf.COMPARE_INVESTMENT_PICKS)
+      and lf.parse_investment_amount("abc") is None)
+check("compare amount warning: starts hidden, cleared on every successful parse/quick pick, shown only on failure",
+      '<span class="cmp-msg error" id="cmp-inv-msg" hidden>' in _cb2
+      and "function setInvestment(v, save) {\n    investment = v;\n    if (invMsg) invMsg.hidden = true;" in lf.COMPARE_SCRIPT
+      and "if (v === null) { if (invMsg && invInput.value.trim()) invMsg.hidden = false; return; }" in lf.COMPARE_SCRIPT
+      and "setInvestment(v, true);" in lf.COMPARE_SCRIPT.split("picks.forEach(function(b) {\n    b.addEventListener")[1][:300]
+      and "var t = String(raw || '').trim().toLowerCase().replace(/[$,\\s]/g, '');" in lf.COMPARE_SCRIPT)
+
+# Narrower table: Vehicle, net multiple under You get back, price line, removed columns.
+check("compare Vehicle: 'L1 SPV · Preferred · 3(c)(1)' + muted seller role; blanks skipped",
+      lf._compare_vehicle_html({"structure": "L1 SPV", "share_class": "Preferred", "exemption": "3(c)(1)",
+                                "seller_role": "GP – new allocation"})
+      == 'L1 SPV · Preferred · 3(c)(1)<div class="cmp-note">GP – new allocation</div>'
+      and lf._compare_vehicle_html({"structure": "Fund", "share_class": "—", "exemption": "—",
+                                    "seller_role": "—"}) == "Fund")
+_cb2_rows = {re.search(r'data-v="([^"]+)"', tr).group(1): tr for tr in _cmp_rows_html(_cb2)}
+check("compare You get back: '$480K' with the net multiple '4.80x' beneath; no Net multiple column",
+      '<span class="cmp-back">$480K</span><div class="cmp-nm" data-v="4.8000">4.80x</div>' in _cb2_rows["Offering A"]
+      and 'data-col="nm"' not in _cb2 and ">Net multiple<" not in _cb2)
+check("compare Valuation: buyer price line 'Gross $33.00'; no price line when the price is blank",
+      '<div class="cmp-price-line">Gross $33.00</div>' in _cb2_rows["Offering A"]
+      and "cmp-price-line" not in _cb2_rows["Offering C"] and "Net —" not in _cb2 and "Gross —" not in _cb2)
+_ct3 = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+_ca3 = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+check("compare Valuation: seller sees 'Net $30.00', admin sees 'Net $30.00 · Gross $33.00'",
+      '<div class="cmp-price-line">Net $30.00</div>' in _ct3 and "Gross $33.00" not in _ct3
+      and '<div class="cmp-price-line">Net $30.00 · Gross $33.00</div>' in _ca3)
+check("compare: removed columns absent (min/max ticket, updated, net multiple, structure, role, class, exemption, price)",
+      not any(f'data-col="{c}"' in _cb2 for c in ("min", "max", "updated", "nm", "structure", "role", "class",
+                                                   "exemption", "price"))
+      and not any(h in _cb2 for h in (">Min ticket<", ">Max ticket<", ">Seller role<", ">Structure<", ">Price<",
+                                      ">Net price<", ">Exemption<", ">Class<", ">Updated<")))
+check("compare: Offering cell carries 'Updated N days ago'; fee cells compact ('0%/yr') with per-cell Edit kept",
+      re.search(r'<div class="cmp-updated">Updated \d+ days? ago</div>', _cb2_rows["Offering A"]) is not None
+      and '<span class="cmp-fee-v">0%/yr</span>' in _cb2_rows["Offering A"]
+      and _ct3.count('class="cmp-edit-btn"') == 3 and 'class="num cmp-fee" data-col="upfront" data-field="upfront"' in _ct3
+      and ".cmp-table td.cmp-fee { width: 64px;" in lf.COMPARE_CSS)
+
 _cmp_min_deal = json.loads(json.dumps(_cmp_d2))
 _cmp_min_deal["custom_fields"][lf.TICKET_MIN_FIELD] = 250_000
 _cmp_min_deal["updated_at"] = "2026/10/31 10:00:00 -0400"
