@@ -81,6 +81,7 @@ import functools
 import threading
 import hashlib
 import hmac
+import math
 import json
 import re
 import os
@@ -19844,6 +19845,11 @@ COMPARE_SHARE_CLASS_LABELS = {5077831: "Common", 5077834: "Preferred", 5077912: 
 COMPARE_OUTCOMES = (2, 5, 10)
 COMPARE_DEFAULT_OUTCOME = 5
 COMPARE_DEFAULT_YEARS = 5
+COMPARE_DEFAULT_INVESTMENT = 100_000
+COMPARE_INVESTMENT_PICKS = (50_000, 100_000, 250_000, 500_000, 1_000_000)
+COMPARE_RANK_ROUND = 100          # ties: net proceeds rounded to the nearest $100
+COMPARE_SUBTITLE_LEAD = ("Ranked by what your investment returns after upfront, management and carry fees "
+                         "(commission excluded — it is the same on every offering).")
 COMPARE_FEE_FIELDS = {"upfront": SELLER_FEE_FIELD, "mgmt": MGMT_FEE_FIELD, "carry": CARRY_FIELD}
 COMPARE_FEE_LABELS = {"upfront": "upfront fee", "mgmt": "management fee", "carry": "carry"}
 COMPARE_UNAVAILABLE_MSG = "Offerings are being updated — please check back shortly."
@@ -19900,6 +19906,89 @@ def compare_ref_valuation(valuations):
         return None
     best = max(counts.values())
     return min(v for v, n in counts.items() if n == best)
+
+
+def parse_investment_amount(raw):
+    """"300000", "300k", "1.5m", "$100K", "1,000,000" -> whole dollars (> 0), else None."""
+    s = re.sub(r"[$,\s]", "", str(raw or "").strip().lower())
+    m = re.fullmatch(r"(\d+(?:\.\d*)?|\.\d+)([km]?)", s)
+    if not m:
+        return None
+    v = int(round(float(m.group(1)) * {"": 1, "k": 1_000, "m": 1_000_000}[m.group(2)]))
+    return v if v > 0 else None
+
+
+def compare_fmt_money(v):
+    """"$480K", "$437.5K", "$1.25M", "$950" (mirrors COMPARE_SCRIPT's fmtMoney)."""
+    if v is None:
+        return "—"
+    a = abs(v)
+    if a >= 1_000_000:
+        t = f"{a / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+    elif a >= 1_000:
+        t = f"{a / 1_000:.1f}".rstrip("0").rstrip(".") + "K"
+    else:
+        t = f"{a:,.0f}"
+    return ("-" if v < 0 else "") + "$" + t
+
+
+def compare_valuation_ratio(ref_valuation, row_valuation):
+    if ref_valuation and row_valuation and ref_valuation > 0 and row_valuation > 0:
+        return ref_valuation / row_valuation
+    return 1.0
+
+
+def compare_proceeds(investment, upfront_pct, mgmt_pct, carry_pct, outcome, years, ref_valuation=None,
+                     row_valuation=None):
+    """(you get back, fees cost, net multiple) for an investment: proceeds =
+    investment x net multiple; fees cost = no-fee value (investment x outcome
+    x valuation ratio) - proceeds."""
+    nm = compare_net_multiple(upfront_pct, mgmt_pct, carry_pct, outcome, years, ref_valuation, row_valuation)
+    back = investment * nm
+    cost = investment * outcome * compare_valuation_ratio(ref_valuation, row_valuation) - back
+    return back, cost, nm
+
+
+def compare_competition_ranks(proceeds_by_key):
+    """{key: rank}: competition ranking on proceeds rounded to the nearest
+    COMPARE_RANK_ROUND (equal values share a rank, the next rank skips)."""
+    rounded = {k: math.floor(v / COMPARE_RANK_ROUND + 0.5) for k, v in proceeds_by_key.items()}
+    return {k: 1 + sum(1 for o in rounded.values() if o > r) for k, r in rounded.items()}
+
+
+def compare_rank_status(row, investment):
+    """"none" (all fees blank), "hold" (admin-only Hold row), "min"/"max"
+    (investment outside the ticket range) or "ranked"."""
+    if row["fee_status"] == "none":
+        return "none"
+    if row["hold"]:
+        return "hold"
+    if row.get("min") is not None and investment < row["min"]:
+        return "min"
+    if row.get("max") is not None and investment > row["max"]:
+        return "max"
+    return "ranked"
+
+
+def _compare_rank_rows(rows, investment, outcome, years, ref):
+    """Fill status/proceeds/fees_cost/net_multiple/rank on each row and sort:
+    ranked (by rank), then unranked min/max/hold, then the no-fees group."""
+    for r in rows:
+        r["status"] = compare_rank_status(r, investment)
+        if r["status"] == "none":
+            r["proceeds"] = r["fees_cost"] = None
+            r["net_multiple"] = None
+        else:
+            r["proceeds"], r["fees_cost"], r["net_multiple"] = compare_proceeds(
+                investment, r["upfront"], r["mgmt"], r["carry"], outcome, years, ref, r["valuation"])
+    ranked = [r for r in rows if r["status"] == "ranked"]
+    ranks = compare_competition_ranks({id(r): r["proceeds"] for r in ranked})
+    for r in rows:
+        r["rank"] = ranks.get(id(r))
+    group = {"ranked": 0, "min": 1, "max": 1, "hold": 1, "none": 2}
+    rows.sort(key=lambda r: (group[r["status"]], r["rank"] or 0,
+                             -(r["proceeds"] or 0) if r["status"] != "none" else 0))
+    return rows
 
 
 def _deal_company_id(deal):
@@ -20152,16 +20241,31 @@ def _compare_rows(entry, role, scope=frozenset()):
             "updated_text": updated_text, "updated_days": updated_days,
         }
         row["fee_status"] = compare_fee_status(row["upfront"], row["mgmt"], row["carry"])
-        row["net_multiple"] = compare_net_multiple(row["upfront"], row["mgmt"], row["carry"],
-                                                   COMPARE_DEFAULT_OUTCOME, COMPARE_DEFAULT_YEARS, ref, val)
         rows.append(row)
-    # Ranked rows by net multiple, then the unranked (no fees) group by deal id.
-    rows.sort(key=lambda r: (r["fee_status"] == "none", 0 if r["fee_status"] == "none" else -r["net_multiple"]))
+    _compare_rank_rows(rows, COMPARE_DEFAULT_INVESTMENT, COMPARE_DEFAULT_OUTCOME, COMPARE_DEFAULT_YEARS, ref)
     return rows, ref
 
 
-def _compare_rank_text(rank, total):
-    return f"Your offering ranks #{rank} of {total} at this outcome."
+def _compare_rank_text(rank, total, investment=COMPARE_DEFAULT_INVESTMENT, outcome=COMPARE_DEFAULT_OUTCOME):
+    return f"Your offering ranks #{rank} of {total} for a {compare_fmt_money(investment)} investment at {outcome:g}x."
+
+
+def _compare_unranked_text(status, row, investment=COMPARE_DEFAULT_INVESTMENT):
+    if status == "min":
+        return (f"Your offering isn't ranked for a {compare_fmt_money(investment)} investment "
+                f"(min {compare_fmt_money(row['min'])}).")
+    if status == "max":
+        return (f"Your offering isn't ranked for a {compare_fmt_money(investment)} investment "
+                f"(max {compare_fmt_money(row['max'])}).")
+    return ""
+
+
+def _compare_limit_text(status, row):
+    if status == "min":
+        return f"Min {compare_fmt_money(row['min'])}"
+    if status == "max":
+        return f"Max {compare_fmt_money(row['max'])}"
+    return ""
 
 
 COMPARE_CSS = """
@@ -20185,6 +20289,19 @@ COMPARE_CSS = """
   .cmp-table th[aria-sort="ascending"]::after { content: " ▴"; }
   .cmp-table td.num { white-space: nowrap; font-variant-numeric: tabular-nums; }
   .cmp-table tr.cmp-own td { background: #eef5f0; }
+  .cmp-table tr.cmp-top td { background: #e3f4ea; }
+  .cmp-table td.cmp-dim, .cmp-table td.cmp-dim .cmp-nm { color: var(--muted); font-weight: 400; }
+  .cmp-rank-v { font-weight: 700; }
+  .cmp-best { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 9999px; font-size: 10.5px;
+              font-weight: 700; color: #fff; background: var(--qp); vertical-align: 1px; }
+  .cmp-limit { font-size: 11px; color: #B42318; opacity: .8; margin-top: 2px; white-space: nowrap; }
+  .cmp-back { font-weight: 700; }
+  .cmp-controls input#cmp-inv { width: 96px; font: inherit; padding: 4px 8px; border: 1px solid var(--line);
+                                border-radius: 6px; }
+  .cmp-picks { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+  .cmp-pick { font: inherit; font-size: 12px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 9999px;
+              background: #fff; color: var(--ink); cursor: pointer; }
+  .cmp-pick.active { background: var(--accent); border-color: var(--accent); color: #fff; }
   .cmp-table tr.cmp-hold td { color: var(--muted); }
   .cmp-label { font-weight: 600; white-space: nowrap; }
   .cmp-partial { font-size: 11px; color: var(--muted); margin-top: 3px; }
@@ -20220,41 +20337,71 @@ COMPARE_CSS = """
 
 # The page's only script: re-rank on outcome/years, sortable columns, and
 # (own/admin rows only) the inline fee-decrease editor.
-COMPARE_SCRIPT = """<script>
+COMPARE_SCRIPT = (r"""<script>
 (function() {
   var table = document.getElementById('cmp-table');
   if (!table) return;
   var tbody = table.tBodies[0];
   var outcomeSel = document.getElementById('cmp-outcome');
   var yearsSel = document.getElementById('cmp-years');
+  var invInput = document.getElementById('cmp-inv');
+  var invMsg = document.getElementById('cmp-inv-msg');
+  var picks = Array.prototype.slice.call(document.querySelectorAll('.cmp-pick'));
   var ref = parseFloat(table.getAttribute('data-ref')) || 0;
   var divider = tbody.querySelector('tr.cmp-divider');
   var isAdmin = table.getAttribute('data-admin') === '1';
   var FEES = ['upfront', 'mgmt', 'carry'];
-  var sortCol = 'nm', sortDir = -1;
+  var STORE = 'gg-compare-investment';
+  var investment = parseFloat(table.getAttribute('data-inv')) || 100000;
+  var sortCol = 'rank', sortDir = 1;
   function num(v) { var n = parseFloat(v); return isNaN(n) ? null : n; }
+  function trimNum(t) { return t.indexOf('.') >= 0 ? t.replace(/0+$/, '').replace(/\.$/, '') : t; }
+  function parseAmount(raw) {
+    var t = String(raw || '').trim().toLowerCase().replace(/[$,\s]/g, '');
+    var m = /^(\d+(?:\.\d*)?|\.\d+)([km]?)$/.exec(t);
+    if (!m) return null;
+    var v = Math.round(parseFloat(m[1]) * ({'': 1, k: 1000, m: 1000000})[m[2]]);
+    return v > 0 ? v : null;
+  }
+  function fmtMoney(v) {
+    if (v === null || v === undefined || isNaN(v)) return '—';
+    var a = Math.abs(v), t;
+    if (a >= 1000000) t = trimNum((a / 1000000).toFixed(2)) + 'M';
+    else if (a >= 1000) t = trimNum((a / 1000).toFixed(1)) + 'K';
+    else t = Math.round(a).toLocaleString('en-US');
+    return (v < 0 ? '-' : '') + '$' + t;
+  }
   function fee(tr, f) { return num(tr.getAttribute('data-' + f)) || 0; }
   function feeStatus(tr) {
     var blanks = FEES.filter(function(f) { return num(tr.getAttribute('data-' + f)) === null; }).length;
     return blanks === 0 ? 'complete' : (blanks === 3 ? 'none' : 'partial');
   }
-  function netMultiple(tr, outcome, years) {
-    var up = fee(tr, 'upfront') / 100;
-    var mg = fee(tr, 'mgmt') / 100;
-    var ca = fee(tr, 'carry') / 100;
+  function ratio(tr) {
     var val = num(tr.getAttribute('data-val'));
-    var ratio = (ref > 0 && val && val > 0) ? ref / val : 1;
-    var exitValue = 100 * (1 - up) * outcome * ratio;
+    return (ref > 0 && val && val > 0) ? ref / val : 1;
+  }
+  function netMultiple(tr, outcome, years) {
+    var up = fee(tr, 'upfront') / 100, mg = fee(tr, 'mgmt') / 100, ca = fee(tr, 'carry') / 100;
+    var exitValue = 100 * (1 - up) * outcome * ratio(tr);
     var mgmt = 100 * mg * years;
     var profit = exitValue - mgmt - 100;
     var carry = ca * Math.max(profit, 0);
     return (exitValue - mgmt - carry) / 100;
   }
+  function status(tr) {
+    if (feeStatus(tr) === 'none') return 'none';
+    if (tr.getAttribute('data-hold') === '1') return 'hold';
+    var mn = num(tr.getAttribute('data-min')), mx = num(tr.getAttribute('data-max'));
+    if (mn !== null && investment < mn) return 'min';
+    if (mx !== null && investment > mx) return 'max';
+    return 'ranked';
+  }
   function rows() {
     return Array.prototype.slice.call(tbody.rows).filter(function(tr) { return !tr.classList.contains('cmp-divider'); });
   }
+  function cell(tr, col) { return tr.querySelector('td[data-col="' + col + '"]'); }
   function cellVal(tr, col) {
-    var td = tr.querySelector('td[data-col="' + col + '"]');
+    var td = cell(tr, col);
     if (!td) return null;
     var v = td.getAttribute('data-v');
     var n = num(v);
@@ -20263,67 +20410,130 @@ COMPARE_SCRIPT = """<script>
   function sortRows() {
     var list = rows();
     list.sort(function(a, b) {
+      var ga = a.getAttribute('data-group'), gb = b.getAttribute('data-group');
+      if (ga !== gb) return ga < gb ? -1 : 1;
       var x = cellVal(a, sortCol), y = cellVal(b, sortCol);
       if (x === y) return 0;
       if (x === null || x === '') return 1;
       if (y === null || y === '') return -1;
       return (x < y ? -1 : 1) * sortDir;
     });
-    var ranked = list.filter(function(tr) { return tr.getAttribute('data-unranked') !== '1'; });
-    var unranked = list.filter(function(tr) { return tr.getAttribute('data-unranked') === '1'; });
-    ranked.forEach(function(tr) { tbody.appendChild(tr); });
-    if (divider) { tbody.appendChild(divider); divider.hidden = unranked.length === 0; }
-    unranked.forEach(function(tr) { tbody.appendChild(tr); });
+    var below = list.filter(function(tr) { return tr.getAttribute('data-group') === '2'; });
+    list.forEach(function(tr) { if (tr.getAttribute('data-group') !== '2') tbody.appendChild(tr); });
+    if (divider) { tbody.appendChild(divider); divider.hidden = below.length === 0; }
+    below.forEach(function(tr) { tbody.appendChild(tr); });
     table.querySelectorAll('th[data-col]').forEach(function(th) {
       if (th.getAttribute('data-col') === sortCol) th.setAttribute('aria-sort', sortDir > 0 ? 'ascending' : 'descending');
       else th.removeAttribute('aria-sort');
     });
   }
+  function setCell(td, v, text) { td.setAttribute('data-v', v); var s = td.querySelector('span'); (s || td).textContent = text; }
   function recompute() {
     var outcome = parseFloat(outcomeSel.value), years = parseFloat(yearsSel.value);
-    var live = rows().filter(function(tr) { return tr.getAttribute('data-hold') !== '1'; });
-    live.forEach(function(tr) {
-      var st = feeStatus(tr);
-      var td = tr.querySelector('td[data-col="nm"]');
+    var all = rows(), ranked = [];
+    all.forEach(function(tr) {
+      var st = status(tr), fs = feeStatus(tr);
+      tr.__st = st;
+      tr.setAttribute('data-group', st === 'ranked' ? '0' : (st === 'none' ? '2' : '1'));
       tr.setAttribute('data-unranked', st === 'none' ? '1' : '0');
+      var nmTd = cell(tr, 'nm'), backTd = cell(tr, 'back'), costTd = cell(tr, 'fees');
       if (st === 'none') {
-        td.setAttribute('data-v', '');
-        td.querySelector('.cmp-nm').textContent = '\u2014';
+        setCell(nmTd, '', '—'); setCell(backTd, '', '—'); setCell(costTd, '', '—');
       } else {
         var nm = netMultiple(tr, outcome, years);
-        td.setAttribute('data-v', nm.toFixed(4));
-        td.querySelector('.cmp-nm').textContent = nm.toFixed(2) + 'x';
+        var back = investment * nm;
+        var cost = investment * outcome * ratio(tr) - back;
+        tr.__back = back;
+        setCell(nmTd, nm.toFixed(4), nm.toFixed(2) + 'x');
+        setCell(backTd, back.toFixed(2), fmtMoney(back));
+        setCell(costTd, cost.toFixed(2), fmtMoney(cost));
+        if (st === 'ranked') ranked.push(tr);
       }
+      [nmTd, backTd, costTd].forEach(function(td) { td.classList.toggle('cmp-dim', st !== 'ranked'); });
       FEES.forEach(function(f) {
         if (num(tr.getAttribute('data-' + f)) !== null) return;
         var fv = tr.querySelector('td[data-col="' + f + '"] .cmp-fee-v');
-        if (fv) fv.textContent = st === 'none' ? 'Not provided' : '\u2014';
+        if (fv) fv.textContent = st === 'none' ? 'Not provided' : '—';
       });
-      var show = {'.cmp-partial': st === 'partial', '.cmp-prompt-confirm': st === 'partial',
+      var show = {'.cmp-partial': fs === 'partial', '.cmp-prompt-confirm': fs === 'partial',
                   '.cmp-prompt-add': st === 'none', '.cmp-ask': st === 'none', '.cmp-rank': st !== 'none'};
       Object.keys(show).forEach(function(sel) {
         tr.querySelectorAll(sel).forEach(function(el) { el.hidden = !show[sel]; });
       });
+      var lim = tr.querySelector('.cmp-limit');
+      if (lim) {
+        var mn = num(tr.getAttribute('data-min')), mx = num(tr.getAttribute('data-max'));
+        lim.textContent = st === 'min' ? 'Min ' + fmtMoney(mn) : (st === 'max' ? 'Max ' + fmtMoney(mx) : '');
+        lim.hidden = st !== 'min' && st !== 'max';
+      }
     });
-    var ranked = live.filter(function(tr) { return tr.getAttribute('data-unranked') !== '1'; }).sort(function(a, b) {
-      return parseFloat(b.querySelector('td[data-col="nm"]').getAttribute('data-v')) -
-             parseFloat(a.querySelector('td[data-col="nm"]').getAttribute('data-v'));
-    });
+    var rounded = ranked.map(function(tr) { return Math.floor(tr.__back / 100 + 0.5); });
     ranked.forEach(function(tr, i) {
-      var rank = tr.querySelector('.cmp-rank');
-      if (rank) rank.textContent = 'Your offering ranks #' + (i + 1) + ' of ' + ranked.length + ' at this outcome.';
+      var r = 1;
+      rounded.forEach(function(o) { if (o > rounded[i]) r++; });
+      tr.__rank = r;
+    });
+    all.forEach(function(tr) {
+      var r = tr.__st === 'ranked' ? tr.__rank : null;
+      var td = cell(tr, 'rank');
+      td.setAttribute('data-v', r === null ? '' : r);
+      td.querySelector('.cmp-rank-v').textContent = r === null ? '—' : '#' + r;
+      td.querySelector('.cmp-best').hidden = r !== 1;
+      tr.classList.toggle('cmp-top', r === 1);
+      var line = tr.querySelector('.cmp-rank');
+      if (!line) return;
+      if (r !== null) {
+        line.textContent = 'Your offering ranks #' + r + ' of ' + ranked.length + ' for a ' + fmtMoney(investment) +
+          ' investment at ' + outcome + 'x.';
+      } else if (tr.__st === 'min' || tr.__st === 'max') {
+        var lim = tr.getAttribute(tr.__st === 'min' ? 'data-min' : 'data-max');
+        line.textContent = 'Your offering isn’t ranked for a ' + fmtMoney(investment) + ' investment (' +
+          tr.__st + ' ' + fmtMoney(num(lim)) + ').';
+      } else {
+        line.textContent = '';
+      }
     });
     sortRows();
   }
+  function setInvestment(v, save) {
+    investment = v;
+    if (invMsg) invMsg.hidden = true;
+    picks.forEach(function(b) { b.classList.toggle('active', num(b.getAttribute('data-v')) === v); });
+    if (save) { try { window.localStorage.setItem(STORE, String(v)); } catch (e) {} }
+    recompute();
+  }
+  if (invInput) {
+    invInput.addEventListener('input', function() {
+      var v = parseAmount(invInput.value);
+      if (v === null) { if (invMsg && invInput.value.trim()) invMsg.hidden = false; return; }
+      setInvestment(v, true);
+    });
+    invInput.addEventListener('blur', function() {
+      if (parseAmount(invInput.value) === null) { invInput.value = fmtMoney(investment); if (invMsg) invMsg.hidden = true; }
+      else invInput.value = fmtMoney(investment);
+    });
+  }
+  picks.forEach(function(b) {
+    b.addEventListener('click', function() {
+      var v = num(b.getAttribute('data-v'));
+      if (invInput) invInput.value = fmtMoney(v);
+      setInvestment(v, true);
+    });
+  });
   outcomeSel.addEventListener('change', recompute);
   yearsSel.addEventListener('change', recompute);
   table.querySelectorAll('th[data-col]').forEach(function(th) {
     th.addEventListener('click', function() {
       var col = th.getAttribute('data-col');
-      if (col === sortCol) sortDir = -sortDir; else { sortCol = col; sortDir = (col === 'nm') ? -1 : 1; }
+      if (col === sortCol) sortDir = -sortDir;
+      else { sortCol = col; sortDir = (col === 'nm' || col === 'back') ? -1 : 1; }
       sortRows();
     });
   });
+  var stored = null;
+  try { stored = parseAmount(window.localStorage.getItem(STORE)); } catch (e) { stored = null; }
+  if (stored && invInput) invInput.value = fmtMoney(stored);
+  setInvestment(stored || investment, false);
   function fmtPct(v) { return (Math.round(v * 10) / 10) + '%'; }
   table.addEventListener('click', function(ev) {
     var btn = ev.target.closest('.cmp-edit-btn');
@@ -20351,7 +20561,7 @@ COMPARE_SCRIPT = """<script>
       if (!isAdmin && old !== null && v > old) {
         msg.className = 'cmp-msg warn';
         var url = tr.getAttribute('data-update-url');
-        msg.innerHTML = url ? '<a href="' + url + '" target="_blank" rel="noopener">""" + COMPARE_RAISE_MSG + """</a>' : '""" + COMPARE_RAISE_MSG + """';
+        msg.innerHTML = url ? '<a href="' + url + '" target="_blank" rel="noopener">@@RAISE@@</a>' : '@@RAISE@@';
         return;
       }
       var body = {deal_id: tr.getAttribute('data-deal-id'), field: field, value: v};
@@ -20374,14 +20584,14 @@ COMPARE_SCRIPT = """<script>
           var fv = td.querySelector('.cmp-fee-v');
           fv.textContent = fmtPct(res.d.value) + (field === 'mgmt' ? ' / yr' : '');
           form.remove();
-          sortCol = 'nm'; sortDir = -1;
+          sortCol = 'rank'; sortDir = 1;
           recompute();
         })
         .catch(function() { msg.className = 'cmp-msg error'; msg.textContent = 'Save failed — please try again.'; });
     });
   });
 })();
-</script>"""
+</script>""").replace("@@RAISE@@", COMPARE_RAISE_MSG)
 
 COMPARE_SEARCH_SCRIPT = """<script>
 (function() {
@@ -20493,7 +20703,9 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                            impersonating=False):
     """role: "admin" (Admin view: everything, every row editable), "tenant"
     (own firm/team rows = "Your offering", editable; impersonating = admin
-    Tenant-view preview), "buyer" (read-only, gross price, nudge line)."""
+    Tenant-view preview), "buyer" (read-only, gross price, nudge line).
+    Server-rendered at the default $100K / 5x / 5 yrs; COMPARE_SCRIPT re-ranks
+    in place for the viewer's investment, outcome and years."""
     back = f'<p class="cmp-sub"><a href="{_esc(_compare_href(None, key, view_as))}">← All companies</a></p>'
     try:
         offerings = _compare_offerings(include_hold=(role == "admin"))
@@ -20508,42 +20720,50 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                               f'{back}<h1>Compare SPV offerings</h1>'
                               '<p class="cmp-empty">No live SPV offerings for this company right now.</p>')
     company = entry["company"]
+    investment, outcome = COMPARE_DEFAULT_INVESTMENT, COMPARE_DEFAULT_OUTCOME
     live_rows = [r for r in rows if not r["hold"]]
-    ranked_rows = [r for r in live_rows if r["fee_status"] != "none"]
-    ranks = {id(r): i + 1 for i, r in enumerate(ranked_rows)}
+    n_ranked = sum(1 for r in rows if r["status"] == "ranked")
+    divider_row = f'<tr class="cmp-divider"{{hidden}}><td colspan="17">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>'
     tr_html = []
     divider_done = False
     for r in rows:
-        unranked = r["fee_status"] == "none"
-        if unranked and not divider_done:
-            tr_html.append(f'<tr class="cmp-divider"><td colspan="14">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>')
+        st = r["status"]
+        no_fees = st == "none"
+        if no_fees and not divider_done:
+            tr_html.append(divider_row.replace("{hidden}", ""))
             divider_done = True
         d = r["deal"]
         deal_id = str(d.get("id"))
         editable = (role == "admin" and not r["hold"]) or r["own"]
+        group = "0" if st == "ranked" else ("2" if no_fees else "1")
         attrs = (f' data-upfront="{"" if r["upfront"] is None else r["upfront"]}"'
                  f' data-mgmt="{"" if r["mgmt"] is None else r["mgmt"]}"'
                  f' data-carry="{"" if r["carry"] is None else r["carry"]}"'
                  f' data-val="{"" if r["valuation"] is None else r["valuation"]}"'
+                 f' data-min="{"" if r["min"] is None else r["min"]}"'
+                 f' data-max="{"" if r["max"] is None else r["max"]}"'
                  f' data-hold="{"1" if r["hold"] else "0"}"'
-                 f' data-unranked="{"1" if unranked else "0"}"')
+                 f' data-group="{group}" data-unranked="{"1" if no_fees else "0"}"')
         if editable:
             attrs += f' data-deal-id="{_esc(deal_id)}"'
             upd = _deal_update_form_url(deal_id)
             if upd:
                 attrs += f' data-update-url="{_esc(upd)}"'
-        cls = "cmp-own" if r["own"] else ("cmp-hold" if r["hold"] else "")
+        top = r["rank"] == 1
+        cls = " ".join(c for c in ("cmp-own" if r["own"] else "", "cmp-hold" if r["hold"] else "",
+                                   "cmp-top" if top else "") if c)
         partial = r["fee_status"] == "partial"
         label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
         label_html += f'<div class="cmp-partial"{"" if partial else " hidden"}>{_esc(COMPARE_PARTIAL_NOTE)}</div>'
         if r["own"]:
-            rank_text = _compare_rank_text(ranks[id(r)], len(ranked_rows)) if id(r) in ranks else ""
-            label_html += f'<div class="cmp-rank"{" hidden" if unranked else ""}>{_esc(rank_text)}</div>'
+            line = (_compare_rank_text(r["rank"], n_ranked, investment, outcome) if st == "ranked"
+                    else _compare_unranked_text(st, r, investment))
+            label_html += f'<div class="cmp-rank"{" hidden" if no_fees else ""}>{_esc(line)}</div>'
             label_html += (f'<div class="cmp-prompt cmp-prompt-confirm"{"" if partial else " hidden"}>'
                            f'{_esc(COMPARE_CONFIRM_FEES_PROMPT)}</div>')
-            label_html += (f'<div class="cmp-prompt cmp-prompt-add"{"" if unranked else " hidden"}>'
+            label_html += (f'<div class="cmp-prompt cmp-prompt-add"{"" if no_fees else " hidden"}>'
                            f'{_esc(COMPARE_ADD_FEES_PROMPT)}</div>')
-        if unranked:
+        if no_fees:
             label_html += (f'<a class="cmp-ask" href="{_esc(COMPARE_ASK_URL.format(deal_id))}" target="_blank" '
                            'rel="noopener">Ask about fees →</a>')
         if role == "admin":
@@ -20555,13 +20775,25 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             val_html += '<div class="cmp-note">from news</div>'
         if r["valuation_assumed"]:
             val_html += '<div class="cmp-note">valuation assumed</div>'
-        nm = r["net_multiple"]
-        no_nm = r["hold"] or unranked
-        nm_html = '<span class="cmp-nm">—</span>' if no_nm else f'<span class="cmp-nm">{nm:.2f}x</span>'
+        limit = _compare_limit_text(st, r)
+        rank_html = (f'<span class="cmp-rank-v">{"#" + str(r["rank"]) if r["rank"] else "—"}</span>'
+                     f'<span class="cmp-best"{"" if top else " hidden"}>Best</span>'
+                     f'<div class="cmp-limit"{"" if limit else " hidden"}>{_esc(limit)}</div>')
+        dim = "" if st == "ranked" else " cmp-dim"
+        if no_fees:
+            nm_v = back_v = cost_v = ""
+            nm_t = back_t = cost_t = "—"
+        else:
+            nm_v, nm_t = f'{r["net_multiple"]:.4f}', f'{r["net_multiple"]:.2f}x'
+            back_v, back_t = f'{r["proceeds"]:.2f}', compare_fmt_money(r["proceeds"])
+            cost_v, cost_t = f'{r["fees_cost"]:.2f}', compare_fmt_money(r["fees_cost"])
         tr_html.append(
             f'<tr class="{cls}"{attrs}>'
             f'<td data-col="label" data-v="{_esc(r["label"])}">{label_html}</td>'
-            f'<td data-col="nm" class="num" data-v="{"" if no_nm else f"{nm:.4f}"}">{nm_html}</td>'
+            f'<td data-col="rank" class="num" data-v="{r["rank"] or ""}">{rank_html}</td>'
+            f'<td data-col="back" class="num{dim}" data-v="{back_v}"><span class="cmp-back">{_esc(back_t)}</span></td>'
+            f'<td data-col="fees" class="num{dim}" data-v="{cost_v}"><span>{_esc(cost_t)}</span></td>'
+            f'<td data-col="nm" class="num{dim}" data-v="{nm_v}"><span class="cmp-nm">{_esc(nm_t)}</span></td>'
             f'<td data-col="structure" data-v="{_esc(r["structure"])}">{_esc(r["structure"])}</td>'
             f'<td data-col="role" data-v="{_esc(r["seller_role"])}">{_esc(r["seller_role"])}</td>'
             f'<td data-col="class" data-v="{_esc(r["share_class"])}">{_esc(r["share_class"])}</td>'
@@ -20577,13 +20809,19 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f'{_esc(_fmt_money(r["max"]))}</td>'
             f'<td data-col="updated" class="num" data-v="{"" if r["updated_days"] is None else r["updated_days"]}">'
             f'{_esc(r["updated_text"])}</td></tr>')
+    if not divider_done:
+        # Always present so the page script can show it if a row loses its fees group.
+        tr_html.append(divider_row.replace("{hidden}", " hidden"))
     price_head = {"buyer": "Price", "tenant": "Net price"}.get(role, "Price")
-    heads = [("label", "Offering"), ("nm", "Net multiple"), ("structure", "Structure"), ("role", "Seller role"),
+    heads = [("label", "Offering"), ("rank", "Rank"), ("back", "You get back"), ("fees", "Fees cost"),
+             ("nm", "Net multiple"), ("structure", "Structure"), ("role", "Seller role"),
              ("class", "Class"), ("exemption", "Exemption"), ("valuation", "Valuation"),
              ("price", price_head), ("upfront", "Upfront"), ("mgmt", "Mgmt fee"), ("carry", "Carry"),
              ("min", "Min ticket"), ("max", "Max ticket"), ("updated", "Updated")]
-    sort_attr = ' aria-sort="descending"'
-    th_html = "".join(f'<th data-col="{c}"{sort_attr if c == "nm" else ""}>{_esc(t)}</th>' for c, t in heads)
+    sort_attr = ' aria-sort="ascending"'
+    th_html = "".join(f'<th data-col="{c}"{sort_attr if c == "rank" else ""}>{_esc(t)}</th>' for c, t in heads)
+    pick_html = "".join(f'<button type="button" class="cmp-pick{" active" if v == investment else ""}" '
+                        f'data-v="{v}">{_esc(compare_fmt_money(v))}</button>' for v in COMPARE_INVESTMENT_PICKS)
     outcome_opts = "".join(f'<option value="{o}"{" selected" if o == COMPARE_DEFAULT_OUTCOME else ""}>{o}x</option>'
                            for o in COMPARE_OUTCOMES)
     years_opts = "".join(f'<option value="{y}"{" selected" if y == COMPARE_DEFAULT_YEARS else ""}>'
@@ -20591,20 +20829,21 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     data_key = ""
     if any(r["own"] or role == "admin" for r in rows) and key:
         data_key = f' data-key="{_esc(key)}"' + (f' data-view-as="{_esc(view_as)}"' if impersonating and view_as else "")
-    if not divider_done:
-        # Always present so the page script can show it if a row loses its rank.
-        tr_html.append(f'<tr class="cmp-divider" hidden><td colspan="14">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>')
     data_key += ' data-admin="1"' if key else ""
     n = len(live_rows)
     nudge = f'<p class="cmp-nudge">{COMPARE_BUYER_NUDGE_HTML}</p>' if role == "buyer" else ""
     body = (f'{back}<h1>{_esc(company)} SPV offerings</h1>'
-            f'<p class="cmp-sub">{n} live offering{"s" if n != 1 else ""}. Net multiple is per $100 committed, '
-            'after upfront, management and carry fees (commission excluded — it is the same on every offering). '
+            f'<p class="cmp-sub">{n} live offering{"s" if n != 1 else ""}. {_esc(COMPARE_SUBTITLE_LEAD)} '
             f'{_esc(COMPARE_FEES_SUBTITLE)} Click a column to sort.</p>'
             '<div class="cmp-controls">'
+            f'<label>Investment <input id="cmp-inv" type="text" inputmode="decimal" autocomplete="off" '
+            f'value="{_esc(compare_fmt_money(investment))}" aria-label="Investment amount"></label>'
+            f'<span class="cmp-picks">{pick_html}</span>'
+            '<span class="cmp-msg error" id="cmp-inv-msg" hidden>Enter an amount like 300k or 1.5m</span>'
             f'<label>Outcome <select id="cmp-outcome">{outcome_opts}</select></label>'
             f'<label>Years to exit <select id="cmp-years">{years_opts}</select></label></div>'
-            f'<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"{data_key}>'
+            f'<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"'
+            f' data-inv="{investment}"{data_key}>'
             f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'
             f'{nudge}{COMPARE_SCRIPT}')
     return _compare_shell(f"{company} offerings", header_html, body)

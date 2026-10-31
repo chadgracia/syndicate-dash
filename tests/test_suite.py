@@ -11280,7 +11280,7 @@ check("compare: Direct deal never listed; new allocation without valuation shows
 check("compare: fresh-copy overlay wins (offering 6002 upfront 7% -> 6% from deal-fresh)",
       'data-upfront="6.0"' in _cb or 'data-upfront="6"' in _cb)
 check("compare: ranked rows by net multiple (4.80x, 4.14x); all-blank row unranked below the divider",
-      _cb.index(">4.80x<") < _cb.index(">4.14x<") < _cb.index('<tr class="cmp-divider"><td colspan="14">Fees not yet provided</td></tr>')
+      _cb.index(">4.80x<") < _cb.index(">4.14x<") < _cb.index('<tr class="cmp-divider"><td colspan="17">Fees not yet provided</td></tr>')
       < _cb.index(">Offering C<") and "~" not in _cb[_cb.index("<tbody>"):_cb.index("</tbody>")])
 check("compare: short labels — '2-Layer', 'GP – selling own units', 'L1 SPV' map; Updated column",
       "2-Layer" in _cb and "Preferred" in _cb and "3(c)(7)" in _cb and "GP – selling own units" in _cb
@@ -11316,9 +11316,9 @@ check("compare module never reads paperwork / terms-completeness helpers",
                                       "_deal_terms_missing", "_deal_terms_complete", "_my_deal_visibility_state",
                                       "_pending_block_items", "_tenant_cef_state")))
 check("compare script: unranked rows stay below the divider under every sort (ranked/unranked partition)",
-      "var unranked = list.filter(function(tr) { return tr.getAttribute('data-unranked') === '1'; });" in lf.COMPARE_SCRIPT
-      and "if (divider) { tbody.appendChild(divider); divider.hidden = unranked.length === 0; }" in lf.COMPARE_SCRIPT
-      and "tr.setAttribute('data-unranked', st === 'none' ? '1' : '0');" in lf.COMPARE_SCRIPT)
+      "if (ga !== gb) return ga < gb ? -1 : 1;" in lf.COMPARE_SCRIPT
+      and "if (divider) { tbody.appendChild(divider); divider.hidden = below.length === 0; }" in lf.COMPARE_SCRIPT
+      and "tr.setAttribute('data-group', st === 'ranked' ? '0' : (st === 'none' ? '2' : '1'));" in lf.COMPARE_SCRIPT)
 check("compare: new allocation valuation 'Round est. $X' + grey 'from news' line",
       lf._fmt_valuation_billions(2.25) == "$2.25B")
 check("compare: table scrolls horizontally with Offering + Net multiple sticky on the left",
@@ -11328,8 +11328,8 @@ check("compare: table scrolls horizontally with Offering + Net multiple sticky o
 # Tenant view: own row highlighted + editable; others anonymous.
 _ct = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
 check("compare tenant view: own firm row = 'Your offering' (highlighted) with a rank line",
-      _ct.count(">Your offering<") == 1 and 'class="cmp-own"' in _ct
-      and "Your offering ranks #1 of 2 at this outcome." in _ct)
+      _ct.count(">Your offering<") == 1 and 'class="cmp-own cmp-top"' in _ct
+      and "Your offering ranks #1 of 2 for a $100K investment at 5x." in _ct)
 check("compare tenant view: net price (not gross), other sellers anonymous, no value",
       "$30.00" in _ct and "$33.00" not in _ct and "Beta Partners" not in _ct and "6002" not in _ct
       and _ct.count("6005") == 1 and "99999" not in _ct and "Otto" not in _ct)
@@ -11350,7 +11350,7 @@ check("compare: partial-blank row is ranked with blanks as 0 (4/—/0 -> 4.80x) 
       ">4.80x<" in _ctb_own and '<div class="cmp-partial">Full fees not confirmed</div>' in _ctb_own
       and '<span class="cmp-fee-v">—</span>' in _ctb_own and 'data-unranked="0"' in _ctb_own)
 check("compare: seller's partial row -> rank line + 'Confirm your remaining fees to rank accurately.'",
-      '<div class="cmp-rank">Your offering ranks #1 of 2 at this outcome.</div>' in _ctb_own
+      '<div class="cmp-rank">Your offering ranks #1 of 2 for a $100K investment at 5x.</div>' in _ctb_own
       and '<div class="cmp-prompt cmp-prompt-confirm">Confirm your remaining fees to rank accurately.</div>' in _ctb_own)
 _cmp_none_own = json.loads(json.dumps(_cmp_d1))
 for _f in (lf.SELLER_FEE_FIELD, lf.MGMT_FEE_FIELD, lf.CARRY_FIELD):
@@ -11552,6 +11552,91 @@ check("compare: filling one fee on an all-blank row moves it into the ranked gro
       and '<tr class="cmp-divider" hidden>' in _cbf and "6005" not in _cbf)
 for _k in ("deal-fresh/6001.json", "deal-fresh/6005.json"):
     _cmp_s3.objs.pop(_k, None)
+
+# Investment amount, rank, You get back, Fees cost.
+check("compare amount parsing: '300000', '300k', '1.5m', '$100K', '1,000,000'; junk/zero rejected",
+      [lf.parse_investment_amount(v) for v in ("300000", "300k", "1.5m", "$100K", "1,000,000", " 250K ")]
+      == [300_000, 300_000, 1_500_000, 100_000, 1_000_000, 250_000]
+      and all(lf.parse_investment_amount(v) is None for v in ("", "abc", "0", "-5k", "1.5b", None, "k")))
+check("compare money format: $480K / $437.5K / $1.25M / $20K / $62.5K",
+      [lf.compare_fmt_money(v) for v in (480_000, 437_500, 1_250_000, 20_000, 62_500)]
+      == ["$480K", "$437.5K", "$1.25M", "$20K", "$62.5K"])
+_pa = lf.compare_proceeds(100_000, 4, 0, 0, 5, 5)
+_pb = lf.compare_proceeds(100_000, 5, 0, 10, 5, 5)
+check("compare $100K, 5x, 5 yrs: 4/0/0 -> back $480K, fees $20K; 5/0/10 -> back $437.5K, fees $62.5K",
+      [lf.compare_fmt_money(v) for v in (_pa[0], _pa[1], _pb[0], _pb[1])] == ["$480K", "$20K", "$437.5K", "$62.5K"]
+      and abs(_pa[0] - 480_000) < 1e-6 and abs(_pb[0] - 437_500) < 1e-6
+      and abs(_pa[1] - 20_000) < 1e-6 and abs(_pb[1] - 62_500) < 1e-6)
+check("compare ranks: ties share a rank and the next skips (#1, #1, #3)",
+      lf.compare_competition_ranks({"a": 480_000, "b": 480_000, "c": 437_500}) == {"a": 1, "b": 1, "c": 3})
+check("compare ranks: rounding to the nearest $100 decides ties",
+      lf.compare_competition_ranks({"a": 480_020, "b": 479_960, "c": 479_940}) == {"a": 1, "b": 1, "c": 3}
+      and lf.compare_competition_ranks({"a": 480_049, "b": 480_051}) == {"a": 2, "b": 1})
+
+
+def _cmp_row(fees, hold=False, mn=None, mx=None, label="X"):
+    up, mg, ca = fees
+    return {"label": label, "hold": hold, "upfront": up, "mgmt": mg, "carry": ca, "valuation": None,
+            "min": mn, "max": mx, "fee_status": lf.compare_fee_status(up, mg, ca)}
+
+
+_rr = [_cmp_row((5, 0, 10), label="B"), _cmp_row((None, None, None), label="N"),
+       _cmp_row((4, 0, 0), mn=250_000, label="MIN"), _cmp_row((4, 0, 0), mx=50_000, label="MAX"),
+       _cmp_row((0, 0, 0), hold=True, label="H"), _cmp_row((4, 0, 0), label="A"), _cmp_row((4, 0, 0), label="A2")]
+lf._compare_rank_rows(_rr, 100_000, 5, 5, None)
+_rrl = {r["label"]: r for r in _rr}
+check("compare rank rows: ranked group by rank (A, A2 tie #1, B #3), then min/max/hold, then no-fees last",
+      [r["label"] for r in _rr][:3] in (["A", "A2", "B"], ["A2", "A", "B"])
+      and [_rrl[k]["rank"] for k in ("A", "A2", "B")] == [1, 1, 3]
+      and set(r["label"] for r in _rr[3:6]) == {"MIN", "MAX", "H"} and _rr[-1]["label"] == "N")
+check("compare rank rows: below-min / above-max / Hold / all-blank are never ranked",
+      [_rrl[k]["rank"] for k in ("MIN", "MAX", "H", "N")] == [None, None, None, None]
+      and [_rrl[k]["status"] for k in ("MIN", "MAX", "H", "N")] == ["min", "max", "hold", "none"]
+      and _rrl["MIN"]["proceeds"] is not None and _rrl["N"]["proceeds"] is None)
+check("compare limit labels: 'Min $250K' / 'Max $50K'",
+      lf._compare_limit_text("min", _rrl["MIN"]) == "Min $250K" and lf._compare_limit_text("max", _rrl["MAX"]) == "Max $50K")
+_rr2 = [_cmp_row((4, 0, 0), mn=250_000, label="MIN")]
+lf._compare_rank_rows(_rr2, 250_000, 5, 5, None)
+check("compare rank rows: investment at/over the min ranks the row", _rr2[0]["rank"] == 1)
+
+_cb2 = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
+check("compare page: Investment control before Outcome, $100K default, quick picks $50K…$1M",
+      _cb2.index('id="cmp-inv"') < _cb2.index('id="cmp-outcome"') and 'value="$100K"' in _cb2
+      and all(f'data-v="{v}">{t}</button>' in _cb2 for v, t in ((50000, "$50K"), (100000, "$100K"),
+                                                            (250000, "$250K"), (500000, "$500K"), (1000000, "$1M")))
+      and "localStorage" in lf.COMPARE_SCRIPT and "try { window.localStorage.setItem" in lf.COMPARE_SCRIPT)
+check("compare page: columns Offering, Rank, You get back, Fees cost, Net multiple; default sort Rank ascending",
+      re.search(r'<th data-col="label">Offering</th><th data-col="rank" aria-sort="ascending">Rank</th>'
+                r'<th data-col="back">You get back</th><th data-col="fees">Fees cost</th>'
+                r'<th data-col="nm">Net multiple</th>', _cb2) is not None)
+_cb2_a = _cb2[_cb2.rindex("<tr", 0, _cb2.index(">Offering A<")):]
+_cb2_a = _cb2_a[:_cb2_a.index("</tr>")]
+check("compare page: #1 row gets the green highlight + 'Best' chip, You get back $480K, Fees cost $20K",
+      'class="cmp-top"' in _cb2_a and '<span class="cmp-rank-v">#1</span><span class="cmp-best">Best</span>' in _cb2_a
+      and '<span class="cmp-back">$480K</span>' in _cb2_a and "<span>$20K</span>" in _cb2_a)
+check("compare page: subtitle leads with the new ranking sentence",
+      "Ranked by what your investment returns after upfront, management and carry fees "
+      "(commission excluded — it is the same on every offering)." in _cb2)
+check("compare page: all-blank row stays below the divider with no rank or calculation",
+      _cb2.index("Fees not yet provided") < _cb2.index(">Offering C<")
+      and re.search(r'data-group="2"[^>]*>.*?<span class="cmp-rank-v">—</span>', _cb2) is not None)
+_cmp_min_deal = json.loads(json.dumps(_cmp_d2))
+_cmp_min_deal["custom_fields"][lf.TICKET_MIN_FIELD] = 250_000
+_cmp_min_deal["updated_at"] = "2026/10/31 10:00:00 -0400"
+_cmp_s3.objs["deal-fresh/6002.json"] = {"fetched_at": "2026-10-31T14:00:00+00:00", "deal": _cmp_min_deal}
+_cb3 = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
+_cb3_b = _cb3[_cb3.rindex("<tr", 0, _cb3.index(">Offering B<")):]
+_cb3_b = _cb3_b[:_cb3_b.index("</tr>")]
+check("compare page: below-min row unranked at $100K — '—' rank, muted 'Min $250K', grey values, group 1",
+      'data-group="1"' in _cb3_b and '<span class="cmp-rank-v">—</span>' in _cb3_b
+      and '<div class="cmp-limit">Min $250K</div>' in _cb3_b and 'class="num cmp-dim"' in _cb3_b
+      and _cb3.index(">Offering A<") < _cb3.index(">Offering B<") < _cb3.index("Fees not yet provided"))
+_cmp_s3.objs.pop("deal-fresh/6002.json", None)
+_ca2 = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+_ca2_h = _ca2[_ca2.rindex("<tr", 0, _ca2.index(">Hold<")):]
+_ca2_h = _ca2_h[:_ca2_h.index("</tr>")]
+check("compare page: admin Hold row never ranked (rank '—', group 1)",
+      '<span class="cmp-rank-v">—</span>' in _ca2_h and 'data-group="1"' in _ca2_h and "cmp-best\">" not in _ca2_h)
 
 # Fail soft.
 _cmp_saved_off = lf._compare_offerings
