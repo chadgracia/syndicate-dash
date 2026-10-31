@@ -5555,10 +5555,12 @@ check("Copy client link's permanent link carries no admin key, no view_as, no ss
       and "sso=" not in lf._tenant_link_url(VT_TENANT_EMAIL))
 check("Copy client link script reads data-link and copies it verbatim",
       "btn.getAttribute('data-link')" in resp_bare_company["body"])
-check("Copy client link fallback input pre-filled with the same link, hidden until clipboard fails",
-      f'id="gg-copy-link-input" value="{lf._esc(lf._tenant_link_url(VT_TENANT_EMAIL))}"'
-      in resp_bare_company["body"]
-      and 'id="gg-copy-link-fallback" hidden' in resp_bare_company["body"])
+check("Copy client link: no visible link field; button flips to 'Copied ✓' for 2s, prompt() fallback",
+      "gg-copy-link-input" not in resp_bare_company["body"] and "gg-copy-link-fallback" not in resp_bare_company["body"]
+      and 'id="gg-copy-link-btn"' in resp_bare_company["body"]
+      and "btn.textContent = 'Copied ✓';" in resp_bare_company["body"]
+      and "setTimeout(function() { btn.textContent = label; }, 2000);" in resp_bare_company["body"]
+      and "window.prompt('Copy this client link:', text);" in resp_bare_company["body"])
 
 # The permanent link itself must actually sign the tenant in: GET it with no
 # cookie, no admin key, nothing else -- same as a tenant pasting it cold into
@@ -11648,6 +11650,65 @@ check("compare: data failure -> 'Offerings are being updated — please check ba
       and "Offerings are being updated — please check back shortly." in _r2["body"])
 check("compare: data failure never breaks the My Deals entry point", lf._compare_entry_html(_cmp_d1) == "")
 lf._compare_offerings = _cmp_saved_off
+
+# Admin strip: admin-only controls above the tenant header.
+def _hdr(html):
+    """The <header class="gg-nav">…</header> element only."""
+    i = html.index('<header class="gg-nav">')
+    return html[i:html.index("</header>", i) + len("</header>")]
+
+
+_as_email = "strip.tenant@example.com"
+_as_admin_tv = lf._nav_html("compare", "Strip Tenant", key=ADMIN_KEY, view_as=_as_email, edit_flag=False)
+_as_admin_av = lf._nav_html("compare", "Strip Tenant", key=ADMIN_KEY, view_as=_as_email, edit_flag=True)
+_as_admin_only = lf._nav_html("mydeals", "Admin", key=ADMIN_KEY, edit_flag=True)
+_as_tenant = lf._nav_html("compare", "Strip Tenant")
+check("admin strip: rendered with a valid admin key (picker, toggle, copy link inside; badge in Admin view)",
+      all('<div class="gg-admin-strip" id="gg-admin-strip">' in h for h in (_as_admin_tv, _as_admin_av, _as_admin_only))
+      and all(x in _as_admin_av[:_as_admin_av.index('<header class="gg-nav">')]
+              for x in ('class="gg-admin-badge"', 'id="gg-tenant-search"', 'class="gg-view-toggle"',
+                        'id="gg-copy-link-btn"'))
+      and _as_admin_av.index("gg-admin-strip") < _as_admin_av.index('<header class="gg-nav">'))
+check("admin strip: header row carries no admin controls (all moved into the strip)",
+      not any(x in _hdr(_as_admin_av) for x in ("gg-admin-badge", "gg-tenant-search", "gg-view-toggle",
+                                                "gg-copy-link-btn", "gg-admin-strip")))
+check("admin strip: tenant sessions contain no admin-strip markup",
+      "gg-admin-strip" not in _as_tenant and "gg-admin-badge" not in _as_tenant
+      and "gg-copy-link-btn" not in _as_tenant and "gg-view-toggle" not in _as_tenant)
+_as_real = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": {"view": "compare"},
+                              "cookies": [tenant_cookie(CMP_SELLER)]}, None)["body"]
+_as_prev = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": {"view": "compare", "key": ADMIN_KEY, "view_as": CMP_SELLER},
+                              "cookies": []}, None)["body"]
+check("admin strip: real tenant page has none; admin preview page has it, no visible link field",
+      'id="gg-admin-strip"' not in _as_real and '<div class="gg-admin-strip' not in _as_real
+      and '<div class="gg-admin-strip" id="gg-admin-strip">' in _as_prev
+      and "gg-copy-link-input" not in _as_prev and 'id="gg-copy-link-btn"' in _as_prev)
+def _hdr_norm(html, strip_suffix=""):
+    """Header row with the admin link suffix, sso tokens and the viewer cell
+    (admin keeps the plain name, tenants get the account menu — unchanged
+    rule) normalized away."""
+    h = _hdr(html).replace(strip_suffix, "") if strip_suffix else _hdr(html)
+    h = re.sub(r"[?&](?:amp;)?sso=[^\"&]+", "", h)
+    # Existing admin-preview rules (unchanged): Add deal's "Opens as" tooltip.
+    h = re.sub(r' title="Opens as [^"]*"', "", h)
+    return re.sub(r'<div class="gg-viewer">.*?</div>\n  </div>\n</header>', "VIEWER", h, flags=re.S)
+
+
+_as_tenant_full = lf._nav_html("compare", "Strip Tenant", account_email=_as_email)
+check("admin strip: tenant header markup identical with and without the strip (key/view_as link suffix aside)",
+      _hdr_norm(_as_admin_tv, lf._tab_qs_suffix(ADMIN_KEY, _as_email)) == _hdr_norm(_as_tenant_full)
+      and "VIEWER" in _hdr_norm(_as_tenant_full))
+check("admin strip: CSS — slim dark-red bar that wraps; tabs one line, wrapping below 1280px (no clipping)",
+      ".gg-admin-strip { background: #7a1f1f; color: #ffffff;" in lf.NAV_CSS
+      and "min-height: 40px;" in lf.NAV_CSS and "flex-wrap: wrap;" in lf.NAV_CSS.split(".gg-admin-strip-inner {")[1][:300]
+      and "max-width: 1280px;" in lf.NAV_CSS.split(".gg-nav-inner {")[1][:60]
+      and "flex-wrap: wrap;" in lf.NAV_CSS.split(".gg-tabs {")[1][:80]
+      and "white-space: nowrap;" in lf.NAV_CSS.split(".gg-tab {")[1][:60])
+check("admin strip: Research gaps stays in the tab row (Admin view)",
+      ">Research gaps</a>" in _hdr(_as_admin_only) and "Research gaps" not in
+      _as_admin_only[:_as_admin_only.index('<header class="gg-nav">')])
 
 print(f"\n{passed} passed, {failed} failed")
 if failed:

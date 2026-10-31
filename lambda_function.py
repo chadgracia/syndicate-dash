@@ -9946,19 +9946,24 @@ NAV_CSS = """
     border-bottom: 1px solid var(--line);
   }
   .gg-nav-inner {
-    max-width: 1000px;
+    max-width: 1280px;
     margin: 0 auto;
     padding: 14px 24px;
     display: flex;
     align-items: center;
     gap: 24px;
   }
+  /* Tabs stay on one line at >= 1280px; narrower, the row wraps (never
+     clips, never overflow-scrolls -- that would clip the My Deals menu). */
   .gg-tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: 4px;
     flex: 1;
+    min-width: 0;
   }
   .gg-tab {
+    white-space: nowrap;
     color: var(--muted);
     text-decoration: none;
     font-size: 13px;
@@ -10171,15 +10176,39 @@ NAV_CSS = """
     white-space: nowrap;
   }
   .gg-copy-link-btn:hover { border-color: var(--accent); }
-  .gg-copy-link-fallback { display: inline-block; margin-left: 6px; }
-  .gg-copy-link-fallback input {
+  /* Admin strip (_admin_strip_html): every admin-only control, on its own
+     slim dark-red bar above the tenant header; wraps onto two lines on
+     narrow screens instead of overflowing. */
+  .gg-admin-strip { background: #7a1f1f; color: #ffffff; border-radius: 6px; }
+  .gg-admin-strip-inner {
+    max-width: 1280px;
+    margin: 0 auto;
+    min-height: 40px;
+    padding: 5px 16px;
+    box-sizing: border-box;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 12px;
     font-size: 12px;
-    padding: 5px 8px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    width: 260px;
-    font-family: ui-monospace, monospace;
   }
+  .gg-admin-strip .gg-admin-badge {
+    background: none;
+    border: 0;
+    padding: 0;
+    border-radius: 0;
+    font-size: 11px;
+    font-weight: 700;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .gg-admin-strip-controls { margin-left: auto; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .gg-admin-strip .gg-view-toggle { border-color: rgba(255,255,255,0.45); }
+  .gg-admin-strip .gg-view-toggle-btn { color: rgba(255,255,255,0.85); padding: 3px 10px; }
+  .gg-admin-strip .gg-view-toggle-btn.active { background: #ffffff; color: #7a1f1f; }
+  .gg-admin-strip .gg-view-toggle-btn:not(.active):hover { color: #ffffff; }
+  .gg-admin-strip .gg-copy-link-btn { color: #ffffff; border-color: rgba(255,255,255,0.5); padding: 4px 10px; }
+  .gg-admin-strip .gg-copy-link-btn:hover { border-color: #ffffff; }
   /* Click/focus-driven only, via the shared GGDropdown helper -- see the
      My Deals nav dropdown comment above. Results are real <a href> rows
      (full-width hit area, no click-intercepting JS); display is gated on
@@ -10709,32 +10738,20 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
                 copy_link_html = (
                     '<button type="button" class="gg-copy-link-btn" id="gg-copy-link-btn" '
                     f'data-link="{_esc(_client_link)}">Copy client link</button>'
-                    '<span class="ei-msg" id="gg-copy-link-msg"></span>'
-                    '<span class="gg-copy-link-fallback" id="gg-copy-link-fallback" hidden>'
-                    f'<input type="text" readonly id="gg-copy-link-input" value="{_esc(_client_link)}"></span>'
                 )
                 view_toggle_script += """<script>
 (function() {
   var btn = document.getElementById('gg-copy-link-btn');
-  var msg = document.getElementById('gg-copy-link-msg');
-  var fallback = document.getElementById('gg-copy-link-fallback');
-  var input = document.getElementById('gg-copy-link-input');
   if (!btn) return;
+  var label = btn.textContent;
   btn.addEventListener('click', function() {
     var text = btn.getAttribute('data-link');
     function showCopied() {
-      msg.className = 'ei-msg saved';
-      msg.textContent = 'Copied ✓';
-      setTimeout(function() { msg.className = 'ei-msg'; msg.textContent = ''; }, 2000);
+      btn.textContent = 'Copied ✓';
+      setTimeout(function() { btn.textContent = label; }, 2000);
     }
     function showFallback() {
-      msg.className = 'ei-msg error';
-      msg.textContent = 'Copy failed — link below';
-      if (fallback) {
-        fallback.hidden = false;
-        input.focus();
-        input.select();
-      }
+      window.prompt('Copy this client link:', text);
     }
     if (navigator.clipboard && navigator.clipboard.writeText) {
       navigator.clipboard.writeText(text).then(showCopied, showFallback);
@@ -10772,7 +10789,15 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
 })();
 </script>"""
 
-    return f"""<header class="gg-nav">
+    # Admin-only controls live in their own strip above the header (valid
+    # admin key only -- key is never set for a tenant), so the header row
+    # below is the same markup a tenant gets.
+    admin_strip_html = ""
+    if key is not None:
+        admin_strip_html = (f'<div class="gg-admin-strip" id="gg-admin-strip"><div class="gg-admin-strip-inner">'
+                            f'{admin_badge_html}<div class="gg-admin-strip-controls">'
+                            f'{tenant_search_html}{view_toggle_html}{copy_link_html}</div></div></div>\n')
+    return f"""{admin_strip_html}<header class="gg-nav">
   <div class="gg-nav-inner">
     <nav class="gg-tabs">
       <a class="{overview_cls}" href="{overview_href}"><span class="gg-tab-icon" aria-hidden="true">&#8962;</span>Overview</a>
@@ -10786,10 +10811,6 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
       {watchlist_tab_html}
       {research_tab_html}
     </nav>
-    {admin_badge_html}
-    {tenant_search_html}
-    {view_toggle_html}
-    {copy_link_html}
     {cef_html}
     <div class="gg-viewer">{viewer_html}</div>
   </div>
