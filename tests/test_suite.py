@@ -11966,20 +11966,32 @@ check("compare bell: disabled with 'No seller email on file' when nobody qualifi
       == '<button type="button" class="cmp-bell" disabled title="No seller email on file" '
          'aria-label="No seller email on file">🔔</button>')
 
-# Email text, rank / unranked variants, disclosure.
-_ns, _nb = lf._compare_nudge_email("Sally", "Varda Space", "https://L", 1, 2)
-check("compare nudge email: subject, greeting, link, rank sentence, signature, disclosure",
+# Email text: one fixed sentence, no rank; disclosure.
+_ns, _nb = lf._compare_nudge_email("Sally", "Varda Space", "https://L")
+_cta = ("See how your terms compare with the other offerings, and add or update your fees directly on the page "
+        "to see how you rank.")
+check("compare nudge email: subject, greeting, link, the one CTA sentence, signature, disclosure",
       _ns == "Varda Space: see how your SPV terms compare"
       and _nb.startswith("Hi Sally,\n\nBuyers can now compare every Varda Space SPV offering side by side. Please "
-                         "visit this page to compare competing SPVs and see where yours ranks:\nhttps://L\n\n")
-      and "At a $100K investment, 5x outcome and 5 years, your offering currently ranks #1 of 2. You can update "
-          "your fees directly on the page." in _nb
-      and "Best wishes,\nChad Gracia" in _nb and all(t in _nb for t in lf.RMS_DISCLOSURE_PARAGRAPHS)
-      and _nb.index("Chad Gracia\n") < _nb.index(lf.RMS_DISCLOSURE_PARAGRAPHS[0]))
-check("compare nudge email: unranked variant",
-      "Your offering isn't ranked yet — add your fees to see where it stands."
-      in lf._compare_nudge_email("Bo", "X", "L", None, 2)[1]
-      and "currently ranks" not in lf._compare_nudge_email("Bo", "X", "L", None, 2)[1])
+                         "visit this page to compare competing SPVs and see where yours ranks:\nhttps://L\n\n"
+                         + _cta + "\n\nBest wishes,\nChad Gracia")
+      and all(t in _nb for t in lf.RMS_DISCLOSURE_PARAGRAPHS)
+      and _nb.index("Chad Gracia\n") < _nb.index(lf.RMS_DISCLOSURE_PARAGRAPHS[0])
+      and not hasattr(lf, "_compare_nudge_rank"))
+
+
+def _no_rank(text):
+    return ("currently ranks" not in text and "isn't ranked" not in text and "add your fees" not in text
+            and not re.search(r"#\d+ of \d+", text) and "$100K investment" not in text)
+
+
+_np_min = json.loads(json.dumps(_cmp_d2))
+_np_min["custom_fields"][lf.TICKET_MIN_FIELD] = 250_000   # below-min at $100K
+_np_cases = {"ranked": _cmp_d1, "below-min": _np_min, "all-blank": _cmp_noval}
+for _nk, _nd in _np_cases.items():
+    _pv = lf._compare_nudge_preview(_nd, "Varda Space")
+    check(f"compare nudge preview ({_nk}): the CTA sentence, no rank numbers or 'add your fees' text",
+          bool(_pv) and all(_cta in m["body"] and _no_rank(m["body"]) for m in _pv))
 
 # Personal login link lands on the compare page (allowlisted destination only).
 _nl = lf._compare_nudge_link(CMP_SELLER, "7001")
@@ -12017,7 +12029,7 @@ check("compare nudge POST: one email per recipient — From Chad, Reply-To + BCC
 _mb = _m.get("Message", {}).get("Body", {}).get("Text", {}).get("Data", "")
 check("compare nudge POST: subject, rank sentence, personal compare link, disclosure in the sent email",
       _m["Message"]["Subject"]["Data"] == "Varda Space: see how your SPV terms compare"
-      and _mb.startswith("Hi Sally,") and "your offering currently ranks #1 of 2." in _mb
+      and _mb.startswith("Hi Sally,") and _cta in _mb and _no_rank(_mb)
       and "/login/" in _mb and "?next=compare&company=7001" in _mb and lf.RMS_DISCLOSURE_PARAGRAPHS[-1] in _mb)
 _nrec = [p for p in _cmp_table.puts if p.get("sk") == "nudge#6001"]
 check("compare nudge POST: throttle record (sent_at, recipients, actor) + audit item; no Pipeline writes",

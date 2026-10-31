@@ -21294,42 +21294,31 @@ def _compare_nudge_link(email, company_id):
     return base + "?next=compare" + (f"&company={company_id}" if company_id and str(company_id).isdigit() else "")
 
 
-def _compare_nudge_rank(deal):
-    """(rank, total) as buyers see it at $100K / 5x / 5 yrs, or (None, total)."""
-    entry = _compare_offerings(False).get(_compare_company_key(deal))
-    if not entry:
-        return None, 0
-    rows, _ = _compare_rows(entry, "buyer")
-    total = sum(1 for r in rows if r["status"] == "ranked")
-    row = next((r for r in rows if str(r["deal"].get("id")) == str(deal.get("id"))), None)
-    return (row["rank"] if row and row["status"] == "ranked" else None), total
+COMPARE_NUDGE_CTA = ("See how your terms compare with the other offerings, and add or update your fees "
+                     "directly on the page to see how you rank.")
 
 
-def _compare_nudge_email(first_name, company, link, rank, total):
-    """(subject, plain-text body) -- disclosure under the signature."""
+def _compare_nudge_email(first_name, company, link):
+    """(subject, plain-text body) -- the same sentence for every recipient
+    (the email never computes or mentions a rank); disclosure under the
+    signature."""
     subject = f"{company}: see how your SPV terms compare"
-    if rank:
-        rank_line = (f"At a $100K investment, 5x outcome and 5 years, your offering currently ranks "
-                     f"#{rank} of {total}. You can update your fees directly on the page.")
-    else:
-        rank_line = "Your offering isn't ranked yet — add your fees to see where it stands."
     body = (f"Hi {first_name},\n\n"
             f"Buyers can now compare every {company} SPV offering side by side. Please visit this page to "
             f"compare competing SPVs and see where yours ranks:\n{link}\n\n"
-            f"{rank_line}\n\n"
+            f"{COMPARE_NUDGE_CTA}\n\n"
             "Best wishes,\nChad Gracia\n\n---\n" + "\n\n".join(RMS_DISCLOSURE_PARAGRAPHS) + "\n")
     return subject, body
 
 
 def _compare_nudge_preview(deal, company):
     """[{to, subject, body}] -- exactly what Send would deliver."""
-    rank, total = _compare_nudge_rank(deal)
     out = []
     for rcp in _compare_nudge_recipients(deal):
         link = _compare_nudge_link(rcp["email"], _deal_company_id(deal))
         if not link:
             continue
-        subject, body = _compare_nudge_email(rcp["first_name"], company, link, rank, total)
+        subject, body = _compare_nudge_email(rcp["first_name"], company, link)
         out.append({"to": rcp["email"], "subject": subject, "body": body})
     return out
 
