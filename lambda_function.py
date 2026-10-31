@@ -19904,10 +19904,6 @@ COMPARE_FEE_FIELDS = {"upfront": SELLER_FEE_FIELD, "mgmt": MGMT_FEE_FIELD, "carr
 COMPARE_FEE_LABELS = {"upfront": "upfront fee", "mgmt": "management fee", "carry": "carry"}
 COMPARE_UNAVAILABLE_MSG = "Offerings are being updated — please check back shortly."
 COMPARE_RAISE_MSG = "To raise fees, use Update deal"
-COMMISSION_TIERS_URL = "https://desk.graciagroup.com/?view=commission-tiers"
-COMPARE_BUYER_NUDGE_HTML = (
-    "Chad's commission is charged on top of the offering terms. Gold and Platinum clients receive "
-    f'15–20% off commission — <a href="{COMMISSION_TIERS_URL}">see your standing</a>')
 
 # deal-fresh overlay: chadgracia/deal-update-form's publish_fresh_deal writes
 # s3://full-pipeline-cache/deal-fresh/<deal_id>.json = {"fetched_at", "deal"}
@@ -20376,7 +20372,6 @@ COMPARE_CSS = """
   .cmp-msg { font-size: 11px; display: block; margin-top: 2px; white-space: normal; }
   .cmp-msg.error { color: #B42318; }
   .cmp-msg.warn { color: #C2410C; }
-  .cmp-nudge { margin: 14px 2px 0; font-size: 13px; color: var(--muted); }
   .cmp-commission { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 14px;
                     margin: 0 0 12px; font-size: 13.5px; }
   .cmp-comm-main { font-weight: 600; }
@@ -21006,7 +21001,6 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
         data_key = f' data-key="{_esc(key)}"' + (f' data-view-as="{_esc(view_as)}"' if impersonating and view_as else "")
     data_key += ' data-admin="1"' if key else ""
     n = len(live_rows)
-    nudge = f'<p class="cmp-nudge">{COMPARE_BUYER_NUDGE_HTML}</p>' if role == "buyer" else ""
     body = (f'{back}<h1>{_esc(company)} SPV offerings</h1>'
             f'<p class="cmp-sub">{n} live offering{"s" if n != 1 else ""}. {_esc(COMPARE_SUBTITLE_LEAD)} '
             f'{_esc(COMPARE_FEES_SUBTITLE)} Click a column to sort.</p>'
@@ -21022,7 +21016,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f' data-inv="{investment}"{data_key}>'
             f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'
             f'<p class="cmp-info-note">{_esc(COMPARE_INFO_NOTE)}</p>'
-            f'{nudge}{COMPARE_SCRIPT}')
+            f'{COMPARE_SCRIPT}')
     return _compare_shell(f"{company} offerings", header_html, body)
 
 

@@ -11274,9 +11274,10 @@ check("compare buyer view: no deal ids, firm/person names, emails or deal value"
       and _cb.count("6005") == 1 and 'href="https://trades.graciagroup.com/deal/6005"' in _cb)
 check("compare buyer view: gross price shown, never net",
       "$33.00" in _cb and "$30.00" not in _cb and "$31.00" not in _cb)
-check("compare buyer view: commission nudge with the tiers link, no commission figures",
-      "Chad's commission is charged on top of the offering terms. Gold and Platinum clients receive 15–20% off commission"
-      in _cb and 'href="https://desk.graciagroup.com/?view=commission-tiers"' in _cb)
+check("compare buyer view: old one-line commission note is gone (the RMS commission box replaces it)",
+      "Chad's commission is charged on top" not in _cb and "15–20% off commission" not in _cb
+      and 'class="cmp-nudge"' not in _cb and not hasattr(lf, "COMPARE_BUYER_NUDGE_HTML")
+      and 'id="cmp-commission"' in _cb)
 check("compare buyer view: Hold row hidden", ">Hold<" not in _cb and "6003" not in _cb)
 check("compare: Direct deal never listed; new allocation without valuation shows 'Not provided' + assumed note",
       "Not provided" in _cb and "valuation assumed" in _cb)
