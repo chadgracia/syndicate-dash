@@ -5588,15 +5588,23 @@ def validate_bio_batch(raw):
     return entries, None
 
 
-def _bio_card_html(headline, points):
+def _bio_card_html(headline, points, edit_html=""):
     """Bio card: the headline is the card title, points are bullets
-    under it. No headline -> untitled points; both empty -> nothing."""
-    if not headline and not points:
+    under it. No headline -> untitled points; both empty -> nothing,
+    unless edit_html (Admin view's _bio_edit_html) is passed: then the
+    card renders with a muted "Public bio (empty)" title and the editor
+    below the bullets."""
+    if not headline and not points and not edit_html:
         return ""
-    title_html = f'<h2 class="buyer-section-heading bio-headline">{_esc(headline)}</h2>' if headline else ""
+    if headline:
+        title_html = f'<h2 class="buyer-section-heading bio-headline">{_esc(headline)}</h2>'
+    elif not points and edit_html:
+        title_html = '<h2 class="buyer-section-heading bio-headline bio-empty">Public bio (empty)</h2>'
+    else:
+        title_html = ""
     items = "".join(f'<li>{_esc(p)}</li>' for p in points)
     list_html = f'<ul class="bio-points">{items}</ul>' if points else ""
-    return f'<div class="card bio-card">{title_html}{list_html}</div>'
+    return f'<div class="card bio-card">{title_html}{list_html}{edit_html}</div>'
 
 
 def _bio_edit_html(person_id, bio_text):
@@ -15585,14 +15593,15 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 closer_kind = _closer_kind(rec, _build_firm_won_index())
                 # Public Bio: the bio card (headline = title, points =
                 # bullets) sits under the header card. edit_mode
-                # (admin key + Admin view) adds the inline editor, even
-                # when the bio is empty; Tenant view / tenants never get it.
+                # (admin key + Admin view) adds the inline editor inside
+                # the bio card, below the bullets -- even when the bio is
+                # empty ("Public bio (empty)"); Tenant view / tenants never
+                # get it. The header card carries no bio editor.
                 bio_text = _person_public_bio(rec)
                 bio_headline, bio_points = parse_public_bio(bio_text)
                 bio_edit_on = bool(edit_mode and key)
+                bio_edit_html = _bio_edit_html(buyer_id, bio_text) if bio_edit_on else ""
                 header_html = _buyer_header_html(rec, closer_kind, key=key, view_as=view_as,
-                                                 bio_edit_html=(_bio_edit_html(buyer_id, bio_text)
-                                                                if bio_edit_on else ""),
                                                  show_phones=show_phones)
                 standing_html = _standing_buyer_page_card_html(buyer_id, admin=key is not None)
 
@@ -15628,7 +15637,7 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 body_html = (
                     '<div class="buyer-columns">'
                     f'<div class="buyer-col-left"><div class="bp-slot bp-o1">{header_html}</div>'
-                    f'<div class="bp-slot bp-o2">{_bio_card_html(bio_headline, bio_points)}</div>'
+                    f'<div class="bp-slot bp-o2">{_bio_card_html(bio_headline, bio_points, bio_edit_html)}</div>'
                     f'<div class="bp-slot bp-o5">{about_html}</div>'
                     f'<div class="bp-slot bp-o6">{history_html}</div></div>'
                     f'<div class="buyer-col-right"><div class="bp-slot bp-o3">{track_html}</div>'
@@ -15785,6 +15794,8 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
   .nh-author {{ font-weight: 600; color: var(--ink); }}
   .nh-text {{ font-size: 14px; line-height: 1.45; overflow-wrap: anywhere; }}
   .bio-points {{ margin: 0; padding-left: 0; list-style: none; font-size: 14px; line-height: 1.5; }}
+  .bio-headline.bio-empty {{ color: var(--text-secondary, #8a8a8a); font-weight: 500; }}
+  .bio-card .bio-edit {{ margin-top: 12px; }}
   .bio-points li {{ margin-top: 6px; }}
   .bio-points li:first-child {{ margin-top: 0; }}
   .bio-points li::before {{ content: "•"; color: var(--muted); margin-right: 8px; }}

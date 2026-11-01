@@ -6658,7 +6658,7 @@ check("display: headline-only bio hides the 'Before your call' card", "Before yo
 bio_table.items.append({"tenant": "__bios__", "sk": "bio#4", "bio": "", "updated_at": "2026-09-02T00:00:00Z"})
 carol_cleared = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMAIL, key=None, view_as=None, edit_mode=False)
 check("display: a fresh empty Dynamo bio (newer than snapshot) renders nothing until the refresh",
-      "Carol CRM headline" not in carol_cleared and "bio-headline" not in carol_cleared)
+      "Carol CRM headline" not in carol_cleared and 'class="buyer-section-heading bio-headline' not in carol_cleared)
 
 # Pipeline is the source of truth: once a snapshot newer than the Dynamo
 # write lands, the Pipeline value wins (incl. an edit made in Pipeline).
@@ -6695,6 +6695,23 @@ admin_empty = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMAIL
 check("admin view: editor shown even when the bio is empty, with placeholder",
       'id="bio-edit-text"' in admin_empty and 'placeholder="Headline • point • point"' in admin_empty
       and "?action=save_bio" in admin_empty)
+def _bio_card_slice(page):
+    i = page.find('class="card bio-card"')
+    return page[i:page.find('class="bp-slot', i)] if i >= 0 else ""
+def _header_slice(page):
+    i = page.find('class="card buyer-header"')
+    return page[i:page.find('class="bp-slot', i)] if i >= 0 else ""
+check("admin view: bio editor sits inside the bio card, below the bullets, not in the header card",
+      'id="bio-edit-text"' in _bio_card_slice(admin_edit) and 'id="bio-edit-text"' not in _header_slice(admin_edit)
+      and _bio_card_slice(admin_edit).find('class="bio-points"') < _bio_card_slice(admin_edit).find('id="bio-edit-text"'))
+check("admin view: empty bio still renders the card with muted 'Public bio (empty)' + editor",
+      ">Public bio (empty)</h2>" in _bio_card_slice(admin_empty) and 'id="bio-edit-text"' in _bio_card_slice(admin_empty)
+      and 'id="bio-edit-text"' not in _header_slice(admin_empty))
+_bio_tv_empty = lf.render_buyer_page("4", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
+                                     view_as=TENANT_EMAIL, edit_mode=False)
+check("tenants / admin Tenant view: no empty bio card, no editor",
+      "Public bio (empty)" not in _bio_tv_empty and 'id="bio-edit-text"' not in _bio_tv_empty
+      and "Public bio (empty)" not in lf._bio_card_html("", []))
 check("admin Tenant view (edit_mode False): no bio editor",
       'id="bio-edit-text"' not in lf.render_buyer_page("2", "Sella Seller", bio_tenant, TENANT_EMAIL, key=ADMIN_KEY,
                                                    view_as=TENANT_EMAIL, edit_mode=False))
