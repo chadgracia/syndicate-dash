@@ -12293,6 +12293,51 @@ _en_rr2, _en_er2 = lf.compare_joint_ranks(_en_rows, [{"upfront": 50, "mgmt": 5, 
 check("compare entries (server mirror): a worse entry ranks last; live ranks unchanged",
       _en_er2 == [len(_en_rr2) + 1] and _en_rr2[id(_en_best)] == 1)
 
+# "Ask Chad to beat this" only when the entry beats or ties the best LIVE offering.
+_ab_rows, _ab_ref = lf._compare_rows(_en_entry, "buyer")
+lf._compare_rank_rows(_ab_rows, 100_000, 5, 5, _ab_ref)
+_ab_best = min((r for r in _ab_rows if r["status"] == "ranked"), key=lambda r: r["rank"])
+check("compare beat rule (server mirror): beats -> True, ties -> True, worse -> False; other entries ignored",
+      lf.compare_entry_beats_best(_ab_rows, _en_top, 100_000, 5, 5, _ab_ref)
+      and lf.compare_entry_beats_best(_ab_rows, _en_tie, 100_000, 5, 5, _ab_ref)
+      and not lf.compare_entry_beats_best(_ab_rows, {"upfront": 50, "mgmt": 5, "carry": 50, "valuation": None},
+                                          100_000, 5, 5, _ab_ref))
+_ab_unranked = [dict(r, status="none") for r in _ab_rows]
+check("compare beat rule: no ranked live offerings -> the button shows (True), even for a poor entry",
+      lf.compare_entry_beats_best([], {"upfront": 50, "mgmt": 5, "carry": 50, "valuation": None}, 100_000, 5, 5, None)
+      and lf.compare_entry_beats_best(_ab_unranked, {"upfront": 50, "mgmt": 5, "carry": 50, "valuation": None},
+                                      100_000, 5, 5, _ab_ref))
+_ab_lim = [dict(r, status="min") if r is _ab_best else r for r in _ab_rows]
+check("compare beat rule: a live row outside its ticket limits (not ranked) is ignored",
+      lf.compare_entry_beats_best(_ab_lim, _en_tie, 100_000, 5, 5, _ab_ref) is True)
+_ab_js = _en_pure + """
+console.log(JSON.stringify({
+  beats: beatsBest(500000, [480000, 410000]), tie: beatsBest(480000, [480040, 410000]),
+  worse: beatsBest(479000, [480000]), none: beatsBest(1, []),
+  entriesIgnored: beatsBest(480000, [480000])}));"""
+_ab_out = json.loads(subprocess.run(["node", "-e", _ab_js], capture_output=True, text=True, check=True).stdout)
+check("compare beat rule (client beatsBest): beats/ties true, worse false, no ranked live -> true",
+      _ab_out == {"beats": True, "tie": True, "worse": False, "none": True, "entriesIgnored": True})
+check("compare beat rule (client): recompute toggles button vs muted text from live rows only, on every "
+      "investment/outcome/years change and entry add/edit",
+      "var liveBacks = ranked.filter(function(tr) { return !isEntry(tr); })" in lf.COMPARE_SCRIPT
+      and "var beats = beatsBest(tr.__back, liveBacks);" in lf.COMPARE_SCRIPT
+      and "if (btn) btn.hidden = !(beats || sent);" in lf.COMPARE_SCRIPT
+      and "if (no) no.hidden = beats || sent;" in lf.COMPARE_SCRIPT
+      and "outcomeSel.addEventListener('change', recompute);" in lf.COMPARE_SCRIPT
+      and "yearsSel.addEventListener('change', recompute);" in lf.COMPARE_SCRIPT
+      and lf.COMPARE_SCRIPT.count("recompute();") >= 2
+      and "window.ggCompare.recompute();" in lf.COMPARE_ENTRY_SCRIPT
+      and "'cmp-beat-no', 'Our best offering already beats this.'" in lf.COMPARE_ENTRY_SCRIPT
+      and ".cmp-beat-no {" in lf.COMPARE_CSS)
+check("compare beat rule (client): 'Sent ✓' state stays regardless of later ranking changes",
+      "if (e.sent) beat.setAttribute('data-sent', '1');" in lf.COMPARE_ENTRY_SCRIPT
+      and "btn.setAttribute('data-sent', '1');" in lf.COMPARE_ENTRY_SCRIPT
+      and "var sent = !!btn && btn.getAttribute('data-sent') === '1';" in lf.COMPARE_SCRIPT
+      and "beat.disabled = !!e.sent;" in lf.COMPARE_ENTRY_SCRIPT)
+check("compare beat rule (client): a server not_best refusal swaps in the muted text",
+      "if (res.d && res.d.not_best) {" in lf.COMPARE_ENTRY_SCRIPT)
+
 # POST ?action=compare_beat
 _bt_pipe = []
 _bt_saved_urlopen = lf.urllib.request.urlopen
@@ -12300,7 +12345,7 @@ lf.urllib.request.urlopen = lambda req, timeout=15: _bt_pipe.append(req.full_url
 
 
 def _bt_body(**kw):
-    b = {"company": "7001", "name": "Broker X SPV", "upfront": 2, "mgmt": 1.5, "carry": 10, "valuation": None,
+    b = {"company": "7001", "name": "Broker X SPV", "upfront": 0, "mgmt": 0.5, "carry": 0, "valuation": None,
          "investment": 250000, "outcome": 5, "years": 5}
     b.update(kw)
     return b
@@ -12338,6 +12383,14 @@ finally:
     _li_deals.remove(_bt_li)
 check("compare beat: buyer with a live intro on the company -> rejected (409), nothing sent",
       _bt_r_li["statusCode"] == 409 and not ses_calls and not _bt_items())
+_bt_puts0 = len(_cmp_table.puts)
+_bt_nb = [_bt_post(_bt_body(name=f"Worse {i}", upfront=2, mgmt=1.5, carry=10), [tenant_cookie(CMP_BUYER)])
+          for i in range(7)]
+check("compare beat: entry that doesn't beat/tie the best live offering -> 409 'Our best offering already beats "
+      "this.', no email, no rate-limit record (7 tries, limits untouched)",
+      all(r["statusCode"] == 409 and json.loads(r["body"]) == {
+          "error": "Our best offering already beats this.", "not_best": True} for r in _bt_nb)
+      and not ses_calls and not _bt_items() and len(_cmp_table.puts) == _bt_puts0)
 _bt1 = _bt_post(_bt_body(), [tenant_cookie(CMP_BUYER)])
 _bm = ses_calls[-1] if ses_calls else {}
 _bmb = _bm.get("Message", {}).get("Body", {}).get("Text", {}).get("Data", "")
@@ -12351,7 +12404,7 @@ check("compare beat email: buyer name, email, Pipeline person link; terms labele
       "Buyer: Bea Buyer" in _bmb and f"Email: {CMP_BUYER}" in _bmb
       and "Pipeline: https://app.pipelinecrm.com/people/503" in _bmb
       and "BUYER-ENTERED, UNVERIFIED TERMS" in _bmb and "Name: Broker X SPV" in _bmb
-      and "Upfront: 2%" in _bmb and "Mgmt: 1.5%/yr" in _bmb and "Carry: 10%" in _bmb
+      and "Upfront: 0%" in _bmb and "Mgmt: 0.5%/yr" in _bmb and "Carry: 0%" in _bmb
       and "Settings: $250K investment · 5x outcome · 5 years to exit" in _bmb
       and "Rank among live offerings: #" in _bmb and "(your entry)" in _bmb)
 check("compare beat email: live offerings with ranks at those settings + admin compare link (view_as the buyer)",
@@ -12367,7 +12420,10 @@ _bt_dup = _bt_post(_bt_body(investment=500000, outcome=10), [tenant_cookie(CMP_B
 check("compare beat: identical entry again within 24h -> 'Already sent — Chad will be in touch.', no email",
       _bt_dup["statusCode"] == 429 and json.loads(_bt_dup["body"]) == {
           "error": "Already sent — Chad will be in touch.", "limited": True} and not ses_calls)
-_bt_more = [_bt_post(_bt_body(name=f"Broker {i}"), [tenant_cookie(CMP_BUYER)])["statusCode"] for i in range(5)]
+_bt_more = [_bt_post(_bt_body(name=f"Broker {i}", **({"upfront": 4, "mgmt": 0} if i == 0 else {})),
+                    [tenant_cookie(CMP_BUYER)])["statusCode"] for i in range(5)]
+check("compare beat: an entry that only TIES the best live offering (4/0/0 vs Offering A) is sent",
+      _bt_more[0] == 200)
 check("compare beat: max 5 sends per buyer per 24h (6th distinct entry -> limited)",
       _bt_more == [200, 200, 200, 200, 429] and len(ses_calls) == 4
       and json.loads(_bt_post(_bt_body(name="Broker 9"), [tenant_cookie(CMP_BUYER)])["body"]).get("limited") is True)

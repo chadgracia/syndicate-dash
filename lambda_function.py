@@ -20753,6 +20753,7 @@ COMPARE_CSS = """
                   border-radius: 9999px; font: inherit; font-size: 11px; font-weight: 600; color: var(--accent);
                   background: #fff; cursor: pointer; white-space: normal; text-align: left; }
   .cmp-beat-btn[disabled] { cursor: default; opacity: .75; border-color: var(--line); color: var(--qp); }
+  .cmp-beat-no { display: block; margin-top: 5px; font-size: 11px; color: var(--muted); white-space: normal; }
   .cmp-table tr.cmp-divider td { position: static; width: auto; min-width: 0; max-width: none; font-size: 11px;
                                  font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
                                  background: var(--bg); }
@@ -20854,6 +20855,12 @@ COMPARE_SCRIPT = (r"""<script>
   }
   function rankText(r, isEntry) { return r === null ? '\u2014' : '#' + r + (isEntry ? ' (your entry)' : ''); }
   function showBest(r, isEntry) { return r === 1 && !isEntry; }
+  // An entry may ask Chad to beat it only when it beats or ties (same $100
+  // rounding) the best ranked LIVE offering; other entries are ignored.
+  function beatsBest(entryBack, liveBacks) {
+    var e = Math.floor(entryBack / 100 + 0.5);
+    return liveBacks.every(function(v) { return e >= Math.floor(v / 100 + 0.5); });
+  }
   // @@RANK_END
   function isEntry(tr) { return tr.getAttribute('data-entry') === '1'; }
   function fee(tr, f) { return num(tr.getAttribute('data-' + f)) || 0; }
@@ -20958,6 +20965,16 @@ COMPARE_SCRIPT = (r"""<script>
     var nLive = ranked.filter(function(tr) { return !isEntry(tr); }).length;
     var jointRanks = competitionRanks(ranked.map(function(tr) { return tr.__back; }));
     ranked.forEach(function(tr, i) { tr.__rank = jointRanks[i]; });
+    var liveBacks = ranked.filter(function(tr) { return !isEntry(tr); }).map(function(tr) { return tr.__back; });
+    ranked.forEach(function(tr) {
+      if (!isEntry(tr)) return;
+      var beats = beatsBest(tr.__back, liveBacks);
+      tr.setAttribute('data-beats', beats ? '1' : '0');
+      var btn = tr.querySelector('.cmp-beat-btn'), no = tr.querySelector('.cmp-beat-no');
+      var sent = !!btn && btn.getAttribute('data-sent') === '1';
+      if (btn) btn.hidden = !(beats || sent);
+      if (no) no.hidden = beats || sent;
+    });
     all.forEach(function(tr) {
       var r = tr.__st === 'ranked' ? tr.__rank : null;
       var ent = isEntry(tr);
@@ -21421,6 +21438,7 @@ COMPARE_ENTRY_FEE_MAX = 50
 COMPARE_BEAT_LABEL = "Ask Chad to beat this"
 COMPARE_BEAT_SENT_LABEL = "Sent ✓ — Chad will be in touch"
 COMPARE_BEAT_LIMIT_MSG = "Already sent — Chad will be in touch."
+COMPARE_BEAT_NOT_BEST_MSG = "Our best offering already beats this."
 COMPARE_BEAT_PARTITION = "__compare_beat__"
 COMPARE_BEAT_WINDOW_SECONDS = 24 * 3600
 COMPARE_BEAT_MAX_PER_DAY = 5
@@ -21452,6 +21470,17 @@ def compare_joint_ranks(rows, entries, investment, outcome, years, ref):
     ranks = compare_competition_ranks(proceeds)
     return ({k[1]: v for k, v in ranks.items() if k[0] == "row"},
             [ranks[("entry", i)] for i in range(len(entries))])
+
+
+def compare_entry_beats_best(rows, entry, investment, outcome, years, ref):
+    """True when the entry's "You get back" (rounded like the ranks) is >= every
+    ranked live row's at these settings (rows already run through
+    _compare_rank_rows); True when no live row is ranked. Mirrors
+    COMPARE_SCRIPT beatsBest."""
+    back, _, _ = compare_proceeds(investment, entry["upfront"], entry["mgmt"], entry["carry"], outcome, years, ref,
+                                  entry.get("valuation"))
+    e = math.floor(back / COMPARE_RANK_ROUND + 0.5)
+    return all(e >= math.floor(r["proceeds"] / COMPARE_RANK_ROUND + 0.5) for r in rows if r.get("status") == "ranked")
 
 
 def _compare_entries_html(company_key, key=None, view_as=None):
@@ -21536,7 +21565,11 @@ COMPARE_ENTRY_SCRIPT = (r"""<script>
       lab.appendChild(acts);
       var beat = el('button', 'cmp-beat-btn', e.sent ? '@@SENT@@' : '@@BEAT@@'); beat.type = 'button';
       beat.disabled = !!e.sent;
-      lab.appendChild(el('div')).appendChild(beat);
+      if (e.sent) beat.setAttribute('data-sent', '1');
+      var beatWrap = lab.appendChild(el('div'));
+      beatWrap.appendChild(beat);
+      var beatNo = el('span', 'cmp-beat-no', '@@NOTBEST@@'); beatNo.hidden = true;
+      beatWrap.appendChild(beatNo);
       var bmsg = el('span', 'cmp-msg'); bmsg.hidden = true; lab.appendChild(bmsg);
       tr.appendChild(lab);
       tr.appendChild(td('rank', 'num', '', el('span', 'cmp-rank-v', '—')));
@@ -21622,6 +21655,7 @@ COMPARE_ENTRY_SCRIPT = (r"""<script>
     btn.disabled = true; btn.textContent = 'Sending…';
     function done() {
       e.sent = true; save(entries);
+      btn.setAttribute('data-sent', '1');
       btn.textContent = '@@SENT@@';
     }
     fetch('?action=compare_beat', {method: 'POST', credentials: 'same-origin',
@@ -21630,6 +21664,11 @@ COMPARE_ENTRY_SCRIPT = (r"""<script>
       .then(function(res) {
         if (res.ok && res.d.ok) { done(); return; }
         if (res.d && res.d.limited) { done(); bmsg.className = 'cmp-msg'; bmsg.textContent = res.d.error; bmsg.hidden = false; return; }
+        if (res.d && res.d.not_best) {
+          btn.disabled = false; btn.textContent = '@@BEAT@@'; btn.hidden = true;
+          var no = tr.querySelector('.cmp-beat-no'); if (no) no.hidden = false;
+          return;
+        }
         btn.disabled = false; btn.textContent = '@@BEAT@@';
         bmsg.className = 'cmp-msg error'; bmsg.textContent = (res.d && res.d.error) || 'Send failed.'; bmsg.hidden = false;
       })
@@ -21642,7 +21681,7 @@ COMPARE_ENTRY_SCRIPT = (r"""<script>
 })();
 </script>""".replace("@@NAMEMAX@@", str(COMPARE_ENTRY_NAME_MAX)).replace("@@FEEMAX@@", str(COMPARE_ENTRY_FEE_MAX))
     .replace("@@CHIP@@", COMPARE_ENTRY_CHIP).replace("@@SENT@@", COMPARE_BEAT_SENT_LABEL)
-    .replace("@@BEAT@@", COMPARE_BEAT_LABEL))
+    .replace("@@BEAT@@", COMPARE_BEAT_LABEL).replace("@@NOTBEST@@", COMPARE_BEAT_NOT_BEST_MSG))
 
 
 def render_compare_company(company_param, role, header_html, scope=frozenset(), key=None, view_as=None,
@@ -22373,6 +22412,18 @@ def _handle_compare_beat(event):
     except Exception as e:
         print(f"compare_beat: live-intro check failed: {type(e).__name__}: {e}")
         return _json_response({"error": "Could not send right now — please try again."}, 503)
+
+    # Only an entry that beats or ties the best live offering may be sent
+    # (checked before the rate limits, so a refusal never consumes them).
+    try:
+        live_rows, live_ref = _compare_rows(company_entry, "buyer")
+        _compare_rank_rows(live_rows, investment, outcome, years, live_ref)
+    except Exception as e:
+        print(f"compare_beat: live ranking failed: {type(e).__name__}: {e}")
+        return _json_response({"error": COMPARE_UNAVAILABLE_MSG}, 503)
+    if not compare_entry_beats_best(live_rows, {"valuation": valuation, **fees}, investment, outcome, years,
+                                    live_ref):
+        return _json_response({"error": COMPARE_BEAT_NOT_BEST_MSG, "not_best": True}, 409)
 
     company_key = company_entry["company_id"] or company_entry["company"].lower()
     fp = _compare_beat_fingerprint(company_key, name, fees["upfront"], fees["mgmt"], fees["carry"], valuation)
