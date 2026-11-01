@@ -4,8 +4,6 @@ Where it lives: Pipeline person field "Public Bio" (custom_label_3801446) is the
 
 Format: "<headline> • <point> • <point>" as plain text, split on "•", max 1500 characters. No HTML, no markdown. The headline is the bio card's title; each point is a bullet under it.
 
-Firm text: the company's Pipeline Summary field shows to sellers in the "About <firm>" card. Use the firm's own website description, kept very short (under ~100 words).
-
 1. Verify identity first: a source counts only if it matches at least 2 CRM facts (email domain, LinkedIn URL, company, city). If identity is unverified, write nothing and flag the person for Chad.
 2. Never repeat anything the header card shows: name, firm/company, title, location, email, phone, LinkedIn, ID verified, Investor Level/QP, ticket size, Transactor Type.
 3. Headline: a one-line characterization of the investor, under 100 characters — no firm name, title or tenure. Example: "Experienced and active investor in leading unicorns, with focus on AI, space, defense tech."
@@ -21,3 +19,14 @@ Firm text: the company's Pipeline Summary field shows to sellers in the "About <
 
 Example (approved Oct 2026):
 Experienced and active investor in leading unicorns, with focus on AI, space, defense tech. • Investing record: active syndicator who raises SPVs for his investors; PitchBook records 18 investments for his firm, and his LinkedIn shows late-stage positions including SpaceX, Groq, Figure, Perplexity and OpenAI. • Previously Partner at a VC firm (2017–2020), led AI investments on a fund's founding team, and ran angel investments for a family office; began in software and investment banking. • Background suggests a sophisticated investor and hard bargainer.
+
+## Firm Summary rules (Pipeline company Summary, shown to sellers on the "About <firm>" card)
+1. Facts only, 50–70 words, neutral tone, no marketing adjectives (leading, exceptional, trusted, world-class…), never first person (we/our/I/my).
+2. Order: firm type; founded year and founder; HQ and offices; size (AUM, fund size or number of investments) if public; stage and sector focus; 2–3 notable investments or exits.
+3. Sources: PitchBook, Crunchbase, CB Insights, SEC/regulatory filings, press. The firm's own claims are attributed ("says it invests in…"), never stated as fact. End with "(Sources: …)".
+4. No overlap with the person's bio: firm facts on the firm card, the person's role and career in the bio.
+5. Never include: notes, opinions or judgments, deal/trade history, fees or terms, contact names, status tags (INACTIVE etc.), anything from KYC/IQF/CEF, tax IDs, beneficial owners. Internal notes go in company Notes.
+6. If fewer than 2 facts can be verified, leave the Summary empty. Existing PitchBook-style Summaries are acceptable as-is; rewrite on introduction if they are website/marketing copy.
+7. pipeline-agent enforces the same rules (SUMMARY_RULES) when it creates or updates companies.
+
+Example: "Technology investment firm founded in 2020 by Abishek Surendran; started in Bengaluru, now headquartered in Dubai with a presence in the US and India. Says it invests in AI, space, defense, energy and frontier tech at the growth stage; earlier also bought IT-services companies. PitchBook records 18 investments, including SpaceX (exited via IPO, Jun 2026) and Mach Industries. (Sources: PitchBook, CB Insights, firm website)"
