@@ -20260,6 +20260,7 @@ COMPARE_UNRANKED_DIVIDER = "Fees not yet provided"
 COMPARE_CONFIRM_FEES_PROMPT = "Confirm your remaining fees to rank accurately."
 COMPARE_ADD_FEES_PROMPT = "Add your fees to be ranked against the other offerings."
 COMPARE_ASK_URL = "https://trades.graciagroup.com/deal/{}"
+COMPARE_VIEW_DEAL_LABEL = "View deal →"
 COMPARE_SHARE_CLASS_LABELS = {5077831: "Common", 5077834: "Preferred", 5077912: "Mixed", 5077915: "Any"}
 COMPARE_OUTCOMES = (2, 5, 10)
 COMPARE_DEFAULT_OUTCOME = 5
@@ -20729,6 +20730,29 @@ COMPARE_CSS = """
   .cmp-partial { font-size: 11px; color: var(--muted); margin-top: 3px; }
   .cmp-prompt { font-size: 11px; color: #C2410C; margin-top: 3px; }
   .cmp-ask { display: inline-block; font-size: 11px; margin-top: 3px; white-space: nowrap; }
+  .cmp-view { display: block; font-size: 11px; margin-top: 2px; white-space: nowrap; }
+  .cmp-entries { margin: 0 0 12px; font-size: 13px; }
+  .cmp-entry-add { font: inherit; font-size: 13px; font-weight: 600; padding: 6px 12px; border: 1px dashed var(--accent);
+                   border-radius: 8px; background: #fff; color: var(--accent); cursor: pointer; }
+  .cmp-entry-add[disabled] { opacity: .55; cursor: default; }
+  .cmp-entry-form { margin-top: 8px; padding: 10px 12px; background: var(--card); border: 1px solid var(--line);
+                    border-radius: 10px; display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: flex-end; }
+  .cmp-entry-form label { display: flex; flex-direction: column; font-size: 11.5px; color: var(--muted); gap: 2px; }
+  .cmp-entry-form input { font: inherit; font-size: 13px; padding: 4px 6px; border: 1px solid var(--line);
+                          border-radius: 6px; width: 84px; color: var(--ink); }
+  .cmp-entry-form input[name="name"] { width: 180px; }
+  .cmp-entry-form button { font: inherit; font-size: 12.5px; padding: 5px 12px; border-radius: 6px; cursor: pointer; }
+  .cmp-entry-note { margin: 6px 2px 0; font-size: 11.5px; color: var(--muted); }
+  .cmp-table tr.cmp-entry td { background: #eef2f7; }
+  .cmp-entry-chip { display: inline-block; margin-top: 4px; padding: 1px 8px; border-radius: 9999px; font-size: 11px;
+                    font-weight: 600; color: #3d5a73; background: #dbe4ee; white-space: nowrap; }
+  .cmp-entry-acts { font-size: 11px; margin-top: 3px; white-space: nowrap; }
+  .cmp-entry-acts button { font: inherit; font-size: 11px; background: none; border: 0; color: var(--accent);
+                           cursor: pointer; padding: 0; }
+  .cmp-beat-btn { display: inline-block; margin-top: 5px; padding: 2px 9px; border: 1px solid var(--accent);
+                  border-radius: 9999px; font: inherit; font-size: 11px; font-weight: 600; color: var(--accent);
+                  background: #fff; cursor: pointer; white-space: normal; text-align: left; }
+  .cmp-beat-btn[disabled] { cursor: default; opacity: .75; border-color: var(--line); color: var(--qp); }
   .cmp-table tr.cmp-divider td { position: static; width: auto; min-width: 0; max-width: none; font-size: 11px;
                                  font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
                                  background: var(--bg); }
@@ -20823,6 +20847,15 @@ COMPARE_SCRIPT = (r"""<script>
     else t = Math.round(a).toLocaleString('en-US');
     return (v < 0 ? '-' : '') + '$' + t;
   }
+  // @@RANK_BEGIN (pure; mirrored by compare_competition_ranks / compare_entry_rank_text)
+  function competitionRanks(values) {
+    var rounded = values.map(function(v) { return Math.floor(v / 100 + 0.5); });
+    return rounded.map(function(x) { var r = 1; rounded.forEach(function(o) { if (o > x) r++; }); return r; });
+  }
+  function rankText(r, isEntry) { return r === null ? '\u2014' : '#' + r + (isEntry ? ' (your entry)' : ''); }
+  function showBest(r, isEntry) { return r === 1 && !isEntry; }
+  // @@RANK_END
+  function isEntry(tr) { return tr.getAttribute('data-entry') === '1'; }
   function fee(tr, f) { return num(tr.getAttribute('data-' + f)) || 0; }
   function feeStatus(tr) {
     var blanks = FEES.filter(function(f) { return num(tr.getAttribute('data-' + f)) === null; }).length;
@@ -20841,6 +20874,7 @@ COMPARE_SCRIPT = (r"""<script>
     return (exitValue - mgmt - carry) / 100;
   }
   function status(tr) {
+    if (isEntry(tr)) return 'ranked';  // buyer entries: all three fees, no ticket limits
     if (feeStatus(tr) === 'none') return 'none';
     if (tr.getAttribute('data-hold') === '1') return 'hold';
     var mn = num(tr.getAttribute('data-min')), mx = num(tr.getAttribute('data-max'));
@@ -20907,8 +20941,10 @@ COMPARE_SCRIPT = (r"""<script>
         var fv = tr.querySelector('td[data-col="' + f + '"] .cmp-fee-v');
         if (fv) { fv.textContent = '\u2014'; fv.classList.toggle('cmp-fee-blank', st === 'none'); }
       });
+      var hasAsk = !!tr.querySelector('.cmp-ask');
       var show = {'.cmp-partial': fs === 'partial', '.cmp-prompt-confirm': fs === 'partial',
-                  '.cmp-prompt-add': st === 'none', '.cmp-ask': st === 'none', '.cmp-rank': st !== 'none'};
+                  '.cmp-prompt-add': st === 'none', '.cmp-ask': st === 'none', '.cmp-rank': st !== 'none',
+                  '.cmp-view': st !== 'none' || !hasAsk};
       Object.keys(show).forEach(function(sel) {
         tr.querySelectorAll(sel).forEach(function(el) { el.hidden = !show[sel]; });
       });
@@ -20919,23 +20955,22 @@ COMPARE_SCRIPT = (r"""<script>
         lim.hidden = st !== 'min' && st !== 'max';
       }
     });
-    var rounded = ranked.map(function(tr) { return Math.floor(tr.__back / 100 + 0.5); });
-    ranked.forEach(function(tr, i) {
-      var r = 1;
-      rounded.forEach(function(o) { if (o > rounded[i]) r++; });
-      tr.__rank = r;
-    });
+    var nLive = ranked.filter(function(tr) { return !isEntry(tr); }).length;
+    var jointRanks = competitionRanks(ranked.map(function(tr) { return tr.__back; }));
+    ranked.forEach(function(tr, i) { tr.__rank = jointRanks[i]; });
     all.forEach(function(tr) {
       var r = tr.__st === 'ranked' ? tr.__rank : null;
+      var ent = isEntry(tr);
       var td = cell(tr, 'rank');
       td.setAttribute('data-v', r === null ? '' : r);
-      td.querySelector('.cmp-rank-v').textContent = r === null ? '—' : '#' + r;
-      td.querySelector('.cmp-best').hidden = r !== 1;
-      tr.classList.toggle('cmp-top', r === 1);
+      td.querySelector('.cmp-rank-v').textContent = rankText(r, ent);
+      var best = td.querySelector('.cmp-best');
+      if (best) best.hidden = !showBest(r, ent);
+      tr.classList.toggle('cmp-top', showBest(r, ent));
       var line = tr.querySelector('.cmp-rank');
       if (!line) return;
       if (r !== null) {
-        line.textContent = 'Your offering ranks #' + r + ' of ' + ranked.length + ' for a ' + fmtMoney(investment) +
+        line.textContent = 'Your offering ranks #' + r + ' of ' + nLive + ' for a ' + fmtMoney(investment) +
           ' investment at ' + outcome + 'x.';
       } else if (tr.__st === 'min' || tr.__st === 'max') {
         var lim = tr.getAttribute(tr.__st === 'min' ? 'data-min' : 'data-max');
@@ -21012,6 +21047,12 @@ COMPARE_SCRIPT = (r"""<script>
   try { stored = parseAmount(window.localStorage.getItem(STORE)); } catch (e) { stored = null; }
   if (stored && invInput) invInput.value = fmtMoney(stored);
   setInvestment(stored || investment, false);
+  window.ggCompare = {
+    recompute: recompute, fmtMoney: fmtMoney,
+    settings: function() {
+      return {investment: investment, outcome: parseFloat(outcomeSel.value), years: parseFloat(yearsSel.value)};
+    }
+  };
   function fmtPct(v) { return (Math.round(v * 10) / 10) + '%'; }
   table.addEventListener('click', function(ev) {
     var btn = ev.target.closest('.cmp-edit-btn');
@@ -21365,6 +21406,245 @@ def _compare_commission_html(mode, email=None, investment=COMPARE_DEFAULT_INVEST
             f'{button}</div>')
 
 
+# ── Buyer entries ("+ Add an offering you're comparing") ─────────────────
+# Buyer view only (identified non-tenant, or admin view_as a non-tenant),
+# never with a live intro on the company. Entries live ONLY in the viewer's
+# browser (localStorage "gg-compare-entries:<company>", try/catch on every
+# access); the server sees one only when the buyer clicks "Ask Chad to beat
+# this" (POST ?action=compare_beat).
+COMPARE_ENTRY_ADD_LABEL = "+ Add an offering you're comparing"
+COMPARE_ENTRY_CHIP = "Your entry · not verified"
+COMPARE_ENTRY_NOTE = "Your entries are visible only to you, in this browser."
+COMPARE_ENTRY_MAX = 5
+COMPARE_ENTRY_NAME_MAX = 40
+COMPARE_ENTRY_FEE_MAX = 50
+COMPARE_BEAT_LABEL = "Ask Chad to beat this"
+COMPARE_BEAT_SENT_LABEL = "Sent ✓ — Chad will be in touch"
+COMPARE_BEAT_LIMIT_MSG = "Already sent — Chad will be in touch."
+COMPARE_BEAT_PARTITION = "__compare_beat__"
+COMPARE_BEAT_WINDOW_SECONDS = 24 * 3600
+COMPARE_BEAT_MAX_PER_DAY = 5
+COMPARE_BEAT_REPLY_TO = "cgracia@rainmakersecurities.com"
+COMPARE_BEAT_UNVERIFIED = "BUYER-ENTERED, UNVERIFIED"
+# Admin links in Chad's own email: the Function URL + ADMIN_KEY from env.
+COMPARE_ADMIN_BASE_URL = "https://ws4stw4iul75a7yx5dra2wmnq40kipav.lambda-url.us-east-1.on.aws/"
+
+
+def compare_entry_rank_text(rank):
+    """Rank cell text for a buyer entry (mirrors COMPARE_SCRIPT rankText)."""
+    return "—" if rank is None else f"#{rank} (your entry)"
+
+
+def compare_joint_ranks(rows, entries, investment, outcome, years, ref):
+    """Joint competition ranks (same rounding/tie rule as the page) of the
+    live rows that are ranked at `investment` (rows already run through
+    _compare_rank_rows at these settings) and buyer entries (always ranked:
+    all three fees, ticket limits ignored). Returns ({id(row): rank},
+    [entry rank]). Entries never change a live row's status."""
+    proceeds = {}
+    for r in rows:
+        if r.get("status") == "ranked":
+            proceeds[("row", id(r))] = r["proceeds"]
+    for i, e in enumerate(entries):
+        back, _, _ = compare_proceeds(investment, e["upfront"], e["mgmt"], e["carry"], outcome, years, ref,
+                                      e.get("valuation"))
+        proceeds[("entry", i)] = back
+    ranks = compare_competition_ranks(proceeds)
+    return ({k[1]: v for k, v in ranks.items() if k[0] == "row"},
+            [ranks[("entry", i)] for i in range(len(entries))])
+
+
+def _compare_entries_html(company_key, key=None, view_as=None):
+    """Button + hidden inline form + muted note above the table (buyer view)."""
+    attrs = f' data-company="{_esc(company_key)}" data-max="{COMPARE_ENTRY_MAX}"'
+    if key:
+        attrs += f' data-key="{_esc(key)}"' + (f' data-view-as="{_esc(view_as)}"' if view_as else "")
+    fee_inputs = "".join(
+        f'<label>{_esc(lbl)}<input name="{n}" type="text" inputmode="decimal" autocomplete="off" required></label>'
+        for n, lbl in (("upfront", "Upfront %"), ("mgmt", "Mgmt %/yr"), ("carry", "Carry %")))
+    return (f'<div class="cmp-entries" id="cmp-entries"{attrs}>'
+            f'<button type="button" class="cmp-entry-add" id="cmp-entry-add">{_esc(COMPARE_ENTRY_ADD_LABEL)}</button>'
+            '<form class="cmp-entry-form" id="cmp-entry-form" hidden autocomplete="off">'
+            f'<label>Name<input name="name" type="text" maxlength="{COMPARE_ENTRY_NAME_MAX}" '
+            'placeholder="e.g. Broker X SPV" required></label>'
+            f'{fee_inputs}'
+            '<label>Valuation $B<input name="val" type="text" inputmode="decimal" placeholder="optional"></label>'
+            '<button type="submit" data-a="save">Save</button><button type="button" data-a="cancel">Cancel</button>'
+            '<span class="cmp-msg error" id="cmp-entry-msg" hidden></span></form>'
+            f'<p class="cmp-entry-note">{_esc(COMPARE_ENTRY_NOTE)}</p></div>')
+
+
+COMPARE_ENTRY_SCRIPT = (r"""<script>
+(function() {
+  var box = document.getElementById('cmp-entries');
+  var table = document.getElementById('cmp-table');
+  if (!box || !table || !window.ggCompare) return;
+  var tbody = table.tBodies[0];
+  var company = box.getAttribute('data-company');
+  var MAX = parseInt(box.getAttribute('data-max'), 10) || 5;
+  var STORE = 'gg-compare-entries:' + company;
+  var addBtn = document.getElementById('cmp-entry-add');
+  var form = document.getElementById('cmp-entry-form');
+  var msg = document.getElementById('cmp-entry-msg');
+  var editing = null;
+  function num(v) { var t = String(v === null || v === undefined ? '' : v).trim().replace(/%$/, '').trim();
+    if (!/^(\d+(\.\d*)?|\.\d+)$/.test(t)) return null; return parseFloat(t); }
+  function valid(e) {
+    return e && typeof e.name === 'string' && e.name.trim() && e.name.length <= @@NAMEMAX@@ &&
+      ['upfront', 'mgmt', 'carry'].every(function(f) { return typeof e[f] === 'number' && e[f] >= 0 && e[f] <= @@FEEMAX@@; }) &&
+      (e.val === null || (typeof e.val === 'number' && e.val > 0));
+  }
+  function load() {
+    var list = [];
+    try { list = JSON.parse(window.localStorage.getItem(STORE) || '[]'); } catch (e) { list = []; }
+    if (!Array.isArray(list)) list = [];
+    return list.filter(valid).slice(0, MAX);
+  }
+  function save(list) { try { window.localStorage.setItem(STORE, JSON.stringify(list)); } catch (e) {} }
+  var entries = load();
+  function pct(v, yr) { return (Math.round(v * 100) / 100) + '%' + (yr ? '/yr' : ''); }
+  function el(tag, cls, text) {
+    var x = document.createElement(tag);
+    if (cls) x.className = cls;
+    if (text !== undefined) x.textContent = text;
+    return x;
+  }
+  function td(col, cls, v, child) {
+    var c = el('td', cls);
+    if (col) c.setAttribute('data-col', col);
+    if (v !== undefined) c.setAttribute('data-v', v);
+    if (child) c.appendChild(child);
+    return c;
+  }
+  function render() {
+    Array.prototype.slice.call(tbody.querySelectorAll('tr.cmp-entry')).forEach(function(tr) { tr.remove(); });
+    entries.forEach(function(e) {
+      var tr = el('tr', 'cmp-entry');
+      tr.setAttribute('data-entry', '1');
+      tr.setAttribute('data-entry-id', e.id);
+      tr.setAttribute('data-group', '0');
+      tr.setAttribute('data-unranked', '0');
+      ['upfront', 'mgmt', 'carry'].forEach(function(f) { tr.setAttribute('data-' + f, e[f]); });
+      tr.setAttribute('data-val', e.val === null ? '' : e.val);
+      var lab = td('label', '', e.name);
+      lab.appendChild(el('div', 'cmp-label', e.name));
+      lab.appendChild(el('div', 'cmp-entry-chip', '@@CHIP@@'));
+      var acts = el('div', 'cmp-entry-acts');
+      var ed = el('button', 'cmp-entry-edit', 'Edit'); ed.type = 'button';
+      var rm = el('button', 'cmp-entry-remove', 'Remove'); rm.type = 'button';
+      acts.appendChild(ed); acts.appendChild(document.createTextNode(' · ')); acts.appendChild(rm);
+      lab.appendChild(acts);
+      var beat = el('button', 'cmp-beat-btn', e.sent ? '@@SENT@@' : '@@BEAT@@'); beat.type = 'button';
+      beat.disabled = !!e.sent;
+      lab.appendChild(el('div')).appendChild(beat);
+      var bmsg = el('span', 'cmp-msg'); bmsg.hidden = true; lab.appendChild(bmsg);
+      tr.appendChild(lab);
+      tr.appendChild(td('rank', 'num', '', el('span', 'cmp-rank-v', '—')));
+      var back = td('back', 'num', '', el('span', 'cmp-back', '—'));
+      back.appendChild(el('div', 'cmp-nm'));
+      tr.appendChild(back);
+      tr.appendChild(td('fees', 'num', '', el('span', '', '—')));
+      ['upfront', 'mgmt', 'carry'].forEach(function(f) {
+        tr.appendChild(td(f, 'num cmp-fee', e[f], el('span', 'cmp-fee-v', pct(e[f], f === 'mgmt'))));
+      });
+      tr.appendChild(td('vehicle', 'cmp-vehicle', undefined, document.createTextNode('—')));
+      tr.appendChild(td('valuation', 'num cmp-valuation', undefined,
+        document.createTextNode(e.val === null ? '—' : '$' + (Math.round(e.val * 100) / 100) + 'B')));
+      tbody.appendChild(tr);
+    });
+    addBtn.disabled = entries.length >= MAX;
+    addBtn.title = entries.length >= MAX ? 'Up to ' + MAX + ' entries per company' : '';
+    window.ggCompare.recompute();
+  }
+  function showForm(e) {
+    editing = e ? e.id : null;
+    form.elements.name.value = e ? e.name : '';
+    form.elements.upfront.value = e ? e.upfront : '';
+    form.elements.mgmt.value = e ? e.mgmt : '';
+    form.elements.carry.value = e ? e.carry : '';
+    form.elements.val.value = e && e.val !== null ? e.val : '';
+    msg.hidden = true;
+    form.hidden = false;
+    form.elements.name.focus();
+  }
+  function fail(t) { msg.textContent = t; msg.hidden = false; }
+  addBtn.addEventListener('click', function() { if (entries.length < MAX) showForm(null); });
+  form.addEventListener('click', function(ev) {
+    if (ev.target.getAttribute('data-a') === 'cancel') { form.hidden = true; editing = null; }
+  });
+  form.addEventListener('submit', function(ev) {
+    ev.preventDefault();
+    var name = form.elements.name.value.trim();
+    if (!name) return fail('Enter a name.');
+    if (name.length > @@NAMEMAX@@) return fail('Name: @@NAMEMAX@@ characters max.');
+    var e = {name: name};
+    var bad = ['upfront', 'mgmt', 'carry'].some(function(f) {
+      var v = num(form.elements[f].value);
+      if (v === null || v < 0 || v > @@FEEMAX@@) return true;
+      e[f] = v; return false;
+    });
+    if (bad) return fail('Enter upfront, mgmt and carry as percents between 0 and @@FEEMAX@@.');
+    var rawVal = form.elements.val.value.trim().replace(/^\$/, '').replace(/b$/i, '');
+    e.val = rawVal === '' ? null : num(rawVal);
+    if (rawVal !== '' && (e.val === null || e.val <= 0)) return fail('Valuation: a positive number in $B, or leave blank.');
+    if (editing) {
+      entries = entries.map(function(x) { return x.id === editing ? Object.assign({id: x.id, sent: false}, e) : x; });
+    } else {
+      if (entries.length >= MAX) return fail('Up to ' + MAX + ' entries per company.');
+      e.id = 'e' + Date.now().toString(36) + Math.floor(Math.random() * 1e6).toString(36);
+      e.sent = false;
+      entries.push(e);
+    }
+    save(entries);
+    form.hidden = true; editing = null;
+    render();
+  });
+  tbody.addEventListener('click', function(ev) {
+    var tr = ev.target.closest('tr.cmp-entry');
+    if (!tr) return;
+    var id = tr.getAttribute('data-entry-id');
+    var e = entries.filter(function(x) { return x.id === id; })[0];
+    if (!e) return;
+    if (ev.target.closest('.cmp-entry-remove')) {
+      entries = entries.filter(function(x) { return x.id !== id; });
+      save(entries); render(); return;
+    }
+    if (ev.target.closest('.cmp-entry-edit')) { showForm(e); return; }
+    var btn = ev.target.closest('.cmp-beat-btn');
+    if (!btn || btn.disabled) return;
+    var bmsg = tr.querySelector('.cmp-msg');
+    var st = window.ggCompare.settings();
+    var body = {company: company, name: e.name, upfront: e.upfront, mgmt: e.mgmt, carry: e.carry,
+                valuation: e.val, investment: st.investment, outcome: st.outcome, years: st.years};
+    var key = box.getAttribute('data-key'), viewAs = box.getAttribute('data-view-as');
+    if (key) body.key = key;
+    if (viewAs) body.view_as = viewAs;
+    btn.disabled = true; btn.textContent = 'Sending…';
+    function done() {
+      e.sent = true; save(entries);
+      btn.textContent = '@@SENT@@';
+    }
+    fetch('?action=compare_beat', {method: 'POST', credentials: 'same-origin',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)})
+      .then(function(r) { return r.json().then(function(d) { return {ok: r.ok, status: r.status, d: d}; }); })
+      .then(function(res) {
+        if (res.ok && res.d.ok) { done(); return; }
+        if (res.d && res.d.limited) { done(); bmsg.className = 'cmp-msg'; bmsg.textContent = res.d.error; bmsg.hidden = false; return; }
+        btn.disabled = false; btn.textContent = '@@BEAT@@';
+        bmsg.className = 'cmp-msg error'; bmsg.textContent = (res.d && res.d.error) || 'Send failed.'; bmsg.hidden = false;
+      })
+      .catch(function() {
+        btn.disabled = false; btn.textContent = '@@BEAT@@';
+        bmsg.className = 'cmp-msg error'; bmsg.textContent = 'Send failed — please try again.'; bmsg.hidden = false;
+      });
+  });
+  render();
+})();
+</script>""".replace("@@NAMEMAX@@", str(COMPARE_ENTRY_NAME_MAX)).replace("@@FEEMAX@@", str(COMPARE_ENTRY_FEE_MAX))
+    .replace("@@CHIP@@", COMPARE_ENTRY_CHIP).replace("@@SENT@@", COMPARE_BEAT_SENT_LABEL)
+    .replace("@@BEAT@@", COMPARE_BEAT_LABEL))
+
+
 def render_compare_company(company_param, role, header_html, scope=frozenset(), key=None, view_as=None,
                            impersonating=False, commission=("admin", None), viewer_ids=frozenset()):
     """role: "admin" (Admin view: everything, every row editable), "tenant"
@@ -21438,6 +21718,14 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                                    "cmp-top" if top else "") if c)
         partial = r["fee_status"] == "partial"
         label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
+        if not r["hold"]:
+            # Every live row links to its trades deal page; an all-blank row
+            # shows "Ask about fees" instead (COMPARE_SCRIPT swaps them when
+            # the fee group changes). Under a live intro only the visible
+            # current-deal row exists, and it always gets this link.
+            view_hidden = no_fees and not live_intro
+            label_html += (f'<a class="cmp-view" href="{_esc(COMPARE_ASK_URL.format(deal_id))}" target="_blank" '
+                           f'rel="noopener"{" hidden" if view_hidden else ""}>{_esc(COMPARE_VIEW_DEAL_LABEL)}</a>')
         if current_deal_id is not None and deal_id == current_deal_id:
             label_html += f'<div class="cmp-current-chip">{_esc(COMPARE_CURRENT_DEAL_CHIP)}</div>'
         if show_bsa and not r["hold"] and not (_deal_cf_option_ids(d, AGENT_AGREEMENT_FIELD) & COMPARE_BSA_SIGNED_IDS):
@@ -21524,6 +21812,11 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     count_text = "" if hide_others else f'{n} live offering{"s" if n != 1 else ""}. '
     hidden_note = (f'<p class="cmp-hidden-note">{_esc(COMPARE_HIDDEN_NOTE.format(company=company))}</p>'
                    if hide_others else "")
+    # Buyer entries: buyer view only (incl. admin view_as a non-tenant), never
+    # with a live intro on this company (saved entries stay in the browser).
+    show_entries = role == "buyer" and not live_intro
+    entries_html = (_compare_entries_html(entry["company_id"] or company, key=key, view_as=view_as)
+                    if show_entries else "")
     body = (f'{back}<h1>{_esc(company)} SPV offerings</h1>'
             f'<p class="cmp-sub">{count_text}{_esc(COMPARE_SUBTITLE_LEAD)} '
             f'{_esc(COMPARE_FEES_SUBTITLE)} Click a column to sort.</p>'
@@ -21535,11 +21828,12 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             f'<label>Outcome <select id="cmp-outcome">{outcome_opts}</select></label>'
             f'<label>Years to exit <select id="cmp-years">{years_opts}</select></label></div>'
             f'{_compare_commission_html(commission[0], commission[1], investment, admin_session=key is not None)}'
-            f'<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"'
+            f'{entries_html}<div class="cmp-scroll"><table class="cmp-table" id="cmp-table" data-ref="{"" if ref is None else ref}"'
             f' data-inv="{investment}"{data_key}>'
             f'<thead><tr>{th_html}</tr></thead><tbody>{"".join(tr_html)}</tbody></table></div>'
             f'{hidden_note}<p class="cmp-info-note">{_esc(COMPARE_INFO_NOTE)}</p>'
-            f'{COMPARE_SCRIPT}{COMPARE_NUDGE_SCRIPT if key is not None else ""}')
+            f'{COMPARE_SCRIPT}{COMPARE_ENTRY_SCRIPT if show_entries else ""}'
+            f'{COMPARE_NUDGE_SCRIPT if key is not None else ""}')
     return _compare_shell(f"{company} offerings", header_html, body)
 
 
@@ -21931,6 +22225,194 @@ def _handle_compare_nudge(event):
     return _json_response({"ok": True, "sent": sent, "sent_label": _compare_sent_label(now)})
 
 
+def _parse_beat_number(raw, lo, hi, allow_blank=False):
+    """A finite number in [lo, hi] (bools rejected); blank -> None only when allowed."""
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return (None, True) if allow_blank else (None, False)
+    if isinstance(raw, bool):
+        return None, False
+    try:
+        v = float(str(raw).strip().rstrip("%").strip())
+    except (TypeError, ValueError):
+        return None, False
+    if not math.isfinite(v) or v < lo or (hi is not None and v > hi):
+        return None, False
+    return v, True
+
+
+def _compare_beat_fingerprint(company_key, name, upfront, mgmt, carry, valuation):
+    """Stable id of one entry (same company/name/fees/valuation = identical)."""
+    raw = json.dumps([str(company_key), name.strip().lower(), round(upfront, 4), round(mgmt, 4), round(carry, 4),
+                      None if valuation is None else round(valuation, 4)])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def _compare_beat_buyer(email):
+    """(display name, [Pipeline person URLs]) for the buyer's email (people-slim)."""
+    try:
+        pids = sorted(set(_people_lookup_index()["email"].get(email) or []))
+        by_id = _people_data()["by_id"]
+    except Exception as e:
+        print(f"compare_beat: buyer lookup failed: {type(e).__name__}: {e}")
+        return email, []
+    name = ""
+    for pid in pids:
+        rec = by_id.get(str(pid)) or {}
+        name = name or (rec.get("full_name") or rec.get("name") or "").strip()
+    return name or email, [PIPELINE_PERSON_URL.format(pid) for pid in pids]
+
+
+def _compare_beat_email(company_entry, buyer_email, buyer_name, person_urls, e, investment, outcome, years,
+                        admin_actor=None):
+    """(subject, plain-text body) for Chad: buyer, the BUYER-ENTERED terms,
+    every live offering ranked jointly with the entry at the buyer's
+    settings, and the admin compare link previewing this buyer."""
+    company = company_entry["company"]
+    rows, ref = _compare_rows(company_entry, "buyer")
+    _compare_rank_rows(rows, investment, outcome, years, ref)
+    row_ranks, (entry_rank,) = compare_joint_ranks(rows, [e], investment, outcome, years, ref)
+    e_back, _, e_nm = compare_proceeds(investment, e["upfront"], e["mgmt"], e["carry"], outcome, years, ref,
+                                       e["valuation"])
+    subject = f"{company}: buyer asks you to beat outside terms"
+    val_text = (_fmt_valuation_billions(e["valuation"]) if e["valuation"] else
+                f"blank (page reference {_fmt_valuation_billions(ref) if ref else 'n/a'})")
+    lines = [f"Buyer: {buyer_name}", f"Email: {buyer_email}"]
+    lines += [f"Pipeline: {u}" for u in person_urls] or ["Pipeline: (no person record matched this email)"]
+    if admin_actor:
+        lines.append(f"Sent from: {admin_actor}")
+    lines += ["", f"Settings: {compare_fmt_money(investment)} investment · {outcome:g}x outcome · "
+                  f"{years:g} year{'s' if years != 1 else ''} to exit", "",
+              f"{COMPARE_BEAT_UNVERIFIED} TERMS",
+              f"  Name: {e['name']}",
+              f"  Upfront: {_compare_pct_text(e['upfront'])}  Mgmt: {_compare_pct_text(e['mgmt'])}/yr  "
+              f"Carry: {_compare_pct_text(e['carry'])}",
+              f"  Valuation: {val_text}",
+              f"  Rank among live offerings: {compare_entry_rank_text(entry_rank)} · you get back "
+              f"{compare_fmt_money(e_back)} ({e_nm:.2f}x)", "",
+              "LIVE OFFERINGS (ranked with the buyer's entry at these settings)"]
+    for r in rows:
+        d = r["deal"]
+        did = str(d.get("id"))
+        st = r["status"]
+        if st == "ranked":
+            rank = f"#{row_ranks[id(r)]} · {compare_fmt_money(r['proceeds'])} ({r['net_multiple']:.2f}x)"
+        elif st in ("min", "max"):
+            rank = f"not ranked ({_compare_limit_text(st, r)})"
+        else:
+            rank = "not ranked (fees not provided)"
+        fees = " / ".join(_compare_fee_text(r[f], f) for f in ("upfront", "mgmt", "carry"))
+        lines.append(f"  {r['label']}: {rank} · fees {fees} · {r['valuation_text']} · "
+                     f"{_compare_firm_text(d)} · {PIPELINE_DEAL_URL.format(did)}")
+    if not rows:
+        lines.append("  (no live offerings)")
+    admin_key = os.environ.get("ADMIN_KEY") or ""
+    company_param = company_entry["company_id"] or company
+    link = (f"{COMPARE_ADMIN_BASE_URL}?key={urllib.parse.quote(admin_key, safe='')}&view=compare"
+            f"&company={urllib.parse.quote(str(company_param), safe='')}"
+            f"&view_as={urllib.parse.quote(buyer_email, safe='')}")
+    lines += ["", f"Admin compare page (as this buyer): {link}", ""]
+    return subject, "\n".join(lines)
+
+
+def _handle_compare_beat(event):
+    """POST ?action=compare_beat {company, name, upfront, mgmt, carry,
+    valuation, investment, outcome, years} (+ key/view_as for an admin
+    preview of a non-tenant). Identified buyers only (gg_id identity that is
+    not a tenant); refused while the buyer has a live intro on the company.
+    Rate limits (Dynamo partition COMPARE_BEAT_PARTITION): one send per
+    identical entry per buyer per 24h, at most COMPARE_BEAT_MAX_PER_DAY per
+    buyer per 24h. One SES email to Chad (existing sender rules). Never
+    writes Pipeline."""
+    body = _parse_json_body(event)
+    allowed = {"company", "name", "upfront", "mgmt", "carry", "valuation", "investment", "outcome", "years"}
+    admin_key = os.environ.get("ADMIN_KEY")
+    admin_actor = None
+    if admin_key and body.get("key") == admin_key:
+        buyer = str(body.get("view_as") or "").strip().lower()
+        if not buyer or set(body) - (allowed | {"key", "view_as"}):
+            return _json_response({"error": "forbidden"}, 403)
+        admin_actor = f"{ADMIN_IMPERSONATION_EMAIL} (admin preview as {buyer})"
+    else:
+        email = _read_identity_email(event)
+        buyer = email.strip().lower() if email else ""
+        if not buyer or set(body) - allowed:
+            return _json_response({"error": "forbidden"}, 403)
+    if _resolve_tenant(buyer) is not None:
+        return _json_response({"error": "forbidden"}, 403)
+
+    name = str(body.get("name") or "").strip()
+    if not name or len(name) > COMPARE_ENTRY_NAME_MAX:
+        return _json_response({"error": f"Name is required ({COMPARE_ENTRY_NAME_MAX} characters max)."}, 400)
+    fees = {}
+    for f in ("upfront", "mgmt", "carry"):
+        v, ok = _parse_beat_number(body.get(f), 0, COMPARE_ENTRY_FEE_MAX)
+        if not ok:
+            return _json_response({"error": f"Fees must be percents between 0 and {COMPARE_ENTRY_FEE_MAX}."}, 400)
+        fees[f] = v
+    valuation, ok = _parse_beat_number(body.get("valuation"), 0, None, allow_blank=True)
+    if not ok or valuation == 0:
+        return _json_response({"error": "Valuation must be a positive number in $B, or blank."}, 400)
+    investment = parse_investment_amount(body.get("investment"))
+    outcome, ok_o = _parse_beat_number(body.get("outcome"), 0, 1000)
+    years, ok_y = _parse_beat_number(body.get("years"), 0, 100)
+    if investment is None or not ok_o or not ok_y or not outcome or not years:
+        return _json_response({"error": "Invalid investment, outcome or years."}, 400)
+
+    try:
+        company_entry = _compare_find_entry(_compare_offerings(False), body.get("company"))
+    except Exception as e:
+        print(f"compare_beat: offerings unavailable: {type(e).__name__}: {e}")
+        return _json_response({"error": COMPARE_UNAVAILABLE_MSG}, 503)
+    if company_entry is None:
+        return _json_response({"error": "No live offerings for this company."}, 404)
+    # Live intro on this company -> refused (fail closed if the check errors).
+    try:
+        if _compare_live_intro(company_entry, _compare_viewer_ids(None, buyer)):
+            return _json_response({"error": "You're already in a deal on this company — "
+                                            "contact Chad about your current deal."}, 409)
+    except Exception as e:
+        print(f"compare_beat: live-intro check failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not send right now — please try again."}, 503)
+
+    company_key = company_entry["company_id"] or company_entry["company"].lower()
+    fp = _compare_beat_fingerprint(company_key, name, fees["upfront"], fees["mgmt"], fees["carry"], valuation)
+    now = time.time()
+    entry_sk, log_sk = f"beat#{buyer}#{fp}", f"beatlog#{buyer}"
+    try:
+        table = _dynamo_table()
+        prev = (table.get_item(Key={"tenant": COMPARE_BEAT_PARTITION, "sk": entry_sk}) or {}).get("Item")
+        log = (table.get_item(Key={"tenant": COMPARE_BEAT_PARTITION, "sk": log_sk}) or {}).get("Item") or {}
+    except Exception as e:
+        print(f"compare_beat: rate-limit read failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not send right now — please try again."}, 503)
+    recent = [float(t) for t in (log.get("sends") or []) if now - float(t) < COMPARE_BEAT_WINDOW_SECONDS]
+    if (prev and now - float(prev.get("sent_epoch") or 0) < COMPARE_BEAT_WINDOW_SECONDS) \
+            or len(recent) >= COMPARE_BEAT_MAX_PER_DAY:
+        return _json_response({"error": COMPARE_BEAT_LIMIT_MSG, "limited": True}, 429)
+
+    e = {"name": name, "valuation": valuation, **fees}
+    buyer_name, person_urls = _compare_beat_buyer(buyer)
+    subject, text = _compare_beat_email(company_entry, buyer, buyer_name, person_urls, e, investment, outcome, years,
+                                        admin_actor=admin_actor)
+    try:
+        boto3.client("ses", region_name="us-east-1").send_email(
+            Source=DEAL_STAGE_EMAIL_FROM, Destination={"ToAddresses": [DEAL_STAGE_EMAIL_TO]},
+            ReplyToAddresses=[COMPARE_BEAT_REPLY_TO],
+            Message={"Subject": {"Data": subject}, "Body": {"Text": {"Data": text}}})
+    except Exception as ex:
+        print(f"compare_beat: email failed: {type(ex).__name__}: {ex}")
+        return _json_response({"error": "Send failed — please try again."}, 502)
+    try:
+        table.put_item(Item={"tenant": COMPARE_BEAT_PARTITION, "sk": entry_sk, "sent_epoch": Decimal(str(int(now))),
+                             "company": company_entry["company"], "name": name,
+                             "actor": admin_actor or buyer})
+        table.put_item(Item={"tenant": COMPARE_BEAT_PARTITION, "sk": log_sk,
+                             "sends": [Decimal(str(int(t))) for t in recent + [now]]})
+    except Exception as ex:
+        print(f"compare_beat: rate-limit write failed: {type(ex).__name__}: {ex}")
+    return _json_response({"ok": True})
+
+
 def _handle_compare_view(query, is_admin_key, view_as, tenant, identity_email, edit_mode, viewer_name, cef_html):
     """?view=compare after auth. Admin: Admin view (edit_mode) = everything;
     &view_as a tenant without Admin view = that tenant's view (fee edits
@@ -22108,6 +22590,11 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_compare_nudge(event)
+
+    if query.get("action") == "compare_beat":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_compare_beat(event)
 
     if query.get("action") == "compare_fee":
         if method != "POST":

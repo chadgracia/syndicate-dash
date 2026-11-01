@@ -11303,10 +11303,16 @@ _cb = _cmp_b_page["body"]
 check("compare buyer view: rows labelled Offering A/B/C, no 'Your offering', no edit controls",
       all(f">Offering {c}<" in _cb for c in "ABC") and ">Your offering<" not in _cb
       and 'class="cmp-edit-btn"' not in _cb)
-check("compare buyer view: no deal ids, firm/person names, emails or deal value",
-      not any(s in _cb for s in ("6001", "6002", "Alpha Capital", "Beta Partners", "Sally", "Otto",
-                                 "@example.com", "99999", "Pipeline #", 'data-deal-id="', "data-key="))
-      and _cb.count("6005") == 1 and 'href="https://trades.graciagroup.com/deal/6005"' in _cb)
+def _no_ids_outside_trades(html, ids):
+    stripped = re.sub(r'https://trades\.graciagroup\.com/deal/\d+', "", html)
+    return not any(i in stripped for i in ids)
+
+
+check("compare buyer view: no deal ids (outside trades deal links), firm/person names, emails or deal value",
+      _no_ids_outside_trades(_cb, ("6001", "6002", "6005"))
+      and not any(s in _cb for s in ("Alpha Capital", "Beta Partners", "Sally", "Otto",
+                                     "@example.com", "99999", "Pipeline #", 'data-deal-id="', "data-key="))
+      and _cb.count("6005") == 2 and 'href="https://trades.graciagroup.com/deal/6005"' in _cb)
 check("compare buyer view: gross price shown, never net",
       "$33.00" in _cb and "$30.00" not in _cb and "$31.00" not in _cb)
 check("compare buyer view: old one-line commission note is gone (the RMS commission box replaces it)",
@@ -11372,8 +11378,9 @@ check("compare tenant view: own firm row = 'Your offering' (highlighted) with a 
       _ct.count(">Your offering<") == 1 and 'class="cmp-own cmp-top"' in _ct
       and "Your offering ranks #1 of 2 for a $100K investment at 5x." in _ct)
 check("compare tenant view: net price (not gross), other sellers anonymous, no value",
-      "$30.00" in _ct and "$33.00" not in _ct and "Beta Partners" not in _ct and "6002" not in _ct
-      and _ct.count("6005") == 1 and "99999" not in _ct and "Otto" not in _ct)
+      "$30.00" in _ct and "$33.00" not in _ct and "Beta Partners" not in _ct
+      and _no_ids_outside_trades(_ct, ("6002", "6005"))
+      and _ct.count("6005") == 2 and "99999" not in _ct and "Otto" not in _ct)
 check("compare tenant view: edit controls only on own row (3 fee cells), own deal id only",
       _ct.count('class="cmp-edit-btn"') == 3 and 'data-deal-id="6001"' in _ct and _ct.count("data-deal-id=") == 1)
 check("compare tenant view: Hold hidden, no buyer nudge", ">Hold<" not in _ct and "commission-tiers" not in _ct)
@@ -11590,7 +11597,9 @@ _cbf_c = _cbf_c[:_cbf_c.index("</tr>")]
 check("compare: filling one fee on an all-blank row moves it into the ranked group (with the note, no Ask link)",
       _r["statusCode"] == 200 and 'data-unranked="0"' in _cbf_c
       and '<div class="cmp-partial">Full fees not confirmed</div>' in _cbf_c and "cmp-ask" not in _cbf_c
-      and '<tr class="cmp-divider" hidden>' in _cbf and "6005" not in _cbf)
+      and '<tr class="cmp-divider" hidden>' in _cbf and _no_ids_outside_trades(_cbf, ("6005",))
+      and '<a class="cmp-view" href="https://trades.graciagroup.com/deal/6005"' in _cbf_c
+      and 'View deal →</a>' in _cbf_c)
 for _k in ("deal-fresh/6001.json", "deal-fresh/6005.json"):
     _cmp_s3.objs.pop(_k, None)
 
@@ -11684,8 +11693,9 @@ check("compare Best chip: [hidden] beats the chip/warning/Ask display rules in C
       ".cmp-wrap [hidden] { display: none !important; }" in lf.COMPARE_CSS)
 check("compare Best chip: client script applies chip/highlight only to rank 1 (ranked rows only)",
       "var r = tr.__st === 'ranked' ? tr.__rank : null;" in lf.COMPARE_SCRIPT
-      and "td.querySelector('.cmp-best').hidden = r !== 1;" in lf.COMPARE_SCRIPT
-      and "tr.classList.toggle('cmp-top', r === 1);" in lf.COMPARE_SCRIPT)
+      and "if (best) best.hidden = !showBest(r, ent);" in lf.COMPARE_SCRIPT
+      and "tr.classList.toggle('cmp-top', showBest(r, ent));" in lf.COMPARE_SCRIPT
+      and "function showBest(r, isEntry) { return r === 1 && !isEntry; }" in lf.COMPARE_SCRIPT)
 _cmp_tie = json.loads(json.dumps(_cmp_d2))
 _cmp_tie["custom_fields"].update({lf.SELLER_FEE_FIELD: 4, lf.MGMT_FEE_FIELD: 0, lf.CARRY_FIELD: 0})
 _cmp_tie["updated_at"] = "2026/10/31 10:00:00 -0400"
@@ -12152,6 +12162,232 @@ check("compare live-intro: index still lists the company normally",
       and "3 offerings" in _li_page(_li_buy(7207579), None, {"view": "compare"}))
 _li_solo = _li_page(_li_buy(7207579), None, {"view": "compare", "company": "7004"})
 check("compare live-intro: other companies unaffected", not _has_note(_li_solo) and "cmp-current-chip\">" not in _li_solo)
+
+# ── "View deal →" on every live row; buyer entries; "Ask Chad to beat this" ──
+_vd_url = "https://trades.graciagroup.com/deal/{}"
+
+
+def _vd_rows(html):
+    """{deal id: row html} via the trades link each live row carries."""
+    out = {}
+    for tr in _cmp_rows_html(html):
+        m = re.search(r'https://trades\.graciagroup\.com/deal/(\d+)', tr)
+        out[m.group(1) if m else "none"] = tr
+    return out
+
+
+_vd_buyer = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_BUYER)])["body"]
+_vd_seller = _cmp_get({"view": "compare", "company": "7001"}, [tenant_cookie(CMP_SELLER)])["body"]
+_vd_admin = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001"})["body"]
+for _vd_name, _vd_html in (("buyer", _vd_buyer), ("seller", _vd_seller), ("admin", _vd_admin)):
+    _vd_r = _vd_rows(_vd_html)
+    _vd_live = [d for d in ("6001", "6002", "6005") if d in _vd_r]
+    check(f"compare View deal ({_vd_name}): every live row carries the trades link (new tab) under the label",
+          len(_vd_live) == 3 and all(
+              (f'<a class="cmp-view" href="{_vd_url.format(d)}" target="_blank" rel="noopener"' in _vd_r[d])
+              and _vd_r[d].index('class="cmp-label"') < _vd_r[d].index('class="cmp-view"')
+              for d in _vd_live))
+    _vd_blank = _vd_r.get("6005", "")
+    check(f"compare View deal ({_vd_name}): all-blank row keeps 'Ask about fees →' (same URL), View deal hidden",
+          'data-unranked="1"' in _vd_blank
+          and f'<a class="cmp-ask" href="{_vd_url.format("6005")}" target="_blank" rel="noopener">Ask about fees →</a>'
+          in _vd_blank
+          and f'<a class="cmp-view" href="{_vd_url.format("6005")}" target="_blank" rel="noopener" hidden>' in _vd_blank
+          and all('class="cmp-ask"' not in _vd_r[d] and ' hidden>View deal' not in _vd_r[d] for d in ("6001", "6002")))
+check("compare View deal: Hold row (admin) gets no View deal link",
+      all('class="cmp-view"' not in tr for tr in _cmp_rows_html(_vd_admin) if 'data-hold="1"' in tr))
+check("compare View deal: no seller/firm names for buyers or other sellers' rows",
+      not any(x in _vd_buyer for x in ("Alpha Capital", "Beta Partners", "Sally", "Otto"))
+      and "Beta Partners" not in _vd_seller and "Otto" not in _vd_seller)
+check("compare View deal: client script shows it when a row has fees, Ask when all blank",
+      "'.cmp-view': st !== 'none' || !hasAsk" in lf.COMPARE_SCRIPT)
+_vd_li = _li_page(_li_buy(7207579))
+_vd_li_rows = _cmp_rows_html(_vd_li)
+check("compare View deal: buyer with a live intro -> only the visible 'Your current deal' row, link shown",
+      len(_vd_li_rows) == 1 and "cmp-current-chip" in _vd_li_rows[0]
+      and re.search(r'<a class="cmp-view" href="https://trades\.graciagroup\.com/deal/600\d" target="_blank" '
+                    r'rel="noopener">View deal →</a>', _vd_li_rows[0])
+      and _vd_li.count('class="cmp-view"') == 1 and "6001" not in _vd_li and "6005" not in _vd_li)
+
+# Add-entry UI: buyers (and admin view_as a buyer) only; never tenants/sellers/plain admin/live intro.
+_en_add = "+ Add an offering you're comparing"
+_en_note = "Your entries are visible only to you, in this browser."
+check("compare entries: buyer gets the button, hidden inline form (name/upfront/mgmt/carry/valuation), note, script",
+      'id="cmp-entries"' in _vd_buyer and _en_add in _vd_buyer and _en_note in _vd_buyer
+      and '<form class="cmp-entry-form" id="cmp-entry-form" hidden' in _vd_buyer
+      and all(f'name="{n}"' in _vd_buyer for n in ("name", "upfront", "mgmt", "carry", "val"))
+      and 'maxlength="40"' in _vd_buyer and 'data-company="7001"' in _vd_buyer and 'data-max="5"' in _vd_buyer
+      and "gg-compare-entries:" in _vd_buyer and "data-key=" not in _vd_buyer
+      and _vd_buyer.index('id="cmp-entries"') < _vd_buyer.index('id="cmp-table"'))
+_en_va = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_BUYER})["body"]
+check("compare entries: admin view_as a buyer gets the UI (posting as that buyer)",
+      'id="cmp-entries"' in _en_va and f'data-view-as="{CMP_BUYER}"' in _en_va and "gg-compare-entries:" in _en_va)
+_en_va_t = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_SELLER})["body"]
+for _en_name, _en_html in (("seller tenant", _vd_seller), ("other tenant", _cmp_get(
+        {"view": "compare", "company": "7001"}, [tenant_cookie(CMP_OTHER)])["body"]),
+                           ("plain admin", _vd_admin), ("admin view_as a tenant", _en_va_t)):
+    check(f"compare entries: absent for {_en_name}",
+          'id="cmp-entries"' not in _en_html and "Add an offering" not in _en_html
+          and "gg-compare-entries" not in _en_html and "Ask Chad to beat this" not in _en_html)
+for _en_name, _en_html in (("buyer", _vd_li), ("admin view_as the buyer", _li_page(
+        _li_buy(7207579), [], {"key": ADMIN_KEY, "view": "compare", "company": "7001", "view_as": CMP_BUYER}))):
+    check(f"compare entries: live intro ({_en_name}) -> no button, form, saved entries or beat-this",
+          'id="cmp-entries"' not in _en_html and "Add an offering" not in _en_html
+          and "gg-compare-entries" not in _en_html and "Ask Chad to beat this" not in _en_html
+          and "Your entry" not in _en_html)
+check("compare entries: localStorage only, every access in try/catch, never sent except via beat-this",
+      lf.COMPARE_ENTRY_SCRIPT.count("window.localStorage") == 2
+      and "try { list = JSON.parse(window.localStorage.getItem(STORE)" in lf.COMPARE_ENTRY_SCRIPT
+      and "try { window.localStorage.setItem(STORE" in lf.COMPARE_ENTRY_SCRIPT
+      and lf.COMPARE_ENTRY_SCRIPT.count("fetch(") == 1 and "?action=compare_beat" in lf.COMPARE_ENTRY_SCRIPT)
+check("compare entries: max 5, name 40 chars, fees 0-50, chip / Edit / Remove / beat button text",
+      "parseInt(box.getAttribute('data-max'), 10) || 5" in lf.COMPARE_ENTRY_SCRIPT
+      and "e.name.length <= 40" in lf.COMPARE_ENTRY_SCRIPT and "v > 50" in lf.COMPARE_ENTRY_SCRIPT
+      and "'Your entry · not verified'" in lf.COMPARE_ENTRY_SCRIPT and "'Edit'" in lf.COMPARE_ENTRY_SCRIPT
+      and "'Remove'" in lf.COMPARE_ENTRY_SCRIPT and "'Ask Chad to beat this'" in lf.COMPARE_ENTRY_SCRIPT
+      and "'Sent ✓ — Chad will be in touch'" in lf.COMPARE_ENTRY_SCRIPT
+      and ".cmp-table tr.cmp-entry td { background: #eef2f7; }" in lf.COMPARE_CSS)
+check("compare entries: never the Best chip, the green highlight or the buy-side chip",
+      not any(x in lf.COMPARE_ENTRY_SCRIPT for x in ("cmp-best", "cmp-top", "cmp-bsa", "Buy-side"))
+      and "if (isEntry(tr)) return 'ranked';" in lf.COMPARE_SCRIPT
+      and "function showBest(r, isEntry) { return r === 1 && !isEntry; }" in lf.COMPARE_SCRIPT
+      and "tr.classList.toggle('cmp-top', showBest(r, ent));" in lf.COMPARE_SCRIPT)
+check("compare entries: vehicle '—'; fee cells have no Edit button (no Pipeline fee edits)",
+      "td('vehicle', 'cmp-vehicle', undefined, document.createTextNode('—'))" in lf.COMPARE_ENTRY_SCRIPT
+      and "cmp-edit-btn" not in lf.COMPARE_ENTRY_SCRIPT)
+import tempfile as _en_tmp
+for _en_sname, _en_src in (("COMPARE_SCRIPT", lf.COMPARE_SCRIPT), ("COMPARE_ENTRY_SCRIPT", lf.COMPARE_ENTRY_SCRIPT)):
+    with _en_tmp.NamedTemporaryFile("w", suffix=".js", delete=False) as _f:
+        _f.write(_en_src.replace("<script>", "").replace("</script>", ""))
+    _en_chk = subprocess.run(["node", "--check", _f.name], capture_output=True, text=True)
+    os.unlink(_f.name)
+    check(f"compare entries: {_en_sname} parses (node --check)", _en_chk.returncode == 0)
+_en_pure = lf.COMPARE_SCRIPT[lf.COMPARE_SCRIPT.index("// @@RANK_BEGIN"):lf.COMPARE_SCRIPT.index("// @@RANK_END")]
+_en_js = _en_pure + """
+console.log(JSON.stringify({
+  tie: competitionRanks([480000, 480040, 410000]),
+  entryTop: competitionRanks([500000, 480000, 410000]),
+  t1: rankText(1, true), t3: rankText(3, true), live: rankText(2, false), none: rankText(null, false),
+  bestEntry: showBest(1, true), bestLive: showBest(1, false), bestTwo: showBest(2, false)}));"""
+_en_out = json.loads(subprocess.run(["node", "-e", _en_js], capture_output=True, text=True, check=True).stdout)
+check("compare entries (client): ties share a rank, next skips; entry #1 shows '#1 (your entry)', no Best",
+      _en_out["tie"] == [1, 1, 3] and _en_out["entryTop"] == [1, 2, 3] and _en_out["t1"] == "#1 (your entry)"
+      and _en_out["t3"] == "#3 (your entry)" and _en_out["live"] == "#2" and _en_out["none"] == "—"
+      and _en_out["bestEntry"] is False and _en_out["bestLive"] is True and _en_out["bestTwo"] is False)
+# Server mirror (used in the beat-this email): same math and tie rule.
+lf._req_cache_reset()
+_en_entry = lf._compare_find_entry(lf._compare_offerings(False), "7001")
+_en_rows, _en_ref = lf._compare_rows(_en_entry, "buyer")
+_en_best = min((r for r in _en_rows if r["status"] == "ranked"), key=lambda r: r["rank"])
+_en_tie = {"upfront": _en_best["upfront"] or 0, "mgmt": _en_best["mgmt"] or 0, "carry": _en_best["carry"] or 0,
+           "valuation": _en_best["valuation"]}
+_en_top = {"upfront": 0, "mgmt": 0, "carry": 0, "valuation": None}
+_en_rr, _en_er = lf.compare_joint_ranks(_en_rows, [_en_top, _en_tie], 100_000, 5, 5, _en_ref)
+check("compare entries (server mirror): entry beating everything is #1; best live offering keeps its true rank "
+      "(#2, shared with a tied entry); next live rank skips",
+      _en_er == [1, 2] and _en_rr[id(_en_best)] == 2
+      and sorted(_en_rr.values())[1] == 4 and lf.compare_entry_rank_text(1) == "#1 (your entry)"
+      and all(r["status"] != "ranked" for r in _en_rows if id(r) not in _en_rr))
+_en_rr2, _en_er2 = lf.compare_joint_ranks(_en_rows, [{"upfront": 50, "mgmt": 5, "carry": 50, "valuation": None}],
+                                          100_000, 5, 5, _en_ref)
+check("compare entries (server mirror): a worse entry ranks last; live ranks unchanged",
+      _en_er2 == [len(_en_rr2) + 1] and _en_rr2[id(_en_best)] == 1)
+
+# POST ?action=compare_beat
+_bt_pipe = []
+_bt_saved_urlopen = lf.urllib.request.urlopen
+lf.urllib.request.urlopen = lambda req, timeout=15: _bt_pipe.append(req.full_url) or _CmpResp(200, {})
+
+
+def _bt_body(**kw):
+    b = {"company": "7001", "name": "Broker X SPV", "upfront": 2, "mgmt": 1.5, "carry": 10, "valuation": None,
+         "investment": 250000, "outcome": 5, "years": 5}
+    b.update(kw)
+    return b
+
+
+def _bt_post(body, cookies=None):
+    return _req({"action": "compare_beat"}, cookies, method="POST", body=body)
+
+
+def _bt_items():
+    return [i for i in _cmp_table.items if i.get("tenant") == "__compare_beat__"]
+
+
+ses_calls.clear(); _cmp_table.puts.clear()
+_cmp_table.items[:] = [i for i in _cmp_table.items if i.get("tenant") != "__compare_beat__"]
+_bt_anon = _bt_post(_bt_body())
+_bt_ten = _bt_post(_bt_body(), [tenant_cookie(CMP_SELLER)])
+_bt_adm = _bt_post(_bt_body(key=ADMIN_KEY))
+_bt_extra = _bt_post(_bt_body(deal_id="6001"), [tenant_cookie(CMP_BUYER)])
+_bt_get = _req({"action": "compare_beat"}, [tenant_cookie(CMP_BUYER)])
+check("compare beat: unidentified / tenant (seller) / admin without view_as / unknown field -> 403; GET -> 405; "
+      "nothing sent or stored",
+      _bt_anon["statusCode"] == 403 and _bt_ten["statusCode"] == 403 and _bt_adm["statusCode"] == 403
+      and _bt_extra["statusCode"] == 403 and _bt_get["statusCode"] == 405 and not ses_calls and not _bt_items())
+_bt_bad = [_bt_post(_bt_body(**kw), [tenant_cookie(CMP_BUYER)])["statusCode"]
+           for kw in ({"upfront": 51}, {"carry": -1}, {"mgmt": ""}, {"name": ""}, {"name": "x" * 41},
+                      {"valuation": 0}, {"investment": "abc"})]
+check("compare beat: invalid name/fees (0-50, required)/valuation/investment -> 400, nothing sent",
+      _bt_bad == [400] * 7 and not ses_calls)
+_bt_li = _li_buy(7207579)
+_li_deals.append(_bt_li)
+try:
+    _bt_r_li = _bt_post(_bt_body(), [tenant_cookie(CMP_BUYER)])
+finally:
+    _li_deals.remove(_bt_li)
+check("compare beat: buyer with a live intro on the company -> rejected (409), nothing sent",
+      _bt_r_li["statusCode"] == 409 and not ses_calls and not _bt_items())
+_bt1 = _bt_post(_bt_body(), [tenant_cookie(CMP_BUYER)])
+_bm = ses_calls[-1] if ses_calls else {}
+_bmb = _bm.get("Message", {}).get("Body", {}).get("Text", {}).get("Data", "")
+check("compare beat: identified buyer -> one email to Chad (existing sender, Reply-To cgracia@rainmakersecurities.com)",
+      _bt1["statusCode"] == 200 and json.loads(_bt1["body"]) == {"ok": True} and len(ses_calls) == 1
+      and _bm["Source"] == lf.DEAL_STAGE_EMAIL_FROM
+      and _bm["Destination"] == {"ToAddresses": ["cgracia@rainmakersecurities.com"]}
+      and _bm["ReplyToAddresses"] == ["cgracia@rainmakersecurities.com"]
+      and _bm["Message"]["Subject"]["Data"] == "Varda Space: buyer asks you to beat outside terms")
+check("compare beat email: buyer name, email, Pipeline person link; terms labeled BUYER-ENTERED, UNVERIFIED",
+      "Buyer: Bea Buyer" in _bmb and f"Email: {CMP_BUYER}" in _bmb
+      and "Pipeline: https://app.pipelinecrm.com/people/503" in _bmb
+      and "BUYER-ENTERED, UNVERIFIED TERMS" in _bmb and "Name: Broker X SPV" in _bmb
+      and "Upfront: 2%" in _bmb and "Mgmt: 1.5%/yr" in _bmb and "Carry: 10%" in _bmb
+      and "Settings: $250K investment · 5x outcome · 5 years to exit" in _bmb
+      and "Rank among live offerings: #" in _bmb and "(your entry)" in _bmb)
+check("compare beat email: live offerings with ranks at those settings + admin compare link (view_as the buyer)",
+      re.search(r"Offering A: #\d", _bmb) and "Offering C: not ranked (fees not provided)" in _bmb
+      and "https://app.pipelinecrm.com/deals/6001" in _bmb
+      and f"{lf.COMPARE_ADMIN_BASE_URL}?key={ADMIN_KEY}&view=compare&company=7001&view_as=cmp-buyer%40example.org"
+      in _bmb and "Hold" not in _bmb)
+check("compare beat: rate-limit records under the dedicated __compare_beat__ prefix; no Pipeline writes",
+      len(_bt_items()) == 2 and {i["sk"].split("#")[0] for i in _bt_items()} == {"beat", "beatlog"}
+      and not _bt_pipe)
+ses_calls.clear()
+_bt_dup = _bt_post(_bt_body(investment=500000, outcome=10), [tenant_cookie(CMP_BUYER)])
+check("compare beat: identical entry again within 24h -> 'Already sent — Chad will be in touch.', no email",
+      _bt_dup["statusCode"] == 429 and json.loads(_bt_dup["body"]) == {
+          "error": "Already sent — Chad will be in touch.", "limited": True} and not ses_calls)
+_bt_more = [_bt_post(_bt_body(name=f"Broker {i}"), [tenant_cookie(CMP_BUYER)])["statusCode"] for i in range(5)]
+check("compare beat: max 5 sends per buyer per 24h (6th distinct entry -> limited)",
+      _bt_more == [200, 200, 200, 200, 429] and len(ses_calls) == 4
+      and json.loads(_bt_post(_bt_body(name="Broker 9"), [tenant_cookie(CMP_BUYER)])["body"]).get("limited") is True)
+_bt_log = next(i for i in _bt_items() if i["sk"] == f"beatlog#{CMP_BUYER}")
+_bt_log["sends"] = [lf.Decimal(str(int(time.time() - 25 * 3600)))] * 5
+for _i in _bt_items():
+    if _i["sk"].startswith("beat#"):
+        _i["sent_epoch"] = lf.Decimal(str(int(time.time() - 25 * 3600)))
+ses_calls.clear()
+_bt_after = _bt_post(_bt_body(), [tenant_cookie(CMP_BUYER)])
+check("compare beat: both limits reset after 24h", _bt_after["statusCode"] == 200 and len(ses_calls) == 1)
+ses_calls.clear()
+_bt_va = _bt_post(_bt_body(name="Admin preview", key=ADMIN_KEY, view_as=CMP_BUYER))
+_bt_va_t = _bt_post(_bt_body(name="Admin preview 2", key=ADMIN_KEY, view_as=CMP_SELLER))
+check("compare beat: admin view_as a buyer can send (marked as an admin preview); view_as a tenant -> 403",
+      _bt_va["statusCode"] == 200 and len(ses_calls) == 1
+      and "admin preview as cmp-buyer@example.org" in ses_calls[0]["Message"]["Body"]["Text"]["Data"]
+      and _bt_va_t["statusCode"] == 403)
+check("compare beat: never writes Pipeline", not _bt_pipe)
+lf.urllib.request.urlopen = _bt_saved_urlopen
 
 # "Buy-side agreement required" marker (buyer/admin only; never ranking).
 _bsa_chip = '<div class="cmp-bsa-chip">Buy-side agreement required</div>'
