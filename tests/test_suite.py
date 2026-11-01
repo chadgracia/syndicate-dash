@@ -11087,9 +11087,9 @@ check("research gaps: non-blocked company keeps the plain step", _rg4["Covenant"
 _rg_nav_admin = lf._nav_html("mydeals", "Admin", key="K1")
 _rg_nav_tenant = lf._nav_html("mydeals", "Tenant")
 _rg_nav_preview = lf._nav_html("mydeals", "Admin", key="K1", view_as="t@example.com", edit_flag=False)
-check("research gaps: admin nav has the Research gaps tab", "view=research_gaps" in _rg_nav_admin)
-check("research gaps: tab never in tenant sessions or the Tenant-view preview",
-      "research_gaps" not in _rg_nav_tenant and "research_gaps" not in _rg_nav_preview)
+check("research gaps: no nav tab anywhere (admin, tenant, Tenant-view preview); page stays at its URL",
+      "research_gaps" not in _rg_nav_admin and "research_gaps" not in _rg_nav_tenant
+      and "research_gaps" not in _rg_nav_preview and callable(lf._handle_research_gaps))
 _TS = lf.TICKET_SIZE_FIELD
 _rg5_people = [{"id": 61, "custom_fields": {_TS: [5014561]}},   # $10M-$25M
                {"id": 62, "custom_fields": {_TS: [5014570]}},   # $100M+
@@ -12247,9 +12247,8 @@ check("admin strip: CSS — slim dark-red bar that wraps; tabs one line, wrappin
       and "max-width: 1280px;" in lf.NAV_CSS.split(".gg-nav-inner {")[1][:60]
       and "flex-wrap: wrap;" in lf.NAV_CSS.split(".gg-tabs {")[1][:80]
       and "white-space: nowrap;" in lf.NAV_CSS.split(".gg-tab {")[1][:60])
-check("admin strip: Research gaps stays in the tab row (Admin view)",
-      ">Research gaps</a>" in _hdr(_as_admin_only) and "Research gaps" not in
-      _as_admin_only[:_as_admin_only.index('<header class="gg-nav">')])
+check("admin strip: no Research gaps link in the strip or the tab row",
+      "Research gaps" not in _as_admin_only)
 
 
 # ======================================================================
@@ -12496,6 +12495,55 @@ check("demand: a buyer who is primary on a Buy deal is never dropped as a 'selle
 
 os.environ.pop("OWNERSHIP_RULE", None)
 lf.urllib.request.urlopen = _ow_saved_urlopen
+reset_caches()
+
+# ======================================================================
+# SECTION: deal-note owner never the buyer (buyer who is also a seller tenant)
+# ======================================================================
+_dn_names = ("_deal_is_sell", "_buy_deal_side_ids", "_seller_email_order", "_tenant_index_req", "_firm_person_ids",
+             "get_deals_list", "_is_matched_or_later_buy_deal", "_deal_linked_person_ids", "_tenant_index",
+             "_tenant_team", "get_intro_details", "get_my_matched_buy_deals", "_resolve_intro_status",
+             "_team_owned_buy_deals")
+_dn_saved = {n: getattr(lf, n) for n in _dn_names}
+DN_BUYER, DN_SELLER, DN_VIEWAS_PID = 1309687264, 7001, 7002
+DN_BUYER_EMAIL, DN_SELLER_EMAIL, DN_VIEWAS_EMAIL = "abishek@t2d3.capital", "sella@sellerco.com", "vas@vasco.com"
+_dn_deal = {"id": 9901, "name": "Varda buy", "company": {"name": "Varda"}, "primary_contact_id": DN_BUYER}
+_dn_linked = {DN_BUYER}
+lf._deal_is_sell = lambda d: False
+lf._buy_deal_side_ids = lambda d: set(_dn_linked)
+lf._deal_linked_person_ids = lambda d: set(_dn_linked)
+lf._tenant_index_req = lambda: {}
+lf._seller_email_order = lambda idx: {DN_BUYER: (0, DN_BUYER_EMAIL), DN_SELLER: (1, DN_SELLER_EMAIL)}
+lf._firm_person_ids = lambda pid: frozenset({pid})
+lf.get_deals_list = lambda *a, **k: [_dn_deal]
+lf._is_matched_or_later_buy_deal = lambda d: True
+lf._tenant_index = lambda: {DN_SELLER_EMAIL: {"name": "Sella Co"}, DN_BUYER_EMAIL: {"name": "Abishek Surendran"}}
+lf._tenant_team = lambda e: {"domain": e.split("@")[1], "member_emails": [e]} if e else None
+lf.get_intro_details = lambda *a, **k: ({}, None)
+lf.get_my_matched_buy_deals = lambda pid: [_dn_deal]
+lf._team_owned_buy_deals = lambda pid, e: [(_dn_deal, False)]
+lf._resolve_intro_status = lambda d, e: {"disclosed": True}
+
+_dn_admin = lf._buyer_deal_note_inputs_html(DN_BUYER, None, None, True)
+check("deal notes: buyer who is a seller tenant never gets a card for his own intro (no other seller -> no card)",
+      _dn_admin == "" and lf._tenant_email_for_deal(_dn_deal, exclude_person_ids={DN_BUYER}) is None)
+check("deal notes: owner write partition never the buyer (update_intro / can_act helper)",
+      lf._buy_deal_owner_email(_dn_deal) is None)
+_dn_linked = {DN_BUYER, DN_SELLER}
+_dn_admin = lf._buyer_deal_note_inputs_html(DN_BUYER, None, None, True)
+check("deal notes: admin card resolves to the real seller, never the buyer or his team",
+      "Deal notes: Varda · Sella Co" in _dn_admin and "Abishek" not in _dn_admin
+      and "t2d3.capital" not in _dn_admin and "sellerco.com" in _dn_admin
+      and lf._buy_deal_owner_email(_dn_deal) == DN_SELLER_EMAIL)
+_dn_tenant_va = {"person_id": DN_VIEWAS_PID, "name": "VAS"}
+_dn_va = lf._buyer_deal_note_inputs_html(DN_BUYER, _dn_tenant_va, DN_VIEWAS_EMAIL, True, view_as=DN_VIEWAS_EMAIL)
+check("deal notes: admin with view_as gets the view_as tenant's cards + visibility text",
+      "Deal notes: Varda</h2>" in _dn_va and "Visible to your team at vasco.com and Gracia Group." in _dn_va
+      and "Sella Co" not in _dn_va)
+_dn_self = lf._buyer_deal_note_inputs_html(DN_BUYER, {"person_id": DN_BUYER}, DN_BUYER_EMAIL, False)
+check("deal notes: the buyer viewing his own page as a tenant gets no deal-note card", _dn_self == "")
+for _n, _f in _dn_saved.items():
+    setattr(lf, _n, _f)
 reset_caches()
 
 print(f"\n{passed} passed, {failed} failed")

@@ -6888,7 +6888,7 @@ def _tenant_can_act_on_deal(identity_email, deal):
     scope = _firm_person_ids(tenant.get("person_id"))
     if DEAL_SIDE_SELL_ID in _deal_cf_option_ids(deal, DEAL_SIDE_FIELD):
         return bool(_deal_owner_ids(deal) & scope)
-    owner = _tenant_email_for_deal(deal)
+    owner = _buy_deal_owner_email(deal)
     if owner is None:
         return False
     if owner == str(identity_email).strip().lower():
@@ -7951,12 +7951,18 @@ def _handle_photo_request(person_id_raw, tenant, anon_key_email, edit_mode):
     return _svg_response(_avatar_svg(_person_initials(rec)))
 
 
-def _tenant_email_for_deal(deal):
+def _tenant_email_for_deal(deal, exclude_person_ids=None):
     """The auto-enrolled tenant email whose person_id is linked to this
     deal, or None if no tenant maps to it — writes are rejected outright
     in that case. Sell deal -> its owners (_deal_owner_ids); Buy deal ->
-    its sell side (_buy_deal_side_ids: under "primary" never the buyer)."""
+    its sell side (_buy_deal_side_ids: under "primary" never the buyer).
+    exclude_person_ids drops candidates (compared as str) -- the buyer
+    and their own firm/team, so a note never lands in the buyer's own
+    partition."""
     linked = _deal_owner_ids(deal) if _deal_is_sell(deal) else _buy_deal_side_ids(deal)
+    if exclude_person_ids:
+        excluded = {str(x) for x in exclude_person_ids}
+        linked = {pid for pid in linked if str(pid) not in excluded}
     if not linked:
         return None
     # Sellers only: the index also holds non-seller domain-team members,
@@ -7967,6 +7973,23 @@ def _tenant_email_for_deal(deal):
     order = _seller_email_order(_tenant_index_req())
     best = min((order[pid] for pid in linked if pid in order), default=None)
     return best[1] if best else None
+
+
+def _buyer_exclusion_ids(buyer_id):
+    """The buyer and everyone on the buyer's own firm/team (never an
+    owner candidate for that buyer's intro)."""
+    if buyer_id is None:
+        return frozenset()
+    return frozenset({buyer_id}) | _firm_person_ids(buyer_id)
+
+
+def _buy_deal_owner_email(deal):
+    """Write partition for an intro: _tenant_email_for_deal, except that
+    on a Buy deal its primary contact (the buyer) and the buyer's
+    firm/team are never the owner."""
+    if _deal_is_sell(deal):
+        return _tenant_email_for_deal(deal)
+    return _tenant_email_for_deal(deal, exclude_person_ids=_buyer_exclusion_ids(_deal_primary_contact_id(deal)))
 
 
 def _seller_email_order(index):
@@ -10950,12 +10973,6 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
     demand_cls = "gg-tab active" if active_tab == "demand" else "gg-tab"
     compare_href = f"?view=compare{suffix}"
     compare_cls = "gg-tab active" if active_tab == "compare" else "gg-tab"
-    # Admin-only "Research gaps" tab (never in tenant sessions or the
-    # Tenant-view preview): links the read-only ?view=research_gaps page.
-    research_tab_html = ""
-    if key and (not view_as or edit_flag):
-        research_tab_html = (f'<a class="gg-tab" href="?key={urllib.parse.quote(key, safe="")}'
-                             f'&view=research_gaps">Research gaps</a>')
     # "Watchlist" tab -> desk Portfolio & Watchlist. Real tenant session gets
     # a signed ?sso= handoff for itself; admin (with or without &view_as, either
     # toggle state) gets the plain link -- a token for the view_as tenant would
@@ -11131,7 +11148,6 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
       <a class="{demand_cls}" href="{demand_href}">Demand Board</a>
       <a class="{compare_cls}" href="{compare_href}">Compare SPVs</a>
       {watchlist_tab_html}
-      {research_tab_html}
     </nav>
     {cef_html}
     <div class="gg-viewer">{viewer_html}</div>
@@ -15381,18 +15397,21 @@ def _buyer_person_note_input_html(rec, buyer_id, tenant_email=None):
         f'data-kind="person" data-buyer-id="{_esc(str(buyer_id))}"')
 
 
-def _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode):
+def _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode, view_as=None):
     """One "Deal notes: <Company>" input per intro the viewer may write a
     note on -- the same deal set the old Notes ledger offered: tenant
-    view, their own disclosed deals with this buyer; admin view, every
-    matched-or-later deal linking this buyer (labelled with its tenant)."""
+    view (and Admin view with view_as: the previewed tenant's cards),
+    their own disclosed deals with this buyer; plain admin view, every
+    matched-or-later deal linking this buyer (labelled with its tenant),
+    never owned by the buyer or the buyer's own firm/team."""
     cards = []
-    if edit_mode:
+    if edit_mode and not (view_as and tenant):
         tenant_index = _tenant_index()
+        exclude = _buyer_exclusion_ids(buyer_id)
         for d in get_deals_list():
             if not _is_matched_or_later_buy_deal(d) or buyer_id not in _deal_linked_person_ids(d):
                 continue
-            owner_email = _tenant_email_for_deal(d)
+            owner_email = _tenant_email_for_deal(d, exclude_person_ids=exclude)
             if owner_email is None:
                 continue
             tenant_name = (tenant_index.get(owner_email) or {}).get("name", owner_email)
@@ -15402,6 +15421,8 @@ def _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode):
                 f'data-kind="deal" data-deal-id="{_esc(str(d.get("id")))}"'))
     else:
         person_id = tenant.get("person_id")
+        if str(buyer_id) in {str(x) for x in _firm_person_ids(person_id)}:
+            return ""
         intro_details, _ = get_intro_details(anon_key_email)
         if _tenant_team(anon_key_email) is not None:
             candidates = [d for d, closed_out in _team_owned_buy_deals(person_id, anon_key_email)
@@ -15600,7 +15621,8 @@ def render_buyer_page(buyer_id_raw, viewer_name, tenant, anon_key_email, key=Non
                 history_html = _buyer_notes_history_html(
                     _buyer_note_history_entries(buyer_id, tenant, anon_key_email, edit_mode), edit_mode)
                 inputs_html = (_buyer_person_note_input_html(rec, buyer_id, anon_key_email)
-                               + _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode))
+                               + _buyer_deal_note_inputs_html(buyer_id, tenant, anon_key_email, edit_mode,
+                                                              view_as=view_as))
                 track_html = _buyer_track_with_you_html(buyer_id, tenant, anon_key_email, edit_mode,
                                                         key=key, view_as=view_as)
                 body_html = (
@@ -19080,7 +19102,7 @@ def _handle_update_intro(event):
     if deal is None:
         return _json_response({"error": "deal not found"}, 404)
 
-    tenant_email = _tenant_email_for_deal(deal)
+    tenant_email = _buy_deal_owner_email(deal)
     if tenant_email is None:
         return _json_response({"error": "deal has no linked tenant"}, 400)
 
