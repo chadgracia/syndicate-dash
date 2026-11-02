@@ -5903,6 +5903,104 @@ def _ownership_person_info(rec, pid):
             "email": emails[0] if emails else "", "firm": (rec.get("company_name") or "").strip()}
 
 
+# Per-deal "Reviewed" marks for the ownership page. DynamoDB only (no
+# Pipeline, no email): tenant OWNERSHIP_REVIEW_PARTITION, sk
+# "review#<deal_id>" = {deal_id, reviewed, reviewed_at, actor, fingerprint};
+# every change also writes an audit item "audit#ownership_review#<deal>#<ms>"
+# with the previous record, so history survives re-ticks and unticks.
+OWNERSHIP_REVIEW_PARTITION = "__ownership_review__"
+
+
+def _ownership_fingerprint(deal):
+    """Deal type tag + primary contact id + sorted linked person ids."""
+    tags = ",".join(str(t) for t in sorted(_deal_cf_option_ids(deal, DEAL_SIDE_FIELD)))
+    primary = _deal_primary_contact_id(deal)
+    linked = ",".join(str(p) for p in sorted(_deal_linked_person_ids(deal)))
+    return f"{tags}|{'' if primary is None else primary}|{linked}"
+
+
+def _ownership_reviews():
+    """{deal_id: record} from ONE partition Query (fail soft -> {})."""
+    out = {}
+    try:
+        table = _dynamo_table()
+        kwargs = {"KeyConditionExpression": Key("tenant").eq(OWNERSHIP_REVIEW_PARTITION)
+                  & Key("sk").begins_with("review#")}
+        while True:
+            resp = table.query(**kwargs)
+            for item in resp.get("Items", []):
+                sk = str(item.get("sk", ""))
+                if sk.startswith("review#"):
+                    out[sk.split("#", 1)[1]] = item
+            lek = resp.get("LastEvaluatedKey")
+            if not lek:
+                break
+            kwargs["ExclusiveStartKey"] = lek
+    except Exception as e:
+        print(f"ownership review read failed: {type(e).__name__}: {e}")
+    return out
+
+
+def _ownership_review_state(deal, record):
+    """("reviewed", at_iso) when the saved mark matches the deal's current
+    fingerprint; ("changed", at_iso) when it was reviewed under a different
+    fingerprint; (None, None) otherwise."""
+    if not record or not record.get("reviewed"):
+        return None, None
+    at = record.get("reviewed_at")
+    if record.get("fingerprint") == _ownership_fingerprint(deal):
+        return "reviewed", at
+    return "changed", at
+
+
+def _ownership_review_label(at_iso):
+    dt = _parse_dt(at_iso) if at_iso else None
+    return f"Reviewed {dt.strftime('%b')} {dt.day}" if dt else "Reviewed"
+
+
+def _handle_ownership_review(event):
+    """POST ?action=ownership_review {key, deal_id, reviewed: bool}. Admin
+    key only (403); the deal must be a current deal (404). Writes ONLY the
+    Dynamo review record + an audit item."""
+    body = _parse_json_body(event)
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (admin_key and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+    deal_id = str(body.get("deal_id") or "").strip()
+    reviewed = body.get("reviewed")
+    if not deal_id.isdigit() or not isinstance(reviewed, bool):
+        return _json_response({"error": "deal_id and reviewed (true/false) are required"}, 400)
+    deal = next((d for d in get_deals_list() if str(d.get("id")) == deal_id), None)
+    if deal is None:
+        return _json_response({"error": "deal not found"}, 404)
+    now = datetime.now(timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    fingerprint = _ownership_fingerprint(deal)
+    try:
+        table = _dynamo_table()
+        old = (table.get_item(Key={"tenant": OWNERSHIP_REVIEW_PARTITION, "sk": f"review#{deal_id}"})
+               .get("Item"))
+        item = {"tenant": OWNERSHIP_REVIEW_PARTITION, "sk": f"review#{deal_id}", "deal_id": deal_id,
+                "reviewed": reviewed, "actor": "admin", "fingerprint": fingerprint}
+        if reviewed:
+            item["reviewed_at"] = now_iso
+        else:
+            item["unreviewed_at"] = now_iso
+            if old and old.get("reviewed_at"):
+                item["reviewed_at"] = old.get("reviewed_at")
+                item["fingerprint"] = old.get("fingerprint") or fingerprint
+        table.put_item(Item=item)
+        table.put_item(Item={"tenant": OWNERSHIP_REVIEW_PARTITION,
+                             "sk": f"audit#ownership_review#{deal_id}#{int(now.timestamp() * 1000)}",
+                             "actor": "admin", "at": now_iso, "old": old or {},
+                             "new": {"reviewed": reviewed, "fingerprint": fingerprint}})
+    except Exception as e:
+        print(f"ownership review write failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not save — try again."}, 502)
+    return _json_response({"ok": True, "deal_id": deal_id, "reviewed": reviewed,
+                           "label": _ownership_review_label(now_iso) if reviewed else ""})
+
+
 def ownership_report():
     """{"retag": [...], "access": [...]} for the ownership page.
     retag: every live Sell deal (OWNERSHIP_LIVE_STAGE_IDS, not archived)
@@ -5920,6 +6018,7 @@ def ownership_report():
     for d in get_deals_list():
         if _deal_is_sell(d):
             primary_owners_any |= sell_deal_owner_person_ids(d)
+    reviews = _ownership_reviews()
     retag, access = [], []
     for d in sorted(live, key=lambda d: ((_deal_company_name(d) or "").lower(), str(d.get("id")))):
         linked = _deal_linked_person_ids_ordered(d)
@@ -5936,6 +6035,9 @@ def ownership_report():
                      "company": _deal_company_name(d) or "",
                      "stage": _deal_stage_label(_deal_stage_id(d)),
                      "url": PIPELINE_DEAL_URL.format(d.get("id"))}
+        review, review_at = _ownership_review_state(d, reviews.get(str(d.get("id"))))
+        deal_info["review"] = review
+        deal_info["review_at"] = review_at
         if multi:
             prec = by_id.get(str(primary)) if primary is not None else None
             retag.append(dict(deal_info,
@@ -5953,8 +6055,88 @@ def ownership_report():
     return {"retag": retag, "access": access}
 
 
-def render_ownership_page():
+OWNERSHIP_REVIEW_SCRIPT = """<script>
+(function() {
+  var hide = document.getElementById('ow-hide-reviewed');
+  function rows() { return Array.prototype.slice.call(document.querySelectorAll('tr.ow-row')); }
+  function apply() {
+    var h = hide && hide.checked;
+    rows().forEach(function(r) { r.hidden = !!(h && r.getAttribute('data-reviewed') === '1'); });
+    document.querySelectorAll('.ow-progress').forEach(function(p) {
+      var sec = p.getAttribute('data-section'), all = {}, done = {};
+      rows().forEach(function(r) {
+        if (r.getAttribute('data-section') !== sec) return;
+        var id = r.getAttribute('data-deal-id');
+        all[id] = 1;
+        if (r.getAttribute('data-reviewed') === '1') done[id] = 1;
+      });
+      p.querySelector('.ow-done').textContent = Object.keys(done).length;
+      p.querySelector('.ow-total').textContent = Object.keys(all).length;
+    });
+  }
+  function setDeal(id, reviewed, noteHtml) {
+    rows().forEach(function(r) {
+      if (r.getAttribute('data-deal-id') !== id) return;
+      r.setAttribute('data-reviewed', reviewed ? '1' : '0');
+      var box = r.querySelector('.ow-rv-box');
+      if (box) { box.checked = reviewed; box.disabled = false; }
+      var slot = r.querySelector('.ow-rv-slot');
+      if (slot && noteHtml !== null) slot.innerHTML = noteHtml;
+    });
+  }
+  function esc(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+  document.querySelectorAll('.ow-rv-box').forEach(function(box) {
+    box.addEventListener('change', function() {
+      var id = box.getAttribute('data-deal-id'), want = box.checked;
+      rows().forEach(function(r) {
+        var b = r.getAttribute('data-deal-id') === id && r.querySelector('.ow-rv-box');
+        if (b) b.disabled = true;
+      });
+      fetch('?action=ownership_review', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: OW_KEY, deal_id: id, reviewed: want})
+      }).then(function(r) {
+        return r.json().then(function(d) { return {ok: r.ok, d: d}; });
+      }).then(function(res) {
+        if (!res.ok) throw new Error((res.d && res.d.error) || 'Could not save');
+        setDeal(id, want, want ? '<span class="ow-rv-note">' + esc(res.d.label || 'Reviewed') + '</span>' : '');
+        apply();
+      }).catch(function(err) {
+        setDeal(id, !want, '<span class="ow-rv-err">' + esc(err.message || 'Could not save') + '</span>');
+        apply();
+      });
+    });
+  });
+  if (hide) hide.addEventListener('change', apply);
+  apply();
+})();
+</script>"""
+
+
+def render_ownership_page(key=None):
     rep = ownership_report()
+
+    def _review_cell(di):
+        state = di.get("review")
+        checked = " checked" if state == "reviewed" else ""
+        note = ""
+        if state == "reviewed":
+            note = f'<span class="ow-rv-note">{_esc(_ownership_review_label(di.get("review_at")))}</span>'
+        elif state == "changed":
+            note = '<span class="ow-rv-note ow-rv-changed">Changed since review</span>'
+        return (f'<td class="ow-rv"><label><input type="checkbox" class="ow-rv-box" '
+                f'data-deal-id="{_esc(di["deal_id"])}"{checked}> Reviewed</label>'
+                f'<span class="ow-rv-slot">{note}</span></td>')
+
+    def _row_attrs(di, section):
+        rv = "1" if di.get("review") == "reviewed" else "0"
+        return f' class="ow-row" data-section="{section}" data-deal-id="{_esc(di["deal_id"])}" data-reviewed="{rv}"'
+
+    def _progress(section, deals):
+        ids = {d["deal_id"] for d in deals}
+        done = {d["deal_id"] for d in deals if d.get("review") == "reviewed"}
+        return (f'<p class="ow-progress" id="ow-progress-{section}" data-section="{section}">'
+                f'<span class="ow-done">{len(done)}</span> of <span class="ow-total">{len(ids)}</span> reviewed</p>')
 
     def _person(p):
         if not p:
@@ -5971,11 +6153,13 @@ def render_ownership_page():
                 f'<br><span class="ow-muted">#{_esc(di["deal_id"])} · {_esc(di["stage"])}</span>')
 
     retag_rows = "".join(
-        f'<tr><td>{_esc(r["company"])}</td><td>{_deal_cell(r)}</td><td>{_person(r["primary"])}</td>'
+        f'<tr{_row_attrs(r, "retag")}>{_review_cell(r)}<td>{_esc(r["company"])}</td><td>{_deal_cell(r)}</td>'
+        f'<td>{_person(r["primary"])}</td>'
         f'<td>{"<hr>".join(_person(o) for o in r["others"]) or "—"}</td></tr>'
         for r in rep["retag"])
     access_rows = "".join(
-        f'<tr><td>{_person(a)}</td><td>{_esc(a["deal"]["company"])}<br>{_deal_cell(a["deal"])}</td>'
+        f'<tr{_row_attrs(a["deal"], "access")}>{_review_cell(a["deal"])}<td>{_person(a)}</td>'
+        f'<td>{_esc(a["deal"]["company"])}<br>{_deal_cell(a["deal"])}</td>'
         f'<td>{_esc(a["reason"])}</td>'
         f'<td>{"Keeps tenancy via own Sell deal(s)" if a["keeps_tenancy"] else "Loses tenancy"}</td></tr>'
         for a in rep["access"])
@@ -5999,23 +6183,39 @@ def render_ownership_page():
   th {{ font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; color: #6b7280; }}
   td hr {{ border: 0; border-top: 1px dashed #e5e7eb; margin: 6px 0; }}
   .ow-muted {{ color: #6b7280; font-size: 12px; }}
+  td.ow-rv {{ white-space: nowrap; width: 1%; }}
+  td.ow-rv label {{ cursor: pointer; font-size: 12px; }}
+  .ow-rv-slot {{ display: block; }}
+  .ow-rv-note {{ font-size: 11px; color: #6b7280; }}
+  .ow-rv-changed {{ color: #C2410C; background: #FDF0E9; padding: 1px 4px; border-radius: 4px; }}
+  .ow-rv-err {{ font-size: 11px; color: #B42318; }}
+  p.ow-progress {{ margin: 0 0 8px; font-size: 13px; font-weight: 600; }}
+  .ow-toolbar {{ margin: 8px 0 4px; font-size: 13px; }}
+  .ow-toolbar label {{ cursor: pointer; }}
+  [hidden] {{ display: none !important; }}
 </style>
 </head>
 <body><div class="wrap">
 <h1>Deal ownership</h1>
 <p class="ow-lead">Computed under the primary-contact rule. Current rule: <strong>{_esc(_ownership_rule())}</strong>
-(env OWNERSHIP_RULE). Read-only.</p>
+(env OWNERSHIP_RULE). Changes nothing in Pipeline; "Reviewed" marks are saved for this page only.</p>
+<div class="ow-toolbar"><label><input type="checkbox" id="ow-hide-reviewed" checked> Hide reviewed</label></div>
 <h2 id="ow-retag">Live Sell deals to retag ({len(rep["retag"])})</h2>
+{_progress("retag", rep["retag"])}
 <p class="ow-lead">{_esc(OWNERSHIP_RETAG_HEADER)}</p>
-<div class="ow-scroll"><table><thead><tr><th>Company</th><th>Deal</th><th>Primary contact</th>
+<div class="ow-scroll"><table><thead><tr><th></th><th>Company</th><th>Deal</th><th>Primary contact</th>
 <th>Other linked people</th></tr></thead>
-<tbody>{retag_rows or '<tr><td colspan="4" class="ow-muted">None.</td></tr>'}</tbody></table></div>
+<tbody>{retag_rows or '<tr><td colspan="5" class="ow-muted">None.</td></tr>'}</tbody></table></div>
 <h2 id="ow-access">Access changes when the switch is on ({n_people} people, {len(rep["access"])} deal links)</h2>
+{_progress("access", [a["deal"] for a in rep["access"]])}
 <p class="ow-lead">People who own a live Sell deal today but would not under the rule.</p>
-<div class="ow-scroll"><table><thead><tr><th>Person</th><th>Deal</th><th>Reason</th><th>After the switch</th>
+<div class="ow-scroll"><table><thead><tr><th></th><th>Person</th><th>Deal</th><th>Reason</th><th>After the switch</th>
 </tr></thead>
-<tbody>{access_rows or '<tr><td colspan="4" class="ow-muted">None.</td></tr>'}</tbody></table></div>
-</div></body></html>"""
+<tbody>{access_rows or '<tr><td colspan="5" class="ow-muted">None.</td></tr>'}</tbody></table></div>
+</div>
+<script>var OW_KEY = {json.dumps(key or "")};</script>
+{OWNERSHIP_REVIEW_SCRIPT}
+</body></html>"""
 
 
 def render_client_links_page():
@@ -22637,6 +22837,11 @@ def _lambda_handler_impl(event, context):
             return _json_response({"error": "POST only"}, 405)
         return _handle_update_intro(event)
 
+    if query.get("action") == "ownership_review":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_ownership_review(event)
+
     if query.get("action") == "compare_nudge":
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
@@ -22762,7 +22967,7 @@ def _lambda_handler_impl(event, context):
     if query.get("view") == "ownership":
         if not is_admin_key:
             return _forbidden()
-        return _html_response(render_ownership_page())
+        return _html_response(render_ownership_page(key=query.get("key")))
 
     if query.get("view") == "client_links":
         if not is_admin_key:

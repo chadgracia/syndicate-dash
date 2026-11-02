@@ -12774,11 +12774,12 @@ check("ownership page: access changes = Ray (keeps own tenancy), Bob and Gus (lo
       and all(a["reason"] == "not primary / not at primary's firm" for a in _ow_rep["access"]))
 _ow_page = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
                               "queryStringParameters": {"key": ADMIN_KEY, "view": "ownership"}}, None)
-check("ownership page: admin GET renders both sections with the exact retag header, read-only",
+check("ownership page: admin GET renders both sections with the exact retag header; only POST is the review mark",
       _ow_page["statusCode"] == 200 and "Live Sell deals to retag (3)" in _ow_page["body"]
       and lf.OWNERSHIP_RETAG_HEADER.replace("'", "&#x27;") in _ow_page["body"].replace("'", "&#x27;")
       and "Access changes when the switch is on (3 people, 3 deal links)" in _ow_page["body"]
-      and "<form" not in _ow_page["body"] and "fetch(" not in _ow_page["body"])
+      and "<form" not in _ow_page["body"]
+      and re.findall(r"fetch\('([^']*)'", _ow_page["body"]) == ["?action=ownership_review"])
 check("ownership page: non-admin -> 403",
       lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
                          "queryStringParameters": {"view": "ownership"},
@@ -12853,6 +12854,116 @@ _dn_self = lf._buyer_deal_note_inputs_html(DN_BUYER, {"person_id": DN_BUYER}, DN
 check("deal notes: the buyer viewing his own page as a tenant gets no deal-note card", _dn_self == "")
 for _n, _f in _dn_saved.items():
     setattr(lf, _n, _f)
+reset_caches()
+
+
+# ======================================================================
+# SECTION: ownership page "Reviewed" marks (Dynamo only)
+# ======================================================================
+def _rv_post(body):
+    lf._req_cache_reset()
+    return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": "ownership_review"},
+                              "body": json.dumps(body)}, None)
+
+
+def _rv_page():
+    lf._req_cache_reset()
+    return lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": {"key": ADMIN_KEY, "view": "ownership"}}, None)["body"]
+
+
+def _rv_rows(page, section):
+    return re.findall(r'<tr class="ow-row" data-section="' + section + r'" data-deal-id="(\d+)" '
+                      r'data-reviewed="([01])">(.*?)</tr>', page, flags=re.S)
+
+
+def _rv_progress(page, section):
+    m = re.search(r'id="ow-progress-' + section + r'" data-section="' + section + r'"><span class="ow-done">(\d+)'
+                  r'</span> of <span class="ow-total">(\d+)</span> reviewed', page)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+_rv_s3, _rv_table = _ow_fixture("legacy")
+_rv_net = []
+lf.urllib.request.urlopen = lambda *a, **k: (_rv_net.append(a) or _cd_raise())
+ses_before = len(ses_calls)
+_rv_p0 = _rv_page()
+check("review: every row in both sections has an unticked 'Reviewed' checkbox, Hide reviewed on by default",
+      len(_rv_rows(_rv_p0, "retag")) == 3 and len(_rv_rows(_rv_p0, "access")) == 3
+      and _rv_p0.count('class="ow-rv-box"') == 6 and " checked> Reviewed" not in _rv_p0
+      and '<input type="checkbox" id="ow-hide-reviewed" checked> Hide reviewed' in _rv_p0)
+check("review: progress 'X of N reviewed' under each heading (0 of 3 / 0 of 3)",
+      _rv_progress(_rv_p0, "retag") == (0, 3) and _rv_progress(_rv_p0, "access") == (0, 3))
+
+_rv_r = _rv_post({"key": ADMIN_KEY, "deal_id": "9101", "reviewed": True})
+_rv_rec = next((i for i in _rv_table.items if i.get("sk") == "review#9101"), None)
+check("review: tick saves immediately -> 200 + Dynamo record {deal_id, reviewed_at, actor, fingerprint}",
+      _rv_r["statusCode"] == 200 and json.loads(_rv_r["body"])["label"].startswith("Reviewed ")
+      and _rv_rec is not None and _rv_rec["tenant"] == lf.OWNERSHIP_REVIEW_PARTITION
+      and _rv_rec["deal_id"] == "9101" and _rv_rec["reviewed"] is True and _rv_rec["actor"] == "admin"
+      and _rv_rec["reviewed_at"].endswith("Z")
+      and _rv_rec["fingerprint"] == f"{lf.DEAL_SIDE_SELL_ID}|{OW_SAM}|{OW_SAM},{OW_SUE},{OW_DOM},{OW_RAY}"
+      and any(str(p.get("sk", "")).startswith("audit#ownership_review#9101#") for p in _rv_table.puts))
+_rv_p1 = _rv_page()
+_rv_retag1 = {i: (rv, body) for i, rv, body in _rv_rows(_rv_p1, "retag")}
+_rv_dt = lf._parse_dt(_rv_rec["reviewed_at"])
+check("review: persists across loads -- ticked with 'Reviewed <Mon D>' in both sections",
+      _rv_retag1["9101"][0] == "1" and 'data-deal-id="9101" checked> Reviewed' in _rv_retag1["9101"][1]
+      and f"Reviewed {_rv_dt.strftime('%b')} {_rv_dt.day}" in _rv_retag1["9101"][1]
+      and all(rv == "1" for i, rv, _b in _rv_rows(_rv_p1, "access") if i == "9101"))
+check("review: progress counts per section (1 of 3 retag, 1 of 3 access)",
+      _rv_progress(_rv_p1, "retag") == (1, 3) and _rv_progress(_rv_p1, "access") == (1, 3))
+check("review: Hide reviewed filters client-side on data-reviewed (script hides reviewed rows, toggle re-applies)",
+      "r.hidden = !!(h && r.getAttribute('data-reviewed') === '1')" in _rv_p1
+      and "hide.addEventListener('change', apply)" in _rv_p1
+      and "fetch('?action=ownership_review'" in _rv_p1 and f'var OW_KEY = "{ADMIN_KEY}"' in _rv_p1)
+
+_rv_r = _rv_post({"key": ADMIN_KEY, "deal_id": "9101", "reviewed": False})
+_rv_p2 = _rv_page()
+check("review: unticking brings the row back (data-reviewed 0) and keeps the old review for history",
+      _rv_r["statusCode"] == 200 and all(rv == "0" for i, rv, _b in _rv_rows(_rv_p2, "retag") if i == "9101")
+      and _rv_progress(_rv_p2, "retag") == (0, 3)
+      and next(i for i in _rv_table.items if i.get("sk") == "review#9101")["reviewed_at"] == _rv_rec["reviewed_at"])
+
+_rv_post({"key": ADMIN_KEY, "deal_id": "9103", "reviewed": True})
+# Bob is dropped from the 1:1 deal and Ray linked instead -> fingerprint changes.
+_rv_changed = [dict(d, people=[{"id": OW_SAM}, {"id": OW_RAY}]) if d["id"] == 9103 else d for d in _ow_live]
+_rv_s3.objs[lf.DEALS_KEY] = {"deals": _rv_changed}
+reset_caches()
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+_rv_p3 = _rv_page()
+_rv_beta = [(rv, b) for i, rv, b in _rv_rows(_rv_p3, "retag") if i == "9103"]
+check("review: fingerprint change -> unticked with amber 'Changed since review', counted as not reviewed",
+      _rv_beta and _rv_beta[0][0] == "0" and "Changed since review" in _rv_beta[0][1]
+      and 'data-deal-id="9103" checked' not in _rv_beta[0][1] and _rv_progress(_rv_p3, "retag")[0] == 0
+      and next(i for i in _rv_table.items if i.get("sk") == "review#9103")["reviewed"] is True)
+
+_rv_n = len(_rv_table.puts)
+check("review: non-admin POST rejected (no key / wrong key) -> 403, nothing written",
+      _rv_post({"deal_id": "9101", "reviewed": True})["statusCode"] == 403
+      and _rv_post({"key": "nope", "deal_id": "9101", "reviewed": True})["statusCode"] == 403
+      and len(_rv_table.puts) == _rv_n)
+check("review: bad body -> 400, unknown deal -> 404, GET -> 405",
+      _rv_post({"key": ADMIN_KEY, "deal_id": "9101", "reviewed": "yes"})["statusCode"] == 400
+      and _rv_post({"key": ADMIN_KEY, "deal_id": "123456", "reviewed": True})["statusCode"] == 404
+      and lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                             "queryStringParameters": {"action": "ownership_review"}}, None)["statusCode"] == 405)
+_rv_s3.objs[lf.DEALS_KEY] = {"deals": [dict(d, custom_fields={lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID]})
+                                      if d["id"] == 9103 else d for d in _rv_changed]}
+reset_caches()
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+_rv_p4 = _rv_page()
+check("review: a deal retagged to Buy drops off both sections; its record is ignored",
+      "9103" not in [i for i, _rv, _b in _rv_rows(_rv_p4, "retag") + _rv_rows(_rv_p4, "access")]
+      and _rv_progress(_rv_p4, "retag")[1] == 2)
+check("review: no Pipeline calls and no emails from any review action",
+      _rv_net == [] and len(ses_calls) == ses_before)
+
+os.environ.pop("OWNERSHIP_RULE", None)
+lf.urllib.request.urlopen = _ow_saved_urlopen
 reset_caches()
 
 print(f"\n{passed} passed, {failed} failed")
