@@ -4429,8 +4429,9 @@ check("Perf fix 2: get_deals_list's own call count collapses 26 -> 5 "
       "3 -> 4 as of the nav's searchable tenant picker, which now computes the eligible-tenant list, "
       "and so calls get_deals_list once more via _tenant_index, on every admin page -- then 4 -> 5 as of "
       "firm-level tenancy's _firm_sell_person_ids_by_company, which scans deals.json once more per request "
-      "to group the firm's own Sell deals by company)",
-      "calls_get_deals_list=5" in line_p12)
+      "to group the firm's own Sell deals by company -- then 5 -> 6 as of the admin strip's Ownership "
+      "badge, whose ownership_report reads the request-cached list once per request)",
+      "calls_get_deals_list=6" in line_p12)
 check("Perf fix 1: get_firm_deals is computed once per request (_request_memo; every other ask is a memo hit)",
       "calls_compute_get_firm_deals=1" in line_p12)
 check("get_firm_matched_buy_deals is computed once per distinct key (12 companies = 12, down from 24 "
@@ -12961,6 +12962,70 @@ check("review: a deal retagged to Buy drops off both sections; its record is ign
       and _rv_progress(_rv_p4, "retag")[1] == 2)
 check("review: no Pipeline calls and no emails from any review action",
       _rv_net == [] and len(ses_calls) == ses_before)
+
+os.environ.pop("OWNERSHIP_RULE", None)
+lf.urllib.request.urlopen = _ow_saved_urlopen
+reset_caches()
+
+
+# ======================================================================
+# SECTION: admin strip Ownership badge (unreviewed deal count)
+# ======================================================================
+def _ob_strip(key=ADMIN_KEY, **kw):
+    lf._req_cache_reset()
+    html = lf._nav_html("overview", "Admin", key=key, **kw)
+    m = re.search(r'view=ownership"[^>]*>Ownership(.*?)</a>', html, flags=re.S)
+    return html, (m.group(1) if m else None)
+
+
+def _ob_count(inner):
+    m = re.search(r'<span class="gg-admin-strip-badge"[^>]*>(\d+)</span>', inner or "")
+    return int(m.group(1)) if m else None
+
+
+_ob_s3, _ob_table = _ow_fixture("legacy")
+_ob_saved_urlopen = lf.urllib.request.urlopen
+lf.urllib.request.urlopen = lambda *a, **k: _cd_raise()
+check("ownership badge: 3 distinct unreviewed deals across both sections -> red pill 'Ownership 3'",
+      _ob_count(_ob_strip()[1]) == 3 and ".gg-admin-strip .gg-admin-strip-badge {" in lf.NAV_CSS
+      and "background: #DC2626" in lf.NAV_CSS.split(".gg-admin-strip-badge {")[1][:200])
+_rv_post({"key": ADMIN_KEY, "deal_id": "9101", "reviewed": True})
+_rv_post({"key": ADMIN_KEY, "deal_id": "9103", "reviewed": True})
+check("ownership badge: reviewed deals drop out of the count (3 -> 1)", _ob_count(_ob_strip()[1]) == 1)
+_ob_s3.objs[lf.DEALS_KEY] = {"deals": [dict(d, people=[{"id": OW_SAM}, {"id": OW_RAY}]) if d["id"] == 9103 else d
+                                      for d in _ow_live]}
+reset_caches()
+lf._closed_deals_cache["fetched_at"] = None
+lf._closed_deals_cache["deals"] = None
+check("ownership badge: 'Changed since review' counts as unreviewed (1 -> 2)", _ob_count(_ob_strip()[1]) == 2)
+_rv_post({"key": ADMIN_KEY, "deal_id": "9103", "reviewed": True})
+_rv_post({"key": ADMIN_KEY, "deal_id": "9106", "reviewed": True})
+_ob_html0, _ob_inner0 = _ob_strip()
+check("ownership badge: hidden at 0 (plain 'Ownership' link, no pill)",
+      _ob_inner0 == "" and "gg-admin-strip-badge" not in _ob_html0)
+_rv_post({"key": ADMIN_KEY, "deal_id": "9106", "reviewed": False})
+check("ownership badge: count is the same number the page's own computation gives",
+      _ob_count(_ob_strip()[1]) == 1
+      == len({d["deal_id"] for d in lf.ownership_report()["retag"] + [a["deal"] for a in lf.ownership_report()["access"]]
+              if d["review"] != "reviewed"}))
+lf._req_cache_reset()
+check("ownership badge: never for tenants / buyers (no admin strip, no badge, no count computed)",
+      "gg-admin-strip-badge" not in lf._nav_html("overview", "Sam", account_email="sam@sellcap.com")
+      and "view=ownership" not in lf._nav_html("overview", "Sam", account_email="sam@sellcap.com")
+      and lf._ownership_badge_html(None) == "" and lf._ownership_badge_html("wrong-key") == "")
+_ob_saved_report = lf.ownership_report
+lf.ownership_report = lambda: (_ for _ in ()).throw(RuntimeError("dynamo down"))
+_ob_html_fail, _ob_inner_fail = _ob_strip()
+lf.ownership_report = _ob_saved_report
+check("ownership badge: computation failure -> link still renders, no badge",
+      _ob_inner_fail == "" and 'view=ownership' in _ob_html_fail and "gg-admin-strip-badge" not in _ob_html_fail)
+_ob_calls = []
+lf.ownership_report = lambda: (_ob_calls.append(1), _ob_saved_report())[1]
+lf._req_cache_reset()
+lf._nav_html("overview", "Admin", key=ADMIN_KEY)
+lf._nav_html("mydeals", "Admin", key=ADMIN_KEY)
+lf.ownership_report = _ob_saved_report
+check("ownership badge: computed at most once per request (memoized)", len(_ob_calls) == 1)
 
 os.environ.pop("OWNERSHIP_RULE", None)
 lf.urllib.request.urlopen = _ow_saved_urlopen

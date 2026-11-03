@@ -6001,6 +6001,33 @@ def _handle_ownership_review(event):
                            "label": _ownership_review_label(now_iso) if reviewed else ""})
 
 
+@_request_memo("ownership_unreviewed", lambda: ())
+def _ownership_unreviewed_count():
+    """Distinct deals on the ownership page (both sections) not reviewed,
+    "Changed since review" included -- straight from ownership_report.
+    Memoized per request; any failure -> None (logged, no badge)."""
+    try:
+        rep = ownership_report()
+        deals = list(rep["retag"]) + [a["deal"] for a in rep["access"]]
+        return len({d["deal_id"] for d in deals if d.get("review") != "reviewed"})
+    except Exception as e:
+        print(f"ownership badge count failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _ownership_badge_html(key):
+    """Small red pill with the unreviewed count on the admin strip's
+    Ownership link; "" at 0, on failure, or without the real admin key."""
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not admin_key or key != admin_key:
+        return ""
+    n = _ownership_unreviewed_count()
+    if not n:
+        return ""
+    return (f' <span class="gg-admin-strip-badge" title="{n} deal{"" if n == 1 else "s"} not reviewed">'
+            f'{n}</span>')
+
+
 def ownership_report():
     """{"retag": [...], "access": [...]} for the ownership page.
     retag: every live Sell deal (OWNERSHIP_LIVE_STAGE_IDS, not archived)
@@ -6010,12 +6037,13 @@ def ownership_report():
     who owns a live Sell deal today (legacy: linked + has a usable email)
     but would not under the primary rule, one row per (person, deal)."""
     by_id = _people_data()["by_id"]
-    live = [d for d in get_deals_list()
+    all_deals = get_deals_list()
+    live = [d for d in all_deals
             if _deal_is_sell(d) and not d.get("is_archived")
             and _deal_stage_id(d) in OWNERSHIP_LIVE_STAGE_IDS]
     # Who owns >= 1 Sell deal (any stage) under the primary rule.
     primary_owners_any = set()
-    for d in get_deals_list():
+    for d in all_deals:
         if _deal_is_sell(d):
             primary_owners_any |= sell_deal_owner_person_ids(d)
     reviews = _ownership_reviews()
@@ -10758,6 +10786,9 @@ NAV_CSS = """
   .gg-admin-strip .gg-view-toggle-btn.active { background: #ffffff; color: #7a1f1f; }
   .gg-admin-strip .gg-view-toggle-btn:not(.active):hover { color: #ffffff; }
   .gg-admin-strip .gg-admin-strip-link { color: #ffffff; font-size: 12px; text-decoration: underline; }
+  .gg-admin-strip .gg-admin-strip-badge { display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 999px;
+                                          background: #DC2626; color: #ffffff; font-size: 11px; font-weight: 700;
+                                          line-height: 16px; text-decoration: none; vertical-align: 1px; }
   .gg-admin-strip .gg-copy-link-btn { color: #ffffff; border-color: rgba(255,255,255,0.5); padding: 4px 10px; }
   .gg-admin-strip .gg-copy-link-btn:hover { border-color: #ffffff; }
   /* Click/focus-driven only, via the shared GGDropdown helper -- see the
@@ -11343,7 +11374,8 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
                             f'{admin_badge_html}<div class="gg-admin-strip-controls">'
                             f'{tenant_search_html}{view_toggle_html}{copy_link_html}'
                             f'<a class="gg-admin-strip-link" href="?key={_esc(urllib.parse.quote(str(key)))}&amp;view=ownership" '
-                            f'target="_blank" rel="noopener noreferrer">Ownership</a></div></div></div>\n')
+                            f'target="_blank" rel="noopener noreferrer">Ownership{_ownership_badge_html(key)}</a>'
+                            f'</div></div></div>\n')
     return f"""{admin_strip_html}<header class="gg-nav">
   <div class="gg-nav-inner">
     <nav class="gg-tabs">
