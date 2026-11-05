@@ -7273,6 +7273,59 @@ check("company team: admin picker groups Mattia under Brian's team",
       {e["email"] for e in ct_rows} == {"brian@teamignite.ventures", "mattia@teamignite.vc"})
 lf.COMPANY_SHARING_BLOCKLIST = _saved_company_blocklist
 
+# --- Contact rule (non-seller Pipeline Type "Contact" never joins a team) ---
+cr_people = {"people": [
+    {"id": 951, "full_name": "Brian Ignite", "email": "brian@teamignite.ventures", "company_id": 7101,
+     "company_name": "Team Ignite", "type": "Contact", "custom_fields": {}},   # seller who is a Contact
+    {"id": 952, "full_name": "Mattia Ignite", "email": "mattia@teamignite.vc", "company_id": 7101,
+     "company_name": "Team Ignite", "type": "Lead", "custom_fields": {}},      # Lead company-mate
+    {"id": 953, "full_name": "Carla Contact", "email": "carla@other.vc", "company_id": 7101,
+     "company_name": "Team Ignite", "type": "Contact", "custom_fields": {}},   # Contact company-mate
+    {"id": 954, "full_name": "Dora Domain", "email": "dora@teamignite.ventures", "company_id": 7199,
+     "company_name": "Elsewhere", "type": "Contact", "custom_fields": {}},     # Contact at seller's domain
+]}
+use_fixture({lf.PEOPLE_KEY: cr_people, lf.INTEREST_KEY: {"buy": {}},
+             lf.DEALS_KEY: {"deals": [_tt_sell(990101, "Ignite Co", 951)]}})
+check("contact rule: off by default", lf.CONTACT_RULE_ENABLED is False and "type" in lf.PEOPLE_SLIM_FIELDS)
+cr_off = lf._build_tenant_index(contact_rule=False)
+check("contact rule off: Contact mates still join (current behavior)",
+      "carla@other.vc" in cr_off and "dora@teamignite.ventures" in cr_off)
+cr_on = lf._build_tenant_index(contact_rule=True)
+check("contact rule: non-seller Contact company-mate -> no access", "carla@other.vc" not in cr_on)
+check("contact rule: non-seller Contact at a seller's email domain -> no access",
+      "dora@teamignite.ventures" not in cr_on)
+check("contact rule: seller whose Type is Contact keeps access",
+      cr_on.get("brian@teamignite.ventures", {}).get("is_seller") is True)
+check("contact rule: non-seller Lead company-mate still joins Brian's team",
+      cr_on.get("mattia@teamignite.vc", {}).get("team_domain") == "teamignite.ventures"
+      and cr_on.teams["teamignite.ventures"]["member_emails"] == ["brian@teamignite.ventures", "mattia@teamignite.vc"])
+_saved_cr = lf.CONTACT_RULE_ENABLED
+lf.CONTACT_RULE_ENABLED = True
+check("contact rule: CONTACT_RULE_ENABLED drives the default build",
+      "carla@other.vc" not in lf._build_tenant_index() and "mattia@teamignite.vc" in lf._build_tenant_index())
+lf.CONTACT_RULE_ENABLED = _saved_cr
+
+def _dp_get(q, method="GET"):
+    return lf.lambda_handler({"requestContext": {"http": {"method": method}}, "rawPath": "/",
+                              "queryStringParameters": q, "cookies": []}, None)
+check("debug_people: no admin key -> 403", _dp_get({"debug_people": "teamignite"})["statusCode"] == 403)
+check("debug_people: wrong key -> 403", _dp_get({"debug_people": "teamignite", "key": "nope"})["statusCode"] == 403)
+check("debug_people: POST -> 403",
+      _dp_get({"debug_people": "teamignite", "key": ADMIN_KEY}, method="POST")["statusCode"] in (403, 405))
+_dp_s3, _ = use_fixture({lf.PEOPLE_KEY: cr_people, lf.INTEREST_KEY: {"buy": {}},
+                         lf.DEALS_KEY: {"deals": [_tt_sell(990101, "Ignite Co", 951)]}})
+lf._tenant_index()  # warm (first run writes the slim file)
+_dp_puts_before = len(_dp_s3.put_calls)
+_dp = _dp_get({"debug_people": "teamignite", "key": ADMIN_KEY})
+_dpj = json.loads(_dp["body"])
+check("debug_people: admin GET returns matches, type values and impact",
+      _dp["statusCode"] == 200 and {m["id"] for m in _dpj["matches"]} == {951, 952, 954}
+      and "type" in _dpj["type_like_keys"]
+      and {r["email"] for r in _dpj["contact_rule_impact"]["would_lose_access"]} == {"carla@other.vc", "dora@teamignite.ventures"})
+check("debug_people: read-only (no S3 writes of people/tenant data)",
+      len(_dp_s3.put_calls) == _dp_puts_before and not _dp_s3.multipart_calls)
+check("debug_people: never linked from a page", "debug_people" not in lf.render_client_links_page())
+
 lf.urllib.request.urlopen = fake_urlopen
 lf.DOMAIN_SHARING_BLOCKLIST = _saved_domain_blocklist
 lf.TENANT_BLOCKLIST = _saved_tenant_blocklist

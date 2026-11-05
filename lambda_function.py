@@ -1084,6 +1084,14 @@ DOMAIN_SHARING_BLOCKLIST = set()
 # (e.g. large banks). Sellers at one of these keep their domain team /
 # individual tenancy; colleagues are not added by company.
 COMPANY_SHARING_BLOCKLIST = set()
+# Pipeline person Type (Lead / Contact). When CONTACT_RULE_ENABLED, a
+# NON-seller whose Type is Contact never joins a team (domain or company
+# path) and gets no access entry; sellers keep access whatever their Type.
+# OFF until Chad confirms the key/values and the impact list
+# (admin ?debug_people=<needle> reports both).
+PERSON_TYPE_FIELD = "type"
+PERSON_TYPE_CONTACT = "contact"
+CONTACT_RULE_ENABLED = False
 # RFC 2606 / RFC 6761 reserved documentation/test domains -- never real
 # mailboxes, so never a team (the test suite's many unrelated tenants
 # share @example.com).
@@ -2182,7 +2190,7 @@ PEOPLE_SLIM_KEY = "syndicate-dash/people-slim.json"
 PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name", "full_name", "company_id",
                       "company_name", "title", "position", "phone", "mobile", "website", "linked_in_url",
                       "work_country", "home_country", "work_city", "home_city", "updated_at", "created_at",
-                      "won_deals_total", "custom_fields")
+                      "won_deals_total", "type", "custom_fields")
 # Every custom_label_N this file references (a test keeps this in sync).
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
     1958, 3052210, 3064297, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163, 3769275,
@@ -3345,8 +3353,16 @@ class _TenantIndex(dict):
     person_team = {}
 
 
+def _person_is_contact(rec):
+    """True when the person's Pipeline Type (PERSON_TYPE_FIELD) is Contact."""
+    v = (rec or {}).get(PERSON_TYPE_FIELD)
+    if isinstance(v, dict):
+        v = v.get("name") or v.get("value")
+    return str(v or "").strip().lower() == PERSON_TYPE_CONTACT
+
+
 @_perf_phase("tenancy")
-def _build_tenant_index():
+def _build_tenant_index(people_list=None, contact_rule=None):
     """email (lowercased) -> {"name", "person_id"} for every auto-
     enrolled tenant: a people.json person linked to >=1 deal tagged Sell
     Order (DEAL_SIDE_FIELD contains DEAL_SIDE_SELL_ID), any stage —
@@ -3373,7 +3389,9 @@ def _build_tenant_index():
     checks) compares it against those same int-coerced deal-linkage
     sets."""
     _perf_count("build_tenant_index")
-    people_list = _people_list()
+    if people_list is None:
+        people_list = _people_list()
+    exclude_contacts = CONTACT_RULE_ENABLED if contact_rule is None else bool(contact_rule)
 
     seller_person_ids = set()
     for deal in get_deals_list():
@@ -3403,6 +3421,10 @@ def _build_tenant_index():
     def _usable_emails(rec):
         return [e for e in _person_all_emails(rec) if e not in TENANT_BLOCKLIST]
 
+    def _excluded(pid_str, rec):
+        # Contact rule: non-seller Contacts never join a team.
+        return exclude_contacts and pid_str not in seller_person_ids_str and _person_is_contact(rec)
+
     tenant_domains = set()
     for pid_str in seller_person_ids_str:
         _pid, rec = people_by_pid.get(pid_str, (None, None))
@@ -3416,6 +3438,8 @@ def _build_tenant_index():
     person_team = {}
     if tenant_domains:
         for pid_str, (_pid, rec) in people_by_pid.items():
+            if _excluded(pid_str, rec):
+                continue
             doms = sorted({_email_domain(e) for e in _usable_emails(rec)} & tenant_domains)
             if doms:
                 person_team[pid_str] = doms[0]
@@ -3440,7 +3464,7 @@ def _build_tenant_index():
     pids_by_cid = {}
     for pid_str, (pid_int, rec) in people_by_pid.items():
         cid = _norm_cid(rec.get("company_id"))
-        if cid is not None:
+        if cid is not None and not _excluded(pid_str, rec):
             pids_by_cid.setdefault(cid, []).append((pid_int, pid_str))
     sellers_by_cid = {}
     for pid_str in seller_person_ids_str:
@@ -8134,6 +8158,82 @@ def _deal_stage_label(sid):
     top-right on a deal card instead of a label. Falls back to the raw
     number only for an id in neither map (never expected)."""
     return STAGE_LABELS.get(sid) or TERMINAL_STAGE_LABELS.get(sid) or (str(sid) if sid is not None else "—")
+
+
+def _handle_debug_people(needle):
+    """?debug_people=<needle>, admin key + GET only (checked by the
+    caller), never linked from any page. READ-ONLY: reads the FULL
+    people.json export (not the slim file) and writes nothing. Reports
+    people.json LastModified, per-key record counts, distinct values of
+    Type-like keys, every person whose email/emails contain <needle>
+    (with their current tenant entry), and which CURRENT tenant emails
+    the Contact rule would remove (index built twice from the full
+    export: rule off vs on)."""
+    from collections import Counter
+    needle = str(needle or "").strip().lower()
+    s3 = _s3_client()
+    out = {"needle": needle, "ownership_rule": os.environ.get("OWNERSHIP_RULE", "legacy"),
+           "contact_rule_enabled": CONTACT_RULE_ENABLED, "person_type_field": PERSON_TYPE_FIELD}
+    try:
+        head = s3.head_object(Bucket=BUCKET, Key=PEOPLE_KEY)
+        out["people_json_last_modified"] = str(head.get("LastModified"))
+        data = json.loads(s3.get_object(Bucket=BUCKET, Key=PEOPLE_KEY)["Body"].read())
+    except Exception as e:
+        out["error"] = f"people.json read failed: {e}"
+        return _json_response(out)
+    people = [r for r in (data.get("people", []) if isinstance(data, dict) else (data or []))
+              if isinstance(r, dict)]
+    out["people_count"] = len(people)
+    keyc = Counter(k for r in people for k in r)
+    out["person_keys"] = dict(sorted(keyc.items()))
+    out["type_like_keys"] = {
+        k: Counter(json.dumps(r.get(k), sort_keys=True)[:80] for r in people if k in r).most_common(20)
+        for k in sorted(keyc)
+        if any(t in k.lower() for t in ("type", "lead", "contact", "kind", "category"))}
+
+    def _addr(e):
+        return str((e.get("address") or e.get("email")) if isinstance(e, dict) else (e or "")).lower()
+
+    try:
+        live_idx = _tenant_index()
+    except Exception as e:
+        live_idx = {}
+        out["live_index_error"] = str(e)
+    matches = []
+    for r in people:
+        ems = r.get("emails") or []
+        vals = [_addr(r.get("email"))] + [_addr(e) for e in (ems if isinstance(ems, list) else [ems])]
+        if needle and any(needle in v for v in vals if v):
+            row = {k: r.get(k) for k in ("id", "full_name", "first_name", "last_name", "company_id",
+                                         "company_name", "email", "emails")}
+            row["type_like"] = {k: r.get(k) for k in r
+                                if any(t in k.lower() for t in ("type", "lead", "contact", "kind", "category"))}
+            row["live_tenant_entries"] = {e: {"team_domain": live_idx[e].get("team_domain"),
+                                              "is_seller": live_idx[e].get("is_seller")}
+                                          for e in [v.strip() for v in vals if v] if e in live_idx}
+            matches.append(row)
+    out["matches"] = matches
+
+    try:
+        idx_off = _build_tenant_index(people_list=people, contact_rule=False)
+        idx_on = _build_tenant_index(people_list=people, contact_rule=True)
+        by_pid = {str(r.get("id")): r for r in people}
+        lost = []
+        for email in sorted(set(idx_off) - set(idx_on)):
+            entry = idx_off[email]
+            rec = by_pid.get(str(entry.get("person_id"))) or {}
+            team = (idx_off.teams or {}).get(entry.get("team_domain")) or {}
+            lost.append({"email": email, "name": entry.get("name"), "person_id": entry.get("person_id"),
+                         "company_name": entry.get("company_name"), "team_key": entry.get("team_domain"),
+                         "team_name": team.get("name"), "type": rec.get(PERSON_TYPE_FIELD)})
+        out["contact_rule_impact"] = {"tenant_emails_rule_off": len(idx_off),
+                                      "tenant_emails_rule_on": len(idx_on),
+                                      "would_lose_access": lost,
+                                      "would_gain_access": sorted(set(idx_on) - set(idx_off))}
+    except Exception as e:
+        out["contact_rule_impact"] = {"error": str(e)}
+    return {"statusCode": 200, "headers": {"Content-Type": "application/json", "Cache-Control": "private, no-store"},
+            "body": json.dumps(out, indent=1, default=str)}
 
 
 def _handle_debug_closed():
@@ -23032,6 +23132,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_debug_deal(debug_deal_param)
+
+    if query.get("debug_people"):
+        if not is_admin_key:
+            return _forbidden()
+        return _handle_debug_people(query.get("debug_people"))
 
     if query.get("debug_closed"):
         if not is_admin_key:
