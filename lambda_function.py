@@ -1080,6 +1080,10 @@ FREE_MAIL_DOMAINS = {
 # Corporate domains whose colleagues must NOT share a team view (e.g. large
 # banks). Anyone at one of these keeps individual tenancy.
 DOMAIN_SHARING_BLOCKLIST = set()
+# Pipeline company_ids (ints) whose people must NOT share a company team
+# (e.g. large banks). Sellers at one of these keep their domain team /
+# individual tenancy; colleagues are not added by company.
+COMPANY_SHARING_BLOCKLIST = set()
 # RFC 2606 / RFC 6761 reserved documentation/test domains -- never real
 # mailboxes, so never a team (the test suite's many unrelated tenants
 # share @example.com).
@@ -3416,6 +3420,53 @@ def _build_tenant_index():
             if doms:
                 person_team[pid_str] = doms[0]
 
+    # Company teams: every people.json person sharing a seller's Pipeline
+    # company_id (never company_name) joins that seller's team. Key
+    # stability: a person already on a domain team never moves; mates
+    # join the domain team of the lowest-person_id seller at the company
+    # that has one (same key -> same anon codes / partitions); with no
+    # such seller the team is keyed "company-<company_id>". Only formed
+    # when at least one person actually joins, so a lone seller stays
+    # an individual tenant. Non-seller company mates get access on every
+    # usable email (company_mates below).
+    def _norm_cid(cid):
+        if cid is None:
+            return None
+        try:
+            return int(cid)
+        except (TypeError, ValueError):
+            return str(cid).strip() or None
+
+    pids_by_cid = {}
+    for pid_str, (pid_int, rec) in people_by_pid.items():
+        cid = _norm_cid(rec.get("company_id"))
+        if cid is not None:
+            pids_by_cid.setdefault(cid, []).append((pid_int, pid_str))
+    sellers_by_cid = {}
+    for pid_str in seller_person_ids_str:
+        pid_int, rec = people_by_pid.get(pid_str, (None, None))
+        if rec is None:
+            continue
+        cid = _norm_cid(rec.get("company_id"))
+        if cid is None or cid in COMPANY_SHARING_BLOCKLIST:
+            continue
+        sellers_by_cid.setdefault(cid, []).append((pid_int, pid_str))
+    company_mates = set()
+    for cid in sorted(sellers_by_cid, key=str):
+        sellers = sorted(sellers_by_cid[cid])
+        joiners = [ps for _pi, ps in sorted(pids_by_cid.get(cid, [])) if ps not in person_team]
+        domain_sellers = [ps for _pi, ps in sellers if ps in person_team]
+        if domain_sellers:
+            key = person_team[domain_sellers[0]]
+        else:
+            if len(joiners) < 2:  # only the lone seller -> stays individual
+                continue
+            key = f"company-{cid}"
+        for ps in joiners:
+            person_team[ps] = key
+            if ps not in seller_person_ids_str:
+                company_mates.add(ps)
+
     by_email = _TenantIndex()
     for rec in people_list:
         pid = rec.get("id")
@@ -3440,7 +3491,7 @@ def _build_tenant_index():
         company_id = rec.get("company_id")
         company_name = (rec.get("company_name") or "").strip() or None
         for email in _usable_emails(rec):
-            if not is_seller and _email_domain(email) != team_domain:
+            if not is_seller and str(pid) not in company_mates and _email_domain(email) != team_domain:
                 continue
             override_name = (TENANT_OVERRIDES.get(email) or {}).get("name")
             by_email[email] = {"name": override_name or default_name or email, "person_id": pid,
@@ -15466,7 +15517,10 @@ def _note_visibility_text(tenant_email):
     """Who can read this viewer's notes: their whole domain team (plus
     Gracia Group) for a team member, else just them."""
     team = _tenant_team(tenant_email)
-    who = f"your team at {team['domain']}" if team else "you"
+    if team and str(team["domain"]).startswith("company-"):
+        who = f"your team at {team.get('name') or team['domain']}"
+    else:
+        who = f"your team at {team['domain']}" if team else "you"
     return f"Visible to {who} and Gracia Group."
 
 

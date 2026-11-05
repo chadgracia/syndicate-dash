@@ -7205,6 +7205,74 @@ check("labels: individual tenant subtitle says 'you'",
       "About this person, across all deals. Visible to you and Gracia Group." in tt_gina_page
       and "Bob person note" not in tt_gina_page)
 
+
+# --- Company teams (membership by Pipeline company_id) ---
+_saved_company_blocklist = set(lf.COMPANY_SHARING_BLOCKLIST)
+ct_people = {"people": [
+    {"id": 901, "full_name": "Brian Ignite", "email": "brian@teamignite.ventures", "company_id": 7001,
+     "company_name": "Team Ignite", "custom_fields": {}},
+    {"id": 902, "full_name": "Mattia Ignite", "email": "mattia@teamignite.vc", "company_id": 7001,
+     "company_name": "Team Ignite", "custom_fields": {}},
+    # (b) same company_name, different company_id -> not merged
+    {"id": 903, "full_name": "Nora Namesake", "email": "nora@otherignite.com", "company_id": 7002,
+     "company_name": "Team Ignite", "custom_fields": {}},
+    # (c) blocklisted company
+    {"id": 904, "full_name": "Sam Bank", "email": "sam@gmail.com", "company_id": 7003,
+     "company_name": "Huge Bank", "custom_fields": {}},
+    {"id": 905, "full_name": "Sue Bank", "email": "sue@hugebank.org", "company_id": 7003,
+     "company_name": "Huge Bank", "custom_fields": {}},
+    # (d) gmail-only seller + company-mate
+    {"id": 906, "full_name": "Gil Gmail", "email": "gil@gmail.com", "company_id": 7004,
+     "company_name": "Gil Partners", "custom_fields": {}},
+    {"id": 907, "full_name": "Pam Mate", "email": "pam@yahoo.com", "company_id": 7004,
+     "company_name": "Gil Partners", "custom_fields": {}},
+    # (e) Hal is a seller on domain team halcap.com; Ivy is on domain team ivycap.com
+    #     (seller Ian) but shares Hal's company_id -> Ivy never moves.
+    {"id": 908, "full_name": "Hal Cap", "email": "hal@halcap.com", "company_id": 7005,
+     "company_name": "Hal Capital", "custom_fields": {}},
+    {"id": 909, "full_name": "Ian Ivy", "email": "ian@ivycap.com", "company_id": 7006,
+     "company_name": "Ivy Capital", "custom_fields": {}},
+    {"id": 910, "full_name": "Ivy Ivy", "email": "ivy@ivycap.com", "company_id": 7005,
+     "company_name": "Hal Capital", "custom_fields": {}},
+    {"id": 911, "full_name": "Lone Gmail", "email": "lone@gmail.com", "company_id": 7007,
+     "company_name": "Lone LLC", "custom_fields": {}},
+]}
+ct_deals = [_tt_sell(990001, "Ignite Co", 901), _tt_sell(990002, "Bank Co", 904),
+            _tt_sell(990003, "Gil Co", 906), _tt_sell(990004, "Hal Co", 908),
+            _tt_sell(990005, "Ian Co", 909), _tt_sell(990006, "Lone Co", 911)]
+lf.COMPANY_SHARING_BLOCKLIST = {7003}
+use_fixture({lf.PEOPLE_KEY: ct_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": ct_deals}})
+ct_idx = lf._tenant_index()
+check("company team (a): Mattia (different domain, same company_id) is a tenant on Brian's team",
+      ct_idx.get("mattia@teamignite.vc", {}).get("team_domain") == "teamignite.ventures"
+      and ct_idx["brian@teamignite.ventures"]["team_domain"] == "teamignite.ventures")
+check("company team (a): Brian and Mattia share the anon key team#teamignite.ventures",
+      lf._anon_key_for("mattia@teamignite.vc") == lf._anon_key_for("brian@teamignite.ventures")
+      == "team#teamignite.ventures"
+      and lf._anon_buyer_code("mattia@teamignite.vc", 1) == lf._anon_buyer_code("brian@teamignite.ventures", 1))
+check("company team (a): team members/partitions include Mattia",
+      lf._tenant_teams()["teamignite.ventures"]["member_emails"] == ["brian@teamignite.ventures", "mattia@teamignite.vc"])
+check("company team (b): same company_name, different company_id -> not merged",
+      lf._resolve_tenant("nora@otherignite.com") is None)
+check("company team (c): COMPANY_SHARING_BLOCKLIST company -> no merge",
+      lf._resolve_tenant("sue@hugebank.org") is None and ct_idx["sam@gmail.com"]["team_domain"] is None)
+check("company team (d): gmail seller + company-mate -> team company-7004",
+      ct_idx["gil@gmail.com"]["team_domain"] == "company-7004"
+      and ct_idx.get("pam@yahoo.com", {}).get("team_domain") == "company-7004"
+      and lf._anon_key_for("pam@yahoo.com") == "team#company-7004"
+      and lf._tenant_teams()["company-7004"]["name"] == "Gil Partners")
+check("company team (d): label names the company",
+      lf._note_visibility_text("pam@yahoo.com") == "Visible to your team at Gil Partners and Gracia Group.")
+check("company team (e): a person already on a domain team is never moved",
+      ct_idx["ivy@ivycap.com"]["team_domain"] == "ivycap.com" and ct_idx["hal@halcap.com"]["team_domain"] == "halcap.com"
+      and lf._tenant_teams()["halcap.com"]["member_emails"] == ["hal@halcap.com"])
+check("company team: a lone gmail seller with no company-mates stays individual",
+      ct_idx["lone@gmail.com"]["team_domain"] is None and lf._anon_key_for("lone@gmail.com") == "lone@gmail.com")
+ct_rows = [e for e in lf._eligible_tenants_list() if e.get("team_domain") == "teamignite.ventures"]
+check("company team: admin picker groups Mattia under Brian's team",
+      {e["email"] for e in ct_rows} == {"brian@teamignite.ventures", "mattia@teamignite.vc"})
+lf.COMPANY_SHARING_BLOCKLIST = _saved_company_blocklist
+
 lf.urllib.request.urlopen = fake_urlopen
 lf.DOMAIN_SHARING_BLOCKLIST = _saved_domain_blocklist
 lf.TENANT_BLOCKLIST = _saved_tenant_blocklist
