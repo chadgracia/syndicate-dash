@@ -1116,6 +1116,7 @@ PLATFORM_BLOCKLIST_DOMAINS = frozenset({
     "augment.capital", "augment.market", "fnex.com", "hedgebay.com", "gatewaypmx.com", "unicorns.exchange",
     # Added from the Nov 6 people.json scan (Hiive, PM Insights, Notice):
     "hiivemarkets.com", "pminsights.com", "notice.co",
+    "siliconvalleyinvestclub.com", "investclub.sv",
 })
 # Lowercased exact company_name matches (Nov 6 people.json scan).
 PLATFORM_BLOCKLIST_COMPANY_NAMES = frozenset({
@@ -8249,6 +8250,32 @@ def _cf_labels(rec, field, labels):
     return [labels.get(i, f"#{i}") for i in sorted(ids)]
 
 
+def _intermediary_mixed_groups(people):
+    """Admin diagnostic (?debug_people=__mixed__): every company_name and
+    every corporate email domain where some people have an Intermediary
+    Transactor Type and others don't, with each person's name, email and
+    Transactor Type labels."""
+    by_key = {}
+    for r in people:
+        row = {"name": _person_display_name(r), "email": (_person_all_emails(r) or [""])[0],
+               "transactor_type": _cf_labels(r, TRANSACTOR_TYPE_FIELD, TRANSACTOR_TYPE_LABELS),
+               "intermediary": bool(_deal_cf_option_ids({"custom_fields": r.get("custom_fields") or {}},
+                                                        TRANSACTOR_TYPE_FIELD) & INTERMEDIARY_TRANSACTOR_IDS)}
+        cname = str(r.get("company_name") or "").strip()
+        if cname:
+            by_key.setdefault(("company", cname.lower(), cname), []).append(row)
+        for d in {_email_domain(e) for e in _person_all_emails(r)}:
+            if _is_corporate_domain(d):
+                by_key.setdefault(("domain", d, d), []).append(row)
+    out = []
+    for (kind, _k, label), rows in sorted(by_key.items()):
+        flags = {x["intermediary"] for x in rows}
+        if flags == {True, False}:
+            out.append({"kind": kind, "group": label,
+                        "people": sorted(rows, key=lambda x: (not x["intermediary"], x["name"] or ""))})
+    return out
+
+
 def _handle_debug_people(needle):
     """?debug_people=<needle>, admin key + GET only (checked by the
     caller), never linked from any page. READ-ONLY: reads the FULL
@@ -8319,6 +8346,8 @@ def _handle_debug_people(needle):
                     dom[d] += 1
         out["company_name_hits"] = cn.most_common(50)
         out["email_domain_hits"] = dom.most_common(50)
+    if needle == "__mixed__":
+        out["intermediary_mixed"] = _intermediary_mixed_groups(people)
 
     try:
         idx_off = _build_tenant_index(people_list=people, intermediary_rule=False)

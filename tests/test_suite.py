@@ -7398,6 +7398,16 @@ check("platform: colleague can't seed or join a team (domain or company)",
       and "equityzen.com" not in rp_on.teams and "company-7501" not in rp_on.teams)
 check("platform: blocked by company name (Notice.co subdomain, Nasdaq Private Markets)",
       rp_on.blocked.get("nia@bd.notice.co") == "platform" and rp_on.blocked.get("ned@nasdaq.com") == "platform")
+check("platform: SVIC domains blocked",
+      lf._person_block_reason({"email": "a@siliconvalleyinvestclub.com"}) == "platform"
+      and lf._person_block_reason({"email": "b@investclub.sv"}) == "platform")
+_mx = lf._intermediary_mixed_groups([
+    {"full_name": "I One", "email": "i@mix.com", "company_name": "Mix Co", "custom_fields": _ir_cf([6577160])},
+    {"full_name": "N Two", "email": "n@mix.com", "company_name": "Mix Co", "custom_fields": _ir_cf([6484810])},
+    {"full_name": "A Solo", "email": "a@solo.com", "company_name": "Solo", "custom_fields": _ir_cf([6577160])}])
+check("debug mixed: groups with intermediaries and non-intermediaries (company + domain), others skipped",
+      sorted((g["kind"], g["group"]) for g in _mx) == [("company", "Mix Co"), ("domain", "mix.com")]
+      and _mx[0]["people"][0]["transactor_type"] == ["Intermediary - Co-Broker"])
 check("platform: Brian/Mattia team unchanged",
       rp_on.get("mattia@teamignite.vc", {}).get("team_domain") == "teamignite.ventures"
       and rp_on.teams["teamignite.ventures"]["member_emails"] == ["brian@teamignite.ventures", "mattia@teamignite.vc"])
