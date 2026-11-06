@@ -7273,37 +7273,83 @@ check("company team: admin picker groups Mattia under Brian's team",
       {e["email"] for e in ct_rows} == {"brian@teamignite.ventures", "mattia@teamignite.vc"})
 lf.COMPANY_SHARING_BLOCKLIST = _saved_company_blocklist
 
-# --- Contact rule (non-seller Pipeline Type "Contact" never joins a team) ---
-cr_people = {"people": [
+# --- Intermediary rule (INTERMEDIARY_RULE_ENABLED, off for now) ---
+def _ir_cf(transactor=None, pdr=None):
+    cf = {}
+    if transactor is not None:
+        cf["custom_label_3759163"] = transactor
+    if pdr is not None:
+        cf["custom_label_4011837"] = pdr
+    return cf
+ir_people = {"people": [
     {"id": 951, "full_name": "Brian Ignite", "email": "brian@teamignite.ventures", "company_id": 7101,
-     "company_name": "Team Ignite", "type": "Contact", "custom_fields": {}},   # seller who is a Contact
+     "company_name": "Team Ignite", "custom_fields": _ir_cf([6484810])},
     {"id": 952, "full_name": "Mattia Ignite", "email": "mattia@teamignite.vc", "company_id": 7101,
-     "company_name": "Team Ignite", "type": "Lead", "custom_fields": {}},      # Lead company-mate
-    {"id": 953, "full_name": "Carla Contact", "email": "carla@other.vc", "company_id": 7101,
-     "company_name": "Team Ignite", "type": "Contact", "custom_fields": {}},   # Contact company-mate
-    {"id": 954, "full_name": "Dora Domain", "email": "dora@teamignite.ventures", "company_id": 7199,
-     "company_name": "Elsewhere", "type": "Contact", "custom_fields": {}},     # Contact at seller's domain
+     "company_name": "Team Ignite", "custom_fields": {}},
+    # intermediary company-mate of a normal seller
+    {"id": 953, "full_name": "Carl CoBroker", "email": "carl@other.vc", "company_id": 7101,
+     "company_name": "Team Ignite", "custom_fields": _ir_cf([6577160])},
+    # intermediary domain-mate (different company)
+    {"id": 954, "full_name": "Dora Finder", "email": "dora@teamignite.ventures", "company_id": 7199,
+     "company_name": "Elsewhere", "custom_fields": _ir_cf(6888332, 7218527)},
+    # Referral - Client, not an intermediary, at Brian's company
+    {"id": 955, "full_name": "Rita Referred", "email": "rita@teamignite.vc", "company_id": 7101,
+     "company_name": "Team Ignite", "custom_fields": _ir_cf([6484810], [7218570])},
+    # intermediary SELLER without Partner - Registered, with a domain-mate and company-mate
+    {"id": 956, "full_name": "Ivan Inter", "email": "ivan@brokerco.com", "company_id": 7201,
+     "company_name": "Broker Co", "custom_fields": _ir_cf([6888333], [7218527])},
+    {"id": 957, "full_name": "Bea Broker", "email": "bea@brokerco.com", "company_id": 7202,
+     "company_name": "Broker Two", "custom_fields": {}},
+    {"id": 958, "full_name": "Cal Broker", "email": "cal@gmail.com", "company_id": 7201,
+     "company_name": "Broker Co", "custom_fields": {}},
+    # intermediary SELLER with Partner - Registered
+    {"id": 959, "full_name": "Pat Partner", "email": "pat@partnerco.com", "company_id": 7301,
+     "company_name": "Partner Co", "custom_fields": _ir_cf([6577160, 6484810], [7218528])},
 ]}
-use_fixture({lf.PEOPLE_KEY: cr_people, lf.INTEREST_KEY: {"buy": {}},
-             lf.DEALS_KEY: {"deals": [_tt_sell(990101, "Ignite Co", 951)]}})
-check("contact rule: off by default", lf.CONTACT_RULE_ENABLED is False and "type" in lf.PEOPLE_SLIM_FIELDS)
-cr_off = lf._build_tenant_index(contact_rule=False)
-check("contact rule off: Contact mates still join (current behavior)",
-      "carla@other.vc" in cr_off and "dora@teamignite.ventures" in cr_off)
-cr_on = lf._build_tenant_index(contact_rule=True)
-check("contact rule: non-seller Contact company-mate -> no access", "carla@other.vc" not in cr_on)
-check("contact rule: non-seller Contact at a seller's email domain -> no access",
-      "dora@teamignite.ventures" not in cr_on)
-check("contact rule: seller whose Type is Contact keeps access",
-      cr_on.get("brian@teamignite.ventures", {}).get("is_seller") is True)
-check("contact rule: non-seller Lead company-mate still joins Brian's team",
-      cr_on.get("mattia@teamignite.vc", {}).get("team_domain") == "teamignite.ventures"
-      and cr_on.teams["teamignite.ventures"]["member_emails"] == ["brian@teamignite.ventures", "mattia@teamignite.vc"])
-_saved_cr = lf.CONTACT_RULE_ENABLED
-lf.CONTACT_RULE_ENABLED = True
-check("contact rule: CONTACT_RULE_ENABLED drives the default build",
-      "carla@other.vc" not in lf._build_tenant_index() and "mattia@teamignite.vc" in lf._build_tenant_index())
-lf.CONTACT_RULE_ENABLED = _saved_cr
+ir_deals = [_tt_sell(990101, "Ignite Co", 951), _tt_sell(990102, "Broker Deal", 956),
+            _tt_sell(990103, "Partner Deal", 959)]
+use_fixture({lf.PEOPLE_KEY: ir_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": ir_deals}})
+check("intermediary rule: off by default; Partner Desk Response in slim custom fields; no 'type' slim field",
+      lf.INTERMEDIARY_RULE_ENABLED is False and "custom_label_4011837" in lf.PEOPLE_SLIM_CUSTOM_FIELDS
+      and "type" not in lf.PEOPLE_SLIM_FIELDS and not hasattr(lf, "CONTACT_RULE_ENABLED"))
+ir_off = lf._build_tenant_index(intermediary_rule=False)
+check("intermediary rule off: current behavior (intermediaries still get access)",
+      "ivan@brokerco.com" in ir_off and "carl@other.vc" in ir_off and "rita@teamignite.vc" in ir_off)
+ir_on = lf._build_tenant_index(intermediary_rule=True)
+check("intermediary rule: intermediary seller without Partner - Registered -> no access",
+      "ivan@brokerco.com" not in ir_on and ir_on.blocked.get("ivan@brokerco.com") == "intermediary")
+check("intermediary rule: intermediary seller with Partner - Registered -> access",
+      ir_on.get("pat@partnerco.com", {}).get("is_seller") is True)
+check("intermediary rule: intermediary company-mate of a normal seller -> no access", "carl@other.vc" not in ir_on)
+check("intermediary rule: intermediary domain-mate -> no access", "dora@teamignite.ventures" not in ir_on)
+check("intermediary rule: Referral - Client non-intermediary -> no access",
+      "rita@teamignite.vc" not in ir_on and ir_on.blocked.get("rita@teamignite.vc") == "referral_client")
+check("intermediary rule: blocked seller's domain/company forms no team",
+      "bea@brokerco.com" not in ir_on and "cal@gmail.com" not in ir_on
+      and "brokerco.com" not in ir_on.teams and "company-7201" not in ir_on.teams)
+check("intermediary rule: Brian/Mattia team unchanged, blocked people not in member list",
+      ir_on.get("mattia@teamignite.vc", {}).get("team_domain") == "teamignite.ventures"
+      and ir_on.teams["teamignite.ventures"]["member_emails"] == ["brian@teamignite.ventures", "mattia@teamignite.vc"]
+      and 953 not in ir_on.teams["teamignite.ventures"]["person_ids"])
+check("intermediary rule: multi-select transactor type (list) handled", lf._person_block_reason(
+      {"custom_fields": _ir_cf([6484810, 6888332])}) == "intermediary"
+      and lf._person_block_reason({"custom_fields": _ir_cf([6484810])}) is None)
+
+_saved_ir = lf.INTERMEDIARY_RULE_ENABLED
+lf.INTERMEDIARY_RULE_ENABLED = True
+use_fixture({lf.PEOPLE_KEY: ir_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": ir_deals}})
+_ir_ivan = _tt_get("ivan@brokerco.com")
+check("intermediary rule: blocked intermediary sign-in -> not-a-tenant page with Partner Desk text + link",
+      "Blockbook isn&#x27;t available to co-brokers or foreign finders. See how to work with Gracia Group:" in _ir_ivan["body"]
+      or "Blockbook isn't available to co-brokers or foreign finders. See how to work with Gracia Group:" in _ir_ivan["body"])
+check("intermediary rule: blocked page links the Partner Desk",
+      'href="https://trades.graciagroup.com/?view=partner-desk"' in _ir_ivan["body"] and "Ignite Co" not in _ir_ivan["body"])
+_ir_rita = _tt_get("rita@teamignite.vc")
+check("intermediary rule: Referral - Client sign-in -> plain not-a-tenant page, no Partner Desk link",
+      lf.NOT_ENABLED_MESSAGE in _ir_rita["body"] and "partner-desk" not in _ir_rita["body"])
+check("intermediary rule: normal non-tenant still gets the plain page",
+      "partner-desk" not in _tt_get("nobody@nowhere.com")["body"])
+lf.INTERMEDIARY_RULE_ENABLED = _saved_ir
 
 def _dp_get(q, method="GET"):
     return lf.lambda_handler({"requestContext": {"http": {"method": method}}, "rawPath": "/",
@@ -7312,18 +7358,23 @@ check("debug_people: no admin key -> 403", _dp_get({"debug_people": "teamignite"
 check("debug_people: wrong key -> 403", _dp_get({"debug_people": "teamignite", "key": "nope"})["statusCode"] == 403)
 check("debug_people: POST -> 403",
       _dp_get({"debug_people": "teamignite", "key": ADMIN_KEY}, method="POST")["statusCode"] in (403, 405))
-_dp_s3, _ = use_fixture({lf.PEOPLE_KEY: cr_people, lf.INTEREST_KEY: {"buy": {}},
-                         lf.DEALS_KEY: {"deals": [_tt_sell(990101, "Ignite Co", 951)]}})
+_dp_s3, _ = use_fixture({lf.PEOPLE_KEY: ir_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": ir_deals}})
 lf._tenant_index()  # warm (first run writes the slim file)
 _dp_puts_before = len(_dp_s3.put_calls)
 _dp = _dp_get({"debug_people": "teamignite", "key": ADMIN_KEY})
 _dpj = json.loads(_dp["body"])
-check("debug_people: admin GET returns matches, type values and impact",
-      _dp["statusCode"] == 200 and {m["id"] for m in _dpj["matches"]} == {951, 952, 954}
-      and "type" in _dpj["type_like_keys"]
-      and {r["email"] for r in _dpj["contact_rule_impact"]["would_lose_access"]} == {"carla@other.vc", "dora@teamignite.ventures"})
-check("debug_people: read-only (no S3 writes of people/tenant data)",
-      len(_dp_s3.put_calls) == _dp_puts_before and not _dp_s3.multipart_calls)
+_dp_lost = {r["email"]: r for r in _dpj["intermediary_rule_impact"]["would_lose_access"]}
+check("debug_people: admin GET returns matches with labels and the intermediary impact list",
+      _dp["statusCode"] == 200 and {m["id"] for m in _dpj["matches"]} == {951, 952, 954, 955}
+      and set(_dp_lost) == {"carl@other.vc", "dora@teamignite.ventures", "rita@teamignite.vc",
+                            "ivan@brokerco.com", "bea@brokerco.com", "cal@gmail.com"})
+check("debug_people: impact rows carry seller flag, team and labels",
+      _dp_lost["ivan@brokerco.com"]["is_seller"] is True
+      and _dp_lost["ivan@brokerco.com"]["transactor_type"] == ["Intermediary - Other"]
+      and _dp_lost["ivan@brokerco.com"]["partner_desk_response"] == ["Partner - Interested"]
+      and _dp_lost["carl@other.vc"]["team_key"] == "teamignite.ventures"
+      and _dpj["intermediary_rule_impact"]["tenant_emails_rule_off"] - _dpj["intermediary_rule_impact"]["tenant_emails_rule_on"] == 6)
+check("debug_people: read-only (no S3 writes)", len(_dp_s3.put_calls) == _dp_puts_before and not _dp_s3.multipart_calls)
 check("debug_people: never linked from a page", "debug_people" not in lf.render_client_links_page())
 
 lf.urllib.request.urlopen = fake_urlopen

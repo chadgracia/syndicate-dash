@@ -1084,14 +1084,26 @@ DOMAIN_SHARING_BLOCKLIST = set()
 # (e.g. large banks). Sellers at one of these keep their domain team /
 # individual tenancy; colleagues are not added by company.
 COMPANY_SHARING_BLOCKLIST = set()
-# Pipeline person Type (Lead / Contact). When CONTACT_RULE_ENABLED, a
-# NON-seller whose Type is Contact never joins a team (domain or company
-# path) and gets no access entry; sellers keep access whatever their Type.
-# OFF until Chad confirms the key/values and the impact list
-# (admin ?debug_people=<needle> reports both).
-PERSON_TYPE_FIELD = "type"
-PERSON_TYPE_CONTACT = "contact"
-CONTACT_RULE_ENABLED = False
+# Intermediary rule (see _person_block_reason). When INTERMEDIARY_RULE_
+# ENABLED, a person is kept out of Blockbook entirely (no access entry on
+# any path, never seeds or joins a team) when (1) their Transactor Type
+# includes an Intermediary option and their Partner Desk Response is not
+# Partner - Registered -- sellers NOT exempt -- or (2) their Partner Desk
+# Response is Referral - Client. OFF until Chad confirms the impact list
+# (admin ?debug_people=<needle> reports it).
+INTERMEDIARY_RULE_ENABLED = False
+INTERMEDIARY_TRANSACTOR_IDS = frozenset({6577160, 6888332, 6888333})
+PARTNER_DESK_RESPONSE_FIELD = "custom_label_4011837"
+PARTNER_DESK_RESPONSE_LABELS = {
+    7218523: "Investor", 7218524: "Not interested", 7218525: "Referral - Interested",
+    7218526: "Referral - Registered", 7218527: "Partner - Interested", 7218528: "Partner - Registered",
+    7218570: "Referral - Client", 7218529: "Revoked",
+}
+PDR_PARTNER_REGISTERED = 7218528
+PDR_REFERRAL_CLIENT = 7218570
+PARTNER_DESK_URL = "https://trades.graciagroup.com/?view=partner-desk"
+INTERMEDIARY_BLOCKED_MESSAGE = ("Blockbook isn't available to co-brokers or foreign finders. "
+                                "See how to work with Gracia Group:")
 # RFC 2606 / RFC 6761 reserved documentation/test domains -- never real
 # mailboxes, so never a team (the test suite's many unrelated tenants
 # share @example.com).
@@ -2190,12 +2202,12 @@ PEOPLE_SLIM_KEY = "syndicate-dash/people-slim.json"
 PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name", "full_name", "company_id",
                       "company_name", "title", "position", "phone", "mobile", "website", "linked_in_url",
                       "work_country", "home_country", "work_city", "home_city", "updated_at", "created_at",
-                      "won_deals_total", "type", "custom_fields")
+                      "won_deals_total", "custom_fields")
 # Every custom_label_N this file references (a test keeps this in sync).
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
     1958, 3052210, 3064297, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163, 3769275,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
-    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 3900670, 2447206))
+    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 4011837, 3900670, 2447206))
 
 
 def _people_slim_schema():
@@ -3351,18 +3363,29 @@ class _TenantIndex(dict):
     "scope"}}) and .person_team ({str(person_id): domain})."""
     teams = {}
     person_team = {}
+    blocked = {}
 
 
-def _person_is_contact(rec):
-    """True when the person's Pipeline Type (PERSON_TYPE_FIELD) is Contact."""
-    v = (rec or {}).get(PERSON_TYPE_FIELD)
-    if isinstance(v, dict):
-        v = v.get("name") or v.get("value")
-    return str(v or "").strip().lower() == PERSON_TYPE_CONTACT
+def _person_block_reason(rec):
+    """Why this person is kept out of Blockbook under the intermediary
+    rule: "referral_client" (Partner Desk Response = Referral - Client,
+    anyone), "intermediary" (Transactor Type includes an Intermediary
+    option and Partner Desk Response is not Partner - Registered), else
+    None. Option ids compared as sets (multi-select safe)."""
+    cf = (rec or {}).get("custom_fields") or {}
+    if not isinstance(cf, dict):
+        return None
+    pdr = set(_deal_cf_option_ids({"custom_fields": cf}, PARTNER_DESK_RESPONSE_FIELD))
+    if PDR_REFERRAL_CLIENT in pdr:
+        return "referral_client"
+    transactor = set(_deal_cf_option_ids({"custom_fields": cf}, TRANSACTOR_TYPE_FIELD))
+    if transactor & INTERMEDIARY_TRANSACTOR_IDS and PDR_PARTNER_REGISTERED not in pdr:
+        return "intermediary"
+    return None
 
 
 @_perf_phase("tenancy")
-def _build_tenant_index(people_list=None, contact_rule=None):
+def _build_tenant_index(people_list=None, intermediary_rule=None):
     """email (lowercased) -> {"name", "person_id"} for every auto-
     enrolled tenant: a people.json person linked to >=1 deal tagged Sell
     Order (DEAL_SIDE_FIELD contains DEAL_SIDE_SELL_ID), any stage —
@@ -3391,7 +3414,7 @@ def _build_tenant_index(people_list=None, contact_rule=None):
     _perf_count("build_tenant_index")
     if people_list is None:
         people_list = _people_list()
-    exclude_contacts = CONTACT_RULE_ENABLED if contact_rule is None else bool(contact_rule)
+    enforce_block = INTERMEDIARY_RULE_ENABLED if intermediary_rule is None else bool(intermediary_rule)
 
     seller_person_ids = set()
     for deal in get_deals_list():
@@ -3421,14 +3444,22 @@ def _build_tenant_index(people_list=None, contact_rule=None):
     def _usable_emails(rec):
         return [e for e in _person_all_emails(rec) if e not in TENANT_BLOCKLIST]
 
+    # Intermediary rule: a blocked person (seller or not) gets no entry,
+    # never seeds a tenant domain / company team and never joins one.
+    blocked = {}
+    if enforce_block:
+        for pid_str, (_pid, rec) in people_by_pid.items():
+            reason = _person_block_reason(rec)
+            if reason:
+                blocked[pid_str] = reason
+
     def _excluded(pid_str, rec):
-        # Contact rule: non-seller Contacts never join a team.
-        return exclude_contacts and pid_str not in seller_person_ids_str and _person_is_contact(rec)
+        return pid_str in blocked
 
     tenant_domains = set()
     for pid_str in seller_person_ids_str:
         _pid, rec = people_by_pid.get(pid_str, (None, None))
-        if rec is None:
+        if rec is None or _excluded(pid_str, rec):
             continue
         for email in _usable_emails(rec):
             domain = _email_domain(email)
@@ -3469,7 +3500,7 @@ def _build_tenant_index(people_list=None, contact_rule=None):
     sellers_by_cid = {}
     for pid_str in seller_person_ids_str:
         pid_int, rec = people_by_pid.get(pid_str, (None, None))
-        if rec is None:
+        if rec is None or _excluded(pid_str, rec):
             continue
         cid = _norm_cid(rec.get("company_id"))
         if cid is None or cid in COMPANY_SHARING_BLOCKLIST:
@@ -3492,10 +3523,17 @@ def _build_tenant_index(people_list=None, contact_rule=None):
                 company_mates.add(ps)
 
     by_email = _TenantIndex()
+    blocked_emails = {}
     for rec in people_list:
         pid = rec.get("id")
         if pid is None:
             continue
+        if enforce_block:
+            reason = blocked.get(str(pid)) or _person_block_reason(rec)
+            if reason:
+                for email in _usable_emails(rec):
+                    blocked_emails.setdefault(email, reason)
+                continue
         is_seller = str(pid) in seller_person_ids_str
         team_domain = person_team.get(str(pid))
         if not is_seller and not team_domain:
@@ -3559,6 +3597,8 @@ def _build_tenant_index(people_list=None, contact_rule=None):
         team["scope"] = frozenset(team["scope"])
     by_email.teams = teams
     by_email.person_team = person_team
+    # email -> block reason, only for emails that got no entry (sign-in page wording).
+    by_email.blocked = {e: r for e, r in blocked_emails.items() if e not in by_email}
     return by_email
 
 
@@ -3593,6 +3633,14 @@ def _resolve_tenant(email):
     if not email:
         return None
     return _tenant_index_req().get(email.strip().lower())
+
+
+def _tenant_block_reason(email):
+    """Intermediary-rule block reason for a signed-in email that has no
+    tenant entry ("intermediary" / "referral_client"), else None."""
+    if not email:
+        return None
+    return (getattr(_tenant_index_req(), "blocked", {}) or {}).get(email.strip().lower())
 
 
 def _tenant_index_req():
@@ -8160,20 +8208,27 @@ def _deal_stage_label(sid):
     return STAGE_LABELS.get(sid) or TERMINAL_STAGE_LABELS.get(sid) or (str(sid) if sid is not None else "—")
 
 
+def _cf_labels(rec, field, labels):
+    """Option labels (unknown ids as "#<id>") for a person custom field."""
+    ids = _deal_cf_option_ids({"custom_fields": (rec or {}).get("custom_fields") or {}}, field)
+    return [labels.get(i, f"#{i}") for i in sorted(ids)]
+
+
 def _handle_debug_people(needle):
     """?debug_people=<needle>, admin key + GET only (checked by the
     caller), never linked from any page. READ-ONLY: reads the FULL
     people.json export (not the slim file) and writes nothing. Reports
     people.json LastModified, per-key record counts, distinct values of
     Type-like keys, every person whose email/emails contain <needle>
-    (with their current tenant entry), and which CURRENT tenant emails
-    the Contact rule would remove (index built twice from the full
+    (with Transactor Type / Partner Desk Response labels and their
+    current tenant entry), and which CURRENT tenant emails the
+    intermediary rule would remove (index built twice from the full
     export: rule off vs on)."""
     from collections import Counter
     needle = str(needle or "").strip().lower()
     s3 = _s3_client()
     out = {"needle": needle, "ownership_rule": os.environ.get("OWNERSHIP_RULE", "legacy"),
-           "contact_rule_enabled": CONTACT_RULE_ENABLED, "person_type_field": PERSON_TYPE_FIELD}
+           "intermediary_rule_enabled": INTERMEDIARY_RULE_ENABLED}
     try:
         head = s3.head_object(Bucket=BUCKET, Key=PEOPLE_KEY)
         out["people_json_last_modified"] = str(head.get("LastModified"))
@@ -8208,6 +8263,9 @@ def _handle_debug_people(needle):
                                          "company_name", "email", "emails")}
             row["type_like"] = {k: r.get(k) for k in r
                                 if any(t in k.lower() for t in ("type", "lead", "contact", "kind", "category"))}
+            row["transactor_type"] = _cf_labels(r, TRANSACTOR_TYPE_FIELD, TRANSACTOR_TYPE_LABELS)
+            row["partner_desk_response"] = _cf_labels(r, PARTNER_DESK_RESPONSE_FIELD, PARTNER_DESK_RESPONSE_LABELS)
+            row["block_reason"] = _person_block_reason(r)
             row["live_tenant_entries"] = {e: {"team_domain": live_idx[e].get("team_domain"),
                                               "is_seller": live_idx[e].get("is_seller")}
                                           for e in [v.strip() for v in vals if v] if e in live_idx}
@@ -8215,8 +8273,8 @@ def _handle_debug_people(needle):
     out["matches"] = matches
 
     try:
-        idx_off = _build_tenant_index(people_list=people, contact_rule=False)
-        idx_on = _build_tenant_index(people_list=people, contact_rule=True)
+        idx_off = _build_tenant_index(people_list=people, intermediary_rule=False)
+        idx_on = _build_tenant_index(people_list=people, intermediary_rule=True)
         by_pid = {str(r.get("id")): r for r in people}
         lost = []
         for email in sorted(set(idx_off) - set(idx_on)):
@@ -8225,13 +8283,17 @@ def _handle_debug_people(needle):
             team = (idx_off.teams or {}).get(entry.get("team_domain")) or {}
             lost.append({"email": email, "name": entry.get("name"), "person_id": entry.get("person_id"),
                          "company_name": entry.get("company_name"), "team_key": entry.get("team_domain"),
-                         "team_name": team.get("name"), "type": rec.get(PERSON_TYPE_FIELD)})
-        out["contact_rule_impact"] = {"tenant_emails_rule_off": len(idx_off),
+                         "team_name": team.get("name"), "is_seller": entry.get("is_seller"),
+                         "transactor_type": _cf_labels(rec, TRANSACTOR_TYPE_FIELD, TRANSACTOR_TYPE_LABELS),
+                         "partner_desk_response": _cf_labels(rec, PARTNER_DESK_RESPONSE_FIELD,
+                                                             PARTNER_DESK_RESPONSE_LABELS),
+                         "block_reason": _person_block_reason(rec)})
+        out["intermediary_rule_impact"] = {"tenant_emails_rule_off": len(idx_off),
                                       "tenant_emails_rule_on": len(idx_on),
                                       "would_lose_access": lost,
                                       "would_gain_access": sorted(set(idx_on) - set(idx_off))}
     except Exception as e:
-        out["contact_rule_impact"] = {"error": str(e)}
+        out["intermediary_rule_impact"] = {"error": str(e)}
     return {"statusCode": 200, "headers": {"Content-Type": "application/json", "Cache-Control": "private, no-store"},
             "body": json.dumps(out, indent=1, default=str)}
 
@@ -16288,7 +16350,8 @@ SELL_ORDER_MAILTO_URL = (
 )
 
 
-def _message_page(title, message, show_signin=False, show_sell_cta=False, show_signout=False, primary_cta=None):
+def _message_page(title, message, show_signin=False, show_sell_cta=False, show_signout=False, primary_cta=None,
+                  message_link=None):
     """Standalone pre-auth / not-enabled page. Reuses the board's own dark
     palette (not the nav's) since there's no tab shell to sit under here.
 
@@ -16328,6 +16391,10 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
         signin_html += f'<p><a class="gg-btn" href="{_esc(cta_href)}">{_esc(cta_label)}</a></p>'
     if show_signout:
         signin_html += f'<p><a class="gg-link" href="{_esc(_signout_url())}">Sign out</a></p>'
+    msg_link_html = ""
+    if message_link:
+        ml_href, ml_label = message_link
+        msg_link_html = f' <a class="gg-link" href="{_esc(ml_href)}">{_esc(ml_label)}</a>'
     sell_cta_html = ""
     if show_sell_cta:
         sell_cta_html = (
@@ -16375,7 +16442,7 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
 <body>
   <div class="gg-card">
     <h1>{_esc(title)}</h1>
-    <p>{_esc(message)}</p>
+    <p>{_esc(message)}{msg_link_html}</p>
     {raised_html}
     {sell_cta_html}
     {signin_html}
@@ -23286,6 +23353,10 @@ def _lambda_handler_impl(event, context):
             if query.get("welcome") == "1":
                 return _html_response(_message_page(WELCOME_TITLE, WELCOME_MESSAGE, show_signout=True,
                                                     primary_cta=(WELCOME_CTA_URL, WELCOME_CTA_LABEL)))
+            if _tenant_block_reason(identity_email) == "intermediary":
+                return _html_response(_message_page("Not enabled", INTERMEDIARY_BLOCKED_MESSAGE, show_sell_cta=True,
+                                                    show_signout=True,
+                                                    message_link=(PARTNER_DESK_URL, "Partner Desk \u2192")))
             return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True,
                                                 show_signout=True))
         viewer_name = tenant["name"]
