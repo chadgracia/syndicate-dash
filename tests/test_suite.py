@@ -7309,8 +7309,8 @@ ir_people = {"people": [
 ir_deals = [_tt_sell(990101, "Ignite Co", 951), _tt_sell(990102, "Broker Deal", 956),
             _tt_sell(990103, "Partner Deal", 959)]
 use_fixture({lf.PEOPLE_KEY: ir_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": ir_deals}})
-check("intermediary rule: off by default; Partner Desk Response in slim custom fields; no 'type' slim field",
-      lf.INTERMEDIARY_RULE_ENABLED is False and "custom_label_4011837" in lf.PEOPLE_SLIM_CUSTOM_FIELDS
+check("intermediary rule: ON; Partner Desk Response in slim custom fields; no 'type' slim field",
+      lf.INTERMEDIARY_RULE_ENABLED is True and "custom_label_4011837" in lf.PEOPLE_SLIM_CUSTOM_FIELDS
       and "type" not in lf.PEOPLE_SLIM_FIELDS and not hasattr(lf, "CONTACT_RULE_ENABLED"))
 ir_off = lf._build_tenant_index(intermediary_rule=False)
 check("intermediary rule off: current behavior (intermediaries still get access)",
@@ -7344,12 +7344,70 @@ check("intermediary rule: blocked intermediary sign-in -> not-a-tenant page with
       or "Blockbook isn't available to co-brokers or foreign finders. See how to work with Gracia Group:" in _ir_ivan["body"])
 check("intermediary rule: blocked page links the Partner Desk",
       'href="https://trades.graciagroup.com/?view=partner-desk"' in _ir_ivan["body"] and "Ignite Co" not in _ir_ivan["body"])
+check("intermediary rule: blocked page has no sell-order line but keeps Sign out",
+      "Submit a sell order" not in _ir_ivan["body"] and "Sign out" in _ir_ivan["body"])
 _ir_rita = _tt_get("rita@teamignite.vc")
 check("intermediary rule: Referral - Client sign-in -> plain not-a-tenant page, no Partner Desk link",
       lf.NOT_ENABLED_MESSAGE in _ir_rita["body"] and "partner-desk" not in _ir_rita["body"])
 check("intermediary rule: normal non-tenant still gets the plain page",
       "partner-desk" not in _tt_get("nobody@nowhere.com")["body"])
 lf.INTERMEDIARY_RULE_ENABLED = _saved_ir
+
+# --- Rainmaker + platform blocks (same switch) ---
+rp_people = {"people": [
+    {"id": 951, "full_name": "Brian Ignite", "email": "brian@teamignite.ventures", "company_id": 7101,
+     "company_name": "Team Ignite", "custom_fields": {}},
+    {"id": 952, "full_name": "Mattia Ignite", "email": "mattia@teamignite.vc", "company_id": 7101,
+     "company_name": "Team Ignite", "custom_fields": {}},
+    # Rainmaker by domain (a seller, Partner - Registered) -> still blocked
+    {"id": 961, "full_name": "Rae Maker", "email": "rae@gmail.com",
+     "emails": [{"address": "rae@RainmakerSecurities.com"}], "company_id": 7401,
+     "company_name": "Rae LLC", "custom_fields": _ir_cf([6577160], [7218528])},
+    # Rainmaker by company name, non-Rainmaker domain
+    {"id": 962, "full_name": "Ron Maker", "email": "ron@rmsalt.com", "company_id": 7402,
+     "company_name": "  Rainmaker Securities ", "custom_fields": {}},
+    # Platform seller by domain + a colleague at the same domain and company
+    {"id": 963, "full_name": "Pia Platform", "email": "pia@equityzen.com", "company_id": 7501,
+     "company_name": "EquityZen", "custom_fields": {}},
+    {"id": 964, "full_name": "Paz Platform", "email": "paz@equityzen.com", "company_id": 7501,
+     "company_name": "EquityZen", "custom_fields": {}},
+    {"id": 965, "full_name": "Pol Gmail", "email": "pol@gmail.com", "company_id": 7501,
+     "company_name": "EquityZen", "custom_fields": {}},
+    # Platform by company name (subdomain email)
+    {"id": 966, "full_name": "Nia Notice", "email": "nia@bd.notice.co", "company_id": 7601,
+     "company_name": "Notice.co", "custom_fields": {}},
+    {"id": 967, "full_name": "Ned Npm", "email": "ned@nasdaq.com", "company_id": 7602,
+     "company_name": "Nasdaq Private Markets", "custom_fields": {}},
+]}
+rp_deals = [_tt_sell(990201, "Ignite Co", 951), _tt_sell(990202, "Rae Deal", 961), _tt_sell(990203, "Ron Deal", 962),
+            _tt_sell(990204, "Pia Deal", 963), _tt_sell(990205, "Nia Deal", 966), _tt_sell(990206, "Ned Deal", 967)]
+use_fixture({lf.PEOPLE_KEY: rp_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": rp_deals}})
+rp_on = lf._build_tenant_index()
+rp_off = lf._build_tenant_index(intermediary_rule=False)
+check("rainmaker: blocked by any email @rainmakersecurities.com (all of their emails)",
+      "rae@gmail.com" not in rp_on and "rae@rainmakersecurities.com" not in rp_on
+      and rp_on.blocked.get("rae@gmail.com") == "rainmaker" and "rae@gmail.com" in rp_off)
+check("rainmaker: Partner - Registered intermediary seller at Rainmaker still blocked",
+      lf._person_block_reason(rp_people["people"][2]) == "rainmaker")
+check("rainmaker: blocked by company name with a non-Rainmaker domain",
+      "ron@rmsalt.com" not in rp_on and rp_on.blocked.get("ron@rmsalt.com") == "rainmaker" and "ron@rmsalt.com" in rp_off)
+check("platform: blocked by domain (seller)", "pia@equityzen.com" not in rp_on
+      and rp_on.blocked.get("pia@equityzen.com") == "platform")
+check("platform: colleague can't seed or join a team (domain or company)",
+      "paz@equityzen.com" not in rp_on and "pol@gmail.com" not in rp_on
+      and "equityzen.com" not in rp_on.teams and "company-7501" not in rp_on.teams)
+check("platform: blocked by company name (Notice.co subdomain, Nasdaq Private Markets)",
+      rp_on.blocked.get("nia@bd.notice.co") == "platform" and rp_on.blocked.get("ned@nasdaq.com") == "platform")
+check("platform: Brian/Mattia team unchanged",
+      rp_on.get("mattia@teamignite.vc", {}).get("team_domain") == "teamignite.ventures"
+      and rp_on.teams["teamignite.ventures"]["member_emails"] == ["brian@teamignite.ventures", "mattia@teamignite.vc"])
+for _rp_email in ("rae@gmail.com", "pia@equityzen.com"):
+    _rp_page = _tt_get(_rp_email)["body"]
+    check(f"blocked sign-in ({_rp_email}): plain not-a-tenant page, no Partner Desk link",
+          lf.NOT_ENABLED_MESSAGE in _rp_page and "partner-desk" not in _rp_page and "Ignite Co" not in _rp_page
+          and "Sign out" in _rp_page)
+check("rainmaker sign-in: no sell-order line", "Submit a sell order" not in _tt_get("rae@gmail.com")["body"])
+check("platform sign-in: plain page keeps its sell-order line", "Submit a sell order" in _tt_get("pia@equityzen.com")["body"])
 
 def _dp_get(q, method="GET"):
     return lf.lambda_handler({"requestContext": {"http": {"method": method}}, "rawPath": "/",

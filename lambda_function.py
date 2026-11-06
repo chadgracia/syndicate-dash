@@ -1091,7 +1091,7 @@ COMPANY_SHARING_BLOCKLIST = set()
 # Partner - Registered -- sellers NOT exempt -- or (2) their Partner Desk
 # Response is Referral - Client. OFF until Chad confirms the impact list
 # (admin ?debug_people=<needle> reports it).
-INTERMEDIARY_RULE_ENABLED = False
+INTERMEDIARY_RULE_ENABLED = True
 INTERMEDIARY_TRANSACTOR_IDS = frozenset({6577160, 6888332, 6888333})
 PARTNER_DESK_RESPONSE_FIELD = "custom_label_4011837"
 PARTNER_DESK_RESPONSE_LABELS = {
@@ -1114,8 +1114,13 @@ RAINMAKER_COMPANY_NAME = "rainmaker securities"
 PLATFORM_BLOCKLIST_DOMAINS = frozenset({
     "settercap.com", "equityzen.com", "forgeglobal.com", "linqto.com", "lbx.pro", "launchbaycapital.com",
     "augment.capital", "augment.market", "fnex.com", "hedgebay.com", "gatewaypmx.com", "unicorns.exchange",
+    # Added from the Nov 6 people.json scan (Hiive, PM Insights, Notice):
+    "hiivemarkets.com", "pminsights.com", "notice.co",
 })
-PLATFORM_BLOCKLIST_COMPANY_NAMES = frozenset()
+# Lowercased exact company_name matches (Nov 6 people.json scan).
+PLATFORM_BLOCKLIST_COMPANY_NAMES = frozenset({
+    "clarity (ex-hiive)", "notice.co", "nasdaq private markets", "gateway private markets",
+})
 INTERMEDIARY_BLOCKED_MESSAGE = ("Blockbook isn't available to co-brokers or foreign finders. "
                                 "See how to work with Gracia Group:")
 # RFC 2606 / RFC 6761 reserved documentation/test domains -- never real
@@ -23396,7 +23401,10 @@ def _lambda_handler_impl(event, context):
             if query.get("welcome") == "1":
                 return _html_response(_message_page(WELCOME_TITLE, WELCOME_MESSAGE, show_signout=True,
                                                     primary_cta=(WELCOME_CTA_URL, WELCOME_CTA_LABEL)))
-            if _tenant_block_reason(identity_email) == "intermediary":
+            _block_reason = _tenant_block_reason(identity_email)
+            if _block_reason == "rainmaker":
+                return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_signout=True))
+            if _block_reason == "intermediary":
                 return _html_response(_message_page("Not enabled", INTERMEDIARY_BLOCKED_MESSAGE,
                                                     show_signout=True,
                                                     message_link=(PARTNER_DESK_URL, "Partner Desk \u2192")))
