@@ -1102,6 +1102,20 @@ PARTNER_DESK_RESPONSE_LABELS = {
 PDR_PARTNER_REGISTERED = 7218528
 PDR_REFERRAL_CLIENT = 7218570
 PARTNER_DESK_URL = "https://trades.graciagroup.com/?view=partner-desk"
+# Rainmaker block (same switch): no Rainmaker Securities person ever gets
+# Blockbook access (any email @rainmakersecurities.com, or company_name
+# "Rainmaker Securities"), whatever their deals or fields. Admin-key
+# access is unaffected.
+RAINMAKER_EMAIL_DOMAIN = "rainmakersecurities.com"
+RAINMAKER_COMPANY_NAME = "rainmaker securities"
+# Platform block (same switch): people at competing secondary platforms.
+# Email domain match is exact or a subdomain; company names exact,
+# case-insensitive, trimmed.
+PLATFORM_BLOCKLIST_DOMAINS = frozenset({
+    "settercap.com", "equityzen.com", "forgeglobal.com", "linqto.com", "lbx.pro", "launchbaycapital.com",
+    "augment.capital", "augment.market", "fnex.com", "hedgebay.com", "gatewaypmx.com", "unicorns.exchange",
+})
+PLATFORM_BLOCKLIST_COMPANY_NAMES = frozenset()
 INTERMEDIARY_BLOCKED_MESSAGE = ("Blockbook isn't available to co-brokers or foreign finders. "
                                 "See how to work with Gracia Group:")
 # RFC 2606 / RFC 6761 reserved documentation/test domains -- never real
@@ -3366,13 +3380,29 @@ class _TenantIndex(dict):
     blocked = {}
 
 
+def _domain_in(domain, domains):
+    return any(domain == d or domain.endswith("." + d) for d in domains)
+
+
 def _person_block_reason(rec):
-    """Why this person is kept out of Blockbook under the intermediary
-    rule: "referral_client" (Partner Desk Response = Referral - Client,
-    anyone), "intermediary" (Transactor Type includes an Intermediary
-    option and Partner Desk Response is not Partner - Registered), else
-    None. Option ids compared as sets (multi-select safe)."""
-    cf = (rec or {}).get("custom_fields") or {}
+    """Why this person is kept out of Blockbook (INTERMEDIARY_RULE_
+    ENABLED), first match wins: "rainmaker" (any email
+    @rainmakersecurities.com or company_name Rainmaker Securities),
+    "platform" (any email at a PLATFORM_BLOCKLIST_DOMAINS domain or
+    company_name in PLATFORM_BLOCKLIST_COMPANY_NAMES), "referral_client"
+    (Partner Desk Response = Referral - Client, anyone), "intermediary"
+    (Transactor Type includes an Intermediary option and Partner Desk
+    Response is not Partner - Registered), else None. Option ids
+    compared as sets (multi-select safe)."""
+    rec = rec or {}
+    domains = {_email_domain(e) for e in _person_all_emails(rec)} - {""}
+    cname = str(rec.get("company_name") or "").strip().lower()
+    if RAINMAKER_EMAIL_DOMAIN in domains or cname == RAINMAKER_COMPANY_NAME:
+        return "rainmaker"
+    if any(_domain_in(d, PLATFORM_BLOCKLIST_DOMAINS) for d in domains) or (
+            cname and cname in PLATFORM_BLOCKLIST_COMPANY_NAMES):
+        return "platform"
+    cf = rec.get("custom_fields") or {}
     if not isinstance(cf, dict):
         return None
     pdr = set(_deal_cf_option_ids({"custom_fields": cf}, PARTNER_DESK_RESPONSE_FIELD))
@@ -8271,6 +8301,19 @@ def _handle_debug_people(needle):
                                           for e in [v.strip() for v in vals if v] if e in live_idx}
             matches.append(row)
     out["matches"] = matches
+    # Platform scan helpers: company names / email domains containing the needle.
+    if needle:
+        cn = Counter()
+        dom = Counter()
+        for r in people:
+            name = str(r.get("company_name") or "").strip()
+            if needle in name.lower():
+                cn[f"{name} (company_id {r.get('company_id')})"] += 1
+            for d in {_email_domain(e) for e in _person_all_emails(r)}:
+                if d and needle in d:
+                    dom[d] += 1
+        out["company_name_hits"] = cn.most_common(50)
+        out["email_domain_hits"] = dom.most_common(50)
 
     try:
         idx_off = _build_tenant_index(people_list=people, intermediary_rule=False)
@@ -23354,7 +23397,7 @@ def _lambda_handler_impl(event, context):
                 return _html_response(_message_page(WELCOME_TITLE, WELCOME_MESSAGE, show_signout=True,
                                                     primary_cta=(WELCOME_CTA_URL, WELCOME_CTA_LABEL)))
             if _tenant_block_reason(identity_email) == "intermediary":
-                return _html_response(_message_page("Not enabled", INTERMEDIARY_BLOCKED_MESSAGE, show_sell_cta=True,
+                return _html_response(_message_page("Not enabled", INTERMEDIARY_BLOCKED_MESSAGE,
                                                     show_signout=True,
                                                     message_link=(PARTNER_DESK_URL, "Partner Desk \u2192")))
             return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True,
