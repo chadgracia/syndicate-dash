@@ -1116,11 +1116,12 @@ PLATFORM_BLOCKLIST_DOMAINS = frozenset({
     "augment.capital", "augment.market", "fnex.com", "hedgebay.com", "gatewaypmx.com", "unicorns.exchange",
     # Added from the Nov 6 people.json scan (Hiive, PM Insights, Notice):
     "hiivemarkets.com", "pminsights.com", "notice.co",
-    "siliconvalleyinvestclub.com", "investclub.sv",
+    "siliconvalleyinvestclub.com", "investclub.sv", "clarity.com",
 })
 # Lowercased exact company_name matches (Nov 6 people.json scan).
 PLATFORM_BLOCKLIST_COMPANY_NAMES = frozenset({
     "clarity (ex-hiive)", "notice.co", "nasdaq private markets", "gateway private markets",
+    "linqto liquidshares",
 })
 INTERMEDIARY_BLOCKED_MESSAGE = ("Blockbook isn't available to co-brokers or foreign finders. "
                                 "See how to work with Gracia Group:")
@@ -23431,7 +23432,7 @@ def _lambda_handler_impl(event, context):
                 return _html_response(_message_page(WELCOME_TITLE, WELCOME_MESSAGE, show_signout=True,
                                                     primary_cta=(WELCOME_CTA_URL, WELCOME_CTA_LABEL)))
             _block_reason = _tenant_block_reason(identity_email)
-            if _block_reason == "rainmaker":
+            if _block_reason in ("rainmaker", "platform"):
                 return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_signout=True))
             if _block_reason == "intermediary":
                 return _html_response(_message_page("Not enabled", INTERMEDIARY_BLOCKED_MESSAGE,

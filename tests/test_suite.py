@@ -7417,7 +7417,11 @@ for _rp_email in ("rae@gmail.com", "pia@equityzen.com"):
           lf.NOT_ENABLED_MESSAGE in _rp_page and "partner-desk" not in _rp_page and "Ignite Co" not in _rp_page
           and "Sign out" in _rp_page)
 check("rainmaker sign-in: no sell-order line", "Submit a sell order" not in _tt_get("rae@gmail.com")["body"])
-check("platform sign-in: plain page keeps its sell-order line", "Submit a sell order" in _tt_get("pia@equityzen.com")["body"])
+check("platform sign-in: no sell-order line", "Submit a sell order" not in _tt_get("pia@equityzen.com")["body"])
+check("platform: Linqto Liquidshares by company name, clarity.com by domain",
+      lf._person_block_reason({"email": "x@nikkl.com", "company_name": " Linqto Liquidshares "}) == "platform"
+      and lf._person_block_reason({"email": "y@clarity.com"}) == "platform"
+      and lf._person_block_reason({"email": "z@claritypartners.net", "company_name": "Clarity Partners"}) is None)
 
 def _dp_get(q, method="GET"):
     return lf.lambda_handler({"requestContext": {"http": {"method": method}}, "rawPath": "/",
