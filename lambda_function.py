@@ -161,6 +161,7 @@ def _req_cache_reset():
     _req_cache["standing"] = None
     _req_cache["compare"] = {}
     _req_cache.pop("fresh_tenants", None)
+    _req_cache["approval"] = {}
 
 
 def _perf_start(page):
@@ -3670,11 +3671,605 @@ def _resolve_tenant(email):
     control check below calls instead of the old TENANTS lookup."""
     if not email:
         return None
+    status, entry = _tenant_access_status(email)
+    return entry if status == "ok" else None
+
+
+def _resolve_tenant_ungated(email):
+    """The tenant entry under the auto-enrollment rules alone (hourly
+    index, then the deal-fresh instant path), BEFORE the stranger
+    approval gate. Only the gate itself and the grandfather seed call it."""
+    if not email:
+        return None
     key = email.strip().lower()
     entry = _tenant_index_req().get(key)
     if entry is not None:
         return entry
     return _fresh_tenant(key)
+
+
+# ── Stranger approval gate ───────────────────────────────────────────────
+# A "stranger" = a would-be tenant whose access-granting Sell deals are ALL
+# self-created (a New Order attestation exists at s3://gracia-deal-qa/
+# attestations/<deal_id>.json, written by chadgracia/deal-update-form) AND
+# whose Pipeline person record was created < 24h before the earliest of
+# those deals' attested_at. Strangers need Chad's approval (Dynamo tenant
+# "__tenant_approval__", sk "approve#<person_id>" {status, at, actor} +
+# audit items). Everyone who was a tenant when this shipped is seeded as
+# approved once (marker sk "seeded") before anything is enforced.
+# Fail closed for NEW access only: attestations LIST / created_at /
+# attested_at unavailable -> pending unless an approved record exists.
+ATTEST_BUCKET = "gracia-deal-qa"
+ATTEST_PREFIX = "attestations/"
+ATTEST_NEW_DEAL_GRACE_SECONDS = 60     # attestation is written right after the deal; newer -> undecided
+STRANGER_WINDOW = timedelta(hours=24)
+TENANT_APPROVAL_PARTITION = "__tenant_approval__"
+TENANT_APPROVAL_STATUSES = ("approved", "rejected")
+PENDING_APPROVAL_TITLE = "Thanks \u2014 we've received your position."
+PENDING_APPROVAL_MESSAGE = "Your dashboard will be activated after a quick review, usually within one business day."
+_attest_cache = {"ids": None, "at": 0.0, "wall": None}   # container: last good LIST
+_attest_records = {}                                      # container: deal id -> record (append-only data)
+_approval_container = {"seeded": False, "status": {}, "seed_failed_at": None}  # container: seed flag + last good statuses
+APPROVAL_SEED_RETRY_SECONDS = 300
+
+
+def _approval_req():
+    return _req_cache.setdefault("approval", {})
+
+
+def _attest_list(s3):
+    ids, token = set(), None
+    while True:
+        kw = {"Bucket": ATTEST_BUCKET, "Prefix": ATTEST_PREFIX}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        for o in resp.get("Contents") or []:
+            name = str(o.get("Key") or "")[len(ATTEST_PREFIX):]
+            if name.endswith(".json") and name[:-5].isdigit():
+                ids.add(name[:-5])
+        if not resp.get("IsTruncated"):
+            return ids
+        token = resp.get("NextContinuationToken")
+
+
+def _attested_deal_ids(force=False):
+    """(set of self-created deal ids as str, ok, fetched_this_request).
+    ONE container-cached LIST of attestations/ (reused for
+    S3_VERSION_TTL_SECONDS and only while it is newer than the current
+    deals.json); force=True re-lists once per request. Failure -> ok False."""
+    memo = _approval_req()
+    if "attest" in memo and not (force and not memo["attest"][2]):
+        return memo["attest"]
+    s3 = _s3_client()
+    try:
+        _cached_object_version(s3, DEALS_KEY)
+    except Exception:
+        pass
+    deals_lm = _s3_last_modified.get(DEALS_KEY)
+    c = _attest_cache
+    fresh_enough = (c["ids"] is not None and time.monotonic() - c["at"] < S3_VERSION_TTL_SECONDS
+                    and (deals_lm is None or (c["wall"] is not None and c["wall"] > deals_lm)))
+    if fresh_enough and not force:
+        result = (c["ids"], True, False)
+    else:
+        try:
+            wall = datetime.now(timezone.utc)
+            _perf_count("s3_attest_list")
+            with _perf_timer("s3_attest_list"):
+                ids = _attest_list(s3)
+            c.update(ids=ids, at=time.monotonic(), wall=wall)
+            result = (ids, True, True)
+        except Exception as e:
+            print(f"tenant-approval: attestations LIST failed ({type(e).__name__}: {e}); fail closed for new access")
+            result = (None, False, True)
+    memo["attest"] = result
+    return result
+
+
+def _attestation_record(deal_id):
+    did = str(deal_id)
+    if did in _attest_records:
+        return _attest_records[did]
+    try:
+        obj = _s3_client().get_object(Bucket=ATTEST_BUCKET, Key=f"{ATTEST_PREFIX}{did}.json")
+        rec = json.loads(obj["Body"].read())
+    except Exception as e:
+        print(f"tenant-approval: attestation {did} read failed: {type(e).__name__}: {e}")
+        return None
+    if isinstance(rec, dict):
+        _attest_records[did] = rec
+        return rec
+    return None
+
+
+def _approval_deals_by_id():
+    memo = _approval_req()
+    if "deals_by_id" not in memo:
+        memo["deals_by_id"] = {str(d.get("id")): d for d in get_deals_list()
+                               if isinstance(d, dict) and d.get("id") is not None}
+    return memo["deals_by_id"]
+
+
+def _attested_owner_pids(attested):
+    """str person ids owning >= 1 self-created Sell deal in the deals list."""
+    if not attested:
+        return set()
+    memo = _approval_req()
+    if "attested_owners" not in memo:
+        by_id = _approval_deals_by_id()
+        out = set()
+        for did in attested:
+            d = by_id.get(did)
+            if d is not None and _deal_is_sell(d):
+                out.update(str(p) for p in _deal_owner_ids(d))
+        memo["attested_owners"] = out
+    return memo["attested_owners"]
+
+
+def _owned_sell_deal_ids(pid):
+    memo = _approval_req()
+    if "owned_sell" not in memo:
+        owned = {}
+        for did, d in _approval_deals_by_id().items():
+            if _deal_is_sell(d):
+                for p in _deal_owner_ids(d):
+                    owned.setdefault(str(p), set()).add(did)
+        memo["owned_sell"] = owned
+    return set(memo["owned_sell"].get(str(pid), ()))
+
+
+def _approval_status(pid):
+    """"approved" / "rejected" / None for a person (GetItem, memoized per
+    request; a failed read falls back to this container's last good value)."""
+    pid = str(pid)
+    memo = _approval_req().setdefault("status", {})
+    if pid in memo:
+        return memo[pid]
+    try:
+        item = _dynamo_table().get_item(Key={"tenant": TENANT_APPROVAL_PARTITION, "sk": f"approve#{pid}"}).get("Item")
+        st = item.get("status") if item else None
+        st = st if st in TENANT_APPROVAL_STATUSES else None
+        _approval_container["status"][pid] = st
+    except Exception as e:
+        print(f"tenant-approval: read {pid} failed ({type(e).__name__}: {e}); last known value")
+        st = _approval_container["status"].get(pid)
+    memo[pid] = st
+    return st
+
+
+def _approval_enforced():
+    """True once the grandfather seed exists (container-cached). Missing
+    marker -> seed now; seed failure -> not enforced this request (old
+    behavior, logged). Marker read failure -> enforced (fail closed)."""
+    if _approval_container["seeded"]:
+        return True
+    memo = _approval_req()
+    if "enforced" in memo:
+        return memo["enforced"]
+    try:
+        marker = _dynamo_table().get_item(Key={"tenant": TENANT_APPROVAL_PARTITION, "sk": "seeded"}).get("Item")
+    except Exception as e:
+        print(f"tenant-approval: seed marker read failed ({type(e).__name__}: {e}); enforcing")
+        memo["enforced"] = True
+        return True
+    if marker:
+        _approval_container["seeded"] = True
+        return True
+    failed_at = _approval_container.get("seed_failed_at")
+    if failed_at is not None and time.monotonic() - failed_at < APPROVAL_SEED_RETRY_SECONDS:
+        memo["enforced"] = False
+        return False
+    try:
+        _seed_tenant_approvals()
+        _approval_container["seeded"] = True
+        _approval_container["seed_failed_at"] = None
+        memo["enforced"] = True
+    except Exception as e:
+        print(f"tenant-approval: grandfather seed FAILED ({type(e).__name__}: {e}); NOT enforcing approvals "
+              f"until a seed succeeds (retry in {APPROVAL_SEED_RETRY_SECONDS}s)")
+        _approval_container["seed_failed_at"] = time.monotonic()
+        memo["enforced"] = False
+    return memo["enforced"]
+
+
+def _seed_tenant_approvals():
+    """Once: an approved record (actor "seed") for every person who is a
+    tenant under the pre-approval rules right now (hourly index + deal-fresh
+    instant path), skipping persons that already have a record, then one
+    audit item and the "seeded" marker. Idempotent."""
+    pids = set()
+    for entry in _tenant_index().values():
+        if entry.get("person_id") is not None:
+            pids.add(str(entry["person_id"]))
+    try:
+        for email in list(_fresh_tenant_map()):
+            entry = _fresh_tenant(email)
+            if entry and entry.get("person_id") is not None:
+                pids.add(str(entry["person_id"]))
+    except Exception as e:
+        print(f"tenant-approval: seed fresh-path read failed (non-fatal): {type(e).__name__}: {e}")
+    table = _dynamo_table()
+    existing = set()
+    kwargs = {"KeyConditionExpression": Key("tenant").eq(TENANT_APPROVAL_PARTITION) & Key("sk").begins_with("approve#")}
+    while True:
+        resp = table.query(**kwargs)
+        for item in resp.get("Items", []):
+            sk = str(item.get("sk", ""))
+            if sk.startswith("approve#"):
+                existing.add(sk.split("#", 1)[1])
+        lek = resp.get("LastEvaluatedKey")
+        if not lek:
+            break
+        kwargs["ExclusiveStartKey"] = lek
+    now = datetime.now(timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    todo = sorted(pids - existing, key=lambda x: (len(x), x))
+    items = [{"tenant": TENANT_APPROVAL_PARTITION, "sk": f"approve#{p}", "person_id": p,
+              "status": "approved", "at": now_iso, "actor": "seed"} for p in todo]
+    # Plain PutItem only (no BatchWriteItem permission needed), in parallel
+    # through the Table's thread-safe client when there is one.
+    if getattr(getattr(table, "meta", None), "client", None) is not None and len(items) > 1:
+        _dynamo_parallel_map(lambda it: _thread_dynamo_table().put_item(Item=it), items)
+    else:
+        for it in items:
+            table.put_item(Item=it)
+    for p in todo:
+        _approval_container["status"][p] = "approved"
+    table.put_item(Item={"tenant": TENANT_APPROVAL_PARTITION, "sk": f"audit#tenant_approval#seed#{int(now.timestamp() * 1000)}",
+                         "actor": "seed", "at": now_iso, "count": len(todo), "person_ids": todo})
+    table.put_item(Item={"tenant": TENANT_APPROVAL_PARTITION, "sk": "seeded", "at": now_iso,
+                         "count": len(todo), "already": len(existing)})
+    print(f"tenant-approval: seeded {len(todo)} approved records ({len(existing)} already present)")
+
+
+def _person_created_dt(pid):
+    rec = _people_data()["by_id"].get(str(pid))
+    return _parse_pipeline_ts((rec or {}).get("created_at")) if rec else None
+
+
+def _seller_access_state(pid, extra_deals=None):
+    """"ok" / "pending" / "rejected" for one seller's own Sell deals
+    (+ extra_deals {id: deal}, the deal-fresh instant path's deals)."""
+    extra = {str(k): v for k, v in (extra_deals or {}).items()}
+    mkey = (str(pid), tuple(sorted(extra)))
+    memo = _approval_req().setdefault("seller", {})
+    if mkey in memo:
+        return memo[mkey]
+    attested, ok, fetched = _attested_deal_ids()
+    if ok and any(d not in attested for d in extra) and not fetched:
+        attested, ok, fetched = _attested_deal_ids(force=True)
+    decided = None
+    if ok:
+        now = datetime.now(timezone.utc)
+        undecided_new = [d for d, deal in extra.items() if d not in attested and (
+            _parse_pipeline_ts((deal or {}).get("created_at")) is None
+            or (now - _parse_pipeline_ts(deal.get("created_at"))).total_seconds() < ATTEST_NEW_DEAL_GRACE_SECONDS)]
+        candidate = str(pid) in _attested_owner_pids(attested) or any(d in attested for d in extra)
+        if not undecided_new and not candidate:
+            decided = "ok"
+        elif not undecided_new:
+            deals = _owned_sell_deal_ids(pid) | set(extra)
+            if not deals or any(d not in attested for d in deals):
+                decided = "ok"
+            else:
+                created = _person_created_dt(pid)
+                stamps = [_parse_dt((_attestation_record(d) or {}).get("attested_at")) for d in sorted(deals)]
+                if created is not None and stamps and all(stamps) and min(stamps) - created >= STRANGER_WINDOW:
+                    decided = "ok"   # existing contact adding a first position
+    if decided is None:
+        st = _approval_status(pid)
+        decided = "ok" if st == "approved" else ("rejected" if st == "rejected" else "pending")
+    memo[mkey] = decided
+    return decided
+
+
+def _team_seller_pids(entry):
+    domain = entry.get("team_domain")
+    if not domain:
+        return []
+    index = _tenant_index_req()
+    team = (getattr(index, "teams", {}) or {}).get(domain) or {}
+    out = []
+    for e in team.get("member_emails") or []:
+        m = index.get(e) or {}
+        if m.get("is_seller") and m.get("person_id") is not None and str(m["person_id"]) not in out:
+            out.append(str(m["person_id"]))
+    return out
+
+
+def _tenant_gate_core(entry):
+    """"ok" / "pending" / "rejected" / "none" (a team member whose only
+    granting sellers are unapproved strangers) for an ungated entry."""
+    pid = entry.get("person_id")
+    if pid is None:
+        return "ok"
+    own = None
+    if entry.get("is_seller"):
+        own = _seller_access_state(pid, entry.get("fresh_deals"))
+        if own == "ok":
+            return "ok"
+    for t in _team_seller_pids(entry):
+        if t != str(pid) and _seller_access_state(t) == "ok":
+            return "ok"
+    return own if own is not None else "none"
+
+
+def _tenant_access_status(email):
+    """(status, entry): "ok" (tenant), "pending" / "rejected" (stranger
+    awaiting / refused approval; entry = the would-be tenant entry), or
+    ("none", None). Memoized per request."""
+    key = str(email or "").strip().lower()
+    memo = _approval_req().setdefault("access", {})
+    if key in memo:
+        return memo[key]
+    entry = _resolve_tenant_ungated(key) if key else None
+    if entry is None:
+        res = ("none", None)
+    else:
+        try:
+            st = _tenant_gate_core(entry) if _approval_enforced() else "ok"
+        except Exception as e:
+            print(f"tenant-approval: gate failed for {key} ({type(e).__name__}: {e}); approved records only")
+            st = "ok" if _approval_status(entry.get("person_id")) == "approved" else "pending"
+        res = (st, entry) if st != "none" else ("none", None)
+    memo[key] = res
+    return res
+
+
+def _person_self_created_deals(pid, extra_deals=None):
+    """[(deal id, deal or None)] of this person's self-created Sell deals."""
+    attested, ok, _ = _attested_deal_ids()
+    if not ok:
+        return []
+    by_id = _approval_deals_by_id()
+    extra = {str(k): v for k, v in (extra_deals or {}).items()}
+    ids = (_owned_sell_deal_ids(pid) | set(extra)) & attested
+    return [(d, extra.get(d) or by_id.get(d)) for d in sorted(ids, key=lambda x: (len(x), x))]
+
+
+def _pending_approval_rows():
+    """Strangers awaiting (or refused) approval for the admin page / badge:
+    [{person_id, name, emails, company, signup, status, deals}], pending
+    first. None when the attestations LIST is unavailable."""
+    memo = _approval_req()
+    if "rows" in memo:
+        return memo["rows"]
+    attested, ok, _ = _attested_deal_ids()
+    if not ok:
+        memo["rows"] = None
+        return None
+    owners = _attested_owner_pids(attested)
+    entries = {}   # pid -> (entry, [emails])
+    index = _tenant_index_req()
+    for email, entry in index.items():
+        pid = entry.get("person_id")
+        if pid is not None and entry.get("is_seller") and str(pid) in owners:
+            entries.setdefault(str(pid), (entry, []))[1].append(email)
+    try:
+        for email in list(_fresh_tenant_map()):
+            entry = _fresh_tenant(email)
+            if entry and entry.get("person_id") is not None and set(entry.get("fresh_deals") or {}) & attested:
+                entries.setdefault(str(entry["person_id"]), (entry, []))[1].append(email)
+    except Exception as e:
+        print(f"tenant-approval: fresh-path read for approvals failed: {type(e).__name__}: {e}")
+    by_people = _people_data()["by_id"]
+    rows = []
+    for pid, (entry, emails) in entries.items():
+        st = _tenant_gate_core(entry)
+        if st not in ("pending", "rejected"):
+            continue
+        deals = _person_self_created_deals(pid, entry.get("fresh_deals"))
+        created = _person_created_dt(pid)
+        stamps = [_parse_dt((_attestation_record(d) or {}).get("attested_at")) for d, _ in deals]
+        stamps = [x for x in stamps if x]
+        signup = created or (min(stamps) if stamps else None)
+        rec = by_people.get(pid) or {}
+        rows.append({"person_id": pid, "name": entry.get("name") or _person_display_name(rec) or pid,
+                     "emails": sorted(set(emails)), "company": entry.get("company_name") or rec.get("company_name") or "",
+                     "signup": signup, "status": st, "deals": deals})
+    rows.sort(key=lambda r: (r["status"] != "pending", -(r["signup"].timestamp() if r["signup"] else 0)))
+    memo["rows"] = rows
+    return rows
+
+
+def _pending_approval_count():
+    try:
+        rows = _pending_approval_rows()
+        return None if rows is None else sum(1 for r in rows if r["status"] == "pending")
+    except Exception as e:
+        print(f"approvals badge count failed: {type(e).__name__}: {e}")
+        return None
+
+
+def _approvals_badge_html(key):
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not admin_key or key != admin_key:
+        return ""
+    n = _pending_approval_count()
+    if not n:
+        return ""
+    return (f' <span class="gg-admin-strip-badge" title="{n} pending approval{"" if n == 1 else "s"}">'
+            f'{n}</span>')
+
+
+def _approvals_page_url():
+    admin_key = os.environ.get("ADMIN_KEY") or ""
+    q = f"?key={urllib.parse.quote(admin_key, safe='')}&view=approvals" if admin_key else "?view=approvals"
+    return COMPARE_ADMIN_BASE_URL.rstrip("/") + "/" + q
+
+
+def _deal_line_text(did, deal):
+    if deal is None:
+        return f"Deal {did} \u2014 {PIPELINE_DEAL_URL.format(did)}"
+    return f"{_deal_company_name(deal) or '—'} · {_deal_title(deal)} — {PIPELINE_DEAL_URL.format(did)}"
+
+
+def _notify_pending_stranger(email, entry):
+    """First pending-page hit per person: ONE SES email to Chad (dedupe
+    record sk "notified#<pid>", written before sending; removed again if
+    SES fails so a later hit retries). Never raises."""
+    pid = str(entry.get("person_id"))
+    try:
+        table = _dynamo_table()
+        key = {"tenant": TENANT_APPROVAL_PARTITION, "sk": f"notified#{pid}"}
+        if table.get_item(Key=key).get("Item"):
+            return False
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            table.put_item(Item={**key, "person_id": pid, "email": email, "at": now_iso},
+                           ConditionExpression="attribute_not_exists(sk)")
+        except Exception as e:
+            if "ConditionalCheckFailed" in f"{type(e).__name__}: {e}":
+                return False
+            raise
+    except Exception as e:
+        print(f"tenant-approval: notify dedupe failed for {pid} ({type(e).__name__}: {e}); no email")
+        return False
+    name = entry.get("name") or email
+    deals = _person_self_created_deals(pid, entry.get("fresh_deals"))
+    lines = [f"{name} ({email}) added a position and is waiting for Blockbook approval.", "",
+             f"Person: {PIPELINE_PERSON_URL.format(pid)}",
+             f"Company: {entry.get('company_name') or '—'}", "", "Self-created deals:"]
+    lines += [f"  {_deal_line_text(d, deal)}" for d, deal in deals] or ["  (none found)"]
+    lines += ["", f"Approve or reject: {_approvals_page_url()}"]
+    try:
+        boto3.client("ses", region_name="us-east-1").send_email(
+            Source=DEAL_STAGE_EMAIL_FROM,
+            Destination={"ToAddresses": [DEAL_STAGE_EMAIL_TO]},
+            Message={"Subject": {"Data": f"Blockbook approval needed: {name} ({email})"},
+                     "Body": {"Text": {"Data": "\n".join(lines)}}},
+        )
+        return True
+    except Exception as e:
+        print(f"tenant-approval: approval email failed for {pid} ({type(e).__name__}: {e})")
+        try:
+            table.delete_item(Key=key)
+        except Exception:
+            pass
+        return False
+
+
+def _handle_tenant_approval(event):
+    """POST ?action=tenant_approval {key, person_id, status}. Admin key
+    only (403). Writes the approval record + an audit item (Dynamo only)."""
+    body = _parse_json_body(event)
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (admin_key and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+    pid = str(body.get("person_id") or "").strip()
+    status = body.get("status")
+    if not pid.isdigit() or status not in TENANT_APPROVAL_STATUSES:
+        return _json_response({"error": "person_id and status (approved/rejected) are required"}, 400)
+    now = datetime.now(timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        table = _dynamo_table()
+        key = {"tenant": TENANT_APPROVAL_PARTITION, "sk": f"approve#{pid}"}
+        old = table.get_item(Key=key).get("Item")
+        table.put_item(Item={**key, "person_id": pid, "status": status, "at": now_iso, "actor": "admin"})
+        table.put_item(Item={"tenant": TENANT_APPROVAL_PARTITION,
+                             "sk": f"audit#tenant_approval#{pid}#{int(now.timestamp() * 1000)}",
+                             "actor": "admin", "at": now_iso, "old": old or {},
+                             "new": {"status": status}})
+    except Exception as e:
+        print(f"tenant approval write failed: {type(e).__name__}: {e}")
+        return _json_response({"error": "Could not save \u2014 try again."}, 502)
+    _approval_container["status"][pid] = status
+    _approval_req().setdefault("status", {})[pid] = status
+    return _json_response({"ok": True, "person_id": pid, "status": status})
+
+
+APPROVALS_SCRIPT = """
+<script>
+(function () {
+  document.querySelectorAll('.ap-btn').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var row = btn.closest('tr');
+      var msg = row.querySelector('.ap-msg');
+      row.querySelectorAll('.ap-btn').forEach(function (b) { b.disabled = true; });
+      fetch('?action=tenant_approval', {method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({key: btn.dataset.key, person_id: btn.dataset.pid, status: btn.dataset.status})})
+        .then(function (r) { return r.json().then(function (j) { return [r.ok, j]; }); })
+        .then(function (res) {
+          if (!res[0]) { throw new Error(res[1].error || 'Could not save'); }
+          msg.textContent = res[1].status === 'approved' ? 'Approved \u2713' : 'Rejected';
+        })
+        .catch(function (e) {
+          msg.textContent = e.message;
+          row.querySelectorAll('.ap-btn').forEach(function (b) { b.disabled = false; });
+        });
+    });
+  });
+})();
+</script>"""
+
+
+def render_approvals_page(key):
+    """Admin ?key=ADMIN_KEY&view=approvals: strangers waiting for approval
+    (+ rejected ones, which can still be approved)."""
+    rows = _pending_approval_rows()
+
+    def _table(items, buttons):
+        if not items:
+            return '<p class="ap-empty">None.</p>'
+        trs = []
+        for r in items:
+            deals = "<br>".join(
+                f'<a href="{_esc(PIPELINE_DEAL_URL.format(d))}" target="_blank" rel="noopener">'
+                f'{_esc((_deal_company_name(deal) or "") + " · " + _deal_title(deal) if deal else "Deal " + d)}</a>'
+                for d, deal in r["deals"]) or "\u2014"
+            signup = r["signup"].strftime("%b %-d, %Y %H:%M UTC") if r["signup"] else "\u2014"
+            btns = "".join(
+                f'<button type="button" class="ap-btn ap-{st}" data-key="{_esc(key)}" data-pid="{_esc(r["person_id"])}" '
+                f'data-status="{st}">{label}</button>' for st, label in buttons)
+            trs.append(
+                f'<tr><td><a href="{_esc(PIPELINE_PERSON_URL.format(r["person_id"]))}" target="_blank" rel="noopener">'
+                f'{_esc(r["name"])}</a></td><td>{_esc(", ".join(r["emails"]))}</td><td>{_esc(r["company"] or "—")}</td>'
+                f'<td>{_esc(signup)}</td><td>{deals}</td><td>{btns} <span class="ap-msg"></span></td></tr>')
+        return ('<table class="ap-table"><thead><tr><th>Name</th><th>Email</th><th>Company</th><th>Signed up</th>'
+                f'<th>Self-created deals</th><th></th></tr></thead><tbody>{"".join(trs)}</tbody></table>')
+
+    if rows is None:
+        body = '<p class="ap-error">The New Order attestation list could not be read, so pending strangers can\'t be listed right now.</p>'
+    else:
+        pending = [r for r in rows if r["status"] == "pending"]
+        rejected = [r for r in rows if r["status"] == "rejected"]
+        body = (f'<h2>Pending ({len(pending)})</h2>'
+                + _table(pending, (("approved", "Approve"), ("rejected", "Reject")))
+                + f'<h2>Rejected ({len(rejected)})</h2>'
+                + _table(rejected, (("approved", "Approve"),)))
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Approvals \u00b7 Blockbook admin</title>
+<style>
+  body {{ margin: 0; padding: 24px; background: #f4f2ee; color: #16181d;
+         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
+  .ap-wrap {{ max-width: 1200px; margin: 0 auto; }}
+  h1 {{ font-size: 22px; margin: 0 0 4px; }}
+  h2 {{ font-size: 16px; margin: 24px 0 8px; }}
+  .ap-sub, .ap-empty {{ color: #6b7280; font-size: 13px; }}
+  .ap-error {{ color: #B42318; }}
+  .ap-table {{ width: 100%; border-collapse: collapse; background: #fff; font-size: 13px; }}
+  .ap-table th, .ap-table td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid #e5e7eb; vertical-align: top; }}
+  .ap-btn {{ font: inherit; padding: 4px 10px; margin-right: 4px; border-radius: 4px; border: 1px solid #d1d5db; cursor: pointer; background: #fff; }}
+  .ap-approved {{ background: #1f7a4d; color: #fff; border-color: #1f7a4d; }}
+  .ap-rejected {{ color: #B42318; }}
+  .ap-msg {{ color: #6b7280; }}
+</style>
+</head>
+<body>
+<div class="ap-wrap">
+  <h1>Blockbook approvals</h1>
+  <p class="ap-sub">New sellers who signed up and added their first position through the New Order form. Approving gives them their dashboard immediately.</p>
+  {body}
+</div>
+{APPROVALS_SCRIPT}
+</body>
+</html>"""
 
 
 def _fresh_tenant(email):
@@ -3694,7 +4289,11 @@ def _fresh_tenant(email):
     except Exception as e:
         print(f"fresh-tenant: {type(e).__name__}: {e}")
         return None
-    return dict(entry) if entry else None
+    if not entry:
+        return None
+    out = dict(entry)
+    out["fresh_deals"] = dict(entry.get("fresh_deals") or {})
+    return out
 
 
 def _fresh_tenant_map():
@@ -3728,13 +4327,17 @@ def _fresh_tenant_map():
                 emails += [e for e in _person_all_emails(rec) if e not in emails]
             name = str(pc.get("name") or "").strip() or (_person_display_name(rec) if rec else "")
             for e in emails:
-                if e in TENANT_BLOCKLIST or e in out:
+                if e in TENANT_BLOCKLIST:
+                    continue
+                if e in out:
+                    out[e]["fresh_deals"][str(did)] = deal
                     continue
                 override_name = (TENANT_OVERRIDES.get(e) or {}).get("name")
                 out[e] = {"name": override_name or name or e, "person_id": pid,
                           "company_id": (rec or {}).get("company_id"),
                           "company_name": ((rec or {}).get("company_name") or "").strip() or None,
-                          "team_domain": None, "is_seller": True, "fresh": True}
+                          "team_domain": None, "is_seller": True, "fresh": True,
+                          "fresh_deals": {str(did): deal}}
     except Exception as e:
         print(f"fresh-tenant: overlay check failed ({type(e).__name__}: {e}); not-a-tenant")
         out = {}
@@ -5015,6 +5618,9 @@ class _ThreadSafeTable:
 
     def scan(self, **kwargs):
         return self._client.scan(TableName=INTRO_TABLE, **kwargs)
+
+    def put_item(self, **kwargs):
+        return self._client.put_item(TableName=INTRO_TABLE, **kwargs)
 
 
 def _thread_dynamo_table():
@@ -11736,6 +12342,8 @@ def _nav_html(active_tab, viewer_name, key=None, view_as=None, show_viewer=True,
                             f'{tenant_search_html}{view_toggle_html}{copy_link_html}'
                             f'<a class="gg-admin-strip-link" href="?key={_esc(urllib.parse.quote(str(key)))}&amp;view=ownership" '
                             f'target="_blank" rel="noopener noreferrer">Ownership{_ownership_badge_html(key)}</a>'
+                            f'<a class="gg-admin-strip-link" href="?key={_esc(urllib.parse.quote(str(key)))}&amp;view=approvals" '
+                            f'target="_blank" rel="noopener noreferrer">Approvals{_approvals_badge_html(key)}</a>'
                             f'</div></div></div>\n')
     return f"""{admin_strip_html}<header class="gg-nav">
   <div class="gg-nav-inner">
@@ -22987,7 +23595,7 @@ def _handle_compare_beat(event):
         buyer = email.strip().lower() if email else ""
         if not buyer or set(body) - allowed:
             return _json_response({"error": "forbidden"}, 403)
-    if _resolve_tenant(buyer) is not None:
+    if _resolve_tenant(buyer) is not None or _tenant_access_status(buyer)[0] in ("pending", "rejected"):
         return _json_response({"error": "forbidden"}, 403)
 
     name = str(body.get("name") or "").strip()
@@ -23168,7 +23776,8 @@ def _task_warm():
     memory. Never renders a page."""
     loaded = {}
     for name, fn in (("people", _people_data), ("tenants", _tenant_index), ("deals", get_deals_list),
-                     ("interest", _interest_buy_map), ("companies", _companies_list)):
+                     ("interest", _interest_buy_map), ("companies", _companies_list),
+                     ("approvals_seed", _approval_enforced)):
         try:
             fn()
             loaded[name] = True
@@ -23252,6 +23861,11 @@ def _lambda_handler_impl(event, context):
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
         return _handle_ownership_review(event)
+
+    if query.get("action") == "tenant_approval":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_tenant_approval(event)
 
     if query.get("action") == "compare_nudge":
         if method != "POST":
@@ -23385,6 +23999,11 @@ def _lambda_handler_impl(event, context):
             return _forbidden()
         return _html_response(render_ownership_page(key=query.get("key")))
 
+    if query.get("view") == "approvals":
+        if not is_admin_key:
+            return _forbidden()
+        return _html_response(render_approvals_page(query.get("key")))
+
     if query.get("view") == "client_links":
         if not is_admin_key:
             return _forbidden()
@@ -23503,7 +24122,13 @@ def _lambda_handler_impl(event, context):
         if not identity_email:
             return _html_response(_signin_page(_request_base_url(event.get("rawPath")),
                                                return_qs=_compare_return_qs(query)), 403)
-        tenant = _resolve_tenant(identity_email)
+        _access, _access_entry = _tenant_access_status(identity_email)
+        if _access == "pending":
+            _notify_pending_stranger(identity_email.strip().lower(), _access_entry)
+            return _html_response(_message_page(PENDING_APPROVAL_TITLE, PENDING_APPROVAL_MESSAGE, show_signout=True))
+        if _access == "rejected":
+            return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_signout=True))
+        tenant = _access_entry if _access == "ok" else None
         if not tenant and query.get("view") == "compare":
             # The ONLY view a signed-in non-tenant may open: buyer view.
             return _handle_compare_view(query, False, "", None, identity_email, False, "", "")

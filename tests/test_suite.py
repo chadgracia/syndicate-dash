@@ -93,6 +93,12 @@ def reset_caches():
     lf._data_cache.clear()
     lf._people_cache.update({"version": None, "people": None, "by_id": None})
     lf._feature_agg_cache["value"] = None
+    # Stranger approval gate: legacy fixtures run as already seeded (no
+    # seed writes); the approvals section resets this to exercise the
+    # grandfather seed itself.
+    lf._approval_container.update(seeded=True, status={}, seed_failed_at=None)
+    lf._attest_cache.update(ids=None, at=0.0, wall=None)
+    lf._attest_records.clear()
 
 
 class FakeBody:
@@ -122,6 +128,16 @@ class FakeS3:
         # something real to read in tests.
         return {"Body": FakeBody(self.objs[Key]), "ContentLength": len(json.dumps(self.objs[Key])),
                 "LastModified": self.last_modified.get(Key, datetime.now(timezone.utc))}
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        # Only the New Order attestations prefix is listable on the base
+        # fake (empty unless a test seeds attestations/<id>.json); every
+        # other prefix keeps the old "no LIST permission" behavior
+        # (FakeS3List lists everything).
+        if Prefix != lf.ATTEST_PREFIX:
+            raise AttributeError("'FakeS3' object has no attribute 'list_objects_v2'")
+        return {"Contents": [{"Key": k, "LastModified": datetime.now(timezone.utc)}
+                             for k in sorted(self.objs) if k.startswith(Prefix)], "IsTruncated": False}
 
     def head_object(self, Bucket, Key):
         if Key not in self.objs:
@@ -13321,7 +13337,8 @@ def _np_fresh_sell(did, pid, email=None, name=None, side="sell"):
     d = {"id": did, "name": f"New {did}", "company": {"name": f"Fresh Co {did}"},
          "deal_stage": {"id": lf.STAGE_HOLD},
          "custom_fields": cf_sell() if side == "sell" else cf_status(None),
-         "primary_contact_id": pid, "people": [{"id": pid}], "updated_at": "2026-11-09T10:00:00Z"}
+         "primary_contact_id": pid, "people": [{"id": pid}], "updated_at": "2026-11-09T10:00:00Z",
+         "created_at": "2026/11/01 10:00:00 +0000"}
     pc = {"id": pid}
     if email is not None:
         pc["email"] = email
@@ -13441,7 +13458,8 @@ check("fresh: overlay GET failure -> not a tenant", lf._resolve_tenant("nina@new
 _np_s3m, _ = _np_fixture([_np_fresh_sell(996011, 1502, email="nina@newco.com")])
 _np_lists = []
 _np_orig_list = _np_s3m.list_objects_v2
-_np_s3m.list_objects_v2 = lambda **kw: (_np_lists.append(1), _np_orig_list(**kw))[1]
+_np_s3m.list_objects_v2 = lambda **kw: (_np_lists.append(1) if kw.get("Prefix") == lf.DEAL_FRESH_PREFIX else None,
+                                         _np_orig_list(**kw))[1]
 lf._req_cache_reset()
 lf._resolve_tenant("nina@newco.com"); lf._resolve_tenant("nobody@x.com"); lf._resolve_tenant("nina@newco.com")
 check("fresh: one LIST per request (memoized)", len(_np_lists) == 1)
@@ -13449,7 +13467,8 @@ check("fresh: one LIST per request (memoized)", len(_np_lists) == 1)
 _np_s3t, _ = _np_fixture([_np_fresh_sell(996012, 1502, email="nina@newco.com")])
 _np_tl = []
 _np_orig_tl = _np_s3t.list_objects_v2
-_np_s3t.list_objects_v2 = lambda **kw: (_np_tl.append(1), _np_orig_tl(**kw))[1]
+_np_s3t.list_objects_v2 = lambda **kw: (_np_tl.append(1) if kw.get("Prefix") == lf.DEAL_FRESH_PREFIX else None,
+                                         _np_orig_tl(**kw))[1]
 lf._req_cache_reset()
 check("fresh: existing tenant unchanged and never touches the overlay",
       lf._resolve_tenant("sal@sellerfund.com")["person_id"] == 1501
@@ -13459,6 +13478,260 @@ check("fresh: existing tenant dashboard unchanged", _np_sal["statusCode"] == 200
       and lf.NOT_ENABLED_MESSAGE not in _np_sal["body"])
 
 lf.INTERMEDIARY_RULE_ENABLED = _saved_np_ir
+reset_caches()
+
+# ======================================================================
+# Stranger approval gate (New Order self-sign-ups need Chad's approval)
+# ======================================================================
+_ap_people = {"people": [
+    {"id": 2001, "full_name": "Stan Stranger", "email": "stan@newfund.com", "company_id": 9201,
+     "company_name": "New Fund", "created_at": "2026/11/08 10:00:00 +0000", "custom_fields": {}},
+    {"id": 2002, "full_name": "Ellie Existing", "email": "ellie@oldco.com", "company_id": 9202,
+     "company_name": "Old Co", "created_at": "2025/01/15 09:00:00 +0000", "custom_fields": {}},
+    {"id": 2003, "full_name": "Carl Chadmade", "email": "carl@chadmade.com", "company_id": 9203,
+     "company_name": "Chadmade", "created_at": "2026/11/08 11:00:00 +0000", "custom_fields": {}},
+    {"id": 2004, "full_name": "Ivan Broker", "email": "ivan@brokerco3.com", "company_id": 9204,
+     "company_name": "BrokerCo3", "created_at": "2026/11/08 10:00:00 +0000", "custom_fields": _ir_cf([6577160])},
+    {"id": 2005, "full_name": "Rita Reject", "email": "rita@rejectme.com", "company_id": 9205,
+     "company_name": "RejectMe", "created_at": "2026/11/08 10:30:00 +0000", "custom_fields": {}},
+    {"id": 2006, "full_name": "Mia Mixed", "email": "mia@mixedco.com", "company_id": 9206,
+     "company_name": "MixedCo", "created_at": "2026/11/08 10:00:00 +0000", "custom_fields": {}},
+    {"id": 2007, "full_name": "Nora Nodate", "email": "nora@nodate.com", "company_id": 9207,
+     "company_name": "NoDate", "custom_fields": {}},
+    {"id": 2008, "full_name": "Tess Teammate", "email": "tess@newfund.com", "company_id": 9208,
+     "company_name": "Other Shell", "created_at": "2024/01/01 00:00:00 +0000", "custom_fields": {}},
+]}
+_ap_deals = [_tt_sell(997001, "Stan Co", 2001), _tt_sell(997002, "Ellie Co", 2002),
+             _tt_sell(997003, "Carl Co", 2003), _tt_sell(997004, "Ivan Co", 2004),
+             _tt_sell(997005, "Rita Co", 2005), _tt_sell(997061, "Mia Self", 2006),
+             _tt_sell(997062, "Mia Chad", 2006), _tt_sell(997007, "Nora Co", 2007)]
+
+
+def _ap_attest(did, pid, email, at="2026-11-08T12:00:00Z"):
+    return {"deal_id": did, "person_id": pid, "email": email, "side": "sell", "text": "x", "attested_at": at}
+
+
+def _ap_objs(extra=None):
+    objs = {lf.PEOPLE_KEY: _ap_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": list(_ap_deals)},
+            "attestations/997001.json": _ap_attest(997001, 2001, "stan@newfund.com"),
+            "attestations/997002.json": _ap_attest(997002, 2002, "ellie@oldco.com"),
+            "attestations/997004.json": _ap_attest(997004, 2004, "ivan@brokerco3.com"),
+            "attestations/997005.json": _ap_attest(997005, 2005, "rita@rejectme.com"),
+            "attestations/997061.json": _ap_attest(997061, 2006, "mia@mixedco.com"),
+            "attestations/997007.json": _ap_attest(997007, 2007, "nora@nodate.com")}
+    objs.update(extra or {})
+    return objs
+
+
+def _ap_fixture(extra=None, items=None):
+    ses_calls.clear()
+    return use_fixture(_ap_objs(extra), table_items=items, ses=FakeSES())
+
+
+def _ap_status(email):
+    lf._req_cache_reset()
+    return lf._tenant_access_status(email)[0]
+
+
+def _ap_post(body):
+    return lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": "tenant_approval"},
+                              "body": json.dumps(body)}, None)
+
+
+def _ap_approval_ses():
+    return [c for c in ses_calls if "Blockbook approval needed" in c["Message"]["Subject"]["Data"]]
+
+
+_saved_ap_ir = lf.INTERMEDIARY_RULE_ENABLED
+lf.INTERMEDIARY_RULE_ENABLED = True
+
+# --- Rule 1: stranger pending, on every path ---
+_, _ap_table = _ap_fixture()
+check("approval: stranger (all deals self-created, record made <24h before attesting) is pending",
+      _ap_status("stan@newfund.com") == "pending")
+lf._req_cache_reset()
+check("approval: pending stranger is not a tenant for any _resolve_tenant caller",
+      lf._resolve_tenant("stan@newfund.com") is None)
+_ap_page = _tt_get("stan@newfund.com")
+_ap_body = _ap_page["body"]
+check("approval: pending page text",
+      "Thanks — we&#x27;ve received your position." in _ap_body.replace("we've", "we&#x27;ve")
+      and lf.PENDING_APPROVAL_MESSAGE in _ap_body)
+check("approval: pending page has Sign out + RMS footer, no dashboard data",
+      ">Sign out</a>" in _ap_body and 'class="rms-disclosure"' in _ap_body and "Stan Co" not in _ap_body
+      and "Add your first position" not in _ap_body and "gg-tabs" not in _ap_body)
+for _ap_q in ({"tab": "demand"}, {"tab": "overview"}, {"view": "compare"}, {"welcome": "1"}):
+    _ap_qb = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                "queryStringParameters": dict(_ap_q),
+                                "cookies": [tenant_cookie("stan@newfund.com")]}, None)["body"]
+    check(f"approval: pending stranger gets the pending page on {_ap_q}",
+          lf.PENDING_APPROVAL_MESSAGE in _ap_qb and "cmp-table" not in _ap_qb and "Welcome to Blockbook" not in _ap_qb)
+_ap_beat = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                              "queryStringParameters": {"action": "compare_beat"},
+                              "body": json.dumps({"company": "Stan Co", "name": "X", "upfront": 1, "mgmt": 1,
+                                                  "carry": 10, "investment": "100k", "outcome": 5, "years": 5}),
+                              "cookies": [tenant_cookie("stan@newfund.com")]}, None)
+check("approval: pending stranger can't use compare_beat (403)", _ap_beat["statusCode"] == 403)
+
+# --- Rule 5: one email per stranger ---
+_ap_mails = _ap_approval_ses()
+check("approval: first pending hit emails Chad once (to cgracia@ only)",
+      len(_ap_mails) == 1 and _ap_mails[0]["Destination"]["ToAddresses"] == ["cgracia@rainmakersecurities.com"]
+      and _ap_mails[0]["Source"] == lf.DEAL_STAGE_EMAIL_FROM)
+_ap_mail_body = _ap_mails[0]["Message"]["Body"]["Text"]["Data"] if _ap_mails else ""
+check("approval: email subject names the person",
+      bool(_ap_mails) and _ap_mails[0]["Message"]["Subject"]["Data"]
+      == "Blockbook approval needed: Stan Stranger (stan@newfund.com)")
+check("approval: email lists the self-created deal + approvals link with the env admin key",
+      "https://app.pipelinecrm.com/deals/997001" in _ap_mail_body and "Stan Co" in _ap_mail_body
+      and lf.COMPARE_ADMIN_BASE_URL.rstrip("/") + "/?key=" + ADMIN_KEY + "&view=approvals" in _ap_mail_body)
+check("approval: dedupe record written in Dynamo",
+      any(i.get("sk") == "notified#2001" for i in _ap_table.items))
+_tt_get("stan@newfund.com"); _tt_get("stan@newfund.com")
+check("approval: repeat pending hits send no more email (deduped per person)", len(_ap_approval_ses()) == 1)
+
+# --- Rule 2: everyone else unchanged ---
+check("approval: existing contact (record long before the New Order) keeps instant access",
+      _ap_status("ellie@oldco.com") == "ok" and _tt_get("ellie@oldco.com")["statusCode"] == 200
+      and "Ellie Co" in _tt_get("ellie@oldco.com")["body"])
+check("approval: Chad-created Sell deal (no attestation) unaffected even for a new record",
+      _ap_status("carl@chadmade.com") == "ok" and "Carl Co" in _tt_get("carl@chadmade.com")["body"])
+check("approval: one non-self-created Sell deal is enough (not a stranger)", _ap_status("mia@mixedco.com") == "ok")
+check("approval: blocked intermediary still gets the block page (blocks win)",
+      _ap_status("ivan@brokerco3.com") == "none" and "partner-desk" in _tt_get("ivan@brokerco3.com")["body"]
+      and lf.PENDING_APPROVAL_MESSAGE not in _tt_get("ivan@brokerco3.com")["body"])
+lf.TENANT_BLOCKLIST.add("stan@newfund.com")
+check("approval: TENANT_BLOCKLIST wins over pending", _ap_status("stan@newfund.com") == "none")
+lf.TENANT_BLOCKLIST.discard("stan@newfund.com")
+check("approval: domain teammate of an unapproved stranger gets no tenant access",
+      _ap_status("tess@newfund.com") == "none"
+      and lf.NOT_ENABLED_MESSAGE in _tt_get("tess@newfund.com")["body"])
+check("approval: no emails for the unaffected people", len(_ap_approval_ses()) == 1)
+
+# --- Rule 4: admin page, badge, approve / reject ---
+_ap_admin = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                               "queryStringParameters": {"key": ADMIN_KEY, "view": "approvals"}}, None)
+check("approval page: lists the pending stranger with deal link and buttons",
+      _ap_admin["statusCode"] == 200 and "Stan Stranger" in _ap_admin["body"] and "stan@newfund.com" in _ap_admin["body"]
+      and "https://app.pipelinecrm.com/deals/997001" in _ap_admin["body"] and 'data-status="approved"' in _ap_admin["body"]
+      and 'data-status="rejected"' in _ap_admin["body"] and "Nov 8, 2026" in _ap_admin["body"])
+check("approval page: existing contact / Chad-created / blocked people are not listed",
+      all(n not in _ap_admin["body"] for n in ("Ellie Existing", "Carl Chadmade", "Ivan Broker", "Mia Mixed")))
+check("approval page: non-admin 403", lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+      "queryStringParameters": {"key": "nope", "view": "approvals"}}, None)["statusCode"] == 403)
+lf._req_cache_reset()
+_ap_nav = lf._nav_html("overview", "Admin", key=ADMIN_KEY)
+_ap_badge = re.search(r'view=approvals"[^>]*>Approvals <span class="gg-admin-strip-badge"[^>]*>(\d+)</span>', _ap_nav)
+check("approval badge: Approvals link with the pending count (Stan, Rita, Nora)",
+      _ap_badge is not None and _ap_badge.group(1) == "3")
+lf._req_cache_reset()
+check("approval badge: never for tenants / wrong key", lf._approvals_badge_html("nope") == ""
+      and "view=approvals" not in lf._nav_html("overview", "Sam", account_email="sam@sellcap.com"))
+check("approval POST: wrong key 403", _ap_post({"key": "nope", "person_id": "2001", "status": "approved"})["statusCode"] == 403)
+check("approval POST: bad status 400", _ap_post({"key": ADMIN_KEY, "person_id": "2001", "status": "maybe"})["statusCode"] == 400)
+check("approval POST: GET 405", lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+      "queryStringParameters": {"action": "tenant_approval"}}, None)["statusCode"] == 405)
+_ap_puts_before = len(_ap_table.puts)
+_ap_ok = _ap_post({"key": ADMIN_KEY, "person_id": "2001", "status": "approved"})
+check("approval POST: approve 200", _ap_ok["statusCode"] == 200 and json.loads(_ap_ok["body"])["status"] == "approved")
+check("approval POST: record + audit item written",
+      any(i.get("sk") == "approve#2001" and i.get("status") == "approved" and i.get("actor") == "admin"
+          for i in _ap_table.items)
+      and any(str(p.get("sk", "")).startswith("audit#tenant_approval#2001#") for p in _ap_table.puts[_ap_puts_before:]))
+lf._approval_container["status"].clear()   # another container: Dynamo is the source
+_ap_after = _tt_get("stan@newfund.com")
+check("approval: approved stranger gets the dashboard immediately",
+      _ap_status("stan@newfund.com") == "ok" and _ap_after["statusCode"] == 200 and "Stan Co" in _ap_after["body"]
+      and lf.PENDING_APPROVAL_MESSAGE not in _ap_after["body"])
+check("approval: approved stranger's teammate regains team access", _ap_status("tess@newfund.com") == "ok")
+_ap_rej = _ap_post({"key": ADMIN_KEY, "person_id": "2005", "status": "rejected"})
+_ap_rita = _tt_get("rita@rejectme.com")["body"]
+check("approval: rejected stranger gets the plain not-a-tenant page, no Add-position button, no mailto",
+      _ap_rej["statusCode"] == 200 and _ap_status("rita@rejectme.com") == "rejected"
+      and lf.NOT_ENABLED_MESSAGE in _ap_rita and "Add your first position" not in _ap_rita
+      and "Submit a sell order" not in _ap_rita and lf.PENDING_APPROVAL_MESSAGE not in _ap_rita)
+check("approval: rejected stranger sent no approval email", len(_ap_approval_ses()) == 1)
+lf._req_cache_reset()
+_ap_admin2 = render = lf.render_approvals_page(ADMIN_KEY)
+check("approval page: rejected listed under Rejected with an Approve button; approved no longer listed",
+      "Rita Reject" in _ap_admin2 and "Rejected (1)" in _ap_admin2 and "Stan Stranger" not in _ap_admin2)
+
+# --- Rule 3: fail closed for new access only ---
+_, _ap_t2 = _ap_fixture(items=[{"tenant": lf.TENANT_APPROVAL_PARTITION, "sk": "approve#2002", "status": "approved",
+                                "actor": "seed"}])
+lf._s3_client().list_objects_v2 = lambda **kw: (_ for _ in ()).throw(RuntimeError("AccessDenied"))
+check("fail closed: LIST unavailable -> stranger pending", _ap_status("stan@newfund.com") == "pending")
+check("fail closed: LIST unavailable -> un-approved would-be tenant pending (even Chad-created)",
+      _ap_status("carl@chadmade.com") == "pending")
+check("fail closed: LIST unavailable -> grandfathered/approved person unaffected", _ap_status("ellie@oldco.com") == "ok")
+lf._req_cache_reset()
+check("fail closed: approvals page says the list is unavailable",
+      "could not be read" in lf.render_approvals_page(ADMIN_KEY))
+_ap_fixture()
+check("fail closed: created_at unavailable -> pending", _ap_status("nora@nodate.com") == "pending")
+_, _ap_t3 = _ap_fixture()
+lf._s3_client().get_object = (lambda _orig: (lambda Bucket, Key: (_ for _ in ()).throw(RuntimeError("s3 down"))
+                              if Key.startswith("attestations/") else _orig(Bucket, Key)))(lf._s3_client().get_object)
+check("fail closed: attested_at unavailable -> pending (existing contact can't be proven)",
+      _ap_status("ellie@oldco.com") == "pending")
+check("fail closed: Chad-created deals unaffected when only the record GET fails", _ap_status("carl@chadmade.com") == "ok")
+
+# --- Fresh (deal-fresh instant) path ---
+_ap_fresh_deal = {"id": 997099, "name": "Brand New sell", "company": {"name": "Brand New Co"},
+                  "deal_stage": {"id": lf.STAGE_INQUIRY}, "custom_fields": cf_sell(), "primary_contact_id": 2099,
+                  "primary_contact": {"id": 2099, "name": "Bree New", "email": "bree@brandnew.com"},
+                  "people": [{"id": 2099}], "created_at": "2026/11/08 12:00:00 +0000", "updated_at": "2026/11/08 12:00:00 +0000"}
+_ap_fixture({"deal-fresh/997099.json": {"fetched_at": "2026-11-08T12:00:01+00:00", "deal": _ap_fresh_deal},
+             "attestations/997099.json": _ap_attest(997099, 2099, "bree@brandnew.com")})
+FakeBoto3.S3 = FakeS3List(FakeBoto3.S3.objs)
+reset_caches()
+check("fresh path: brand-new New Order seller (not in people.json yet) is pending, not instant",
+      _ap_status("bree@brandnew.com") == "pending")
+check("fresh path: pending page shown", lf.PENDING_APPROVAL_MESSAGE in _tt_get("bree@brandnew.com")["body"])
+
+# --- Grandfather seed ---
+_, _ap_t4 = _ap_fixture()
+lf._approval_container["seeded"] = False
+check("seed: Stan (a tenant under the old rules at deploy) is grandfathered", _ap_status("stan@newfund.com") == "ok")
+_ap_seeded = {i["sk"] for i in _ap_t4.items if str(i.get("sk", "")).startswith("approve#")}
+check("seed: an approved record for every current tenant person (incl. teammates), actor seed",
+      _ap_seeded == {f"approve#{p}" for p in (2001, 2002, 2003, 2005, 2006, 2007, 2008)}
+      and all(i.get("status") == "approved" and i.get("actor") == "seed"
+              for i in _ap_t4.items if str(i.get("sk", "")).startswith("approve#")))
+check("seed: blocked people are not seeded", "approve#2004" not in _ap_seeded)
+check("seed: marker + one audit item",
+      any(i.get("sk") == "seeded" for i in _ap_t4.items)
+      and sum(1 for p in _ap_t4.puts if str(p.get("sk", "")).startswith("audit#tenant_approval#seed#")) == 1)
+_ap_n_puts = len(_ap_t4.puts)
+lf._approval_container["seeded"] = False
+_ap_status("ellie@oldco.com")
+check("seed: idempotent (marker present -> no second seed)", len(_ap_t4.puts) == _ap_n_puts)
+_ap_t4.items = [i for i in _ap_t4.items if i.get("sk") != "seeded"]
+lf._approval_container["seeded"] = False
+_ap_status("ellie@oldco.com")
+check("seed: re-run without the marker writes no duplicate approvals",
+      sum(1 for p in _ap_t4.puts[_ap_n_puts:] if str(p.get("sk", "")).startswith("approve#")) == 0)
+_, _ap_t5 = _ap_fixture()
+lf._approval_container["seeded"] = False
+_ap_t5.query = lambda **kw: (_ for _ in ()).throw(RuntimeError("dynamo down"))
+check("seed: seed failure -> nothing enforced yet (old behavior), logged",
+      _ap_status("stan@newfund.com") == "ok" and lf._approval_container["seeded"] is False)
+_ap_q_calls = []
+_ap_t5.query = lambda **kw: (_ap_q_calls.append(1), (_ for _ in ()).throw(RuntimeError("dynamo down")))[1]
+_ap_status("stan@newfund.com")
+check("seed: no retry storm -- a failed seed waits APPROVAL_SEED_RETRY_SECONDS before retrying", _ap_q_calls == [])
+lf._approval_container["seed_failed_at"] = time.monotonic() - lf.APPROVAL_SEED_RETRY_SECONDS - 1
+del _ap_t5.query
+check("seed: retried after the backoff and then enforced",
+      _ap_status("stan@newfund.com") == "ok" and lf._approval_container["seeded"] is True
+      and any(i.get("sk") == "seeded" for i in _ap_t5.items))
+_, _ap_t6 = _ap_fixture()
+lf._approval_container["seeded"] = False
+lf._task_warm()
+check("seed: the warm task seeds at deploy", any(i.get("sk") == "seeded" for i in _ap_t6.items))
+
+lf.INTERMEDIARY_RULE_ENABLED = _saved_ap_ir
 reset_caches()
 
 print(f"\n{passed} passed, {failed} failed")
