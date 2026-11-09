@@ -160,6 +160,7 @@ def _req_cache_reset():
     _req_cache["aggregate_scan"] = None
     _req_cache["standing"] = None
     _req_cache["compare"] = {}
+    _req_cache.pop("fresh_tenants", None)
 
 
 def _perf_start(page):
@@ -3669,7 +3670,76 @@ def _resolve_tenant(email):
     control check below calls instead of the old TENANTS lookup."""
     if not email:
         return None
-    return _tenant_index_req().get(email.strip().lower())
+    key = email.strip().lower()
+    entry = _tenant_index_req().get(key)
+    if entry is not None:
+        return entry
+    return _fresh_tenant(key)
+
+
+def _fresh_tenant(email):
+    """Instant access for a brand-new seller before the hourly tenant
+    index includes them: an individual tenant entry when a deal-fresh
+    overlay (written since deals.json) is a Sell deal whose primary
+    contact is this email (primary_contact.email, or primary_contact_id
+    -> a people-slim person carrying the email), else None. Block
+    reasons and TENANT_BLOCKLIST always win. Read-only; any error ->
+    None (old not-a-tenant behavior)."""
+    if not email or email in TENANT_BLOCKLIST:
+        return None
+    try:
+        if _tenant_block_reason(email):
+            return None
+        entry = _fresh_tenant_map().get(email)
+    except Exception as e:
+        print(f"fresh-tenant: {type(e).__name__}: {e}")
+        return None
+    return dict(entry) if entry else None
+
+
+def _fresh_tenant_map():
+    """{email: tenant entry} from the deal-fresh overlays, built once per
+    request (_req_cache "fresh_tenants", failure memoized as {})."""
+    if "fresh_tenants" in _req_cache:
+        return _req_cache["fresh_tenants"]
+    out = {}
+    try:
+        _cached_object_version(_s3_client(), DEALS_KEY)
+        if _s3_last_modified.get(DEALS_KEY) is None:
+            raise RuntimeError("deals.json LastModified unknown")
+        overlays = _deal_fresh_overlays(())
+        by_id = _people_data()["by_id"] if overlays else {}
+        for did in sorted(overlays, key=lambda d: (len(d), d)):
+            deal = overlays[did]
+            if not _deal_is_sell(deal):
+                continue
+            pid = _deal_primary_contact_id(deal)
+            if pid is None:
+                continue
+            pc = deal.get("primary_contact") if isinstance(deal.get("primary_contact"), dict) else {}
+            rec = by_id.get(str(pid))
+            if rec is not None and INTERMEDIARY_RULE_ENABLED and _person_block_reason(rec):
+                continue
+            emails = []
+            pc_email = str(pc.get("email") or "").strip().lower()
+            if pc_email:
+                emails.append(pc_email)
+            if rec is not None:
+                emails += [e for e in _person_all_emails(rec) if e not in emails]
+            name = str(pc.get("name") or "").strip() or (_person_display_name(rec) if rec else "")
+            for e in emails:
+                if e in TENANT_BLOCKLIST or e in out:
+                    continue
+                override_name = (TENANT_OVERRIDES.get(e) or {}).get("name")
+                out[e] = {"name": override_name or name or e, "person_id": pid,
+                          "company_id": (rec or {}).get("company_id"),
+                          "company_name": ((rec or {}).get("company_name") or "").strip() or None,
+                          "team_domain": None, "is_seller": True, "fresh": True}
+    except Exception as e:
+        print(f"fresh-tenant: overlay check failed ({type(e).__name__}: {e}); not-a-tenant")
+        out = {}
+    _req_cache["fresh_tenants"] = out
+    return out
 
 
 def _tenant_block_reason(email):
@@ -16429,7 +16499,7 @@ SELL_ORDER_MAILTO_URL = (
 
 
 def _message_page(title, message, show_signin=False, show_sell_cta=False, show_signout=False, primary_cta=None,
-                  message_link=None):
+                  message_link=None, add_position_url=None):
     """Standalone pre-auth / not-enabled page. Reuses the board's own dark
     palette (not the nav's) since there's no tab shell to sit under here.
 
@@ -16474,7 +16544,14 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
         ml_href, ml_label = message_link
         msg_link_html = f' <a class="gg-link" href="{_esc(ml_href)}">{_esc(ml_label)}</a>'
     sell_cta_html = ""
-    if show_sell_cta:
+    if show_sell_cta and add_position_url:
+        # Signed-in, unblocked non-tenant: the same New Order link the
+        # tenant "+ Add deal" uses (_add_deal_url) instead of the mailto.
+        sell_cta_html = (
+            f'<p><a class="gg-btn" href="{_esc(add_position_url)}" target="_blank" rel="noopener">'
+            'Add your first position &rarr;</a></p>'
+        )
+    elif show_sell_cta:
         sell_cta_html = (
             f'<p>Have a block or shares to sell? '
             f'<a class="gg-link" href="{SELL_ORDER_MAILTO_URL}">Submit a sell order &rarr;</a></p>'
@@ -20988,6 +21065,7 @@ def _deal_fresh_overlays(candidate_ids=()):
         return memo["fresh"]
     s3 = _s3_client()
     keys = None
+    listed = True
     try:
         snap_lm = _s3_last_modified.get(DEALS_KEY)
         cutoff = snap_lm.timestamp() - DEAL_FRESH_SNAPSHOT_SLACK_SECONDS if snap_lm is not None else None
@@ -21007,6 +21085,7 @@ def _deal_fresh_overlays(candidate_ids=()):
                 token = resp.get("NextContinuationToken")
     except Exception as e:
         print(f"deal-fresh: list failed ({type(e).__name__}: {e}); per-deal reads")
+        listed = False
         ids = [str(i) for i in candidate_ids][:DEAL_FRESH_FALLBACK_MAX]
         keys = [f"{DEAL_FRESH_PREFIX}{i}.json" for i in ids]
     out = {}
@@ -21021,7 +21100,8 @@ def _deal_fresh_overlays(candidate_ids=()):
         for deal in results:
             if deal is not None:
                 out[str(deal["id"])] = deal
-    memo["fresh"] = out
+    if listed or candidate_ids:
+        memo["fresh"] = out
     return out
 
 
@@ -23438,8 +23518,9 @@ def _lambda_handler_impl(event, context):
                 return _html_response(_message_page("Not enabled", INTERMEDIARY_BLOCKED_MESSAGE,
                                                     show_signout=True,
                                                     message_link=(PARTNER_DESK_URL, "Partner Desk \u2192")))
-            return _html_response(_message_page("Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True,
-                                                show_signout=True))
+            return _html_response(_message_page(
+                "Not enabled", NOT_ENABLED_MESSAGE, show_sell_cta=True, show_signout=True,
+                add_position_url=_add_deal_url(identity_email) if _block_reason is None else None))
         viewer_name = tenant["name"]
         anon_key_email = identity_email.strip().lower()
 

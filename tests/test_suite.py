@@ -585,8 +585,9 @@ full_cookie2 = lf._make_identity_cookie("nosell@example.com")
 resp_nosell = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}},
                                   "queryStringParameters": {"tab": "mydeals"},
                                   "cookies": [full_cookie2.split(";")[0]]}, None)
-check("lambda_handler: a genuinely ineligible user gets the not-enabled page with the sell CTA",
-      "Submit a sell order" in resp_nosell["body"] and "This dashboard is for sellers" in resp_nosell["body"])
+check("lambda_handler: a genuinely ineligible (unblocked) user gets the not-enabled page with the Add-position CTA",
+      "Add your first position" in resp_nosell["body"] and "Submit a sell order" not in resp_nosell["body"]
+      and "This dashboard is for sellers" in resp_nosell["body"])
 
 
 # ======================================================================
@@ -11227,7 +11228,8 @@ check("non-tenant with welcome=1: welcome page, trades button, Sign out",
       and ">Sign out</a>" in _wl_page and lf.NOT_ENABLED_MESSAGE not in _wl_page)
 _wl_old = _tl_get({}, cookies=[tenant_cookie(_wl_new)])["body"]
 check("non-tenant without welcome=1: old not-enabled message unchanged",
-      lf.NOT_ENABLED_MESSAGE in _wl_old and "Welcome to Blockbook" not in _wl_old and 'class="gg-btn"' not in _wl_old)
+      lf.NOT_ENABLED_MESSAGE in _wl_old and "Welcome to Blockbook" not in _wl_old
+      and "While you wait, explore" not in _wl_old)
 check("tenant with welcome=1 still gets the dashboard",
       "Welcome to Blockbook" not in _tl_get({"welcome": "1"}, cookies=[tenant_cookie(_ad_email)])["body"])
 
@@ -13273,6 +13275,190 @@ check("ownership badge: computed at most once per request (memoized)", len(_ob_c
 
 os.environ.pop("OWNERSHIP_RULE", None)
 lf.urllib.request.urlopen = _ow_saved_urlopen
+reset_caches()
+
+# ======================================================================
+# Generic onboarding link: "Add your first position" + deal-fresh instant access
+# ======================================================================
+import html as _ob_html_mod
+import urllib.parse as _ob_up
+
+
+def _np_href(body):
+    m = re.search(r'<a class="gg-btn" href="([^"]+)"[^>]*>Add your first position', body)
+    return _ob_html_mod.unescape(m.group(1)) if m else None
+
+
+def _np_sso_email(href):
+    if not href or not href.startswith(lf.ADD_DEAL_FORM_URL + "&sso="):
+        return None
+    return lf._verify_sso_handoff(_ob_up.unquote(href.split("&sso=", 1)[1]))
+
+
+_np_people = {"people": [
+    {"id": 1501, "full_name": "Sal Seller", "email": "sal@sellerfund.com", "company_id": 9101,
+     "company_name": "Seller Fund", "custom_fields": {}},
+    {"id": 1502, "full_name": "Nina New", "email": "nina@newco.com", "company_id": 9102,
+     "company_name": "NewCo Capital", "custom_fields": {}},
+    {"id": 1503, "full_name": "Pete Pipe", "email": "pete@pipeco.com",
+     "emails": [{"address": "pete.alt@gmail.com"}], "company_id": 9103,
+     "company_name": "PipeCo", "custom_fields": {}},
+    {"id": 1504, "full_name": "Ivan Broker", "email": "ivan@brokerco2.com", "company_id": 9104,
+     "company_name": "BrokerCo", "custom_fields": _ir_cf([6577160])},
+    {"id": 1505, "full_name": "Rita Ref", "email": "rita@refclient.com", "company_id": 9105,
+     "company_name": "Ref Client", "custom_fields": _ir_cf(None, [lf.PDR_REFERRAL_CLIENT])},
+    {"id": 1506, "full_name": "Rae Maker", "email": "rae2@rainmakersecurities.com", "company_id": 9106,
+     "company_name": "Rae LLC", "custom_fields": {}},
+    {"id": 1507, "full_name": "Pia Platform", "email": "pia2@equityzen.com", "company_id": 9107,
+     "company_name": "EquityZen", "custom_fields": {}},
+    {"id": 1508, "full_name": "Bo Buyer", "email": "bo@buyerco.com", "company_id": 9108,
+     "company_name": "BuyerCo", "custom_fields": {}},
+]}
+_np_deals = [_tt_sell(995001, "Existing Co", 1501)]
+
+
+def _np_fresh_sell(did, pid, email=None, name=None, side="sell"):
+    d = {"id": did, "name": f"New {did}", "company": {"name": f"Fresh Co {did}"},
+         "deal_stage": {"id": lf.STAGE_HOLD},
+         "custom_fields": cf_sell() if side == "sell" else cf_status(None),
+         "primary_contact_id": pid, "people": [{"id": pid}], "updated_at": "2026-11-09T10:00:00Z"}
+    pc = {"id": pid}
+    if email is not None:
+        pc["email"] = email
+    if name is not None:
+        pc["name"] = name
+    d["primary_contact"] = pc
+    return d
+
+
+def _np_fixture(fresh=(), listable=True):
+    objs = {lf.PEOPLE_KEY: _np_people, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": list(_np_deals)}}
+    for d in fresh:
+        objs[f"deal-fresh/{d['id']}.json"] = {"fetched_at": "2026-11-09T10:00:00+00:00", "deal": d}
+    s3, table = use_fixture(objs)
+    if listable:
+        s3 = FakeS3List(objs)
+        FakeBoto3.S3 = s3
+        reset_caches()
+    return s3, table
+
+
+_saved_np_ir = lf.INTERMEDIARY_RULE_ENABLED
+lf.INTERMEDIARY_RULE_ENABLED = True
+
+# --- 1. Not-a-tenant page: button for unblocked, nothing for blocked ---
+_np_fixture()
+_np_body = _tt_get("nina@newco.com")["body"]
+_np_h = _np_href(_np_body)
+check("onboarding: unblocked non-tenant sees 'Add your first position' button",
+      _np_h is not None and lf.NOT_ENABLED_MESSAGE in _np_body)
+check("onboarding: button is the New Order (_add_deal_url) link signed for the viewer",
+      _np_sso_email(_np_h) == "nina@newco.com")
+check("onboarding: mailto sell-order line replaced for the unblocked non-tenant",
+      "Submit a sell order" not in _np_body and "mailto:" not in _np_body.split("rms-disclosure")[0])
+check("onboarding: raised headline still on the page",
+      lf._message_page("Not enabled", lf.NOT_ENABLED_MESSAGE, show_sell_cta=True,
+                       add_position_url="https://x/y").count("Add your first position") == 1)
+for _np_b_email, _np_b_kind in (("ivan@brokerco2.com", "intermediary"), ("rita@refclient.com", "referral_client"),
+                                ("rae2@rainmakersecurities.com", "rainmaker"), ("pia2@equityzen.com", "platform")):
+    lf._req_cache_reset()
+    check(f"onboarding: {_np_b_kind} block reason detected", lf._tenant_block_reason(_np_b_email) == _np_b_kind)
+    _np_bb = _tt_get(_np_b_email)["body"]
+    check(f"onboarding: blocked {_np_b_kind} sees no Add-position button", "Add your first position" not in _np_bb)
+_np_rita = _tt_get("rita@refclient.com")["body"]
+check("onboarding: referral_client page unchanged (still the mailto sell-order line)",
+      "Submit a sell order" in _np_rita and lf.NOT_ENABLED_MESSAGE in _np_rita)
+_saved_np_secret = lf.IDENTITY_SECRET
+lf.IDENTITY_SECRET = ""
+_np_nosecret = lf._message_page("Not enabled", lf.NOT_ENABLED_MESSAGE, show_sell_cta=True,
+                                add_position_url=lf._add_deal_url("nina@newco.com"))
+lf.IDENTITY_SECRET = _saved_np_secret
+check("onboarding: no IDENTITY_SECRET -> no broken button, mailto fallback",
+      "Add your first position" not in _np_nosecret and "Submit a sell order" in _np_nosecret)
+
+# --- 2. Instant access from the deal-fresh overlay ---
+_np_s3, _ = _np_fixture([_np_fresh_sell(996001, 1502, email="Nina@NewCo.com", name="Nina N.")])
+lf._req_cache_reset()
+_np_t = lf._resolve_tenant("nina@newco.com")
+check("fresh: Sell deal with matching primary_contact.email grants tenancy (case-insensitive)",
+      _np_t is not None and _np_t["person_id"] == 1502 and _np_t["name"] == "Nina N."
+      and _np_t["company_name"] == "NewCo Capital" and _np_t["company_id"] == 9102 and _np_t["team_domain"] is None)
+check("fresh: not written to the hourly index", "nina@newco.com" not in lf._tenant_index())
+_np_put_before = len(_np_s3.put_calls)
+_np_r = _tt_get("nina@newco.com")
+check("fresh: dashboard renders instead of the not-a-tenant page",
+      _np_r["statusCode"] == 200 and lf.NOT_ENABLED_MESSAGE not in _np_r["body"]
+      and "Add your first position" not in _np_r["body"])
+check("fresh: nothing written for the fresh-tenant check",
+      not [c for c in _np_s3.put_calls[_np_put_before:] if "fresh" in c["Key"] or "tenant" in c["Key"]])
+
+_np_fixture([_np_fresh_sell(996002, 1503)])  # no primary_contact.email; id -> people-slim emails
+lf._req_cache_reset()
+_np_p = lf._resolve_tenant("pete.alt@gmail.com")
+check("fresh: primary_contact_id -> people-slim email match (any email on the record)",
+      _np_p is not None and _np_p["person_id"] == 1503 and _np_p["name"] == "Pete Pipe"
+      and lf._resolve_tenant("PETE@pipeco.com") is not None)
+
+_np_fixture([_np_fresh_sell(996003, 1508, email="bo@buyerco.com", side="buy")])
+lf._req_cache_reset()
+check("fresh: Buy deal never grants tenancy", lf._resolve_tenant("bo@buyerco.com") is None)
+check("fresh: Buy deal -> still the not-a-tenant page",
+      lf.NOT_ENABLED_MESSAGE in _tt_get("bo@buyerco.com")["body"])
+
+_np_fixture([_np_fresh_sell(996004, 1502, email="nina@newco.com")])
+lf._req_cache_reset()
+check("fresh: non-matching email gets nothing", lf._resolve_tenant("someone@else.com") is None
+      and lf._resolve_tenant("sal@sellerfund.com") is not None)
+
+_np_fixture([_np_fresh_sell(996005, 1504, email="ivan@brokerco2.com"),
+             _np_fresh_sell(996006, 1505, email="rita@refclient.com"),
+             _np_fresh_sell(996007, 1506, email="rae2@rainmakersecurities.com")])
+lf._req_cache_reset()
+check("fresh: blocked people never get tenancy from a fresh Sell deal",
+      all(lf._resolve_tenant(e) is None for e in ("ivan@brokerco2.com", "rita@refclient.com",
+                                                     "rae2@rainmakersecurities.com")))
+check("fresh: blocked intermediary keeps the Partner Desk page",
+      "partner-desk" in _tt_get("ivan@brokerco2.com")["body"])
+
+_np_fixture([_np_fresh_sell(996008, 1502, email="nina@newco.com")])
+lf.TENANT_BLOCKLIST.add("nina@newco.com")
+lf._req_cache_reset()
+check("fresh: TENANT_BLOCKLIST wins", lf._resolve_tenant("nina@newco.com") is None)
+lf.TENANT_BLOCKLIST.discard("nina@newco.com")
+
+_np_fixture([_np_fresh_sell(996009, 1502, email="nina@newco.com")], listable=False)  # LIST unavailable
+lf._req_cache_reset()
+check("fresh: overlay LIST failure -> old behavior (not a tenant)", lf._resolve_tenant("nina@newco.com") is None)
+check("fresh: overlay failure -> not-a-tenant page with the Add-position button",
+      _np_href(_tt_get("nina@newco.com")["body"]) is not None)
+
+_np_s3f, _ = _np_fixture([_np_fresh_sell(996010, 1502, email="nina@newco.com")])
+_np_s3f.get_object = lambda Bucket, Key: (_ for _ in ()).throw(RuntimeError("s3 down")) \
+    if Key.startswith("deal-fresh/") else FakeS3.get_object(_np_s3f, Bucket, Key)
+lf._req_cache_reset()
+check("fresh: overlay GET failure -> not a tenant", lf._resolve_tenant("nina@newco.com") is None)
+
+_np_s3m, _ = _np_fixture([_np_fresh_sell(996011, 1502, email="nina@newco.com")])
+_np_lists = []
+_np_orig_list = _np_s3m.list_objects_v2
+_np_s3m.list_objects_v2 = lambda **kw: (_np_lists.append(1), _np_orig_list(**kw))[1]
+lf._req_cache_reset()
+lf._resolve_tenant("nina@newco.com"); lf._resolve_tenant("nobody@x.com"); lf._resolve_tenant("nina@newco.com")
+check("fresh: one LIST per request (memoized)", len(_np_lists) == 1)
+
+_np_s3t, _ = _np_fixture([_np_fresh_sell(996012, 1502, email="nina@newco.com")])
+_np_tl = []
+_np_orig_tl = _np_s3t.list_objects_v2
+_np_s3t.list_objects_v2 = lambda **kw: (_np_tl.append(1), _np_orig_tl(**kw))[1]
+lf._req_cache_reset()
+check("fresh: existing tenant unchanged and never touches the overlay",
+      lf._resolve_tenant("sal@sellerfund.com")["person_id"] == 1501
+      and lf._resolve_tenant("sal@sellerfund.com").get("fresh") is None and _np_tl == [])
+_np_sal = _tt_get("sal@sellerfund.com")
+check("fresh: existing tenant dashboard unchanged", _np_sal["statusCode"] == 200 and "Existing Co" in _np_sal["body"]
+      and lf.NOT_ENABLED_MESSAGE not in _np_sal["body"])
+
+lf.INTERMEDIARY_RULE_ENABLED = _saved_np_ir
 reset_caches()
 
 print(f"\n{passed} passed, {failed} failed")
