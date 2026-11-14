@@ -2230,7 +2230,7 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name"
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
     1958, 3052210, 3064297, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163, 3769275,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
-    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 4011837, 3900670, 2447206))
+    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 4011837, 3900670, 2447206, 4013323))
 
 
 def _people_slim_schema():
@@ -9725,6 +9725,11 @@ def _my_deal_visibility_badge_core_html(deal, cef_state, is_held, is_won=False):
         return '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>'
     if state == "held":
         return '<span class="visibility-badge held">Held · not shown to buyers</span>'
+    vis = _deal_effective_visibility(deal)
+    if vis == VIS_PRIVATE:
+        return '<span class="visibility-badge held">Private · not shown to buyers</span>'
+    if vis == VIS_INTERESTED:
+        return '<span class="visibility-badge live">Live · interested investors only</span>'
     return '<span class="visibility-badge live">Live · shown to buyers</span>'
 
 
@@ -21730,6 +21735,112 @@ def _merge_deal_fresh(deals, overlays):
     return list(by_id.values())
 
 
+# Per-deal Visibility (Pipeline dropdown). Blank / unknown = All Investors,
+# so existing deals never change. Private / Interested-only Sell deals are
+# shown only to admin and the deal's own tenant team (My Deals badge,
+# Compare SPVs). Fresher values come from deal-update-form's
+# visibility-overrides.json ({"<deal_id>": {"v": <option id>, "at": ...}}),
+# which wins over the deal record; read at most every 60s per container.
+VISIBILITY_FIELD = "custom_label_4013323"
+VIS_ALL = 7223456          # "All Investors"
+VIS_INTERESTED = 7223457   # "Interested investors only"
+VIS_PRIVATE = 7223458      # "Private"
+VIS_RESTRICTED = frozenset({VIS_INTERESTED, VIS_PRIVATE})
+VISIBILITY_OVERRIDES_KEY = "visibility-overrides.json"
+VISIBILITY_OVERRIDES_TTL_SECONDS = 60
+_visibility_overrides_cache = {"at": None, "data": {}}
+
+
+def _normalize_visibility(v):
+    """int, numeric string, "7223458.0" or a 1-element list -> option id;
+    blank / unparseable / unknown -> VIS_ALL."""
+    if isinstance(v, (list, tuple)):
+        v = v[0] if v else None
+    if v is None or isinstance(v, bool):
+        return VIS_ALL
+    try:
+        n = int(float(str(v).strip()))
+    except (TypeError, ValueError, OverflowError):
+        return VIS_ALL
+    return n if n in (VIS_ALL, VIS_INTERESTED, VIS_PRIVATE) else VIS_ALL
+
+
+def _visibility_overrides():
+    """{str(deal_id): option id} from visibility-overrides.json, cached
+    VISIBILITY_OVERRIDES_TTL_SECONDS per container. Missing / unreadable
+    -> {} (deal records alone)."""
+    c = _visibility_overrides_cache
+    now = time.time()
+    if c["at"] is not None and now - c["at"] < VISIBILITY_OVERRIDES_TTL_SECONDS:
+        return c["data"]
+    data = {}
+    try:
+        obj = _s3_client().get_object(Bucket=BUCKET, Key=VISIBILITY_OVERRIDES_KEY)
+        raw = json.loads(obj["Body"].read())
+        if isinstance(raw, dict):
+            for k, item in raw.items():
+                if isinstance(item, dict) and "v" in item:
+                    data[str(k)] = _normalize_visibility(item["v"])
+    except Exception as e:
+        if "NoSuchKey" not in f"{type(e).__name__}: {e}":
+            print(f"visibility: overrides read failed; using deal records: {type(e).__name__}")
+    c["at"], c["data"] = now, data
+    return data
+
+
+def _deal_visibility(deal):
+    """Visibility option id for a deal record (override file wins). Any
+    error -> VIS_ALL (no filtering), logged once per request."""
+    try:
+        did = str(deal.get("id"))
+        ov = _visibility_overrides()
+        if did in ov:
+            return ov[did]
+        cf = deal.get("custom_fields") or {}
+        return _normalize_visibility(cf.get(VISIBILITY_FIELD) if isinstance(cf, dict) else None)
+    except Exception as e:
+        if not _req_cache.get("visibility_err_logged"):
+            _req_cache["visibility_err_logged"] = True
+            print(f"visibility: lookup failed; no visibility filtering: {type(e).__name__}")
+        return VIS_ALL
+
+
+def _deal_effective_visibility(deal):
+    """_deal_visibility on the effective record: the deal-fresh overlay
+    swapped in when it is at/after the snapshot (same rule as Compare)."""
+    try:
+        did = str(deal.get("id"))
+        if "visibility_fresh" not in _req_cache:
+            _req_cache["visibility_fresh"] = _deal_fresh_overlays(())
+        fresh = _req_cache["visibility_fresh"].get(did)
+        if fresh is not None:
+            deal = _merge_deal_fresh([deal], {did: fresh})[0]
+    except Exception as e:
+        print(f"visibility: deal-fresh lookup failed; using snapshot: {type(e).__name__}")
+    return _deal_visibility(deal)
+
+
+def _compare_viewer_can_see(deal, role, scope=frozenset()):
+    """Private / Interested-only offerings: admin and the deal's own tenant
+    firm/team only."""
+    if role == "admin" or _deal_visibility(deal) not in VIS_RESTRICTED:
+        return True
+    return role == "tenant" and bool(_deal_owner_ids(deal) & scope)
+
+
+def _compare_visible_offerings(offerings, role, scope=frozenset()):
+    """_compare_offerings filtered for the viewer (companies left with no
+    visible offering drop out)."""
+    if role == "admin":
+        return offerings
+    out = {}
+    for ck, entry in offerings.items():
+        deals = [d for d in entry["deals"] if _compare_viewer_can_see(d, role, scope)]
+        if deals:
+            out[ck] = {**entry, "deals": deals}
+    return out
+
+
 def _compare_offerings(include_hold, use_overlay=True):
     """{company key: {"company", "company_id", "deals": [...]}} over every
     qualifying offering, deals sorted by id. Memoized per request."""
@@ -21760,14 +21871,19 @@ def _compare_offerings(include_hold, use_overlay=True):
 
 def _compare_offering_count(deal):
     """Non-Hold qualifying offerings for this deal's company (snapshot
-    only, no overlay -- the entry points never add S3 calls). 0 on any
-    failure."""
+    only, no overlay -- the entry points never add S3 calls). Private /
+    Interested-only offerings other than this deal itself are not counted.
+    0 on any failure."""
     try:
         entry = _compare_offerings(False, use_overlay=False).get(_compare_company_key(deal))
     except Exception as e:
         print(f"compare count failed (non-fatal): {type(e).__name__}: {e}")
         return 0
-    return len(entry["deals"]) if entry else 0
+    if not entry:
+        return 0
+    own_id = str(deal.get("id"))
+    return sum(1 for d in entry["deals"]
+               if str(d.get("id")) == own_id or _deal_visibility(d) not in VIS_RESTRICTED)
 
 
 def _compare_href(company_param, key=None, view_as=None):
@@ -22430,9 +22546,9 @@ def _compare_vehicle_html(row):
     return html
 
 
-def render_compare_index(role, header_html, key=None, view_as=None):
+def render_compare_index(role, header_html, key=None, view_as=None, scope=frozenset()):
     try:
-        offerings = _compare_offerings(include_hold=(role == "admin"))
+        offerings = _compare_visible_offerings(_compare_offerings(include_hold=(role == "admin")), role, scope)
     except Exception as e:
         print(f"compare index failed: {type(e).__name__}: {e}")
         return _compare_shell("Compare SPVs", header_html,
@@ -22912,8 +23028,11 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     in place for the viewer's investment, outcome and years."""
     back = f'<p class="cmp-sub"><a href="{_esc(_compare_href(None, key, view_as))}">← All companies</a></p>'
     try:
-        offerings = _compare_offerings(include_hold=(role == "admin"))
-        entry = _compare_find_entry(offerings, company_param)
+        all_offerings = _compare_offerings(include_hold=(role == "admin"))
+        # The live-intro guard reads every offering (unchanged); rows only
+        # the ones this viewer may see (Private / Interested-only filtered).
+        entry_all = _compare_find_entry(all_offerings, company_param)
+        entry = _compare_find_entry(_compare_visible_offerings(all_offerings, role, scope), company_param)
         rows, ref = _compare_rows(entry, role, scope) if entry else ([], None)
     except Exception as e:
         print(f"compare company failed: {type(e).__name__}: {e}")
@@ -22926,7 +23045,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     company = entry["company"]
     investment, outcome = COMPARE_DEFAULT_INVESTMENT, COMPARE_DEFAULT_OUTCOME
     try:
-        live_intro = _compare_live_intro(entry, viewer_ids) if viewer_ids else None
+        live_intro = _compare_live_intro(entry_all or entry, viewer_ids) if viewer_ids else None
     except Exception as e:
         print(f"compare live-intro check failed (no guard): {type(e).__name__}: {e}")
         live_intro = None
@@ -23012,7 +23131,8 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             elif key is not None:
                 label_html += f'<div>{_compare_bell_html(r, nudge_state, company)}</div>'
         if role == "admin":
-            label_html += (f'<div class="cmp-admin">{_esc(r["label"])} · {_esc(_compare_firm_text(d))} · '
+            vis_tag = {VIS_PRIVATE: "Private · ", VIS_INTERESTED: "Interested only · "}.get(_deal_visibility(d), "")
+            label_html += (f'<div class="cmp-admin">{_esc(r["label"])} · {vis_tag}{_esc(_compare_firm_text(d))} · '
                            f'<a href="{_esc(PIPELINE_DEAL_URL.format(deal_id))}" target="_blank" rel="noopener">'
                            f'Pipeline #{_esc(deal_id)}</a></div>')
         val_html = _esc(r["valuation_text"])
@@ -23101,7 +23221,7 @@ def render_compare_page(query, role, header_html, scope=frozenset(), key=None, v
     if company:
         return render_compare_company(company, role, header_html, scope=scope, key=key, view_as=view_as,
                                       impersonating=impersonating, commission=commission, viewer_ids=viewer_ids)
-    return render_compare_index(role, header_html, key=key, view_as=view_as)
+    return render_compare_index(role, header_html, key=key, view_as=view_as, scope=scope)
 
 
 def _parse_fee_pct_input(raw):
@@ -23634,8 +23754,13 @@ def _handle_compare_beat(event):
 
     # Only an entry that beats or ties the best live offering may be sent
     # (checked before the rate limits, so a refusal never consumes them).
+    # Ranking uses only the offerings a buyer may see (no Private /
+    # Interested-only rows); the live-intro check above reads them all.
+    visible_entry = _compare_visible_offerings({"_": company_entry}, "buyer").get("_")
+    if visible_entry is None:
+        return _json_response({"error": "No live offerings for this company."}, 404)
     try:
-        live_rows, live_ref = _compare_rows(company_entry, "buyer")
+        live_rows, live_ref = _compare_rows(visible_entry, "buyer")
         _compare_rank_rows(live_rows, investment, outcome, years, live_ref)
     except Exception as e:
         print(f"compare_beat: live ranking failed: {type(e).__name__}: {e}")

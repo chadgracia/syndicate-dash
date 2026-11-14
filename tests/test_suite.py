@@ -13734,6 +13734,121 @@ check("seed: the warm task seeds at deploy", any(i.get("sk") == "seeded" for i i
 lf.INTERMEDIARY_RULE_ENABLED = _saved_ap_ir
 reset_caches()
 
+# ======================================================================
+# Per-deal Visibility (custom_label_4013323): My Deals badge + Compare SPVs
+# ======================================================================
+check("visibility: constants are the spec's",
+      lf.VISIBILITY_FIELD == "custom_label_4013323" and (lf.VIS_ALL, lf.VIS_INTERESTED, lf.VIS_PRIVATE)
+      == (7223456, 7223457, 7223458))
+check("visibility: normalise int / numeric string / '.0' / 1-element list",
+      lf._normalize_visibility(7223458) == lf.VIS_PRIVATE and lf._normalize_visibility("7223457") == lf.VIS_INTERESTED
+      and lf._normalize_visibility("7223458.0") == lf.VIS_PRIVATE and lf._normalize_visibility([7223457]) == lf.VIS_INTERESTED
+      and lf._normalize_visibility(["7223456"]) == lf.VIS_ALL)
+check("visibility: blank / None / [] / junk / unknown id / bool -> VIS_ALL",
+      all(lf._normalize_visibility(v) == lf.VIS_ALL for v in (None, "", " ", [], "abc", 12345, True, {"x": 1})))
+
+
+def _vis_reset(overrides=None):
+    lf._visibility_overrides_cache.update({"at": None, "data": {}})
+    lf._req_cache_reset()
+
+
+def _vis_cf(deal, v):
+    d = json.loads(json.dumps(deal))
+    if v is not None:
+        d["custom_fields"][lf.VISIBILITY_FIELD] = v
+    return d
+
+
+# My Deals badge (no deal-fresh / overrides in this fixture -> deal record).
+use_fixture({lf.PEOPLE_KEY: {"people": []}, lf.INTEREST_KEY: {"buy": {}}, lf.DEALS_KEY: {"deals": []}})
+_vis_reset()
+check("badge: blank visibility -> unchanged 'Live · shown to buyers'",
+      lf._my_deal_visibility_badge_html(deal_full, lf.CEF_YES_ID, False)
+      == '<span class="visibility-badge live">Live · shown to buyers</span>')
+check("badge: VIS_ALL -> 'Live · shown to buyers'",
+      lf._my_deal_visibility_badge_html(_vis_cf(deal_full, [lf.VIS_ALL]), lf.CEF_YES_ID, False)
+      == '<span class="visibility-badge live">Live · shown to buyers</span>')
+check("badge: VIS_PRIVATE -> 'Private · not shown to buyers' (held style)",
+      lf._my_deal_visibility_badge_html(_vis_cf(deal_full, [lf.VIS_PRIVATE]), lf.CEF_YES_ID, False)
+      == '<span class="visibility-badge held">Private · not shown to buyers</span>')
+check("badge: VIS_INTERESTED -> 'Live · interested investors only'",
+      lf._my_deal_visibility_badge_html(_vis_cf(deal_full, "7223457"), lf.CEF_YES_ID, False)
+      == '<span class="visibility-badge live">Live · interested investors only</span>')
+check("badge: Hold keeps priority over Private",
+      lf._my_deal_visibility_badge_html(_vis_cf(deal_full, [lf.VIS_PRIVATE]), lf.CEF_YES_ID, True)
+      == '<span class="visibility-badge held">Held · not shown to buyers</span>')
+check("badge: terms-incomplete keeps priority over Interested-only",
+      lf._my_deal_visibility_badge_html(_vis_cf(deal_no_terms, [lf.VIS_INTERESTED]), lf.CEF_YES_ID, False)
+      == '<span class="visibility-badge terms-incomplete">Not live · awaiting deal terms</span>')
+check("badge: sold keeps priority over Private",
+      lf._my_deal_visibility_badge_html(_vis_cf(deal_full, [lf.VIS_PRIVATE]), None, False, is_won=True)
+      == '<span class="visibility-badge sold">Sold &#10003;</span>')
+_vis_d = _vis_cf(deal_full, None)
+_vis_d["id"] = 77001
+lf._visibility_overrides_cache.update({"at": time.time(), "data": {"77001": lf.VIS_PRIVATE}})
+lf._req_cache_reset()
+check("badge: visibility-overrides.json wins over a blank deal record",
+      "Private · not shown to buyers" in lf._my_deal_visibility_badge_html(_vis_d, lf.CEF_YES_ID, False))
+_vis_reset()
+
+# Compare SPVs: one company, six offerings.
+_vis_v1 = _vis_cf(_cmp_deal(6101, "Vis Co", 7101, 501, lf.STAGE_FIRM, {lf.SELLER_FEE_FIELD: 4}), "7223458.0")
+_vis_v2 = _cmp_deal(6102, "Vis Co", 7101, 502, lf.STAGE_INQUIRY, {lf.SELLER_FEE_FIELD: 5})
+_vis_v3 = _vis_cf(_cmp_deal(6103, "Vis Co", 7101, 502, lf.STAGE_MATCHED, {lf.SELLER_FEE_FIELD: 6}), [lf.VIS_INTERESTED])
+_vis_v4 = _vis_cf(_cmp_deal(6104, "Vis Co", 7101, 502, lf.STAGE_FIRM, {lf.SELLER_FEE_FIELD: 3}), [lf.VIS_ALL])
+_vis_v5 = _cmp_deal(6105, "Vis Co", 7101, 502, lf.STAGE_FIRM, {lf.SELLER_FEE_FIELD: 2})
+_vis_v6 = _vis_cf(_cmp_deal(6106, "Vis Co", 7101, 502, lf.STAGE_FIRM, {lf.SELLER_FEE_FIELD: 1}), "7223456")
+_vis_v4_fresh = _vis_cf(_vis_v4, [lf.VIS_INTERESTED])
+_vis_v4_fresh["updated_at"] = "2026/10/29 09:00:00 -0400"
+_vis_objs = {"people.json": _cmp_people, "interest_people.json": {"buy": {}}, "companies.json": {"companies": []},
+             "deals.json": {"deals": [_vis_v1, _vis_v2, _vis_v3, _vis_v4, _vis_v5, _vis_v6]},
+             "deal-fresh/6104.json": {"fetched_at": "2026-10-29T13:00:00+00:00", "deal": _vis_v4_fresh},
+             lf.VISIBILITY_OVERRIDES_KEY: {"6105": {"v": lf.VIS_PRIVATE, "at": "2026-10-29T13:00:00+00:00"},
+                                           "6102": {"v": "junk", "at": "2026-10-29T13:00:00+00:00"}}}
+use_fixture(_vis_objs, ses=FakeSES())
+FakeBoto3.S3 = FakeS3List(_vis_objs)
+reset_caches()
+_vis_reset()
+_vis_admin_idx = _cmp_get({"key": ADMIN_KEY, "view": "compare"})["body"]
+_vis_buyer_idx = _cmp_get({"view": "compare"}, [tenant_cookie(CMP_BUYER)])["body"]
+_vis_s1_idx = _cmp_get({"view": "compare"}, [tenant_cookie(CMP_SELLER)])["body"]
+_vis_s2_idx = _cmp_get({"view": "compare"}, [tenant_cookie(CMP_OTHER)])["body"]
+check("compare visibility: admin sees all 6 offerings (Private / Interested-only included)",
+      "6 offerings" in _vis_admin_idx)
+check("compare visibility: buyer sees only the All-investors offerings (blank, explicit, junk override) -> 2",
+      "Vis Co" in _vis_buyer_idx and "2 offerings" in _vis_buyer_idx)
+check("compare visibility: seller A sees own Private offering + 2 public ones -> 3 (not B's restricted ones)",
+      "3 offerings" in _vis_s1_idx)
+check("compare visibility: seller B sees own Interested/Private/overridden ones but not A's Private -> 5",
+      "5 offerings" in _vis_s2_idx)
+_vis_admin_pg = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7101", "edit": "1"})["body"]
+_vis_buyer_pg = _cmp_get({"view": "compare", "company": "7101"}, [tenant_cookie(CMP_BUYER)])["body"]
+check("compare visibility: buyer company page lists 2 live offerings, no Offering C",
+      "2 live offerings." in _vis_buyer_pg and "Offering C" not in _vis_buyer_pg
+      and "trades.graciagroup.com/deal/6101" not in _vis_buyer_pg
+      and "trades.graciagroup.com/deal/6103" not in _vis_buyer_pg
+      and "trades.graciagroup.com/deal/6104" not in _vis_buyer_pg
+      and "trades.graciagroup.com/deal/6105" not in _vis_buyer_pg
+      and "trades.graciagroup.com/deal/6102" in _vis_buyer_pg)
+check("compare visibility: admin rows labelled Private / Interested only",
+      "Private · " in _vis_admin_pg and "Interested only · " in _vis_admin_pg)
+_vis_reset()
+check("compare count: restricted offerings not counted (deal-fresh-free snapshot + overrides), own deal counted",
+      lf._compare_offering_count(_vis_v2) == 3 and lf._compare_offering_count(_vis_v1) == 4)
+_vis_reset()
+_vis_saved = lf._visibility_overrides
+lf._visibility_overrides = lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+_vis_buf = io.StringIO()
+with contextlib.redirect_stdout(_vis_buf):
+    _vis_fs = [lf._deal_visibility(_vis_v1), lf._deal_visibility(_vis_v3)]
+lf._visibility_overrides = _vis_saved
+check("visibility fail-soft: lookup error -> VIS_ALL (no filtering), one log line",
+      _vis_fs == [lf.VIS_ALL, lf.VIS_ALL]
+      and _vis_buf.getvalue().count("visibility: lookup failed; no visibility filtering") == 1)
+_vis_reset()
+reset_caches()
+
 print(f"\n{passed} passed, {failed} failed")
 if failed:
     raise SystemExit(1)
