@@ -58,6 +58,7 @@ def check(label, cond):
 
 
 def reset_caches():
+    lf._restore_log_cache.update({"by_deal": None, "loaded_at": 0.0})
     lf._tenant_cache["version"] = None
     lf._tenant_cache["by_email"] = None
     lf._deals_cache["version"] = None
@@ -11484,12 +11485,18 @@ _cmp_people = {"people": [
      "custom_fields": {}}]}
 
 
+def _cmp_ts(days_ago):
+    """Pipeline-format updated_at relative to today, so the Compare fixtures
+    stay inside the Unconfirmed thresholds whatever day the suite runs."""
+    return (datetime.now(timezone.utc) - timedelta(days=days_ago)).strftime("%Y/%m/%d %H:%M:%S +0000")
+
+
 def _cmp_deal(did, company, cid, pid, stage, extra):
     cf = {lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID]}
     cf.update(extra)
     return {"id": did, "name": f"{company} deal {did}", "company": {"id": cid, "name": company},
             "deal_stage": {"id": stage}, "custom_fields": cf_sell(cf), "people": [{"id": pid}],
-            "value": 99999, "value_in_cents": 9999900, "updated_at": "2026/10/20 09:00:00 -0400"}
+            "value": 99999, "value_in_cents": 9999900, "updated_at": _cmp_ts(27)}
 
 
 _cmp_d1 = _cmp_deal(6001, "Varda Space", 7001, 501, lf.STAGE_FIRM,
@@ -11510,7 +11517,7 @@ _cmp_public = _cmp_deal(6008, "Pubco$", 7003, 502, lf.STAGE_FIRM, {})
 _cmp_solo = _cmp_deal(6009, "Solo Co", 7004, 501, lf.STAGE_FIRM, {})
 _cmp_fresh_d2 = json.loads(json.dumps(_cmp_d2))
 _cmp_fresh_d2["custom_fields"][lf.SELLER_FEE_FIELD] = 6
-_cmp_fresh_d2["updated_at"] = "2026/10/29 09:00:00 -0400"
+_cmp_fresh_d2["updated_at"] = _cmp_ts(18)
 
 
 class FakeS3List(FakeS3):
@@ -11603,12 +11610,13 @@ check("compare: Direct deal never listed; new allocation without valuation shows
 check("compare: fresh-copy overlay wins (offering 6002 upfront 7% -> 6% from deal-fresh)",
       'data-upfront="6.0"' in _cb or 'data-upfront="6"' in _cb)
 check("compare: ranked rows by net multiple (4.80x, 4.14x); all-blank row unranked below the divider",
-      _cb.index(">4.80x<") < _cb.index(">4.14x<") < _cb.index('<tr class="cmp-divider"><td colspan="9">Fees not yet provided</td></tr>')
+      _cb.index(">4.80x<") < _cb.index(">4.14x<") < _cb.index('<tr class="cmp-divider" data-divider="2"><td colspan="9">Fees not yet provided</td></tr>')
       < _cb.index(">Offering C<") and "~" not in _cb[_cb.index("<tbody>"):_cb.index("</tbody>")])
-check("compare: short labels — '2-Layer', 'GP – selling own units', 'L1 SPV' map; Updated column",
+check("compare: short labels — '2-Layer', 'GP – selling own units', 'L1 SPV' map; Last confirmed line",
       "2-Layer" in _cb and "Preferred" in _cb and "3(c)(7)" in _cb and "GP – selling own units" in _cb
       and "GP — selling own units" not in _cb and lf.COMPARE_LAYER_LABELS[7000228] == "L1 SPV"
-      and re.search(r'<div class="cmp-updated">Updated \d+ days? ago</div>', _cb) is not None)
+      and re.search(r'<div class="cmp-updated">Last confirmed [A-Z][a-z]{2} \d{1,2}, \d{4}</div>', _cb) is not None
+      and "days ago" not in _cb)
 _cb_c = _cb[_cb.rindex("<tr", 0, _cb.index(">Offering C<")):]
 _cb_c = _cb_c[:_cb_c.index("</tr>")]
 check("compare: all-blank row -> Net multiple '—', fee cells muted '—' (not 'Not provided'), unranked, Ask link",
@@ -11642,8 +11650,10 @@ check("compare module never reads paperwork / terms-completeness helpers",
                                       "_pending_block_items", "_tenant_cef_state")))
 check("compare script: unranked rows stay below the divider under every sort (ranked/unranked partition)",
       "if (ga !== gb) return ga < gb ? -1 : 1;" in lf.COMPARE_SCRIPT
-      and "if (divider) { tbody.appendChild(divider); divider.hidden = below.length === 0; }" in lf.COMPARE_SCRIPT
-      and "tr.setAttribute('data-group', st === 'ranked' ? '0' : (st === 'none' ? '2' : '1'));" in lf.COMPARE_SCRIPT)
+      and "if (dv) { tbody.appendChild(dv); dv.hidden = below.length === 0; }" in lf.COMPARE_SCRIPT
+      and "['2', '3', '4'].forEach(function(g) {" in lf.COMPARE_SCRIPT
+      and "tr.setAttribute('data-group', groupOf(st));" in lf.COMPARE_SCRIPT
+      and "none: '2', unconfirmed: '3', intermediary: '4'" in lf.COMPARE_SCRIPT)
 check("compare: new allocation valuation 'Round est. $X' + grey 'from news' line",
       lf._fmt_valuation_billions(2.25) == "$2.25B")
 check("compare: table scrolls horizontally with Offering + Net multiple sticky on the left",
@@ -11875,7 +11885,7 @@ _cbf_c = _cbf_c[:_cbf_c.index("</tr>")]
 check("compare: filling one fee on an all-blank row moves it into the ranked group (with the note, no Ask link)",
       _r["statusCode"] == 200 and 'data-unranked="0"' in _cbf_c
       and '<div class="cmp-partial">Full fees not confirmed</div>' in _cbf_c and "cmp-ask" not in _cbf_c
-      and '<tr class="cmp-divider" hidden>' in _cbf and _no_ids_outside_trades(_cbf, ("6005",))
+      and '<tr class="cmp-divider" data-divider="2" hidden>' in _cbf and _no_ids_outside_trades(_cbf, ("6005",))
       and '<a class="cmp-view" href="https://trades.graciagroup.com/deal/6005"' in _cbf_c
       and 'View deal →</a>' in _cbf_c)
 for _k in ("deal-fresh/6001.json", "deal-fresh/6005.json"):
@@ -12026,8 +12036,8 @@ check("compare: removed columns absent (min/max ticket, updated, net multiple, s
                                                    "exemption", "price"))
       and not any(h in _cb2 for h in (">Min ticket<", ">Max ticket<", ">Seller role<", ">Structure<", ">Price<",
                                       ">Net price<", ">Exemption<", ">Class<", ">Updated<")))
-check("compare: Offering cell carries 'Updated N days ago'; fee cells compact ('0%/yr') with per-cell Edit kept",
-      re.search(r'<div class="cmp-updated">Updated \d+ days? ago</div>', _cb2_rows["Offering A"]) is not None
+check("compare: Offering cell carries 'Last confirmed <date>'; fee cells compact ('0%/yr') with per-cell Edit kept",
+      re.search(r'<div class="cmp-updated">Last confirmed [A-Z][a-z]{2} \d{1,2}, \d{4}</div>', _cb2_rows["Offering A"]) is not None
       and '<span class="cmp-fee-v">0%/yr</span>' in _cb2_rows["Offering A"]
       and _ct3.count('class="cmp-edit-btn"') == 3 and 'class="num cmp-fee" data-col="upfront" data-field="upfront"' in _ct3
       and ".cmp-table td.cmp-fee { width: 64px;" in lf.COMPARE_CSS)
@@ -13815,7 +13825,7 @@ _vis_v4 = _vis_cf(_cmp_deal(6104, "Vis Co", 7101, 502, lf.STAGE_FIRM, {lf.SELLER
 _vis_v5 = _cmp_deal(6105, "Vis Co", 7101, 502, lf.STAGE_FIRM, {lf.SELLER_FEE_FIELD: 2})
 _vis_v6 = _vis_cf(_cmp_deal(6106, "Vis Co", 7101, 502, lf.STAGE_FIRM, {lf.SELLER_FEE_FIELD: 1}), "7223456")
 _vis_v4_fresh = _vis_cf(_vis_v4, [lf.VIS_INTERESTED])
-_vis_v4_fresh["updated_at"] = "2026/10/29 09:00:00 -0400"
+_vis_v4_fresh["updated_at"] = _cmp_ts(18)
 _vis_objs = {"people.json": _cmp_people, "interest_people.json": {"buy": {}}, "companies.json": {"companies": []},
              "deals.json": {"deals": [_vis_v1, _vis_v2, _vis_v3, _vis_v4, _vis_v5, _vis_v6]},
              "deal-fresh/6104.json": {"fetched_at": "2026-10-29T13:00:00+00:00", "deal": _vis_v4_fresh},
@@ -14350,6 +14360,229 @@ check("interest task: also chained after rebuild_slim and registered as its own 
 reset_caches()
 lf._data_cache.clear()
 lf._s3_version_cache.clear()
+
+# ======================================================================
+# Compare: Unconfirmed rule + intermediary gate
+# ======================================================================
+from datetime import date as _uc_date
+lf._restore_log_cache.update({"by_deal": {}, "loaded_at": time.time()})
+
+
+def _uc_d(extra=None, upd="2026/09/30 12:00:00 +0000", stage=lf.STAGE_FIRM, did=1):
+    return {"id": did, "deal_stage": {"id": stage}, "updated_at": upd, "custom_fields": dict(extra or {})}
+
+
+_UC_TODAY = _uc_date(2026, 11, 16)   # updated_at above = 47 days earlier
+_GP = {lf.SELLER_ROLE_FIELD: [7020357]}
+check("unconfirmed: default threshold 60 days (47 days old -> confirmed, effective = updated_at date)",
+      lf.unconfirmed_status(_uc_d(), _UC_TODAY) == (False, _uc_date(2026, 9, 30)))
+check("unconfirmed: Seller Role GP new allocation 7020357 -> 30 days (47 days old -> Unconfirmed)",
+      lf.unconfirmed_status(_uc_d(_GP), _UC_TODAY) == (True, _uc_date(2026, 9, 30))
+      and lf.unconfirmed_status(_uc_d({lf.SELLER_ROLE_FIELD: [{"id": "7020357"}]}), _UC_TODAY)[0] is True)
+check("unconfirmed: Refresh field overrides both (40 -> Unconfirmed; 50 on a GP deal -> confirmed)",
+      lf.unconfirmed_status(_uc_d({lf.REFRESH_FIELD: "40"}), _UC_TODAY)[0] is True
+      and lf.unconfirmed_status(_uc_d({lf.REFRESH_FIELD: 50, **_GP}), _UC_TODAY)[0] is False)
+check("unconfirmed: Refresh 0 (or negative) -> never Unconfirmed",
+      lf.unconfirmed_status(_uc_d({lf.REFRESH_FIELD: 0}, upd="2025/01/01 00:00:00 +0000"), _UC_TODAY) == (False, None)
+      and lf.unconfirmed_status(_uc_d({lf.REFRESH_FIELD: "-5"}, upd=""), _UC_TODAY) == (False, None))
+check("unconfirmed: Hold / closed / archived never Unconfirmed; no dates at all -> Unconfirmed with no date",
+      lf.unconfirmed_status(_uc_d(stage=lf.STAGE_HOLD, upd=""), _UC_TODAY) == (False, None)
+      and lf.unconfirmed_status({**_uc_d(upd=""), "deal_stage": {"id": 1, "name": "Won"}}, _UC_TODAY) == (False, None)
+      and lf.unconfirmed_status({**_uc_d(upd=""), "is_archived": True}, _UC_TODAY) == (False, None)
+      and lf.unconfirmed_status(_uc_d(upd=""), _UC_TODAY) == (True, None))
+check("unconfirmed: effective date = newer of Last Confirmed (either format) and updated_at",
+      lf.unconfirmed_status(_uc_d({lf.LAST_CONFIRMED_FIELD: "2026-11-10", **_GP}), _UC_TODAY)
+      == (False, _uc_date(2026, 11, 10))
+      and lf.unconfirmed_status(_uc_d({lf.LAST_CONFIRMED_FIELD: "2026/01/02"}), _UC_TODAY)[1] == _uc_date(2026, 9, 30))
+check("unconfirmed: unparseable input fails soft (False, None)",
+      lf.unconfirmed_status(_uc_d({lf.LAST_CONFIRMED_FIELD: "soon"}), _UC_TODAY) == (False, None)
+      and lf.unconfirmed_status(_uc_d(upd="yesterday"), _UC_TODAY) == (False, None))
+# Restore exception.
+lf._restore_log_cache.update({"by_deal": {"9": {"deal_id": 9, "action": "restored", "at": "2026-09-30T12:00:00Z"},
+                                          "8": {"deal_id": 8, "action": "obsoleted", "at": "2026-09-30T12:00:00Z"}},
+                              "loaded_at": time.time()})
+_uc_old_lc = {lf.LAST_CONFIRMED_FIELD: "2026/06/01"}
+_UC_T2 = _uc_date(2026, 10, 5)
+check("unconfirmed restore: updated_at within 15 min of a 'restored' entry does not count (Last Confirmed alone)",
+      lf.unconfirmed_status(_uc_d(_uc_old_lc, upd="2026/09/30 12:10:00 +0000", did=9), _UC_T2)
+      == (True, _uc_date(2026, 6, 1))
+      and lf.unconfirmed_status(_uc_d({}, upd="2026/09/30 12:15:00 +0000", did=9), _UC_T2) == (True, None))
+check("unconfirmed restore: updated_at more than 15 min after the restore counts again",
+      lf.unconfirmed_status(_uc_d(_uc_old_lc, upd="2026/09/30 12:20:00 +0000", did=9), _UC_T2)
+      == (False, _uc_date(2026, 9, 30)))
+check("unconfirmed restore: latest entry not 'restored' -> updated_at counts as usual",
+      lf.unconfirmed_status(_uc_d(_uc_old_lc, upd="2026/09/30 12:10:00 +0000", did=8), _UC_T2)
+      == (False, _uc_date(2026, 9, 30)))
+_uc_log = {"entries": [{"deal_id": 9, "action": "restored", "at": "2026-09-30T12:00:00Z"},
+                       {"deal_id": 9, "action": "obsoleted", "at": "2026-09-01T12:00:00Z"},
+                       {"deal_id": "7", "action": "obsoleted", "at": "2026-09-01T12:00:00Z"}]}
+use_fixture({"obsolete-review/log.json": _uc_log})
+check("unconfirmed restore log: parsed to the latest entry per deal (by 'at'), read from S3",
+      lf._restore_log_latest()["9"]["action"] == "restored" and lf._restore_log_latest()["7"]["action"] == "obsoleted")
+use_fixture({})
+check("unconfirmed restore log: missing log fails soft -> no restores, rule still works (never raises)",
+      lf._restore_log_latest() == {}
+      and lf.unconfirmed_status(_uc_d(did=9), _UC_TODAY) == (False, _uc_date(2026, 9, 30)))
+use_fixture({"obsolete-review/log.json": "not json {"})
+check("unconfirmed restore log: malformed log fails soft too",
+      lf._restore_log_latest() == {} and lf.unconfirmed_status(_uc_d(did=9), _UC_TODAY)[0] is False)
+
+# Page fixture: Uncon Co (7101).
+UC_A, UC_B, UC_C, UC_BUYER = "uc-a@example.com", "uc-b@example.com", "uc-c@example.com", "uc-buyer@example.org"
+_uc_people = {"people": [
+    {"id": 601, "full_name": "Ann A", "email": UC_A, "company_id": 9101, "company_name": "A Fund", "custom_fields": {}},
+    {"id": 602, "full_name": "Ben B", "email": UC_B, "company_id": 9102, "company_name": "B Fund", "custom_fields": {}},
+    {"id": 603, "full_name": "Cat C", "email": UC_C, "company_id": 9103, "company_name": "C Fund", "custom_fields": {}},
+    {"id": 604, "full_name": "Bo Broker", "email": "bo@example.net", "company_id": 9104, "company_name": "Brokerage",
+     "custom_fields": {lf.TRANSACTOR_TYPE_FIELD: [6577160], lf.PARTNER_DESK_RESPONSE_FIELD: [7218528]}},
+    {"id": 605, "full_name": "Bea Buyer", "email": UC_BUYER, "company_id": 9105, "company_name": "Buyer LLC",
+     "custom_fields": {}}]}
+_uc_fees = lambda up, mg, ca, val: {lf.SELLER_FEE_FIELD: up, lf.MGMT_FEE_FIELD: mg, lf.CARRY_FIELD: ca,
+                                    lf.EST_VAL_FIELD: val}
+_uc_ok = _cmp_deal(8001, "Uncon Co", 7101, 601, lf.STAGE_FIRM, _uc_fees(4, 0, 0, 5.0))
+_uc_ok["updated_at"] = _cmp_ts(10)
+_uc_stale = _cmp_deal(8002, "Uncon Co", 7101, 602, lf.STAGE_FIRM, _uc_fees(0, 0, 0, 4.0))  # best terms, stale
+_uc_stale["updated_at"] = _cmp_ts(90)
+_uc_cp = _cmp_deal(8003, "Uncon Co", 7101, 603, lf.STAGE_FIRM,
+                   {**_uc_fees(0, 0, 0, 3.0), lf.CP_DIRECT_FIELD: [{"id": 5080987}]})
+_uc_cp["updated_at"] = _cmp_ts(5)
+_uc_tt = _cmp_deal(8004, "Uncon Co", 7101, 604, lf.STAGE_FIRM, _uc_fees(1, 0, 0, 5.0))
+_uc_tt["updated_at"] = _cmp_ts(5)
+_uc_lc = _cmp_deal(8005, "Uncon Co", 7101, 602, lf.STAGE_INQUIRY,
+                   {**_uc_fees(7, 0, 15, 6.0),
+                    lf.LAST_CONFIRMED_FIELD: (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y/%m/%d")})
+_uc_lc["updated_at"] = _cmp_ts(70)
+_uc_objs = {"people.json": _uc_people, "interest_people.json": {"buy": {}}, "companies.json": {"companies": []},
+            "deals.json": {"deals": [_uc_ok, _uc_stale, _uc_cp, _uc_tt, _uc_lc]}}
+use_fixture(_uc_objs, ses=FakeSES())
+FakeBoto3.S3 = FakeS3List(_uc_objs)
+reset_caches()
+check("intermediary: CP Direct? = No (5080987) -> intermediary deal",
+      lf._compare_is_intermediary_deal(_uc_cp) is True and lf._compare_is_intermediary_deal(_uc_ok) is False)
+check("intermediary: linked person with an intermediary Transactor Type -> intermediary (Partner – Registered "
+      "does not exempt)", lf._compare_is_intermediary_deal(_uc_tt) is True)
+check("intermediary: fails soft to False",
+      lf._compare_is_intermediary_deal({"id": 1, "custom_fields": None, "people": "x"}) is False)
+_uc_b = _cmp_get({"view": "compare", "company": "7101"}, [tenant_cookie(UC_BUYER)])["body"]
+_uc_ad = _cmp_get({"key": ADMIN_KEY, "view": "compare", "company": "7101"})["body"]
+_uc_brows = _cmp_rows_html(_uc_b)
+_uc_arows = _cmp_rows_html(_uc_ad)
+
+
+def _uc_row(rows, deal_id):
+    return next((r for r in rows if f"/deal/{deal_id}\"" in r), "")
+
+
+_uc_b_stale = _uc_row(_uc_brows, 8002)
+check("compare unconfirmed (buyer): stale row never ranked or Best though it has the best terms",
+      'data-group="3"' in _uc_b_stale and '<span class="cmp-rank-v">—</span>' in _uc_b_stale
+      and '<span class="cmp-best" hidden>Best</span>' in _uc_b_stale and "cmp-top" not in _uc_b_stale.split(">", 1)[0]
+      and '<span class="cmp-rank-v">#1</span><span class="cmp-best">Best</span>' in _uc_row(_uc_brows, 8001)
+      and _best_ok(_uc_b))
+check("compare unconfirmed (buyer): amber clock + dated text ('not recently confirmed' without a date), View deal kept, values visible",
+      'class="cmp-clock"' in _uc_b_stale and "stroke=\"#C2410C\"" in _uc_b_stale
+      and (f"Unconfirmed — last confirmed {lf._compare_date_text((datetime.now(timezone.utc) - timedelta(days=90)).date())}."
+           " This offering may no longer be available.") in _uc_b_stale
+      and lf._compare_unconfirmed_text(None)
+      == "Unconfirmed — not recently confirmed. This offering may no longer be available."
+      and 'class="cmp-view" href="https://trades.graciagroup.com/deal/8002"' in _uc_b_stale
+      and 'class="cmp-view" href="https://trades.graciagroup.com/deal/8002" target="_blank" rel="noopener">' in _uc_b_stale
+      and "cmp-unconf" in _uc_b_stale.split(">", 1)[0] and "2-Layer" not in _uc_b_stale and "$4.0B" in _uc_b_stale)
+check("compare unconfirmed: rendered under an 'Unconfirmed' divider after the fees divider",
+      _uc_b.index('data-divider="2" hidden') < _uc_b.index('<tr class="cmp-divider" data-divider="3"><td colspan="9">'
+                                                          'Unconfirmed</td></tr>') < _uc_b.index("/deal/8002\"")
+      and 'data-divider="4"' not in _uc_b)
+check("compare: 'Last confirmed <Mon D, YYYY>' from the effective date (Last Confirmed field beats older updated_at)",
+      f'Last confirmed {lf._compare_date_text((datetime.now(timezone.utc) - timedelta(days=5)).date())}<'
+      in _uc_row(_uc_brows, 8005) and "days ago" not in _uc_b and "Updated " not in _uc_b)
+check("compare unconfirmed: dated message 'last confirmed <date>'",
+      lf._compare_unconfirmed_text(_uc_date(2026, 9, 3))
+      == "Unconfirmed — last confirmed Sep 3, 2026. This offering may no longer be available.")
+check("compare unconfirmed: excluded from the reference valuation when a confirmed row has one (ref 5.0, not 4.0)",
+      'data-ref="5.0"' in _uc_b and 'data-ref="5.0"' in _uc_ad)
+check("compare intermediary (buyer): gated deals never reach the page (no ids, chips, rows)",
+      "8003" not in _uc_b and "8004" not in _uc_b and "Intermediary" not in _uc_b and len(_uc_brows) == 3)
+check("compare intermediary (admin): rows kept, unranked, under 'Intermediary — hidden from clients', grey chip",
+      len(_uc_arows) == 5 and _uc_ad.count('<div class="cmp-inter-chip">Intermediary</div>') == 2
+      and all('data-group="4"' in _uc_row(_uc_arows, d) and '<span class="cmp-rank-v">—</span>' in _uc_row(_uc_arows, d)
+              for d in (8003, 8004))
+      and _uc_ad.index('<tr class="cmp-divider" data-divider="3">') < _uc_ad.index(
+          '<tr class="cmp-divider" data-divider="4"><td colspan="9">Intermediary — hidden from clients</td></tr>')
+      < _uc_ad.index("Pipeline #8003"))
+
+
+def _uc_rank(row):
+    return re.search(r'<span class="cmp-rank-v">([^<]*)</span>', row).group(1)
+
+
+check("compare intermediary (admin): ranking of the other rows matches what clients see",
+      all(_uc_rank(_uc_row(_uc_arows, d)) == _uc_rank(_uc_row(_uc_brows, d)) for d in (8001, 8002, 8005))
+      and _uc_rank(_uc_row(_uc_arows, 8001)) == "#1")
+lf._req_cache_reset()
+_uc_cnt_b = lf._demand_offer_counts("buyer", frozenset(), frozenset())
+_uc_cnt_a = lf._demand_offer_counts("admin")
+lf._req_cache_reset()
+_uc_bidx = _cmp_get({"view": "compare"}, [tenant_cookie(UC_BUYER)])["body"]
+check("compare counts: buyer Offers = 3 = page rows = index; admin = 5 = admin page rows",
+      _uc_cnt_b["uncon co"][0] == 3 == len(_uc_brows) and "3 offerings" in _uc_bidx
+      and _uc_cnt_a["uncon co"][0] == 5 == len(_uc_arows))
+lf._req_cache_reset()
+check("compare counts: 'Compare all N' entry button skips other firms' intermediary deals, keeps the row's own",
+      lf._compare_offering_count(_uc_ok) == 3 and lf._compare_offering_count(_uc_cp) == 4)
+_uc_c = _cmp_get({"view": "compare", "company": "7101"}, [tenant_cookie(UC_C)])["body"]
+_uc_c_own = _uc_row(_cmp_rows_html(_uc_c), 8003)
+check("compare intermediary (tenant): own firm's intermediary deal shown as 'Your offering'; others' gated",
+      '<div class="cmp-label">Your offering</div>' in _uc_c_own and "8004" not in _uc_c
+      and "Intermediary" not in _uc_c and len(_cmp_rows_html(_uc_c)) == 4)
+lf._req_cache_reset()
+check("compare intermediary (tenant): visible offerings filter keeps own, drops others' (scope check)",
+      [d["id"] for d in lf._compare_visible_offerings(lf._compare_offerings(False), "tenant",
+                                                      frozenset({603}))["7101"]["deals"]] == [8001, 8002, 8003, 8005])
+_uc_bown = _cmp_get({"view": "compare", "company": "7101"}, [tenant_cookie(UC_B)])["body"]
+_uc_bown_row = _uc_row(_cmp_rows_html(_uc_bown), 8002)
+check("compare unconfirmed (tenant own row): 'Please confirm…' next to Update deal, no generic notice, unranked",
+      '<div class="cmp-label">Your offering</div>' in _uc_bown_row
+      and re.search(r'>Update deal</a> <span class="cmp-unconf-own">.*?Please confirm this offering is still '
+                    r'available\.</span>', _uc_bown_row) is not None
+      and "This offering may no longer be available." not in _uc_bown_row
+      and '<div class="cmp-rank" hidden>' in _uc_bown_row and 'data-group="3"' in _uc_bown_row)
+# Server ranking at other settings: an Unconfirmed row is never ranked.
+lf._req_cache_reset()
+_uc_entry = lf._compare_find_entry(lf._compare_offerings(False), "7101")
+_uc_rows, _uc_ref = lf._compare_rows(_uc_entry, "buyer")
+_uc_ok_all = True
+for _inv in (50_000, 100_000, 1_000_000):
+    for _out in (2, 5, 10):
+        lf._compare_rank_rows(_uc_rows, _inv, _out, 3, _uc_ref)
+        _st = next(r for r in _uc_rows if r["deal"]["id"] == 8002)
+        _uc_ok_all &= _st["status"] == "unconfirmed" and _st["rank"] is None and _uc_rows[-1] is _st
+check("compare unconfirmed (server): never ranked at any investment / outcome / years; stays last",
+      _uc_ok_all and lf.compare_rank_status({"unconfirmed": True, "fee_status": "complete", "hold": False}, 1)
+      == "unconfirmed")
+check("compare unconfirmed: beat-this ranking ignores it (joint ranks over ranked rows only)",
+      8002 not in [r["deal"]["id"] for r in _uc_rows if id(r) in lf.compare_joint_ranks(
+          _uc_rows, [], 100_000, 5, 5, _uc_ref)[0]])
+# JS mirror (pure helpers in the @@RANK block) + the wiring that uses them.
+_uc_pure = lf.COMPARE_SCRIPT[lf.COMPARE_SCRIPT.index("// @@RANK_BEGIN"):lf.COMPARE_SCRIPT.index("// @@RANK_END")]
+_uc_js = _uc_pure + """
+console.log(JSON.stringify({u: fixedStatus(true, false), i: fixedStatus(false, true), both: fixedStatus(true, true),
+  none: fixedStatus(false, false), gu: groupOf('unconfirmed'), gi: groupOf('intermediary'), gn: groupOf('none'),
+  gr: groupOf('ranked')}));"""
+_uc_jo = json.loads(subprocess.run(["node", "-e", _uc_js], capture_output=True, text=True, check=True).stdout)
+check("compare unconfirmed (client mirror): fixed status/group helpers",
+      _uc_jo == {"u": "unconfirmed", "i": "intermediary", "both": "intermediary", "none": None,
+                 "gu": "3", "gi": "4", "gn": "2", "gr": "0"})
+_uc_status_fn = lf.COMPARE_SCRIPT[lf.COMPARE_SCRIPT.index("  function status(tr) {"):]
+_uc_status_fn = _uc_status_fn[:_uc_status_fn.index("\n  }\n")]
+check("compare unconfirmed (client): status() returns the fixed status before fees/ticket checks; only 'ranked' "
+      "rows get a rank, so investment/outcome/years changes never rank them",
+      _uc_status_fn.index("fixedStatus(") < _uc_status_fn.index("feeStatus(tr) === 'none'")
+      < _uc_status_fn.index("return 'ranked';", _uc_status_fn.index("fixedStatus("))
+      and "if (st === 'ranked') ranked.push(tr);" in lf.COMPARE_SCRIPT
+      and "var r = tr.__st === 'ranked' ? tr.__rank : null;" in lf.COMPARE_SCRIPT
+      and "'.cmp-rank': st !== 'none' && !fixed" in lf.COMPARE_SCRIPT)
+reset_caches()
+lf._restore_log_cache.update({"by_deal": None, "loaded_at": 0.0})
 
 print(f"\n{passed} passed, {failed} failed")
 if failed:

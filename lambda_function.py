@@ -2234,7 +2234,7 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "email2", "home_email", "emails", "name", "
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
     1958, 3052210, 3064297, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163, 3769275,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
-    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 4011837, 3900670, 2447206, 4013323, 4012491))
+    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 4011837, 3900670, 2447206, 4013323, 4012491, 3994687, 3065662))
 
 
 def _people_slim_schema():
@@ -18165,14 +18165,19 @@ def _demand_offer_counts(role, scope=frozenset(), viewer_ids=frozenset()):
                 if (isinstance(d, dict) and _deal_is_buy(d)
                         and {str(p) for p in _deal_linked_person_ids(d)} & vids):
                     buyer_companies.add((_deal_company_name(d) or "").strip().lower())
-        for ck, entry in visible.items():
+        for ck, entry_all in all_offerings.items():
+            entry = visible.get(ck) or {**entry_all, "deals": []}
             name = (entry["company"] or "").strip().lower()
             n = len(entry["deals"])
             if name in buyer_companies:
-                live = _compare_live_intro(all_offerings.get(ck) or entry, vids)
+                live = _compare_live_intro(entry_all, vids)
                 own = role == "tenant" and any(_deal_owner_ids(d) & scope for d in entry["deals"])
                 if live and not own:
-                    n = 1 if live[1] and any(str(d.get("id")) == live[1] for d in entry["deals"]) else 0
+                    # Same as the page: the current deal is shown even when the
+                    # intermediary gate hides it (never when Private).
+                    n = 1 if live[1] and any(
+                        str(d.get("id")) == live[1] and _compare_viewer_can_see(d, role, scope)
+                        for d in entry_all["deals"]) else 0
             if n:
                 out[name] = (n, entry["company_id"] or entry["company"])
     except Exception as e:
@@ -22586,8 +22591,13 @@ def compare_competition_ranks(proceeds_by_key):
 
 
 def compare_rank_status(row, investment):
-    """"none" (all fees blank), "hold" (admin-only Hold row), "min"/"max"
-    (investment outside the ticket range) or "ranked"."""
+    """"intermediary" (admin-only intermediary row), "unconfirmed" (never
+    ranked), "none" (all fees blank), "hold" (admin-only Hold row),
+    "min"/"max" (investment outside the ticket range) or "ranked"."""
+    if row.get("intermediary"):
+        return "intermediary"
+    if row.get("unconfirmed"):
+        return "unconfirmed"
     if row["fee_status"] == "none":
         return "none"
     if row["hold"]:
@@ -22601,10 +22611,11 @@ def compare_rank_status(row, investment):
 
 def _compare_rank_rows(rows, investment, outcome, years, ref):
     """Fill status/proceeds/fees_cost/net_multiple/rank on each row and sort:
-    ranked (by rank), then unranked min/max/hold, then the no-fees group."""
+    ranked (by rank), then unranked min/max/hold, then the no-fees group,
+    then Unconfirmed, then (admin only) intermediary."""
     for r in rows:
         r["status"] = compare_rank_status(r, investment)
-        if r["status"] == "none":
+        if r["fee_status"] == "none":
             r["proceeds"] = r["fees_cost"] = None
             r["net_multiple"] = None
         else:
@@ -22614,9 +22625,8 @@ def _compare_rank_rows(rows, investment, outcome, years, ref):
     ranks = compare_competition_ranks({id(r): r["proceeds"] for r in ranked})
     for r in rows:
         r["rank"] = ranks.get(id(r))
-    group = {"ranked": 0, "min": 1, "max": 1, "hold": 1, "none": 2}
-    rows.sort(key=lambda r: (group[r["status"]], r["rank"] or 0,
-                             -(r["proceeds"] or 0) if r["status"] != "none" else 0))
+    group = {"ranked": 0, "min": 1, "max": 1, "hold": 1, "none": 2, "unconfirmed": 3, "intermediary": 4}
+    rows.sort(key=lambda r: (group[r["status"]], r["rank"] or 0, -(r["proceeds"] or 0)))
     return rows
 
 
@@ -22820,14 +22830,27 @@ def _compare_viewer_can_see(deal, role, scope=frozenset()):
     return role == "tenant" and bool(_deal_owner_ids(deal) & scope)
 
 
+def _compare_viewer_sees_offering(deal, role, scope=frozenset()):
+    """_compare_viewer_can_see plus the intermediary gate: non-admins never
+    see intermediary deals, except a tenant's own firm/team deal."""
+    if role == "admin":
+        return True
+    if not _compare_viewer_can_see(deal, role, scope):
+        return False
+    if role == "tenant" and bool(_deal_owner_ids(deal) & scope):
+        return True
+    return not _compare_is_intermediary_deal(deal)
+
+
 def _compare_visible_offerings(offerings, role, scope=frozenset()):
     """_compare_offerings filtered for the viewer (companies left with no
-    visible offering drop out)."""
+    visible offering drop out): Private / Interested-only and intermediary
+    deals per _compare_viewer_sees_offering."""
     if role == "admin":
         return offerings
     out = {}
     for ck, entry in offerings.items():
-        deals = [d for d in entry["deals"] if _compare_viewer_can_see(d, role, scope)]
+        deals = [d for d in entry["deals"] if _compare_viewer_sees_offering(d, role, scope)]
         if deals:
             out[ck] = {**entry, "deals": deals}
     return out
@@ -22875,7 +22898,8 @@ def _compare_offering_count(deal):
         return 0
     own_id = str(deal.get("id"))
     return sum(1 for d in entry["deals"]
-               if str(d.get("id")) == own_id or _deal_visibility(d) not in VIS_RESTRICTED)
+               if str(d.get("id")) == own_id or (_deal_visibility(d) not in VIS_RESTRICTED
+                                                 and not _compare_is_intermediary_deal(d)))
 
 
 def _compare_href(company_param, key=None, view_as=None):
@@ -22897,6 +22921,191 @@ def _compare_entry_html(deal, key=None, view_as=None):
             f'Compare all {n} {_esc(company)} offerings</a>')
 
 
+# --- Unconfirmed rule (shared across repos: CRMDealDetails, trades) ----------
+# Ported from chadgracia/CRMDealDetails unconfirmed_status; the rule body is
+# identical. Only the small helpers carry a _uc_ prefix (this file already has
+# int-returning _deal_stage_id / _deal_cf_option_ids) and logging is print().
+REFRESH_FIELD        = "custom_label_3994687"   # days; 0 = never Unconfirmed
+SELLER_ROLE_GP_ALLOC = "7020357"                # GP — syndicating new allocation
+UNCONFIRMED_CLOSED_STAGES = {"obsolete", "won", "lost"} | {"trade broken", "archived"}
+RESTORE_LOG_BUCKET     = "full-pipeline-cache"
+RESTORE_LOG_KEY        = "obsolete-review/log.json"   # written by stale-deal-scanner
+RESTORE_LOG_TTL        = 600                          # seconds
+RESTORE_GRACE_MINUTES  = 15
+_restore_log_cache = {"by_deal": None, "loaded_at": 0.0}
+
+
+def _uc_stage_name(deal_data):
+    for key in ('deal_stage', 'stage'):
+        value = deal_data.get(key)
+        if isinstance(value, dict):
+            name = value.get('name') or ''
+        elif isinstance(value, str):
+            name = value
+        else:
+            continue
+        if name.strip():
+            return name.strip()
+    return ''
+
+
+def _uc_stage_id(deal_data):
+    v = deal_data.get('deal_stage')
+    if isinstance(v, dict) and v.get('id') is not None:
+        return str(v.get('id'))
+    if deal_data.get('deal_stage_id') is not None:
+        return str(deal_data.get('deal_stage_id'))
+    return ''
+
+
+def _uc_cf_option_ids(value):
+    """A custom-field value (single id, list, or {"id": ...} dicts) as a set of id strings."""
+    if value is None:
+        return set()
+    out = set()
+    for item in (value if isinstance(value, list) else [value]):
+        if isinstance(item, dict):
+            item = item.get("option_id") or item.get("id") or item.get("value")
+        if item not in (None, ""):
+            out.add(str(item).split(".")[0])
+    return out
+
+
+def _parse_iso_utc(value):
+    """ISO timestamp -> aware UTC datetime, or None."""
+    try:
+        dt = datetime.fromisoformat(str(value).strip().replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _restore_log_latest():
+    """{str(deal_id): latest log entry} from the obsolete-review log, cached 10 min.
+    Never raises: missing/unreadable/malformed log -> {} (no restores)."""
+    cache = _restore_log_cache
+    now = time.time()
+    if cache["by_deal"] is not None and now - cache["loaded_at"] < RESTORE_LOG_TTL:
+        return cache["by_deal"]
+    by_deal, best = {}, {}
+    try:
+        obj = _s3_client().get_object(Bucket=RESTORE_LOG_BUCKET, Key=RESTORE_LOG_KEY)
+        entries = json.loads(obj["Body"].read()).get("entries") or []
+        floor = datetime.min.replace(tzinfo=timezone.utc)
+        for i, e in enumerate(entries):
+            if not isinstance(e, dict) or e.get("deal_id") is None:
+                continue
+            did = str(e.get("deal_id")).strip()
+            key = (_parse_iso_utc(e.get("at")) or floor, i)
+            if did not in best or key >= best[did]:
+                best[did], by_deal[did] = key, e
+    except Exception as e:
+        print(f"restore log: unavailable ({type(e).__name__})")
+        by_deal = {}
+    cache["by_deal"], cache["loaded_at"] = by_deal, now
+    return by_deal
+
+
+def unconfirmed_status(deal_data, today=None):
+    """(is_unconfirmed, effective_date_or_None). Effective date = newer of Last
+    Confirmed and the UTC date of updated_at (restore exception applies).
+    Fail-soft: any unparseable input the rule needs returns (False, None)."""
+    try:
+        stage = _uc_stage_name(deal_data).strip().lower()
+        if (_uc_stage_id(deal_data) == str(HOLD_STAGE_ID) or stage == "hold"
+                or stage in UNCONFIRMED_CLOSED_STAGES
+                or deal_data.get('is_archived') or deal_data.get('archived')):
+            return False, None
+        cf = deal_data.get('custom_fields') or {}
+        if not isinstance(cf, dict):
+            return False, None
+        refresh = cf.get(REFRESH_FIELD)
+        if isinstance(refresh, list):
+            refresh = refresh[0] if refresh else None
+        if refresh not in (None, ""):
+            threshold = int(float(str(refresh).strip()))
+            if threshold <= 0:
+                return False, None
+        else:
+            threshold = 30 if SELLER_ROLE_GP_ALLOC in _uc_cf_option_ids(cf.get(SELLER_ROLE_FIELD)) else 60
+        raw = cf.get(LAST_CONFIRMED_FIELD)
+        confirmed = None
+        if raw is not None and str(raw).strip() != "":
+            txt = str(raw).strip()[:10].replace('-', '/')
+            confirmed = datetime.strptime(txt, "%Y/%m/%d").date()
+        # Any Pipeline edit counts as confirmation, except the restore's own write:
+        # if the deal's latest obsolete-review log entry is "restored", updated_at
+        # counts only when it is more than 15 minutes after that restore.
+        updated = None
+        upd_raw = deal_data.get('updated_at')
+        if upd_raw not in (None, ""):
+            upd_dt = datetime.strptime(str(upd_raw).strip(), '%Y/%m/%d %H:%M:%S %z').astimezone(timezone.utc)
+            entry = _restore_log_latest().get(str(deal_data.get('id')))
+            if entry is None or entry.get('action') != 'restored':
+                updated = upd_dt.date()
+            else:
+                at = _parse_iso_utc(entry.get('at'))
+                if at is not None and upd_dt > at + timedelta(minutes=RESTORE_GRACE_MINUTES):
+                    updated = upd_dt.date()
+        dates = [d for d in (confirmed, updated) if d is not None]
+        if not dates:
+            return True, None
+        effective = max(dates)
+        today = today or datetime.utcnow().date()
+        return (today - effective).days > threshold, effective
+    except Exception as e:
+        print(f"unconfirmed_status: skipped ({type(e).__name__})")
+        return False, None
+# --- end Unconfirmed rule -----------------------------------------------------
+
+
+# Compare: intermediary (co-broker) deals -- terms Chad cannot confirm directly.
+CP_DIRECT_FIELD = "custom_label_3065662"
+CP_DIRECT_NO = 5080987
+COMPARE_UNCONFIRMED_DIVIDER = "Unconfirmed"
+COMPARE_INTERMEDIARY_DIVIDER = "Intermediary — hidden from clients"
+COMPARE_INTERMEDIARY_CHIP = "Intermediary"
+COMPARE_UNCONFIRMED_TAIL = "This offering may no longer be available."
+COMPARE_CLOCK_SVG = ('<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="#C2410C" stroke-width="1.8" '
+                     'stroke-linecap="round"><circle cx="8" cy="8" r="6.5"/><path d="M8 4.5V8l2.5 1.5"/></svg>')
+COMPARE_OWN_UNCONFIRMED_PROMPT = "Please confirm this offering is still available."
+
+
+def _compare_is_intermediary_deal(deal):
+    """CP Direct? = No, or any linked person (same linkage as _deal_owner_ids
+    under legacy) with an intermediary Transactor Type. Partner Desk Response
+    never exempts. Reads the people-slim index already loaded for the page.
+    Fail soft: False."""
+    try:
+        if CP_DIRECT_NO in _deal_cf_option_ids(deal, CP_DIRECT_FIELD):
+            return True
+        pids = _deal_linked_person_ids(deal)
+        if not pids:
+            return False
+        by_id = _people_data()["by_id"]
+        for pid in pids:
+            cf = (by_id.get(str(pid)) or {}).get("custom_fields") or {}
+            if isinstance(cf, dict) and (_deal_cf_option_ids({"custom_fields": cf}, TRANSACTOR_TYPE_FIELD)
+                                         & INTERMEDIARY_TRANSACTOR_IDS):
+                return True
+        return False
+    except Exception as e:
+        print(f"compare intermediary check failed (treated as direct): {type(e).__name__}")
+        return False
+
+
+def _compare_date_text(d):
+    return f"{d.strftime('%b')} {d.day}, {d.year}" if d else ""
+
+
+def _compare_unconfirmed_text(confirmed):
+    if confirmed:
+        return f"Unconfirmed — last confirmed {_compare_date_text(confirmed)}. {COMPARE_UNCONFIRMED_TAIL}"
+    return f"Unconfirmed — not recently confirmed. {COMPARE_UNCONFIRMED_TAIL}"
+
+
 def _compare_letter(i):
     s = ""
     i += 1
@@ -22908,16 +23117,6 @@ def _compare_letter(i):
 
 def _compare_pct_text(v):
     return "—" if v is None else _fmt_pct(v)
-
-
-def _compare_days_ago_text(deal, now=None):
-    dt = _parse_pipeline_ts(deal.get("updated_at"))
-    if dt is None:
-        return "—", None
-    days = max(0, ((now or datetime.now(timezone.utc)) - dt).days)
-    if days == 0:
-        return "today", 0
-    return f"{days} day{'s' if days != 1 else ''} ago", days
 
 
 def _compare_firm_text(deal):
@@ -22936,8 +23135,16 @@ def _compare_rows(entry, role, scope=frozenset()):
     """One dict per offering for `role` ("admin" | "tenant" | "buyer").
     Own = a linked person in the tenant's firm/team scope."""
     deals = entry["deals"]
-    vals = [_deal_cf_number(d, EST_VAL_FIELD) for d in deals if _deal_stage_id(d) != STAGE_HOLD]
-    ref = compare_ref_valuation(vals) or compare_ref_valuation(_deal_cf_number(d, EST_VAL_FIELD) for d in deals)
+    # Unconfirmed is read on the merged (deal-fresh overlay) record; the
+    # intermediary flag only matters to admin (non-admins never get those
+    # rows, except a tenant's own deal, which stays a normal row).
+    unconf = {id(d): unconfirmed_status(d) for d in deals}
+    inter = {id(d): role == "admin" and _compare_is_intermediary_deal(d) for d in deals}
+    live = [d for d in deals if _deal_stage_id(d) != STAGE_HOLD and not inter[id(d)]]
+    confirmed = [d for d in live if not unconf[id(d)][0]]
+    ref = (compare_ref_valuation(_deal_cf_number(d, EST_VAL_FIELD) for d in confirmed)
+           or compare_ref_valuation(_deal_cf_number(d, EST_VAL_FIELD) for d in live)
+           or compare_ref_valuation(_deal_cf_number(d, EST_VAL_FIELD) for d in deals))
     rows, letter_i = [], 0
     for d in deals:
         hold = _deal_stage_id(d) == STAGE_HOLD
@@ -22968,7 +23175,7 @@ def _compare_rows(entry, role, scope=frozenset()):
         if role in ("buyer", "admin") and gross is not None:
             price_parts.append(f"Gross {_fmt_price_2dp(gross)}")
         price_text = " · ".join(price_parts)
-        updated_text, updated_days = _compare_days_ago_text(d)
+        is_unconf, confirmed_date = unconf[id(d)]
         row = {
             "deal": d, "label": label, "own": own, "hold": hold,
             "structure": structure,
@@ -22981,7 +23188,8 @@ def _compare_rows(entry, role, scope=frozenset()):
             "upfront": _deal_cf_number(d, SELLER_FEE_FIELD), "mgmt": _deal_cf_number(d, MGMT_FEE_FIELD),
             "carry": _deal_cf_number(d, CARRY_FIELD),
             "min": _deal_cf_number(d, TICKET_MIN_FIELD), "max": _deal_cf_number(d, TICKET_MAX_FIELD),
-            "updated_text": updated_text, "updated_days": updated_days,
+            "unconfirmed": bool(is_unconf), "confirmed_date": confirmed_date,
+            "intermediary": bool(inter[id(d)]),
         }
         row["fee_status"] = compare_fee_status(row["upfront"], row["mgmt"], row["carry"])
         rows.append(row)
@@ -23081,6 +23289,14 @@ COMPARE_CSS = """
                   background: #fff; cursor: pointer; white-space: normal; text-align: left; }
   .cmp-beat-btn[disabled] { cursor: default; opacity: .75; border-color: var(--line); color: var(--qp); }
   .cmp-beat-no { display: block; margin-top: 5px; font-size: 11px; color: var(--muted); white-space: normal; }
+  .cmp-table tr.cmp-unconf td, .cmp-table tr.cmp-inter td { color: var(--muted); }
+  .cmp-table tr.cmp-unconf .cmp-label, .cmp-table tr.cmp-inter .cmp-label { color: var(--muted); }
+  .cmp-unconf-note, .cmp-unconf-own { display: block; margin-top: 4px; font-size: 11px; color: #C2410C;
+                                      background: #FDF0E9; padding: 2px 6px; border-radius: 4px; white-space: normal; }
+  .cmp-unconf-own { display: inline-block; margin-left: 6px; }
+  .cmp-clock svg { vertical-align: -2px; }
+  .cmp-inter-chip { display: inline-block; margin-top: 4px; padding: 1px 8px; border-radius: 9999px; font-size: 11px;
+                    font-weight: 600; color: #475467; background: #EAECF0; }
   .cmp-table tr.cmp-divider td { position: static; width: auto; min-width: 0; max-width: none; font-size: 11px;
                                  font-weight: 600; text-transform: uppercase; letter-spacing: .03em; color: var(--muted);
                                  background: var(--bg); }
@@ -23152,7 +23368,10 @@ COMPARE_SCRIPT = (r"""<script>
   var invMsg = document.getElementById('cmp-inv-msg');
   var picks = Array.prototype.slice.call(document.querySelectorAll('.cmp-pick'));
   var ref = parseFloat(table.getAttribute('data-ref')) || 0;
-  var divider = tbody.querySelector('tr.cmp-divider');
+  var dividers = {};
+  Array.prototype.slice.call(tbody.querySelectorAll('tr.cmp-divider')).forEach(function(tr) {
+    dividers[tr.getAttribute('data-divider') || '2'] = tr;
+  });
   var isAdmin = table.getAttribute('data-admin') === '1';
   var FEES = ['upfront', 'mgmt', 'carry'];
   var STORE = 'gg-compare-investment';
@@ -23182,6 +23401,14 @@ COMPARE_SCRIPT = (r"""<script>
   }
   function rankText(r, isEntry) { return r === null ? '\u2014' : '#' + r + (isEntry ? ' (your entry)' : ''); }
   function showBest(r, isEntry) { return r === 1 && !isEntry; }
+  // Unconfirmed / admin-only intermediary rows are never ranked (fixed
+  // groups 3 / 4, whatever the investment, outcome or years).
+  function fixedStatus(unconfirmed, intermediary) {
+    return intermediary ? 'intermediary' : (unconfirmed ? 'unconfirmed' : null);
+  }
+  function groupOf(st) {
+    return ({ranked: '0', min: '1', max: '1', hold: '1', none: '2', unconfirmed: '3', intermediary: '4'})[st];
+  }
   // An entry may ask Chad to beat it only when it beats or ties (same $100
   // rounding) the best ranked LIVE offering; other entries are ignored.
   function beatsBest(entryBack, liveBacks) {
@@ -23209,6 +23436,8 @@ COMPARE_SCRIPT = (r"""<script>
   }
   function status(tr) {
     if (isEntry(tr)) return 'ranked';  // buyer entries: all three fees, no ticket limits
+    var fx = fixedStatus(tr.getAttribute('data-unconfirmed') === '1', tr.getAttribute('data-intermediary') === '1');
+    if (fx) return fx;
     if (feeStatus(tr) === 'none') return 'none';
     if (tr.getAttribute('data-hold') === '1') return 'hold';
     var mn = num(tr.getAttribute('data-min')), mx = num(tr.getAttribute('data-max'));
@@ -23238,10 +23467,13 @@ COMPARE_SCRIPT = (r"""<script>
       if (y === null || y === '') return -1;
       return (x < y ? -1 : 1) * sortDir;
     });
-    var below = list.filter(function(tr) { return tr.getAttribute('data-group') === '2'; });
-    list.forEach(function(tr) { if (tr.getAttribute('data-group') !== '2') tbody.appendChild(tr); });
-    if (divider) { tbody.appendChild(divider); divider.hidden = below.length === 0; }
-    below.forEach(function(tr) { tbody.appendChild(tr); });
+    list.forEach(function(tr) { if (tr.getAttribute('data-group') < '2') tbody.appendChild(tr); });
+    ['2', '3', '4'].forEach(function(g) {
+      var below = list.filter(function(tr) { return tr.getAttribute('data-group') === g; });
+      var dv = dividers[g];
+      if (dv) { tbody.appendChild(dv); dv.hidden = below.length === 0; }
+      below.forEach(function(tr) { tbody.appendChild(tr); });
+    });
     table.querySelectorAll('th[data-col]').forEach(function(th) {
       if (th.getAttribute('data-col') === sortCol) th.setAttribute('aria-sort', sortDir > 0 ? 'ascending' : 'descending');
       else th.removeAttribute('aria-sort');
@@ -23254,10 +23486,11 @@ COMPARE_SCRIPT = (r"""<script>
     all.forEach(function(tr) {
       var st = status(tr), fs = feeStatus(tr);
       tr.__st = st;
-      tr.setAttribute('data-group', st === 'ranked' ? '0' : (st === 'none' ? '2' : '1'));
-      tr.setAttribute('data-unranked', st === 'none' ? '1' : '0');
+      var fixed = st === 'unconfirmed' || st === 'intermediary';
+      tr.setAttribute('data-group', groupOf(st));
+      tr.setAttribute('data-unranked', groupOf(st) >= '2' ? '1' : '0');
       var nmEl = tr.querySelector('.cmp-nm'), backTd = cell(tr, 'back'), costTd = cell(tr, 'fees');
-      if (st === 'none') {
+      if (fs === 'none') {
         nmEl.textContent = ''; setCell(backTd, '', '—'); setCell(costTd, '', '—');
       } else {
         var nm = netMultiple(tr, outcome, years);
@@ -23273,12 +23506,12 @@ COMPARE_SCRIPT = (r"""<script>
       FEES.forEach(function(f) {
         if (num(tr.getAttribute('data-' + f)) !== null) return;
         var fv = tr.querySelector('td[data-col="' + f + '"] .cmp-fee-v');
-        if (fv) { fv.textContent = '\u2014'; fv.classList.toggle('cmp-fee-blank', st === 'none'); }
+        if (fv) { fv.textContent = '\u2014'; fv.classList.toggle('cmp-fee-blank', fs === 'none'); }
       });
       var hasAsk = !!tr.querySelector('.cmp-ask');
       var show = {'.cmp-partial': fs === 'partial', '.cmp-prompt-confirm': fs === 'partial',
-                  '.cmp-prompt-add': st === 'none', '.cmp-ask': st === 'none', '.cmp-rank': st !== 'none',
-                  '.cmp-view': st !== 'none' || !hasAsk};
+                  '.cmp-prompt-add': fs === 'none', '.cmp-ask': st === 'none',
+                  '.cmp-rank': st !== 'none' && !fixed, '.cmp-view': st !== 'none' || !hasAsk};
       Object.keys(show).forEach(function(sel) {
         tr.querySelectorAll(sel).forEach(function(el) { el.hidden = !show[sel]; });
       });
@@ -24030,22 +24263,29 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
         print(f"compare company failed: {type(e).__name__}: {e}")
         return _compare_shell("Compare SPVs", header_html,
                               f'{back}<h1>Compare SPV offerings</h1><p class="cmp-empty">{_esc(COMPARE_UNAVAILABLE_MSG)}</p>')
-    if not entry or not rows:
-        return _compare_shell("Compare SPVs", header_html,
-                              f'{back}<h1>Compare SPV offerings</h1>'
-                              '<p class="cmp-empty">No live SPV offerings for this company right now.</p>')
-    company = entry["company"]
-    investment, outcome = COMPARE_DEFAULT_INVESTMENT, COMPARE_DEFAULT_OUTCOME
     try:
-        live_intro = _compare_live_intro(entry_all or entry, viewer_ids) if viewer_ids else None
+        live_intro = (_compare_live_intro(entry_all or entry, viewer_ids)
+                      if viewer_ids and (entry_all or entry) else None)
     except Exception as e:
         print(f"compare live-intro check failed (no guard): {type(e).__name__}: {e}")
         live_intro = None
+    if (not entry or not rows) and not live_intro:
+        return _compare_shell("Compare SPVs", header_html,
+                              f'{back}<h1>Compare SPV offerings</h1>'
+                              '<p class="cmp-empty">No live SPV offerings for this company right now.</p>')
+    entry = entry or {**entry_all, "deals": []}
+    company = entry["company"]
+    investment, outcome = COMPARE_DEFAULT_INVESTMENT, COMPARE_DEFAULT_OUTCOME
     current_deal_id = live_intro[1] if live_intro else None
     # Sellers viewing their own firm's offerings are never filtered.
     hide_others = bool(live_intro) and not any(r["own"] for r in rows)
     if hide_others:
         keep = [d for d in entry["deals"] if str(d.get("id")) == current_deal_id] if current_deal_id else []
+        if not keep and current_deal_id and entry_all:
+            # The live intro wins over the intermediary gate (never over
+            # Private / Interested-only visibility).
+            keep = [d for d in entry_all["deals"] if str(d.get("id")) == current_deal_id
+                    and _compare_viewer_can_see(d, role, scope)]
         rows, ref = _compare_rows({**entry, "deals": keep}, role, scope) if keep else ([], None)
         if not rows:
             return _compare_shell(f"{company} offerings", header_html,
@@ -24056,19 +24296,33 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
     live_rows = [r for r in rows if not r["hold"]]
     n_ranked = sum(1 for r in rows if r["status"] == "ranked")
     nudge_state = _compare_nudge_states([str(r["deal"].get("id")) for r in rows]) if key is not None else {}
-    divider_row = f'<tr class="cmp-divider"{{hidden}}><td colspan="9">{_esc(COMPARE_UNRANKED_DIVIDER)}</td></tr>'
+    dividers = {"2": COMPARE_UNRANKED_DIVIDER, "3": COMPARE_UNCONFIRMED_DIVIDER}
+    if role == "admin":
+        dividers["4"] = COMPARE_INTERMEDIARY_DIVIDER
+    group_of = {"ranked": "0", "min": "1", "max": "1", "hold": "1", "none": "2", "unconfirmed": "3",
+                "intermediary": "4"}
+
+    def divider_row(g, hidden):
+        return (f'<tr class="cmp-divider" data-divider="{g}"{" hidden" if hidden else ""}>'
+                f'<td colspan="9">{_esc(dividers[g])}</td></tr>')
     tr_html = []
-    divider_done = False
+    dividers_done = set()
     for r in rows:
         st = r["status"]
-        no_fees = st == "none"
-        if no_fees and not divider_done:
-            tr_html.append(divider_row.replace("{hidden}", ""))
-            divider_done = True
+        group = group_of[st]
+        if group in dividers and group not in dividers_done:
+            # Every divider up to this group is emitted (hidden when empty) so
+            # the page script can show it if a row moves groups.
+            for g in sorted(dividers):
+                if g <= group and g not in dividers_done:
+                    tr_html.append(divider_row(g, hidden=g != group))
+                    dividers_done.add(g)
+        fixed = st in ("unconfirmed", "intermediary")
+        no_fees = r["fee_status"] == "none"
+        no_fees_group = st == "none"
         d = r["deal"]
         deal_id = str(d.get("id"))
         editable = (role == "admin" and not r["hold"]) or r["own"]
-        group = "0" if st == "ranked" else ("2" if no_fees else "1")
         attrs = (f' data-upfront="{"" if r["upfront"] is None else r["upfront"]}"'
                  f' data-mgmt="{"" if r["mgmt"] is None else r["mgmt"]}"'
                  f' data-carry="{"" if r["carry"] is None else r["carry"]}"'
@@ -24076,7 +24330,9 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                  f' data-min="{"" if r["min"] is None else r["min"]}"'
                  f' data-max="{"" if r["max"] is None else r["max"]}"'
                  f' data-hold="{"1" if r["hold"] else "0"}"'
-                 f' data-group="{group}" data-unranked="{"1" if no_fees else "0"}"')
+                 f' data-group="{group}" data-unranked="{"0" if group in ("0", "1") else "1"}"'
+                 f' data-unconfirmed="{"1" if r["unconfirmed"] else "0"}"'
+                 f' data-intermediary="{"1" if r["intermediary"] else "0"}"')
         if editable:
             attrs += f' data-deal-id="{_esc(deal_id)}"'
             upd = _deal_update_form_url(deal_id)
@@ -24084,7 +24340,8 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
                 attrs += f' data-update-url="{_esc(upd)}"'
         top = r["rank"] == 1
         cls = " ".join(c for c in ("cmp-own" if r["own"] else "", "cmp-hold" if r["hold"] else "",
-                                   "cmp-top" if top else "") if c)
+                                   "cmp-top" if top else "", "cmp-unconf" if st == "unconfirmed" else "",
+                                   "cmp-inter" if st == "intermediary" else "") if c)
         partial = r["fee_status"] == "partial"
         label_html = f'<div class="cmp-label">{"Your offering" if r["own"] else _esc(r["label"])}</div>'
         if not r["hold"]:
@@ -24092,7 +24349,7 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             # shows "Ask about fees" instead (COMPARE_SCRIPT swaps them when
             # the fee group changes). Under a live intro only the visible
             # current-deal row exists, and it always gets this link.
-            view_hidden = no_fees and not live_intro
+            view_hidden = no_fees_group and not live_intro
             label_html += (f'<a class="cmp-view" href="{_esc(COMPARE_ASK_URL.format(deal_id))}" target="_blank" '
                            f'rel="noopener"{" hidden" if view_hidden else ""}>{_esc(COMPARE_VIEW_DEAL_LABEL)}</a>')
         if current_deal_id is not None and deal_id == current_deal_id:
@@ -24100,28 +24357,39 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
         if show_bsa and not r["hold"] and not (_deal_cf_option_ids(d, AGENT_AGREEMENT_FIELD) & COMPARE_BSA_SIGNED_IDS):
             label_html += (f'<div class="cmp-bsa-chip">{_esc(COMPARE_BSA_CHIP)}</div>'
                            f'<div class="cmp-bsa-note">{_esc(COMPARE_BSA_NOTE)}</div>')
-        if r["updated_days"] is not None:
-            label_html += f'<div class="cmp-updated">Updated {_esc(r["updated_text"])}</div>'
+        if st == "intermediary":
+            label_html += f'<div class="cmp-inter-chip">{_esc(COMPARE_INTERMEDIARY_CHIP)}</div>'
+        if r["unconfirmed"] and not r["own"]:
+            label_html += (f'<div class="cmp-unconf-note"><span class="cmp-clock" aria-hidden="true">{COMPARE_CLOCK_SVG}</span> '
+                           f'{_esc(_compare_unconfirmed_text(r["confirmed_date"]))}</div>')
+        if r["confirmed_date"]:
+            label_html += (f'<div class="cmp-updated">Last confirmed '
+                           f'{_esc(_compare_date_text(r["confirmed_date"]))}</div>')
         label_html += f'<div class="cmp-partial"{"" if partial else " hidden"}>{_esc(COMPARE_PARTIAL_NOTE)}</div>'
         if r["own"]:
             line = (_compare_rank_text(r["rank"], n_ranked, investment, outcome) if st == "ranked"
                     else _compare_unranked_text(st, r, investment))
-            label_html += f'<div class="cmp-rank"{" hidden" if no_fees else ""}>{_esc(line)}</div>'
+            label_html += f'<div class="cmp-rank"{" hidden" if (no_fees_group or fixed) else ""}>{_esc(line)}</div>'
             label_html += (f'<div class="cmp-prompt cmp-prompt-confirm"{"" if partial else " hidden"}>'
                            f'{_esc(COMPARE_CONFIRM_FEES_PROMPT)}</div>')
             label_html += (f'<div class="cmp-prompt cmp-prompt-add"{"" if no_fees else " hidden"}>'
                            f'{_esc(COMPARE_ADD_FEES_PROMPT)}</div>')
-        if no_fees and not live_intro:
+        if no_fees_group and not live_intro:
             label_html += (f'<a class="cmp-ask" href="{_esc(COMPARE_ASK_URL.format(deal_id))}" target="_blank" '
                            'rel="noopener">Ask about fees →</a>')
         if r["own"] or key is not None:
             upd_url = _deal_update_form_url(deal_id)
+            confirm_html = ""
+            if r["own"] and r["unconfirmed"]:
+                confirm_html = (f' <span class="cmp-unconf-own"><span class="cmp-clock" aria-hidden="true">'
+                                f'{COMPARE_CLOCK_SVG}</span> {_esc(COMPARE_OWN_UNCONFIRMED_PROMPT)}</span>')
             if upd_url:
                 label_html += (f'<div><a class="cmp-update-btn" href="{_esc(upd_url)}" target="_blank" '
-                               f'rel="noopener">Update deal</a>'
+                               f'rel="noopener">Update deal</a>{confirm_html}'
                                f'{_compare_bell_html(r, nudge_state, company) if key is not None else ""}</div>')
-            elif key is not None:
-                label_html += f'<div>{_compare_bell_html(r, nudge_state, company)}</div>'
+            elif key is not None or confirm_html:
+                label_html += (f'<div>{confirm_html}'
+                               f'{_compare_bell_html(r, nudge_state, company) if key is not None else ""}</div>')
         if role == "admin":
             vis_tag = {VIS_PRIVATE: "Private · ", VIS_INTERESTED: "Interested only · "}.get(_deal_visibility(d), "")
             label_html += (f'<div class="cmp-admin">{_esc(r["label"])} · {vis_tag}{_esc(_compare_firm_text(d))} · '
@@ -24158,9 +24426,10 @@ def render_compare_company(company_param, role, header_html, scope=frozenset(), 
             + _compare_fee_cell_html(r, "carry", editable)
             + f'<td data-col="vehicle" class="cmp-vehicle">{_compare_vehicle_html(r)}</td>'
             f'<td data-col="valuation" class="num cmp-valuation">{val_html}</td></tr>')
-    if not divider_done:
-        # Always present so the page script can show it if a row loses its fees group.
-        tr_html.append(divider_row.replace("{hidden}", " hidden"))
+    for g in sorted(dividers):
+        if g not in dividers_done:
+            # Always present so the page script can show it if a row moves groups.
+            tr_html.append(divider_row(g, hidden=True))
     # (column, header, sortable)
     heads = [("label", "Offering", False), ("rank", "Rank", True), ("back", "You get back", True),
              ("fees", "Fees cost", True), ("upfront", "Upfront", True), ("mgmt", "Mgmt fee", True),
