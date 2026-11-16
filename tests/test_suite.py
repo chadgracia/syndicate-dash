@@ -10977,6 +10977,18 @@ reset_caches()
 lf.boto3 = FakeBoto3
 FakeBoto3.S3 = _st_s3
 
+# --- Slim index carries all three Pipeline email slots (deal gate / access queue)
+check("slim: PEOPLE_SLIM_FIELDS has email, email2 and home_email",
+      {"email", "email2", "home_email"} <= set(lf.PEOPLE_SLIM_FIELDS))
+check("slim: schema fingerprint changed vs the old field set (next rebuild_slim rebuilds)",
+      lf._people_slim_schema() != ",".join(sorted(set(lf.PEOPLE_SLIM_FIELDS) - {"email2", "home_email"}))
+      + "|" + ",".join(sorted(lf.PEOPLE_SLIM_CUSTOM_FIELDS)))
+check("slim: _slim_person keeps email2 / home_email",
+      lf._slim_person({"id": 1, "email": "a@x.com", "email2": "b@x.com", "home_email": "c@y.com", "summary": "s"})
+      == {"id": 1, "email": "a@x.com", "email2": "b@x.com", "home_email": "c@y.com"})
+check("slim: Blockbook tenancy still reads only email + emails (no behaviour change)",
+      lf._person_all_emails({"email": "a@x.com", "email2": "b@x.com", "home_email": "c@y.com"}) == ["a@x.com"])
+
 # --- Manual referral editor: same-firm referrals are blocked
 _st_put({}, rev=0)
 _r = _st_post({"key": ADMIN_KEY, "rev": 0, "clients": {"2": _st_row(referrals=[{"person_id": "9", "confirmed_unrelated": True}])}})

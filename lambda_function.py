@@ -2222,7 +2222,10 @@ def _cached_object_version(s3, key):
 # the slim file doesn't exist at all (first run ever). Rebuilds happen out
 # of band: event {"task": "rebuild_slim"} (see _task_rebuild_slim).
 PEOPLE_SLIM_KEY = "syndicate-dash/people-slim.json"
-PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name", "full_name", "company_id",
+# email2 / home_email: the deal gate (trades, CRMDealDetails) and the daily-brief access
+# queue match a viewer on all three Pipeline email slots. Blockbook itself still reads
+# only "email" and "emails" (_person_all_emails), so this changes nothing here.
+PEOPLE_SLIM_FIELDS = ("id", "email", "email2", "home_email", "emails", "name", "first_name", "last_name", "full_name", "company_id",
                       "company_name", "title", "position", "phone", "mobile", "website", "linked_in_url",
                       "work_country", "home_country", "work_city", "home_city", "updated_at", "created_at",
                       "won_deals_total", "custom_fields")
