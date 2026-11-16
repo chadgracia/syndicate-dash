@@ -160,6 +160,7 @@ def _req_cache_reset():
     _req_cache["aggregate_scan"] = None
     _req_cache["standing"] = None
     _req_cache["compare"] = {}
+    _req_cache["demand"] = {}
     _req_cache.pop("fresh_tenants", None)
     _req_cache["approval"] = {}
 
@@ -2474,10 +2475,12 @@ def get_company_table():
 # {"task": "rebuild_interest_activity"} (also chained after rebuild_slim);
 # the request path just reads them and fails soft when they're missing.
 ACTIVE_WINDOW_DAYS = 365
-DEMAND_ACTIVE_FOR_TENANTS = False   # tenant Demand Board "Active buyers" layout (admin preview: &preview_active=1)
+DEMAND_ACTIVE_FOR_TENANTS = True    # tenant Demand Board active ranking (admin preview: &preview_active=1)
 LAST_CONFIRMED_FIELD = "custom_label_4012491"
 INTEREST_ACTIVITY_KEY = "syndicate-dash/interest-activity.json"
 INTEREST_FIRST_SEEN_KEY = "syndicate-dash/interest-first-seen.json"
+INTEREST_ACTIVITY_REPORT_KEY = "syndicate-dash/interest-activity-report.json"
+ACTIVITY_RUN_BUDGET_S = 20   # admin ?view=activity "Run now" hard budget
 CLICK_LOG_PREFIX = "click-log/"
 _CLICK_DAY_RE = re.compile(r"^click-log/(\d{4}-\d{2}-\d{2})/$")
 # Only this explicit verdict counts as a human click (case-insensitive);
@@ -2650,6 +2653,47 @@ def _task_deadline(context):
     return time.monotonic() + remaining * INTEREST_TASK_BUDGET_FRACTION
 
 
+class _TaskStepError(Exception):
+    """An S3 (or data) step of rebuild_interest_activity failed; .text is a
+    plain-words description (action + key, never a secret or trace)."""
+
+    def __init__(self, text, denied=False):
+        super().__init__(text)
+        self.text = text
+        self.denied = denied
+
+
+def _s3_is_denied(err):
+    code = ""
+    resp = getattr(err, "response", None)
+    if isinstance(resp, dict):
+        code = str((resp.get("Error") or {}).get("Code") or "")
+    text = f"{code} {type(err).__name__} {err}"
+    return code in ("AccessDenied", "403", "Forbidden") or "AccessDenied" in text
+
+
+def _s3_step(action, key, fn):
+    """Run one S3 call; any failure -> _TaskStepError naming the action and
+    the key / prefix in plain words."""
+    try:
+        return fn()
+    except _TaskStepError:
+        raise
+    except Exception as e:
+        if _s3_is_denied(e):
+            raise _TaskStepError(f"Access denied: {action} on s3://{BUCKET}/{key}", denied=True)
+        raise _TaskStepError(f"{action} on s3://{BUCKET}/{key} failed ({type(e).__name__})")
+
+
+def _step_failed(e, what):
+    """Result dict for a failed step (one log line)."""
+    if isinstance(e, _TaskStepError):
+        print(f"{what}: {e.text}")
+        return {"ok": False, "error": e.text, "denied": e.denied}
+    print(f"{what}: failed: {type(e).__name__}")
+    return {"ok": False, "error": f"{what} failed ({type(e).__name__})", "denied": False}
+
+
 def _update_first_seen_ledger(s3, now):
     """interest-first-seen.json {"pairs": {company: {pid: date|null}},
     "baseline_at"}. First run (file missing): every current interest pair
@@ -2657,14 +2701,18 @@ def _update_first_seen_ledger(s3, now):
     date. Existing entries are never overwritten; vanished pairs stay. A
     failed read (other than missing) or a malformed file writes nothing."""
     try:
-        ledger, missing = _read_task_json(s3, INTEREST_FIRST_SEEN_KEY)
+        ledger, missing = _s3_step("s3:GetObject", INTEREST_FIRST_SEEN_KEY,
+                                   lambda: _read_task_json(s3, INTEREST_FIRST_SEEN_KEY))
     except Exception as e:
-        print(f"interest-first-seen: read failed, nothing written: {e}")
-        return {"ok": False, "error": "read failed"}
+        out = _step_failed(e, "interest-first-seen: read failed, nothing written")
+        return out
     if not missing and not (isinstance(ledger, dict) and isinstance(ledger.get("pairs"), dict)):
         print("interest-first-seen: existing file malformed, nothing written")
-        return {"ok": False, "error": "malformed"}
-    buy = _interest_buy_map()
+        return {"ok": False, "error": "interest-first-seen.json is malformed; nothing written", "denied": False}
+    try:
+        buy = _s3_step("s3:GetObject", INTEREST_KEY, _interest_buy_map)
+    except Exception as e:
+        return _step_failed(e, "interest-first-seen: interest read failed, nothing written")
     baseline = missing
     pairs = {} if baseline else ledger["pairs"]
     stamp = None if baseline else now.date().isoformat()
@@ -2681,11 +2729,16 @@ def _update_first_seen_ledger(s3, now):
                 slot[k] = stamp
                 added += 1
     if baseline or added:
-        _write_task_json(s3, INTEREST_FIRST_SEEN_KEY, {
-            "pairs": pairs,
-            "baseline_at": _iso_utc(now.timestamp()) if baseline else ledger.get("baseline_at")})
+        data = {"pairs": pairs,
+                "baseline_at": _iso_utc(now.timestamp()) if baseline else ledger.get("baseline_at")}
+        try:
+            _s3_step("s3:PutObject", INTEREST_FIRST_SEEN_KEY,
+                     lambda: _write_task_json(s3, INTEREST_FIRST_SEEN_KEY, data))
+        except Exception as e:
+            return _step_failed(e, "interest-first-seen: write failed")
     return {"ok": True, "baseline": baseline, "added": added,
-            "pairs": sum(len(v) for v in pairs.values() if isinstance(v, dict))}
+            "pairs": sum(len(v) for v in pairs.values() if isinstance(v, dict)),
+            "baseline_at": _iso_utc(now.timestamp()) if baseline else ledger.get("baseline_at")}
 
 
 def _list_click_days(s3):
@@ -2694,7 +2747,7 @@ def _list_click_days(s3):
         kwargs = {"Bucket": BUCKET, "Prefix": CLICK_LOG_PREFIX, "Delimiter": "/"}
         if token:
             kwargs["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**kwargs)
+        resp = _s3_step("s3:ListBucket", CLICK_LOG_PREFIX, lambda: s3.list_objects_v2(**kwargs))
         for p in resp.get("CommonPrefixes") or []:
             m = _CLICK_DAY_RE.match(p.get("Prefix") or "")
             if m:
@@ -2710,13 +2763,14 @@ def _list_click_days(s3):
 def _list_click_keys(s3, day, deadline):
     """Every object key under click-log/<day>/, or None if the deadline hit."""
     keys, token = [], None
+    prefix = f"{CLICK_LOG_PREFIX}{day}/"
     while True:
         if time.monotonic() >= deadline:
             return None
-        kwargs = {"Bucket": BUCKET, "Prefix": f"{CLICK_LOG_PREFIX}{day}/"}
+        kwargs = {"Bucket": BUCKET, "Prefix": prefix}
         if token:
             kwargs["ContinuationToken"] = token
-        resp = s3.list_objects_v2(**kwargs)
+        resp = _s3_step("s3:ListBucket", prefix, lambda: s3.list_objects_v2(**kwargs))
         keys.extend(o["Key"] for o in resp.get("Contents") or [] if o.get("Key", "").endswith(".json"))
         if not resp.get("IsTruncated"):
             return keys
@@ -2745,16 +2799,20 @@ def _process_click_day(s3, day, deal_company, clicks, deadline):
     """Read every click object of one day (never modified) and merge human
     clicks into clicks {company: {pid: latest iso}} (max per pair, so a
     re-run is idempotent). Returns the day's stats, or None when the
-    deadline hit before the day finished."""
+    deadline hit before the day finished. Every object of the day denied
+    -> _TaskStepError (the day is not marked processed)."""
     keys = _list_click_keys(s3, day, deadline)
     if keys is None:
         return None
     stats = {"objects": len(keys), "human": 0, "counted": 0, "unknown_deal": 0, "unreadable": 0, "verdicts": {}}
+    denied = []
 
     def fetch(key):
         try:
             return json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
-        except Exception:
+        except Exception as e:
+            if _s3_is_denied(e):
+                denied.append(key)
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=CLICK_FETCH_WORKERS) as pool:
@@ -2781,6 +2839,8 @@ def _process_click_day(s3, day, deal_company, clicks, deadline):
                 if k not in slot or iso > slot[k]:
                     slot[k] = iso
                 stats["counted"] += 1
+    if keys and len(denied) == len(keys):
+        raise _TaskStepError(f"Access denied: s3:GetObject on s3://{BUCKET}/{CLICK_LOG_PREFIX}{day}/*", denied=True)
     return stats
 
 
@@ -2793,27 +2853,31 @@ def _update_click_activity(s3, now, deadline):
     and saves progress. Never deletes or modifies click-log objects. A
     failed read of the existing file (other than missing) writes nothing."""
     try:
-        data, missing = _read_task_json(s3, INTEREST_ACTIVITY_KEY)
+        data, missing = _s3_step("s3:GetObject", INTEREST_ACTIVITY_KEY,
+                                 lambda: _read_task_json(s3, INTEREST_ACTIVITY_KEY))
     except Exception as e:
-        print(f"interest-activity: read failed, nothing written: {e}")
-        return {"ok": False, "error": "read failed"}
+        return _step_failed(e, "interest-activity: read failed, nothing written")
     if missing:
         data = {}
     if not isinstance(data, dict) or not isinstance(data.get("clicks", {}), dict):
         print("interest-activity: existing file malformed, nothing written")
-        return {"ok": False, "error": "malformed"}
+        return {"ok": False, "error": "interest-activity.json is malformed; nothing written", "denied": False}
     clicks = data.get("clicks") or {}
     processed = set(data.get("processed_days") or [])
     day_stats = data.get("day_stats") if isinstance(data.get("day_stats"), dict) else {}
     verdicts_seen = data.get("verdicts_seen") if isinstance(data.get("verdicts_seen"), dict) else {}
 
-    days = _list_click_days(s3)
+    try:
+        days = _list_click_days(s3)
+        deals = _s3_step("s3:GetObject", DEALS_KEY, get_deals_list)
+    except Exception as e:
+        return _step_failed(e, "interest-activity: nothing written")
     today = now.date().isoformat()
     yesterday = (now.date() - timedelta(days=1)).isoformat()
     recent = [d for d in (today, yesterday) if d in days]
     backlog = [d for d in days if d not in processed and d not in (today, yesterday)]
     deal_company = {}
-    for d in get_deals_list():
+    for d in deals:
         name = (_deal_company_name(d) or "").strip() if isinstance(d, dict) else ""
         if name and d.get("id") is not None:
             deal_company[str(d.get("id")).strip()] = name
@@ -2821,11 +2885,17 @@ def _update_click_activity(s3, now, deadline):
     run = {"days_processed": 0, "objects": 0, "human_clicks": 0, "counted": 0, "unknown_deal": 0,
            "verdicts": {}}
     complete = True
+    step_error = None
     for day in recent + backlog:
         if time.monotonic() >= deadline:
             complete = False
             break
-        st = _process_click_day(s3, day, deal_company, clicks, deadline)
+        try:
+            st = _process_click_day(s3, day, deal_company, clicks, deadline)
+        except _TaskStepError as e:
+            step_error = e
+            complete = False
+            break
         if st is None:
             complete = False
             break
@@ -2841,14 +2911,22 @@ def _update_click_activity(s3, now, deadline):
         if day not in (today, yesterday):
             processed.add(day)
 
+    remaining = [d for d in days if d not in processed and d not in (today, yesterday)]
     out = {"clicks": clicks, "processed_days": sorted(processed), "earliest_day": days[0] if days else None,
-           "built_at": _iso_utc(), "complete": complete and all(d in processed for d in days
-                                                                if d not in (today, yesterday)),
+           "built_at": _iso_utc(), "complete": complete and not remaining,
            "day_stats": day_stats, "verdicts_seen": verdicts_seen}
-    _write_task_json(s3, INTEREST_ACTIVITY_KEY, out)
-    run.update({"ok": True, "complete": out["complete"], "earliest_day": out["earliest_day"],
-                "days_found": len(days), "days_done": len(processed),
-                "verdicts_seen": sorted(verdicts_seen)})
+    try:
+        _s3_step("s3:PutObject", INTEREST_ACTIVITY_KEY, lambda: _write_task_json(s3, INTEREST_ACTIVITY_KEY, out))
+    except Exception as e:
+        return _step_failed(e, "interest-activity: write failed")
+    run.update({"ok": step_error is None, "complete": out["complete"], "earliest_day": out["earliest_day"],
+                "days_found": len(days), "days_done": len(processed), "days_remaining": len(remaining),
+                "built_at": out["built_at"], "verdicts_seen": sorted(verdicts_seen),
+                "human_clicks_total": sum(int((v or {}).get("human") or 0) for v in day_stats.values()),
+                "counted_total": sum(int((v or {}).get("counted") or 0) for v in day_stats.values())})
+    if step_error is not None:
+        print(f"interest-activity: {step_error.text}")
+        run.update({"error": step_error.text, "denied": step_error.denied})
     return run
 
 
@@ -2864,11 +2942,38 @@ def _active_summary(top=25):
             "impossible_foods": [imp["active"], imp["total"]] if imp else None}
 
 
-def _task_rebuild_interest_activity(context=None, summary=True):
+def _write_activity_report(s3, result, summary):
+    """Persist the run to INTEREST_ACTIVITY_REPORT_KEY (the admin status
+    page reads only this). A run without a new summary keeps the previous
+    one. Returns None, or a plain-words error."""
+    prev = {}
+    try:
+        prev, _missing = _read_task_json(s3, INTEREST_ACTIVITY_REPORT_KEY)
+        prev = prev if isinstance(prev, dict) else {}
+    except Exception:
+        prev = {}
+    report = {"run_at": _iso_utc(), "first_seen": result.get("first_seen"), "clicks": result.get("clicks"),
+              "summary": summary if summary is not None else prev.get("summary"),
+              "summary_at": _iso_utc() if summary is not None else prev.get("summary_at")}
+    try:
+        _s3_step("s3:PutObject", INTEREST_ACTIVITY_REPORT_KEY,
+                 lambda: _write_task_json(s3, INTEREST_ACTIVITY_REPORT_KEY, report))
+    except _TaskStepError as e:
+        print(f"interest-activity report: {e.text}")
+        return e.text
+    return None
+
+
+def _task_rebuild_interest_activity(context=None, summary=True, budget_s=None):
     """Out-of-band {"task": "rebuild_interest_activity"}: update the
-    first-seen ledger, then the click summary within the time budget, then
-    (time permitting) return a counts summary. Never renders a page."""
+    first-seen ledger, then the click summary within the time budget
+    (INTEREST_TASK_BUDGET_FRACTION of the Lambda time left, and at most
+    budget_s seconds when given), then (time permitting) a counts summary.
+    Every run is persisted to INTEREST_ACTIVITY_REPORT_KEY. Never renders
+    a page."""
     deadline = _task_deadline(context)
+    if budget_s:
+        deadline = min(deadline, time.monotonic() + budget_s)
     s3 = _s3_client()
     now = datetime.now(timezone.utc)
     result = {"task": "rebuild_interest_activity"}
@@ -2877,14 +2982,178 @@ def _task_rebuild_interest_activity(context=None, summary=True):
         try:
             result[name] = fn()
         except Exception as e:
-            print(f"rebuild_interest_activity {name} failed: {e}")
-            result[name] = {"ok": False, "error": type(e).__name__}
-    if summary and time.monotonic() < deadline:
+            result[name] = _step_failed(e, f"rebuild_interest_activity {name}")
+    new_summary = None
+    if summary and time.monotonic() < deadline - (2 if budget_s else 0):
         try:
-            result["summary"] = _active_summary()
+            new_summary = result["summary"] = _active_summary()
         except Exception as e:
-            print(f"rebuild_interest_activity summary failed: {e}")
+            print(f"rebuild_interest_activity summary failed: {type(e).__name__}")
+    result["complete"] = bool((result.get("clicks") or {}).get("complete"))
+    report_error = _write_activity_report(s3, result, new_summary)
+    result["report_saved"] = report_error is None
+    if report_error:
+        result["report_error"] = report_error
     return result
+
+
+# ── Admin ?view=activity: status of the active-buyers background task ──
+ACTIVITY_PAGE_CSS = """
+  body { margin: 0; background: #f4f2ee; color: #16181d; font-family: -apple-system, BlinkMacSystemFont,
+    "Segoe UI", Arial, sans-serif; padding: 32px 16px 64px; }
+  .ac-wrap { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .ac-sub { color: #6b7280; font-size: 13px; margin: 0 0 20px; }
+  .ac-card { background: #fff; border: 1px solid #e7e5e0; border-radius: 10px; padding: 16px 18px; margin: 0 0 16px; }
+  .ac-card h2 { font-size: 14px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .04em; color: #6b7280; }
+  .ac-grid { display: grid; grid-template-columns: minmax(180px, max-content) 1fr; gap: 6px 16px; font-size: 14px; }
+  .ac-k { color: #6b7280; }
+  .ac-status { font-weight: 700; }
+  .ac-status.done { color: #1f7a4d; }
+  .ac-status.more { color: #C2410C; }
+  .ac-err { background: #FDECEA; color: #B42318; border: 1px solid #F5C2BD; border-radius: 8px; padding: 10px 12px;
+    margin: 0 0 12px; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #e7e5e0; }
+  th.num, td.num { text-align: right; }
+  .ac-btn { background: #3d5a73; color: #fff; border: 0; border-radius: 8px; padding: 9px 16px; font-size: 14px;
+    cursor: pointer; }
+  .ac-btn[disabled] { opacity: .6; cursor: default; }
+  #ac-run-msg { margin-left: 10px; font-size: 13px; color: #6b7280; }
+  a { color: #3d5a73; }
+"""
+
+ACTIVITY_PAGE_SCRIPT = """<script>
+(function() {
+  var btn = document.getElementById('ac-run');
+  var msg = document.getElementById('ac-run-msg');
+  if (!btn) return;
+  btn.addEventListener('click', function() {
+    btn.disabled = true;
+    msg.textContent = 'Running (up to 20 seconds)...';
+    fetch('?action=activity_run', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: btn.getAttribute('data-key')})})
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d && d.report_saved) { location.reload(); return; }
+        var errs = (d && d.errors) || [];
+        msg.textContent = (d && d.complete ? 'Complete' : 'More to process \\u2014 press Run now again') +
+          (errs.length ? ' \\u00b7 ' + errs.join(' \\u00b7 ') : '');
+        btn.disabled = false;
+      })
+      .catch(function() { msg.textContent = 'Run failed. Try again.'; btn.disabled = false; });
+  });
+})();
+</script>"""
+
+
+def _activity_read(s3, key):
+    """(data or None, plain-words error or None) for the status page."""
+    try:
+        data, missing = _s3_step("s3:GetObject", key, lambda: _read_task_json(s3, key))
+    except _TaskStepError as e:
+        return None, e.text
+    return (None if missing else data), None
+
+
+def _activity_run_errors(result):
+    out = []
+    for name in ("first_seen", "clicks"):
+        r = (result or {}).get(name) or {}
+        if r.get("error"):
+            out.append(r["error"])
+    if (result or {}).get("report_error"):
+        out.append(result["report_error"])
+    return out
+
+
+def render_activity_page(key):
+    """Admin-only status of rebuild_interest_activity: reads the two data
+    files and the persisted run report (never recomputes the table)."""
+    s3 = _s3_client()
+    report, rep_err = _activity_read(s3, INTEREST_ACTIVITY_REPORT_KEY)
+    activity, act_err = _activity_read(s3, INTEREST_ACTIVITY_KEY)
+    ledger, led_err = _activity_read(s3, INTEREST_FIRST_SEEN_KEY)
+    errors = [e for e in (rep_err, act_err, led_err) if e] + _activity_run_errors(report)
+    report = report if isinstance(report, dict) else {}
+    activity = activity if isinstance(activity, dict) else {}
+    ledger = ledger if isinstance(ledger, dict) else {}
+    clicks = report.get("clicks") if isinstance(report.get("clicks"), dict) else {}
+    summary = report.get("summary") if isinstance(report.get("summary"), dict) else {}
+    day_stats = activity.get("day_stats") if isinstance(activity.get("day_stats"), dict) else {}
+    processed = activity.get("processed_days") or []
+    complete = bool(activity.get("complete")) if activity else False
+
+    def kv(k, v):
+        return f'<div class="ac-k">{_esc(k)}</div><div>{_esc(v)}</div>'
+
+    days_found = clicks.get("days_found")
+    remaining = clicks.get("days_remaining")
+    status = ('<span class="ac-status done">Complete</span>' if complete else
+              '<span class="ac-status more">More to process — press Run now again</span>')
+    files = "".join([
+        kv("interest-activity.json built", activity.get("built_at") or "never"),
+        kv("interest-first-seen.json baseline", ledger.get("baseline_at") or "never"),
+        kv("First-seen pairs", sum(len(v) for v in (ledger.get("pairs") or {}).values() if isinstance(v, dict))
+           if ledger else "—"),
+        kv("Last run", report.get("run_at") or "never"),
+        kv("Earliest click day", activity.get("earliest_day") or "—"),
+        kv("Days processed", f"{len(processed)} of {days_found}" if days_found is not None else str(len(processed))),
+        kv("Days remaining", remaining if remaining is not None else "—"),
+        kv("Human clicks counted", f'{sum(int((v or {}).get("counted") or 0) for v in day_stats.values()):,} '
+                                   f'(of {sum(int((v or {}).get("human") or 0) for v in day_stats.values()):,} human)'),
+        kv("Verdict values seen", ", ".join(sorted((activity.get("verdicts_seen") or {}).keys())) or "—"),
+    ])
+    if summary:
+        imp = summary.get("impossible_foods")
+        sum_html = "".join([
+            kv("Companies with active > 0", summary.get("active", "—")),
+            kv("Non-Recent", summary.get("non_recent", "—")),
+            kv("Impossible Foods (Active / Total)", f"{imp[0]} / {imp[1]}" if imp else "not on the board"),
+            kv("Summary as of", report.get("summary_at") or "—"),
+        ])
+        top_rows = "".join(f'<tr><td>{i}</td><td>{_esc(c)}</td><td class="num">{a}</td><td class="num">{t}</td></tr>'
+                           for i, (c, a, t) in enumerate(summary.get("top") or [], 1))
+        top_html = (f'<table><thead><tr><th>#</th><th>Company</th><th class="num">Active</th>'
+                    f'<th class="num">Total</th></tr></thead><tbody>{top_rows}</tbody></table>')
+    else:
+        sum_html = kv("Summary", "No summary yet — press Run now")
+        top_html = ""
+    err_html = "".join(f'<div class="ac-err">{_esc(e)}</div>' for e in dict.fromkeys(errors))
+    body = f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interest data status</title><style>{ACTIVITY_PAGE_CSS}</style></head>
+<body><div class="ac-wrap">
+<p class="ac-sub"><a href="?tab=demand{_esc(_tab_qs_suffix(key, None))}">← Demand Board</a></p>
+<h1>Interest data status</h1>
+<p class="ac-sub">Background task behind the Demand Board's Active (12 mo) ranking.</p>
+{err_html}
+<div class="ac-card"><h2>Status</h2><p>{status}</p>
+<button class="ac-btn" id="ac-run" type="button" data-key="{_esc(key)}">Run now</button><span id="ac-run-msg"></span></div>
+<div class="ac-card"><h2>Data files</h2><div class="ac-grid">{files}</div></div>
+<div class="ac-card"><h2>Last summary</h2><div class="ac-grid">{sum_html}</div></div>
+<div class="ac-card"><h2>Top 25 by Active</h2>{top_html or '<p class="ac-sub">No summary yet.</p>'}</div>
+</div>{ACTIVITY_PAGE_SCRIPT}</body></html>"""
+    return body
+
+
+def _handle_activity_run(event, context=None):
+    """POST ?action=activity_run {key}: admin only. Runs
+    _task_rebuild_interest_activity inside the request with a hard
+    ACTIVITY_RUN_BUDGET_S budget; a repeat press continues where it
+    stopped. Returns {complete, report_saved, errors}."""
+    body = _parse_json_body(event)
+    admin_key = os.environ.get("ADMIN_KEY")
+    if not (admin_key and isinstance(body, dict) and body.get("key") == admin_key):
+        return _json_response({"error": "forbidden"}, 403)
+    try:
+        result = _task_rebuild_interest_activity(context, summary=True, budget_s=ACTIVITY_RUN_BUDGET_S)
+    except Exception as e:
+        print(f"activity_run failed: {type(e).__name__}")
+        return _json_response({"complete": False, "report_saved": False,
+                               "errors": [f"Run failed ({type(e).__name__})"]}, 500)
+    return _json_response({"complete": bool(result.get("complete")), "report_saved": bool(result.get("report_saved")),
+                           "errors": _activity_run_errors(result)})
 
 
 def _demand_active_sort_key(r):
@@ -17742,7 +18011,9 @@ DEMAND_BOARD_ACTIVE_SCRIPT = """(function() {
   var sortState = { key: null, dir: 1 };
 
   function cellText(row, colIndex) {
-    return row.children[colIndex].textContent.trim();
+    var cell = row.children[colIndex];
+    var name = cell.getAttribute('data-name');
+    return name !== null ? name : cell.textContent.trim();
   }
 
   function cellSortValue(row, colIndex) {
@@ -17803,16 +18074,132 @@ DEMAND_ACTIVE_CSS = """  #board-divider td { background: var(--bg); padding: 14p
   .nr-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink); }
   .nr-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
   #board-body tr:last-child td { border-bottom: 1px solid var(--line); border-radius: 0; }
+  .sub.activity-link { margin: -18px 0 24px; font-size: 12px; }
+  .sub.activity-link a { color: var(--muted); }
+  .sub a { color: var(--accent); }
+  .rms-tag { display: inline-block; margin-left: 6px; padding: 1px 6px; border-radius: 4px; font-size: 10px;
+    font-weight: 600; color: #B42318; background: #FDECEA; border: 1px solid #F5C2BD; vertical-align: middle;
+    white-space: nowrap; }
+  .ihs-btn { display: inline-block; margin-left: 8px; padding: 1px 8px; border: 1px solid var(--line);
+    border-radius: 999px; font-size: 11px; font-weight: 500; color: var(--accent); background: var(--card);
+    text-decoration: none; white-space: nowrap; vertical-align: middle; }
+  .ihs-btn:hover { border-color: var(--accent); }
+  td.company a.ihs-btn { border-bottom: 1px solid var(--line); }
+  .offers-link { font-size: 12px; color: var(--accent); white-space: nowrap; }
+  td.offers { white-space: nowrap; }
+  @media (max-width: 640px) {
+    .ihs-btn { display: block; width: max-content; margin: 4px 0 0; }
+    thead th, tbody td { padding-left: 8px; padding-right: 8px; }
+    thead th { white-space: normal; font-size: 11px; vertical-align: bottom; }
+    tbody td { font-size: 13px; }
+    .card { overflow-x: auto; }
+  }
 """
+
+DEMAND_NONRECENT_SUB_ADMIN = "No buyer activity in the past 12 months"
+DEMAND_NONRECENT_SUB_TENANT = "No new investor interest in the past 12 months"
+DEMAND_TENANT_SUB_TEXT = ("Ranked by recent investor interest. Counts include every investor who has expressed any "
+                          "form of interest in the name and are not firm bids. To see firm bids, visit "
+                          "trades.graciagroup.com.")
+DEMAND_TENANT_SUB_HTML = DEMAND_TENANT_SUB_TEXT.replace(
+    "trades.graciagroup.com.",
+    '<a href="https://trades.graciagroup.com" target="_blank" rel="noopener">trades.graciagroup.com</a>.')
+
+
+def _demand_offers_link_html(count, key=None, view_as=None):
+    """"Compare N offers" (N >= 2) / "View 1 offer" (N == 1) link to the
+    company's Compare page; "" for none. count = (n, compare param)."""
+    if not count or count[0] < 1:
+        return ""
+    n, param = count
+    label = "View 1 offer" if n == 1 else f"Compare {n} offers"
+    return f'<a class="offers-link" href="{_esc(_compare_href(param, key, view_as))}">{label}</a>'
+
+
+def _demand_company_ids():
+    """{company name lowercased: Pipeline company id} from companies.json
+    (cached per container version), else the deals list. {} on failure."""
+    memo = _req_cache.setdefault("demand", {})
+    if "company_ids" in memo:
+        return memo["company_ids"]
+    out = {}
+    try:
+        for d in get_deals_list():
+            cid = _deal_company_id(d) if isinstance(d, dict) else None
+            name = (_deal_company_name(d) or "").strip().lower() if isinstance(d, dict) else ""
+            if cid and name:
+                out.setdefault(name, cid)
+    except Exception as e:
+        print(f"demand company ids (deals) failed: {type(e).__name__}")
+    try:
+        for rec in _companies_list() or []:
+            if isinstance(rec, dict) and rec.get("id") is not None and str(rec.get("name") or "").strip():
+                out[str(rec["name"]).strip().lower()] = rec["id"]
+    except Exception as e:
+        print(f"demand company ids (companies) failed: {type(e).__name__}")
+    memo["company_ids"] = out
+    return out
+
+
+def _demand_offer_counts(role, scope=frozenset(), viewer_ids=frozenset()):
+    """{company name lowercased: (n, compare param)}: how many offerings the
+    Compare page (?view=compare&company=<id>) shows THIS viewer -- the same
+    _compare_offerings (Hold only for admin), _compare_visible_offerings
+    (Private / Interested-only only for admin and the deal's own team) and
+    live-intro guard (a buyer in a live intro sees only that offering, none
+    when it can't be matched). Snapshot only (no deal-fresh overlay, like
+    the other Compare entry points: no S3 reads). Memoized per request per
+    (role, scope, viewer); {} on any failure."""
+    memo = _req_cache.setdefault("demand", {})
+    mkey = ("offers", role, frozenset(scope or ()), frozenset(viewer_ids or ()))
+    if mkey in memo:
+        return memo[mkey]
+    out = {}
+    try:
+        all_offerings = _compare_offerings(include_hold=(role == "admin"), use_overlay=False)
+        visible = _compare_visible_offerings(all_offerings, role, scope)
+        vids = {str(v) for v in viewer_ids or ()}
+        buyer_companies = set()
+        if vids and role != "admin":
+            for d in get_deals_list():
+                if (isinstance(d, dict) and _deal_is_buy(d)
+                        and {str(p) for p in _deal_linked_person_ids(d)} & vids):
+                    buyer_companies.add((_deal_company_name(d) or "").strip().lower())
+        for ck, entry in visible.items():
+            name = (entry["company"] or "").strip().lower()
+            n = len(entry["deals"])
+            if name in buyer_companies:
+                live = _compare_live_intro(all_offerings.get(ck) or entry, vids)
+                own = role == "tenant" and any(_deal_owner_ids(d) & scope for d in entry["deals"])
+                if live and not own:
+                    n = 1 if live[1] and any(str(d.get("id")) == live[1] for d in entry["deals"]) else 0
+            if n:
+                out[name] = (n, entry["company_id"] or entry["company"])
+    except Exception as e:
+        print(f"demand offer counts failed (no Offers links): {type(e).__name__}: {e}")
+        out = {}
+    memo[mkey] = out
+    return out
 
 
 def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
-                 tenant_picker=False, edit_mode=False, person_id=None, account_email=None, active_layout=False):
-    """Demand Board. Admin (edit_mode) always uses the active-buyers layout;
-    tenants only when active_layout is True (DEMAND_ACTIVE_FOR_TENANTS, or
-    an admin's view_as &preview_active=1). Otherwise the tenant page is
-    exactly the pre-active layout."""
+                 tenant_picker=False, edit_mode=False, person_id=None, account_email=None, active_layout=False,
+                 offer_counts=None, restricted=None):
+    """Demand Board. Admin (edit_mode) always uses the active-buyers layout
+    ("Active (12 mo)" column, RMS Restricted tag, offers link by Sellers);
+    tenants use it when active_layout is True (DEMAND_ACTIVE_FOR_TENANTS, or
+    an admin's view_as &preview_active=1): ranked by active, Non-Recent
+    block, "I have shares" + Offers columns, RMS Restricted rows removed,
+    and NO active number anywhere in the markup. active_layout False ->
+    the pre-active tenant layout. offer_counts = {company_lower: (n,
+    compare param)} for this viewer (_demand_offer_counts)."""
     active_mode = bool(edit_mode or active_layout)
+    offer_counts = offer_counts or {}
+    if active_mode:
+        if restricted is None:
+            restricted = _rms_restricted_company_keys()
+        if not edit_mode:
+            table = [r for r in table if r["company"].strip().lower() not in restricted]
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="demand", edit_mode=edit_mode)
     tenant_picker_html = _tenant_picker_html() if tenant_picker else ""
@@ -17829,14 +18216,19 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
         nonrecent_rows = [r for r in ranked if r.get("active", 0) <= 0]
     if edit_mode:
         def _admin_row(r):
-            return (f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
-                    f'{_esc(r["company"])}</a></td>'
+            tag = (' <span class="rms-tag">RMS Restricted</span>'
+                   if r["company"].strip().lower() in restricted else "")
+            offers = _demand_offers_link_html(offer_counts.get(r["company"].strip().lower()), key, view_as)
+            return (f'<tr><td class="company" data-name="{_esc(r["company"])}">'
+                    f'<a href="{_company_href(r["company"], "demand", key, view_as)}">'
+                    f'{_esc(r["company"])}</a>{tag}</td>'
                     f'<td class="num">{r.get("active", 0)}</td>'
                     f'<td class="num">{r["total"]}</td>'
                     f'<td class="num">{r["qp"]}</td>'
                     f'<td class="num">{r["accredited"]}</td>'
                     f'<td class="num">{r["unknown"]}</td>'
-                    f'<td class="num">{r["sellers"]}</td></tr>')
+                    f'<td class="num" data-sort="{r["sellers"]}">{r["sellers"]}'
+                    f'{" " + offers if offers else ""}</td></tr>')
         rows_html = "".join(_admin_row(r) for r in active_rows)
         nonrecent_html = "".join(_admin_row(r) for r in nonrecent_rows)
         thead_html = """
@@ -17855,26 +18247,45 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     <span><span class="dot unknown"></span>Unknown &mdash; unclassified</span>
   </div>"""
     elif active_mode:
-        def _tenant_active_row(r):
-            link = (f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
-                    f'{_esc(r["company"])}</a></td>')
-            if r.get("active", 0) <= 0:
-                return (link + '<td class="num">0</td>'
-                        '<td class="num" data-sort="0">—</td><td class="num" data-sort="0">—</td>'
-                        '<td class="num" data-sort="0">—</td></tr>')
-            return (link + f'<td class="num">{r["active"]:,}</td>'
-                    f'<td class="num">{r["total"]:,}</td>'
-                    f'<td class="num">{r["qp"] + r["accredited"]:,}</td>'
-                    f'<td class="num" data-sort="{r["ticket_min_sum"]}">{_esc(_potential_demand_cell_html(r))}</td></tr>')
-        rows_html = "".join(_tenant_active_row(r) for r in active_rows)
-        nonrecent_html = "".join(_tenant_active_row(r) for r in nonrecent_rows)
+        # The active count only orders rows and splits off Non-Recent; it is
+        # never rendered (no column, no attribute) for tenants.
+        shares_email = _add_deal_email(key, view_as, account_email)
+        shares_base = _add_deal_url(shares_email) if shares_email else None
+        shares_title = f' title="Opens as {_esc(shares_email)}"' if (shares_base and key is not None) else ""
+        company_ids = _demand_company_ids() if shares_base else {}
+
+        def _tenant_active_row(r, recent):
+            name_key = r["company"].strip().lower()
+            shares = ""
+            if shares_base:
+                cid = company_ids.get(name_key)
+                url = shares_base + (f"&side=sell&company_id={urllib.parse.quote(str(cid), safe='')}"
+                                     if cid not in (None, "") else "")
+                shares = (f'<a class="ihs-btn" href="{_esc(url)}" target="_blank" rel="noopener"{shares_title}>'
+                          'I have shares</a>')
+            oc = offer_counts.get(name_key)
+            n_offers = oc[0] if oc else 0
+            cells = (f'<tr><td class="company" data-name="{_esc(r["company"])}">'
+                     f'<a href="{_company_href(r["company"], "demand", key, view_as)}">'
+                     f'{_esc(r["company"])}</a>{shares}</td>')
+            if recent:
+                cells += (f'<td class="num">{r["total"]:,}</td>'
+                          f'<td class="num">{r["qp"] + r["accredited"]:,}</td>'
+                          f'<td class="num" data-sort="{r["ticket_min_sum"]}">{_esc(_potential_demand_cell_html(r))}</td>')
+            else:
+                cells += ('<td class="num" data-sort="0">—</td><td class="num" data-sort="0">—</td>'
+                          '<td class="num" data-sort="0">—</td>')
+            return (cells + f'<td class="num offers" data-sort="{n_offers}">'
+                    f'{_demand_offers_link_html(oc, key, view_as)}</td></tr>')
+        rows_html = "".join(_tenant_active_row(r, True) for r in active_rows)
+        nonrecent_html = "".join(_tenant_active_row(r, False) for r in nonrecent_rows)
         thead_html = """
         <tr>
           <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
-          <th class="num" data-key="active" data-type="number">Active buyers<span class="arrow"></span></th>
           <th class="num" data-key="total" data-type="number">Total buyer interest<span class="arrow"></span></th>
           <th class="num" data-key="qualified" data-type="number">Qualified buyers<span class="arrow"></span></th>
           <th class="num" data-key="demand" data-type="number">Total Potential Demand<span class="arrow"></span></th>
+          <th class="num" data-key="offers" data-type="number">Offers<span class="arrow"></span></th>
         </tr>"""
         legend_html = ""
     else:
@@ -17899,7 +18310,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
                      person_id=person_id)
     # Tenant layout tightened to ~760px (4 lean columns) so it doesn't
     # float in whitespace; admin's wider 6-column table keeps 1000px.
-    wrap_max_width = "1000px" if edit_mode else "760px"
+    wrap_max_width = "1000px" if edit_mode else ("900px" if active_mode else "760px")
     # Active-buyers layout extras: every one is "" on the plain tenant
     # layout, so that page stays byte-for-byte what it was.
     active_css = board_tail_html = ""
@@ -17909,14 +18320,18 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
         ncols = 7 if edit_mode else 5
         active_css = DEMAND_ACTIVE_CSS
         board_script = DEMAND_BOARD_ACTIVE_SCRIPT
+        nr_sub = DEMAND_NONRECENT_SUB_ADMIN if edit_mode else DEMAND_NONRECENT_SUB_TENANT
         if nonrecent_rows:
             board_tail_html = (
                 f'<tbody id="board-divider"><tr class="nonrecent-divider"><td colspan="{ncols}">'
                 '<div class="nr-title">Non-Recent</div>'
-                '<div class="nr-sub">No buyer activity in the past 12 months</div></td></tr></tbody>'
+                f'<div class="nr-sub">{_esc(nr_sub)}</div></td></tr></tbody>'
                 f'<tbody id="board-body-nonrecent">{nonrecent_html}</tbody>')
-        if not edit_mode:
-            sub_text = f"{len(active_rows)} companies with active buyer interest in the past 12 months"
+        if edit_mode:
+            sub_text += (f'</p><p class="sub activity-link"><a href="?view=activity'
+                         f'{_esc(_tab_qs_suffix(key, None))}">Interest data status</a>')
+        else:
+            sub_text = DEMAND_TENANT_SUB_HTML
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -24574,6 +24989,11 @@ def _lambda_handler_impl(event, context):
             return _json_response({"error": "POST only"}, 405)
         return _handle_ownership_review(event)
 
+    if query.get("action") == "activity_run":
+        if method != "POST":
+            return _json_response({"error": "POST only"}, 405)
+        return _handle_activity_run(event, context)
+
     if query.get("action") == "tenant_approval":
         if method != "POST":
             return _json_response({"error": "POST only"}, 405)
@@ -24705,6 +25125,11 @@ def _lambda_handler_impl(event, context):
         if not is_admin_key:
             return _forbidden()
         return _handle_lookup_company_buyers(lookup_company_buyers_param)
+
+    if query.get("view") == "activity":
+        if not is_admin_key:
+            return _forbidden()
+        return _html_response(render_activity_page(query.get("key")))
 
     if query.get("view") == "ownership":
         if not is_admin_key:
@@ -24948,10 +25373,21 @@ def _lambda_handler_impl(event, context):
         # view_as preview (&preview_active=1 needs the valid admin key).
         demand_active = DEMAND_ACTIVE_FOR_TENANTS or (is_admin_key and bool(view_as)
                                                        and query.get("preview_active") == "1")
+        # Offers counts: exactly what the Compare page would show this viewer.
+        if edit_mode:
+            offer_counts = _demand_offer_counts("admin")
+        elif demand_active and tenant is not None:
+            _d_pid = tenant.get("person_id")
+            _d_scope = _firm_person_ids(_d_pid) if _d_pid is not None else frozenset()
+            offer_counts = _demand_offer_counts(
+                "tenant", _d_scope, _compare_viewer_ids(tenant, view_as if is_admin_key else identity_email))
+        else:
+            offer_counts = {}
         body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as, cef_html=cef_html,
                             anon_key_email=anon_key_email, tenant_picker=(tenant is None), edit_mode=edit_mode,
                             person_id=(tenant.get("person_id") if tenant is not None else None),
-                            account_email=account_email, active_layout=demand_active)
+                            account_email=account_email, active_layout=demand_active,
+                            offer_counts=offer_counts)
     elif tab == "mydeals":
         if tenant is None:
             body = render_my_deals_page(viewer_name, tenant_picker=True,

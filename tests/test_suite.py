@@ -13916,6 +13916,28 @@ _ab_deals = {"deals": [
     _ab_buy(8804, "Alpha Active", 9199, _ab_pts(5)),                                         # not an interest buyer
     _ab_buy(8805, "Gamma Co", 9140, _ab_old),
 ]}
+_AB_SPV = {lf.STRUCTURE_FIELD: [lf.SPV_STRUCTURE_ID]}
+
+
+def _ab_sell(did, company, cid, pid, stage, vis=None):
+    cf = dict(_AB_SPV)
+    if vis is not None:
+        cf[lf.VISIBILITY_FIELD] = vis
+    return {"id": did, "name": f"{company} sell {did}", "company": {"id": cid, "name": company},
+            "deal_stage": {"id": stage}, "custom_fields": cf_sell(cf), "people": [{"id": pid}],
+            "primary_contact_id": pid, "created_at": _ab_old, "updated_at": _ab_old}
+
+
+_ab_deals["deals"] += [
+    _ab_sell(8901, "Gamma Co", 7720, 9002, lf.STAGE_FIRM),                       # public
+    _ab_sell(8902, "Gamma Co", 7720, 9002, lf.STAGE_FIRM, lf.VIS_PRIVATE),       # someone else's Private
+    _ab_sell(8903, "Gamma Co", 7720, 9001, lf.STAGE_FIRM, lf.VIS_INTERESTED),    # the tenant's own, Interested-only
+    _ab_sell(8904, "Gamma Co", 7720, 9002, lf.STAGE_HOLD),                       # Hold: admin only
+    _ab_sell(8905, "Beta Co", 7730, 9002, lf.STAGE_INQUIRY),
+]
+_ab_companies = {"companies": [
+    {"id": 7720, "name": "Gamma Co", "custom_fields": {}}, {"id": 7730, "name": "Beta Co", "custom_fields": {}},
+    {"id": 7740, "name": "Dead Co", "custom_fields": {lf.RMS_RESTRICTED_FIELD: [lf.RMS_RESTRICTED_ID]}}]}
 _ab_interest = {"buy": {
     "Alpha Active": [9101, 9102, 9103, 9104, 9105, 9106, 9109, 9110],
     "Gamma Co": list(range(9120, 9130)),
@@ -13932,7 +13954,7 @@ _ab_first_seen = {"pairs": {"Alpha Active": {"9109": _ab_date(5), "9110": None},
 
 def _ab_fixture(with_files=True):
     objs = {"people.json": json.loads(json.dumps(_ab_people)), "interest_people.json": json.loads(json.dumps(_ab_interest)),
-            "deals.json": json.loads(json.dumps(_ab_deals)), "companies.json": {"companies": []}}
+            "deals.json": json.loads(json.dumps(_ab_deals)), "companies.json": json.loads(json.dumps(_ab_companies))}
     if with_files:
         objs[lf.INTEREST_ACTIVITY_KEY] = json.loads(json.dumps(_ab_activity))
         objs[lf.INTEREST_FIRST_SEEN_KEY] = json.loads(json.dumps(_ab_first_seen))
@@ -13982,7 +14004,8 @@ _ab_fixture()
 _ab_table = lf.get_company_table()
 _ab_admin = lf.render_page(_ab_table, "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",
                            tenant_picker=True, edit_mode=True)
-_ab_order = re.findall(r'<td class="company"><a [^>]*>([^<]+)</a>', _ab_admin)
+_AB_NAME_RE = r'<td class="company" data-name="[^"]*"><a [^>]*>([^<]+)</a>'
+_ab_order = re.findall(_AB_NAME_RE, _ab_admin)
 _ab_div = _ab_admin.find('id="board-divider"')
 check("admin Demand Board: 'Active (12 mo)' column directly after Company",
       re.search(r'>Company<span class="arrow"></span></th>\s*<th class="num" data-key="active" '
@@ -13995,42 +14018,69 @@ check("admin Demand Board: divider labelled Non-Recent with the muted sub-line, 
       '<div class="nr-sub">No buyer activity in the past 12 months</div>' in _ab_admin)
 check("admin Demand Board: Non-Recent rows keep their real totals",
       re.search(r'>Zed Dead</a></td><td class="num">0</td><td class="num">5</td>', _ab_admin) is not None)
+check("admin Demand Board: existing sub line kept + muted 'Interest data status' link (admin only)",
+      "5 companies with interested buyers" in _ab_admin
+      and '<a href="?view=activity&amp;key=test-admin-key">Interest data status</a>' in _ab_admin)
 check("admin Demand Board: sort/search script works per block (both tbodies, divider toggled)",
-      "board-body-nonrecent" in _ab_admin and "divider.hidden" in _ab_admin and "groups.forEach" in _ab_admin)
+      "board-body-nonrecent" in _ab_admin and "divider.hidden" in _ab_admin and "groups.forEach" in _ab_admin
+      and "getAttribute('data-name')" in _ab_admin)
 
-# --- Tenant layout, flag off: identical to the pre-active layout
-check("tenant Active layout is OFF by default", lf.DEMAND_ACTIVE_FOR_TENANTS is False)
-_ab_plain_tbl = [{k: v for k, v in r.items() if k != "active"} for r in _ab_table]
-_ab_ten = lf.render_page(_ab_table, "Abe", anon_key_email=AB_SELLER)
-check("tenant Demand Board (flag off): output identical whether or not rows carry 'active'",
-      _ab_ten == lf.render_page(_ab_plain_tbl, "Abe", anon_key_email=AB_SELLER))
-check("tenant Demand Board (flag off): no Active column, no Non-Recent block, original sub line and order",
-      "Active buyers" not in _ab_ten and "Non-Recent" not in _ab_ten and "board-divider" not in _ab_ten
-      and "5 companies with interested buyers" in _ab_ten
-      and re.findall(r'<td class="company"><a [^>]*>([^<]+)</a>', _ab_ten)
-      == ["Gamma Co", "Alpha Active", "Zed Dead", "Beta Co", "Dead Co"]
-      and lf.DEMAND_BOARD_SCRIPT in _ab_ten)
+# --- Tenant layout (now live): ranked by active, but no active number anywhere
+check("tenant active ranking is ON", lf.DEMAND_ACTIVE_FOR_TENANTS is True)
+_ab_on = lf.render_page(_ab_table, "Abe", anon_key_email=AB_SELLER, active_layout=True, account_email=AB_SELLER)
+_ab_on_thead = _ab_on[_ab_on.find("<thead>"):_ab_on.find("</thead>")]
+_ab_on_tables = _ab_on[_ab_on.find("<thead>"):_ab_on.find("</table>")]
+check("tenant layout: no 'Active' header or data-key=active; headers Company/Total/Qualified/Demand/Offers",
+      "Active" not in _ab_on_thead and 'data-key="active"' not in _ab_on
+      and [h for h in re.findall(r'data-type="\w+">([^<]+)<', _ab_on_thead)]
+      == ["Company", "Total buyer interest", "Qualified buyers", "Total Potential Demand", "Offers"])
+_ab_alpha_row = re.search(r'<tr><td class="company" data-name="Alpha Active">.*?</tr>', _ab_on).group(0)
+check("tenant layout: Alpha row carries total/qualified/demand/offers cells only (active 5 never rendered)",
+      re.findall(r'<td class="num[^"]*"[^>]*>([^<]*)', _ab_alpha_row)[:2] == ["8", "0"]
+      and len(re.findall(r"<td", _ab_alpha_row)) == 5 and ">5<" not in _ab_alpha_row)
+check("tenant layout: sub-header is exactly the ranking/firm-bids line with the trades link (new tab)",
+      '<p class="sub">Ranked by recent investor interest. Counts include every investor who has expressed any '
+      'form of interest in the name and are not firm bids. To see firm bids, visit '
+      '<a href="https://trades.graciagroup.com" target="_blank" rel="noopener">trades.graciagroup.com</a>.</p>'
+      in _ab_on and "companies with" not in _ab_on)
+check("tenant layout: order active desc/total/name; Non-Recent rows below the divider with em dashes",
+      re.findall(_AB_NAME_RE, _ab_on) == ["Alpha Active", "Gamma Co", "Beta Co", "Zed Dead"]
+      and _ab_on.find(">Beta Co<") < _ab_on.find('id="board-divider"') < _ab_on.find(">Zed Dead<")
+      and re.search(r'data-name="Zed Dead">.*?</td><td class="num" data-sort="0">—</td>'
+                    r'<td class="num" data-sort="0">—</td><td class="num" data-sort="0">—</td>', _ab_on))
+check("tenant layout: Non-Recent divider sub-line for tenants, spanning 5 columns",
+      '<td colspan="5"><div class="nr-title">Non-Recent</div>'
+      '<div class="nr-sub">No new investor interest in the past 12 months</div>' in _ab_on)
+check("tenant layout: no wording about clicks, tracking or activity",
+      not re.search(r"click|track|activity", _ab_on_tables + _ab_on[_ab_on.find("<h1>"):_ab_on.find("<thead>")], re.I))
+check("tenant layout: RMS Restricted company removed entirely (rows, search); admin keeps it with a red tag",
+      "Dead Co" not in _ab_on and "RMS Restricted" not in _ab_on
+      and re.search(r'>Dead Co</a> <span class="rms-tag">RMS Restricted</span></td>', _ab_admin) is not None
+      and _ab_admin.count("rms-tag\">") == 1)
 
-# --- Tenant layout, flag on
-_ab_on = lf.render_page(_ab_table, "Abe", anon_key_email=AB_SELLER, active_layout=True)
-check("tenant Active layout: 'Active buyers' directly after Company, original three columns kept",
-      re.search(r'>Company<span class="arrow"></span></th>\s*<th class="num" data-key="active" '
-                r'data-type="number">Active buyers<', _ab_on) is not None
-      and all(h in _ab_on for h in (">Total buyer interest<", ">Qualified buyers<", ">Total Potential Demand<")))
-check("tenant Active layout: sub-header counts companies with active > 0",
-      "3 companies with active buyer interest in the past 12 months" in _ab_on)
-check("tenant Active layout: active rows keep real totals; Non-Recent rows show 0 + em dashes (data-sort 0)",
-      re.search(r'>Alpha Active</a></td><td class="num">5</td><td class="num">8</td>', _ab_on) is not None
-      and '>Zed Dead</a></td><td class="num">0</td><td class="num" data-sort="0">—</td>'
-          '<td class="num" data-sort="0">—</td><td class="num" data-sort="0">—</td></tr>' in _ab_on
-      and '<td colspan="5"><div class="nr-title">Non-Recent</div>' in _ab_on
-      and _ab_on.find(">Beta Co<") < _ab_on.find('id="board-divider"') < _ab_on.find(">Zed Dead<"))
-check("tenant Active layout: no wording about clicks or tracking",
-      not re.search(r"click|track", _ab_on[_ab_on.find("<h1>"):_ab_on.find("</table>")], re.I)
-      and "click" not in lf.DEMAND_ACTIVE_CSS.lower())
+# "I have shares": signed New Order link + side/company id, new tab; none without a link.
+_ab_btns = re.findall(r'<a class="ihs-btn" href="([^"]+)" target="_blank" rel="noopener"( title="[^"]*")?>'
+                      r'I have shares</a>', _ab_on)
+check("I have shares: one button per tenant row (both blocks), New Order link + &side=sell&company_id",
+      len(_ab_btns) == 4 and all(u.startswith("https://desk.graciagroup.com/update/?action=new&amp;sso=")
+                                 for u, _t in _ab_btns)
+      and any(u.endswith("&amp;side=sell&amp;company_id=7720") for u, _t in _ab_btns)
+      and all(not t for _u, t in _ab_btns))
+_ab_saved_tok = lf._make_handoff_token
+lf._make_handoff_token = lambda email: None
+_ab_nobtn = lf.render_page(_ab_table, "Abe", anon_key_email=AB_SELLER, active_layout=True, account_email=AB_SELLER)
+lf._make_handoff_token = _ab_saved_tok
+check("I have shares: no button when _add_deal_url returns None", "ihs-btn\"" not in _ab_nobtn
+      and "I have shares" not in _ab_nobtn)
+_ab_va = lf.render_page(_ab_table, "Abe", key=ADMIN_KEY, view_as=AB_SELLER, anon_key_email=AB_SELLER,
+                        active_layout=True)
+check("I have shares: admin view_as gets the 'Opens as <email>' tooltip like + Add deal",
+      f'title="Opens as {AB_SELLER}">I have shares</a>' in _ab_va)
+check("I have shares: search/sort read data-name, so the button text never matches a search",
+      "var name = cell.getAttribute('data-name');" in _ab_on and ".ihs-btn { display: block" in _ab_on)
 
 
-# --- Request path: preview_active needs the admin key + view_as
+# --- Request path: offers + preview
 def _ab_get(query, cookies=None):
     lf._req_cache_reset()
     lf._cache.update({"version": None, "table": None})
@@ -14039,26 +14089,67 @@ def _ab_get(query, cookies=None):
     return re.sub(r"sso=[A-Za-z0-9_\-]+", "sso=X", resp.get("body") or "")
 
 
+def _ab_cmp_rows(page):
+    tbody = page[page.find("<tbody"):page.rfind("</tbody>")]
+    return len(re.findall(r'<tr class="(?![^"]*cmp-divider)[^"]*"', tbody))
+
+
 with contextlib.redirect_stdout(io.StringIO()):
     _ab_t_plain = _ab_get({"tab": "demand"}, [tenant_cookie(AB_SELLER)])
     _ab_t_prev = _ab_get({"tab": "demand", "preview_active": "1"}, [tenant_cookie(AB_SELLER)])
     _ab_adm_prev = _ab_get({"tab": "demand", "key": ADMIN_KEY, "view_as": AB_SELLER, "preview_active": "1"})
     _ab_adm_plain = _ab_get({"tab": "demand", "key": ADMIN_KEY, "view_as": AB_SELLER})
+    _ab_adm_full = _ab_get({"tab": "demand", "key": ADMIN_KEY})
     _ab_bad_prev = _ab_get({"tab": "demand", "key": "wrong-key", "view_as": AB_SELLER, "preview_active": "1"})
-check("tenant request: plain Demand Board renders (sanity)", "Demand Board" in _ab_t_plain
-      and "5 companies with interested buyers" in _ab_t_plain)
+    _ab_cmp_t = _ab_get({"view": "compare", "company": "7720"}, [tenant_cookie(AB_SELLER)])
+    _ab_cmp_a = _ab_get({"view": "compare", "company": "7720", "key": ADMIN_KEY})
+check("tenant request: Demand Board renders the ranked layout with no active number",
+      "Demand Board" in _ab_t_plain and "Ranked by recent investor interest." in _ab_t_plain
+      and 'data-key="active"' not in _ab_t_plain and "Dead Co" not in _ab_t_plain)
 check("tenant request: preview_active=1 is ignored for a non-admin (page identical)", _ab_t_prev == _ab_t_plain)
-check("admin view_as + preview_active=1 renders the tenant Active layout",
-      "Active buyers" in _ab_adm_prev and "Non-Recent" in _ab_adm_prev and "Active (12 mo)" not in _ab_adm_prev)
-check("admin view_as without preview_active keeps the plain tenant layout",
-      "Active buyers" not in _ab_adm_plain and "Non-Recent" not in _ab_adm_plain)
-check("preview_active with a wrong key never shows the Active layout", "Active buyers" not in _ab_bad_prev)
-lf.DEMAND_ACTIVE_FOR_TENANTS = True
+check("admin view_as (with or without preview_active) shows the tenant layout, never the admin column",
+      "Ranked by recent investor interest." in _ab_adm_prev and "Active (12 mo)" not in _ab_adm_prev
+      and "Ranked by recent investor interest." in _ab_adm_plain)
+check("preview_active with a wrong key never renders a Demand Board", "Ranked by recent" not in _ab_bad_prev
+      and "Active (12 mo)" not in _ab_bad_prev)
+_ab_t_gamma = re.search(r'data-name="Gamma Co".*?</tr>', _ab_t_plain).group(0)
+_ab_t_beta = re.search(r'data-name="Beta Co".*?</tr>', _ab_t_plain).group(0)
+check("Offers (tenant): Gamma = 2 (public + own Interested-only; Private and Hold never counted) = Compare rows",
+      '<td class="num offers" data-sort="2"><a class="offers-link" href="?view=compare&amp;company=7720">'
+      'Compare 2 offers</a></td>' in _ab_t_gamma and _ab_cmp_rows(_ab_cmp_t) == 2)
+check("Offers (tenant): one offering -> 'View 1 offer'; none -> empty cell sorting as 0",
+      ">View 1 offer</a></td>" in _ab_t_beta
+      and re.search(r'data-name="Zed Dead".*?<td class="num offers" data-sort="0"></td></tr>', _ab_t_plain))
+check("Offers (admin): link beside the unchanged Sellers number, admin's own count (Hold + Private) = Compare rows",
+      re.search(r'data-name="Gamma Co".*?<td class="num" data-sort="4">4 <a class="offers-link" '
+                r'href="\?view=compare&amp;company=7720&amp;key=test-admin-key">Compare 4 offers</a></td>',
+                _ab_adm_full) is not None and _ab_cmp_rows(_ab_cmp_a) == 4)
+_ab_counts_t = lf._demand_offer_counts("tenant", frozenset({9001}), frozenset())
+_ab_counts_b = lf._demand_offer_counts("buyer", frozenset(), frozenset())
+check("Offers: counts per role never include hidden deals (tenant 2 incl. own restricted, buyer 1, admin 4)",
+      _ab_counts_t["gamma co"][0] == 2 and _ab_counts_b["gamma co"][0] == 1
+      and lf._demand_offer_counts("admin")["gamma co"][0] == 4)
+
+# --- Admin ?view=activity
 with contextlib.redirect_stdout(io.StringIO()):
-    _ab_t_on = _ab_get({"tab": "demand"}, [tenant_cookie(AB_SELLER)])
-lf.DEMAND_ACTIVE_FOR_TENANTS = False
-check("DEMAND_ACTIVE_FOR_TENANTS=True turns the Active layout on for tenants",
-      "Active buyers" in _ab_t_on and "3 companies with active buyer interest in the past 12 months" in _ab_t_on)
+    _ab_act_t = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                   "queryStringParameters": {"view": "activity"},
+                                   "cookies": [tenant_cookie(AB_SELLER)]}, None)
+    _ab_act_va = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                    "queryStringParameters": {"view": "activity", "view_as": AB_SELLER}}, None)
+    _ab_act_bad = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                     "queryStringParameters": {"view": "activity", "key": "nope"}}, None)
+    _ab_run_bad = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                                     "queryStringParameters": {"action": "activity_run"},
+                                     "body": json.dumps({"key": "nope"}), "cookies": [tenant_cookie(AB_SELLER)]}, None)
+    _ab_act_ok = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                    "queryStringParameters": {"view": "activity", "key": ADMIN_KEY}}, None)
+check("?view=activity: denied for tenants, view_as without key and a wrong key; Run now 403 without the key",
+      all(r["statusCode"] == 403 for r in (_ab_act_t, _ab_act_va, _ab_act_bad, _ab_run_bad))
+      and "Interest data status" not in (_ab_act_t.get("body") or ""))
+check("?view=activity: admin page renders with the Run now button and status",
+      _ab_act_ok["statusCode"] == 200 and "Interest data status" in _ab_act_ok["body"]
+      and 'id="ac-run"' in _ab_act_ok["body"] and "Earliest click day" in _ab_act_ok["body"])
 
 
 # --- rebuild_interest_activity task
@@ -14193,13 +14284,66 @@ check("first-seen: new pairs get today's UTC date; existing entries never overwr
       and _ab_led2["baseline_at"] == _ab_led["baseline_at"] and _ab_r4["first_seen"]["added"] == 2)
 _ab_s3.fail_keys = {lf.INTEREST_FIRST_SEEN_KEY, lf.INTEREST_ACTIVITY_KEY}
 _ab_puts = len(_ab_s3.put_calls)
+_ab_puts_data = [c["Key"] for c in _ab_s3.put_calls]
 _ab_buf = io.StringIO()
 with contextlib.redirect_stdout(_ab_buf):
     _ab_r5 = lf.lambda_handler({"task": "rebuild_interest_activity"}, _AbCtx(60000))
 check("interest task: a failed read (not missing) writes nothing and logs one line per file",
-      len(_ab_s3.put_calls) == _ab_puts and _ab_r5["first_seen"]["ok"] is False and _ab_r5["clicks"]["ok"] is False
+      not any(c["Key"] in (lf.INTEREST_FIRST_SEEN_KEY, lf.INTEREST_ACTIVITY_KEY) for c in _ab_s3.put_calls[_ab_puts:])
+      and _ab_r5["first_seen"]["ok"] is False and _ab_r5["clicks"]["ok"] is False
       and "interest-first-seen: read failed" in _ab_buf.getvalue() and "interest-activity: read failed" in _ab_buf.getvalue())
 _ab_s3.fail_keys = set()
+check("interest task: a denied read is reported in plain words (action + key, no trace)",
+      _ab_r5["first_seen"]["error"] == "Access denied: s3:GetObject on s3://full-pipeline-cache/"
+      "syndicate-dash/interest-first-seen.json" and _ab_r5["first_seen"]["denied"] is True
+      and "Traceback" not in _ab_buf.getvalue())
+_ab_s3.fail_keys = {lf.INTEREST_ACTIVITY_REPORT_KEY}
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_pg = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                "queryStringParameters": {"view": "activity", "key": ADMIN_KEY}}, None)["body"]
+check("?view=activity: AccessDenied shown as the denied action and key, nothing else",
+      '<div class="ac-err">Access denied: s3:GetObject on s3://full-pipeline-cache/'
+      'syndicate-dash/interest-activity-report.json</div>' in _ab_pg and "Traceback" not in _ab_pg)
+_ab_s3.fail_keys = set()
+
+
+def _ab_run(budget):
+    saved = lf.ACTIVITY_RUN_BUDGET_S
+    lf.ACTIVITY_RUN_BUDGET_S = budget
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            r = lf.lambda_handler({"requestContext": {"http": {"method": "POST"}}, "rawPath": "/",
+                                   "queryStringParameters": {"action": "activity_run"},
+                                   "body": json.dumps({"key": ADMIN_KEY})}, _AbCtx(600000))
+    finally:
+        lf.ACTIVITY_RUN_BUDGET_S = saved
+    return r["statusCode"], json.loads(r["body"])
+
+
+_ab_s3 = _ab_task_fixture()
+_ab_rc1, _ab_rr1 = _ab_run(1e-9)
+_ab_rep1 = _ab_s3.objs[lf.INTEREST_ACTIVITY_REPORT_KEY]
+check("Run now: hard budget respected -- an exhausted budget stops cleanly, saves progress, reports more to do",
+      lf.ACTIVITY_RUN_BUDGET_S == 20 and _ab_rc1 == 200 and _ab_rr1["complete"] is False
+      and _ab_rr1["report_saved"] is True and _ab_s3.objs[lf.INTEREST_ACTIVITY_KEY]["complete"] is False
+      and _ab_rep1["summary"] is None)
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_pg2 = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                 "queryStringParameters": {"view": "activity", "key": ADMIN_KEY}}, None)["body"]
+check("?view=activity: incomplete run shows 'More to process — press Run now again'",
+      "More to process — press Run now again" in _ab_pg2)
+_ab_rc2, _ab_rr2 = _ab_run(20)
+_ab_rep2 = _ab_s3.objs[lf.INTEREST_ACTIVITY_REPORT_KEY]
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_pg3 = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                                 "queryStringParameters": {"view": "activity", "key": ADMIN_KEY}}, None)["body"]
+check("Run now: a repeat press continues and completes; report persisted with the summary",
+      _ab_rr2["complete"] is True and _ab_rep2["clicks"]["complete"] is True
+      and _ab_rep2["summary"]["top"][0][0] == "Alpha Active" and _ab_rep2["summary_at"])
+check("?view=activity: complete run shows Complete, earliest day, verdicts, top 25 and Impossible Foods line",
+      '<span class="ac-status done">Complete</span>' in _ab_pg3 and _ab_oldday in _ab_pg3
+      and "Human, automated, human, scanner" in _ab_pg3 and "<td>Alpha Active</td>" in _ab_pg3
+      and "Impossible Foods (Active / Total)" in _ab_pg3)
 check("interest task: also chained after rebuild_slim and registered as its own task",
       "rebuild_interest_activity" in lf.OUT_OF_BAND_TASKS
       and "_task_rebuild_interest_activity(context, summary=False)" in open(lf.__file__).read())
