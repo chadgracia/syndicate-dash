@@ -2230,7 +2230,7 @@ PEOPLE_SLIM_FIELDS = ("id", "email", "emails", "name", "first_name", "last_name"
 PEOPLE_SLIM_CUSTOM_FIELDS = frozenset(f"custom_label_{n}" for n in (
     1958, 3052210, 3064297, 3064330, 3064339, 3064360, 3064369, 3064645, 3065488, 3070843, 3320818, 3714334, 3740611, 3759156, 3759163, 3769275,
     3763008, 3796440, 3801446, 3923758, 3938743, 3938748, 3940558, 3940559, 3940560, 3940561, 3952402,
-    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 4011837, 3900670, 2447206, 4013323))
+    3998063, 4006089, 4006402, 4008329, 4009563, 4011458, 4011837, 3900670, 2447206, 4013323, 4012491))
 
 
 def _people_slim_schema():
@@ -2376,6 +2376,7 @@ def _build_table():
 
     buy = _interest_buy_map()
     deals_list = get_deals_list()
+    active_signals = _active_buyer_signals(people_list, deals_list)
 
     sellers_by_company = {}
     for deal in deals_list:
@@ -2421,6 +2422,7 @@ def _build_table():
         table.append({
             "company": company,
             "total": len(ids),
+            "active": _active_buyer_count(company, ids, active_signals),
             "qp": counts["qp"],
             "accredited": counts["accredited"],
             "unknown": counts["unknown"],
@@ -2442,6 +2444,9 @@ def get_company_table():
         _people_version(s3),
         _cached_object_version(s3, INTEREST_KEY),
         _cached_object_version(s3, DEALS_KEY),
+        _optional_object_version(s3, INTEREST_ACTIVITY_KEY),
+        _optional_object_version(s3, INTEREST_FIRST_SEEN_KEY),
+        datetime.now(timezone.utc).date().isoformat(),  # the 12-month window moves daily
     )
     if _cache["version"] == version and _cache["table"] is not None:
         return _cache["table"]
@@ -2449,6 +2454,439 @@ def get_company_table():
     _cache["version"] = version
     _cache["table"] = table
     return table
+
+
+# ── Active buyers (Demand Board) ──────────────────────────────────────
+# A row's "active" = how many of its buyer ids (after _interest_buyer_ids)
+# showed activity in the last ACTIVE_WINDOW_DAYS, by ANY of:
+#  a. linked (people, else person_ids) to a Buy deal for that company, any
+#     stage, live + closed list, whose created_at OR Last Confirmed
+#     (LAST_CONFIRMED_FIELD, "YYYY/MM/DD") is in the window -- never the
+#     deal's updated_at (bulk edits bump it);
+#  b. a human mailer click on any deal of that company (INTEREST_ACTIVITY_KEY);
+#  c. the person's own Pipeline created_at (people-slim) -- never updated_at;
+#  d. the (company, person) pair's first_seen date (INTEREST_FIRST_SEEN_KEY;
+#     null = pre-ledger baseline, never active).
+# Both files are written ONLY by the out-of-band task
+# {"task": "rebuild_interest_activity"} (also chained after rebuild_slim);
+# the request path just reads them and fails soft when they're missing.
+ACTIVE_WINDOW_DAYS = 365
+DEMAND_ACTIVE_FOR_TENANTS = False   # tenant Demand Board "Active buyers" layout (admin preview: &preview_active=1)
+LAST_CONFIRMED_FIELD = "custom_label_4012491"
+INTEREST_ACTIVITY_KEY = "syndicate-dash/interest-activity.json"
+INTEREST_FIRST_SEEN_KEY = "syndicate-dash/interest-first-seen.json"
+CLICK_LOG_PREFIX = "click-log/"
+_CLICK_DAY_RE = re.compile(r"^click-log/(\d{4}-\d{2}-\d{2})/$")
+# Only this explicit verdict counts as a human click (case-insensitive);
+# every other value (scanner / automated / blank / unknown) is skipped.
+HUMAN_CLICK_VERDICTS = frozenset({"human"})
+INTEREST_TASK_BUDGET_FRACTION = 0.7
+INTEREST_TASK_DEFAULT_REMAINING_S = 300   # no Lambda context (local run)
+CLICK_FETCH_WORKERS = 16
+
+
+def _optional_object_version(s3, key):
+    """_cached_object_version, or None when the key is missing/unreadable
+    (remembered for the request and for S3_VERSION_TTL_SECONDS, so a
+    missing optional file costs one HEAD per minute, never an error)."""
+    versions = _req_cache["object_version"]
+    if key in versions:
+        return versions[key]
+    hit = _s3_version_cache.get(key)
+    if hit is not None and hit[0] is None and time.monotonic() - hit[1] < S3_VERSION_TTL_SECONDS:
+        versions[key] = None
+        return None
+    try:
+        return _cached_object_version(s3, key)
+    except Exception:
+        _s3_version_cache[key] = (None, time.monotonic())
+        versions[key] = None
+        return None
+
+
+def _optional_versioned_s3_json(key, perf_category):
+    """_versioned_s3_json for an optional dict file: {} when it's missing,
+    unreadable or not a dict (one log line on a read/parse failure)."""
+    s3 = _s3_client()
+    if _optional_object_version(s3, key) is None:
+        return {}
+    try:
+        value = _versioned_s3_json(key, perf_category)
+    except Exception as e:
+        print(f"active-buyers: {key} read failed: {e}")
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _active_cutoff(now=None):
+    return (now or datetime.now(timezone.utc)) - timedelta(days=ACTIVE_WINDOW_DAYS)
+
+
+def _deal_last_confirmed_dt(deal):
+    """The deal's Last Confirmed date (LAST_CONFIRMED_FIELD, Pipeline
+    "YYYY/MM/DD"; ISO dates also accepted) as an aware datetime, or None."""
+    raw = (deal.get("custom_fields") or {}).get(LAST_CONFIRMED_FIELD)
+    if isinstance(raw, list):
+        raw = raw[0] if raw else None
+    if isinstance(raw, dict):
+        raw = raw.get("value")
+    if raw is None or not str(raw).strip():
+        return None
+    return _parse_dt(str(raw).strip())
+
+
+def _deal_is_recent_buy(deal, cutoff):
+    """Signal a: created_at or Last Confirmed inside the window. The deal's
+    updated_at is deliberately NOT read."""
+    for dt in (_parse_pipeline_ts(deal.get("created_at")), _deal_last_confirmed_dt(deal)):
+        if dt is not None and dt >= cutoff:
+            return True
+    return False
+
+
+def _recent_pids_by_company(mapping, cutoff, date_only=False):
+    """{company: {pid: iso-or-date-or-null}} -> {company_lower: {pid}} whose
+    value parses to a time inside the window (null / unparsable = no)."""
+    out = {}
+    if not isinstance(mapping, dict):
+        return out
+    cutoff_date = cutoff.date()
+    for company, people in mapping.items():
+        if not isinstance(people, dict):
+            continue
+        key = str(company).strip().lower()
+        for pid, stamp in people.items():
+            if not stamp:
+                continue
+            dt = _parse_dt(str(stamp))
+            if dt is None:
+                continue
+            if (dt.date() >= cutoff_date) if date_only else (dt >= cutoff):
+                out.setdefault(key, set()).add(str(pid))
+    return out
+
+
+def _active_buyer_signals(people_list, deals_list, activity=None, first_seen=None, now=None):
+    """Everything _active_buyer_count needs, computed once per table build:
+    {"deals": {company_lower: {pid}}, "clicks": {...}, "first_seen": {...},
+    "created": {pid}}. activity / first_seen default to the two S3 files
+    (missing -> {} -> those signals contribute nothing)."""
+    cutoff = _active_cutoff(now)
+    if activity is None:
+        activity = _optional_versioned_s3_json(INTEREST_ACTIVITY_KEY, "s3_interest_activity")
+    if first_seen is None:
+        first_seen = _optional_versioned_s3_json(INTEREST_FIRST_SEEN_KEY, "s3_interest_first_seen")
+    deals = {}
+    for d in deals_list or []:
+        if not isinstance(d, dict) or not _deal_is_buy(d):
+            continue
+        company = (_deal_company_name(d) or "").strip().lower()
+        if not company or not _deal_is_recent_buy(d, cutoff):
+            continue
+        deals.setdefault(company, set()).update(str(p) for p in _deal_linked_person_ids(d))
+    created = set()
+    for rec in people_list or []:
+        pid = rec.get("id")
+        if pid is None:
+            continue
+        dt = _parse_pipeline_ts(rec.get("created_at"))
+        if dt is not None and dt >= cutoff:
+            created.add(str(pid))
+    return {"deals": deals,
+            "clicks": _recent_pids_by_company((activity or {}).get("clicks"), cutoff),
+            "first_seen": _recent_pids_by_company((first_seen or {}).get("pairs"), cutoff, date_only=True),
+            "created": created}
+
+
+def _active_buyer_count(company, ids, signals):
+    """How many of a row's buyer ids are active -- always <= len(ids)."""
+    key = (company or "").strip().lower()
+    recent = (signals["deals"].get(key, set()) | signals["clicks"].get(key, set())
+              | signals["first_seen"].get(key, set()))
+    created = signals["created"]
+    return sum(1 for pid in ids if str(pid) in recent or str(pid) in created)
+
+
+# ── Out-of-band {"task": "rebuild_interest_activity"} ──────────────────
+def _s3_is_missing(err):
+    code = ""
+    resp = getattr(err, "response", None)
+    if isinstance(resp, dict):
+        code = str((resp.get("Error") or {}).get("Code") or "")
+    return code in ("NoSuchKey", "404", "NotFound") or "NoSuchKey" in str(err)
+
+
+def _read_task_json(s3, key):
+    """(parsed, missing). Raises on any failure other than a missing key."""
+    try:
+        obj = s3.get_object(Bucket=BUCKET, Key=key)
+    except Exception as e:
+        if _s3_is_missing(e):
+            return None, True
+        raise
+    return json.loads(obj["Body"].read()), False
+
+
+def _write_task_json(s3, key, data):
+    s3.put_object(Bucket=BUCKET, Key=key, ContentType="application/json",
+                  Body=json.dumps(data, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    _s3_version_cache.pop(key, None)
+    _req_cache["object_version"].pop(key, None)
+
+
+def _task_deadline(context):
+    """monotonic() deadline = INTEREST_TASK_BUDGET_FRACTION of the Lambda
+    time remaining now."""
+    remaining = None
+    try:
+        remaining = context.get_remaining_time_in_millis() / 1000.0
+    except Exception:
+        pass
+    if not remaining or remaining <= 0:
+        remaining = INTEREST_TASK_DEFAULT_REMAINING_S
+    return time.monotonic() + remaining * INTEREST_TASK_BUDGET_FRACTION
+
+
+def _update_first_seen_ledger(s3, now):
+    """interest-first-seen.json {"pairs": {company: {pid: date|null}},
+    "baseline_at"}. First run (file missing): every current interest pair
+    = null (baseline, never active). Later runs: a new pair = today's UTC
+    date. Existing entries are never overwritten; vanished pairs stay. A
+    failed read (other than missing) or a malformed file writes nothing."""
+    try:
+        ledger, missing = _read_task_json(s3, INTEREST_FIRST_SEEN_KEY)
+    except Exception as e:
+        print(f"interest-first-seen: read failed, nothing written: {e}")
+        return {"ok": False, "error": "read failed"}
+    if not missing and not (isinstance(ledger, dict) and isinstance(ledger.get("pairs"), dict)):
+        print("interest-first-seen: existing file malformed, nothing written")
+        return {"ok": False, "error": "malformed"}
+    buy = _interest_buy_map()
+    baseline = missing
+    pairs = {} if baseline else ledger["pairs"]
+    stamp = None if baseline else now.date().isoformat()
+    added = 0
+    for company, ids in (buy or {}).items():
+        if not isinstance(ids, list) or not ids:
+            continue
+        slot = pairs.get(company)
+        if not isinstance(slot, dict):
+            slot = pairs[company] = {}
+        for pid in ids:
+            k = str(pid)
+            if k not in slot:
+                slot[k] = stamp
+                added += 1
+    if baseline or added:
+        _write_task_json(s3, INTEREST_FIRST_SEEN_KEY, {
+            "pairs": pairs,
+            "baseline_at": _iso_utc(now.timestamp()) if baseline else ledger.get("baseline_at")})
+    return {"ok": True, "baseline": baseline, "added": added,
+            "pairs": sum(len(v) for v in pairs.values() if isinstance(v, dict))}
+
+
+def _list_click_days(s3):
+    days, token = [], None
+    while True:
+        kwargs = {"Bucket": BUCKET, "Prefix": CLICK_LOG_PREFIX, "Delimiter": "/"}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        for p in resp.get("CommonPrefixes") or []:
+            m = _CLICK_DAY_RE.match(p.get("Prefix") or "")
+            if m:
+                days.append(m.group(1))
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+        if not token:
+            break
+    return sorted(set(days))
+
+
+def _list_click_keys(s3, day, deadline):
+    """Every object key under click-log/<day>/, or None if the deadline hit."""
+    keys, token = [], None
+    while True:
+        if time.monotonic() >= deadline:
+            return None
+        kwargs = {"Bucket": BUCKET, "Prefix": f"{CLICK_LOG_PREFIX}{day}/"}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kwargs)
+        keys.extend(o["Key"] for o in resp.get("Contents") or [] if o.get("Key", "").endswith(".json"))
+        if not resp.get("IsTruncated"):
+            return keys
+        token = resp.get("NextContinuationToken")
+        if not token:
+            return keys
+
+
+def _click_ts_iso(raw, day):
+    """A click record's ts (ISO string or epoch s/ms) as ISO UTC; falls back
+    to the day's midnight when missing/unparsable."""
+    dt = None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            dt = datetime.fromtimestamp(raw / 1000.0 if raw > 1e12 else float(raw), tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            dt = None
+    elif raw:
+        dt = _parse_dt(str(raw).strip())
+    if dt is None:
+        return f"{day}T00:00:00Z"
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _process_click_day(s3, day, deal_company, clicks, deadline):
+    """Read every click object of one day (never modified) and merge human
+    clicks into clicks {company: {pid: latest iso}} (max per pair, so a
+    re-run is idempotent). Returns the day's stats, or None when the
+    deadline hit before the day finished."""
+    keys = _list_click_keys(s3, day, deadline)
+    if keys is None:
+        return None
+    stats = {"objects": len(keys), "human": 0, "counted": 0, "unknown_deal": 0, "unreadable": 0, "verdicts": {}}
+
+    def fetch(key):
+        try:
+            return json.loads(s3.get_object(Bucket=BUCKET, Key=key)["Body"].read())
+        except Exception:
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=CLICK_FETCH_WORKERS) as pool:
+        for start in range(0, len(keys), 200):
+            if time.monotonic() >= deadline:
+                return None
+            for click in pool.map(fetch, keys[start:start + 200]):
+                if not isinstance(click, dict):
+                    stats["unreadable"] += 1
+                    continue
+                verdict = str(click.get("verdict") or "").strip()
+                stats["verdicts"][verdict or "(blank)"] = stats["verdicts"].get(verdict or "(blank)", 0) + 1
+                if verdict.lower() not in HUMAN_CLICK_VERDICTS:
+                    continue
+                stats["human"] += 1
+                pid, did = click.get("pid"), click.get("did")
+                company = deal_company.get(str(did).strip()) if did is not None else None
+                if pid is None or str(pid).strip() == "" or not company:
+                    stats["unknown_deal"] += 1
+                    continue
+                iso = _click_ts_iso(click.get("ts"), day)
+                slot = clicks.setdefault(company, {})
+                k = str(pid).strip()
+                if k not in slot or iso > slot[k]:
+                    slot[k] = iso
+                stats["counted"] += 1
+    return stats
+
+
+def _update_click_activity(s3, now, deadline):
+    """interest-activity.json: {"clicks": {company: {pid: latest_click_iso}},
+    "processed_days", "earliest_day", "built_at", "complete", "day_stats",
+    "verdicts_seen"}. Processes click-log days not yet in processed_days,
+    plus today and yesterday every run (those two are never marked
+    processed, so a late click is always picked up). Stops at the deadline
+    and saves progress. Never deletes or modifies click-log objects. A
+    failed read of the existing file (other than missing) writes nothing."""
+    try:
+        data, missing = _read_task_json(s3, INTEREST_ACTIVITY_KEY)
+    except Exception as e:
+        print(f"interest-activity: read failed, nothing written: {e}")
+        return {"ok": False, "error": "read failed"}
+    if missing:
+        data = {}
+    if not isinstance(data, dict) or not isinstance(data.get("clicks", {}), dict):
+        print("interest-activity: existing file malformed, nothing written")
+        return {"ok": False, "error": "malformed"}
+    clicks = data.get("clicks") or {}
+    processed = set(data.get("processed_days") or [])
+    day_stats = data.get("day_stats") if isinstance(data.get("day_stats"), dict) else {}
+    verdicts_seen = data.get("verdicts_seen") if isinstance(data.get("verdicts_seen"), dict) else {}
+
+    days = _list_click_days(s3)
+    today = now.date().isoformat()
+    yesterday = (now.date() - timedelta(days=1)).isoformat()
+    recent = [d for d in (today, yesterday) if d in days]
+    backlog = [d for d in days if d not in processed and d not in (today, yesterday)]
+    deal_company = {}
+    for d in get_deals_list():
+        name = (_deal_company_name(d) or "").strip() if isinstance(d, dict) else ""
+        if name and d.get("id") is not None:
+            deal_company[str(d.get("id")).strip()] = name
+
+    run = {"days_processed": 0, "objects": 0, "human_clicks": 0, "counted": 0, "unknown_deal": 0,
+           "verdicts": {}}
+    complete = True
+    for day in recent + backlog:
+        if time.monotonic() >= deadline:
+            complete = False
+            break
+        st = _process_click_day(s3, day, deal_company, clicks, deadline)
+        if st is None:
+            complete = False
+            break
+        run["days_processed"] += 1
+        run["objects"] += st["objects"]
+        run["human_clicks"] += st["human"]
+        run["counted"] += st["counted"]
+        run["unknown_deal"] += st["unknown_deal"]
+        for v, n in st["verdicts"].items():
+            run["verdicts"][v] = run["verdicts"].get(v, 0) + n
+            verdicts_seen[v] = max(verdicts_seen.get(v) or "", day)
+        day_stats[day] = {"objects": st["objects"], "human": st["human"], "counted": st["counted"]}
+        if day not in (today, yesterday):
+            processed.add(day)
+
+    out = {"clicks": clicks, "processed_days": sorted(processed), "earliest_day": days[0] if days else None,
+           "built_at": _iso_utc(), "complete": complete and all(d in processed for d in days
+                                                                if d not in (today, yesterday)),
+           "day_stats": day_stats, "verdicts_seen": verdicts_seen}
+    _write_task_json(s3, INTEREST_ACTIVITY_KEY, out)
+    run.update({"ok": True, "complete": out["complete"], "earliest_day": out["earliest_day"],
+                "days_found": len(days), "days_done": len(processed),
+                "verdicts_seen": sorted(verdicts_seen)})
+    return run
+
+
+def _active_summary(top=25):
+    """Post-run summary of the freshly built Demand table (counts only)."""
+    _cache["version"] = None
+    table = _build_table()
+    ranked = sorted(table, key=_demand_active_sort_key)
+    imp = next((r for r in table if r["company"].strip().lower() == "impossible foods"), None)
+    return {"companies": len(table), "active": sum(1 for r in table if r["active"] > 0),
+            "non_recent": sum(1 for r in table if r["active"] == 0),
+            "top": [[r["company"], r["active"], r["total"]] for r in ranked[:top]],
+            "impossible_foods": [imp["active"], imp["total"]] if imp else None}
+
+
+def _task_rebuild_interest_activity(context=None, summary=True):
+    """Out-of-band {"task": "rebuild_interest_activity"}: update the
+    first-seen ledger, then the click summary within the time budget, then
+    (time permitting) return a counts summary. Never renders a page."""
+    deadline = _task_deadline(context)
+    s3 = _s3_client()
+    now = datetime.now(timezone.utc)
+    result = {"task": "rebuild_interest_activity"}
+    for name, fn in (("first_seen", lambda: _update_first_seen_ledger(s3, now)),
+                     ("clicks", lambda: _update_click_activity(s3, now, deadline))):
+        try:
+            result[name] = fn()
+        except Exception as e:
+            print(f"rebuild_interest_activity {name} failed: {e}")
+            result[name] = {"ok": False, "error": type(e).__name__}
+    if summary and time.monotonic() < deadline:
+        try:
+            result["summary"] = _active_summary()
+        except Exception as e:
+            print(f"rebuild_interest_activity summary failed: {e}")
+    return result
+
+
+def _demand_active_sort_key(r):
+    """Active-layout default order: active desc, total desc, company name."""
+    return (-r.get("active", 0), -r["total"], r["company"].lower())
 
 
 # Separate module-level cache for the raw deals.json list, used by My Deals.
@@ -17219,8 +17657,159 @@ def _message_page(title, message, show_signin=False, show_sell_cta=False, show_s
 </html>"""
 
 
+# Demand Board client-side search/sort. DEMAND_BOARD_SCRIPT = the plain
+# tenant layout (unchanged); DEMAND_BOARD_ACTIVE_SCRIPT = the active-buyers
+# layout (two row blocks, sorted within each, search across both).
+DEMAND_BOARD_SCRIPT = """(function() {
+  var tbody = document.getElementById('board-body');
+  var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
+  var search = document.getElementById('search');
+  var emptyState = document.getElementById('empty-state');
+  var headers = document.querySelectorAll('#board thead th');
+  var sortState = { key: null, dir: 1 };
+
+  function cellText(row, colIndex) {
+    return row.children[colIndex].textContent.trim();
+  }
+
+  function cellSortValue(row, colIndex) {
+    var cell = row.children[colIndex];
+    var sortAttr = cell.getAttribute('data-sort');
+    return sortAttr !== null ? sortAttr : cell.textContent.trim();
+  }
+
+  function applyFilter() {
+    var q = search.value.trim().toLowerCase();
+    var visibleCount = 0;
+    rows.forEach(function(row) {
+      var name = cellText(row, 0).toLowerCase();
+      var match = name.indexOf(q) !== -1;
+      row.hidden = !match;
+      if (match) visibleCount++;
+    });
+    emptyState.hidden = visibleCount !== 0;
+  }
+
+  function applySort(colIndex, key, type) {
+    var dir = (sortState.key === key) ? -sortState.dir : 1;
+    sortState = { key: key, dir: dir };
+    headers.forEach(function(h) {
+      var arrow = h.querySelector('.arrow');
+      if (!arrow) return;
+      arrow.textContent = '';
+    });
+    var activeHeader = headers[colIndex];
+    var arrow = activeHeader.querySelector('.arrow');
+    if (arrow) arrow.textContent = dir === 1 ? '\\u25B2' : '\\u25BC';
+
+    rows.sort(function(a, b) {
+      if (type === 'number') {
+        var av = cellSortValue(a, colIndex);
+        var bv = cellSortValue(b, colIndex);
+        return (parseFloat(av) - parseFloat(bv)) * dir;
+      }
+      var av = cellText(a, colIndex);
+      var bv = cellText(b, colIndex);
+      return av.localeCompare(bv) * dir;
+    });
+    rows.forEach(function(row) { tbody.appendChild(row); });
+  }
+
+  search.addEventListener('input', applyFilter);
+  headers.forEach(function(h, idx) {
+    h.addEventListener('click', function() {
+      applySort(idx, h.getAttribute('data-key'), h.getAttribute('data-type'));
+    });
+  });
+})();
+"""
+
+DEMAND_BOARD_ACTIVE_SCRIPT = """(function() {
+  // Active-buyers layout: rows live in two blocks (#board-body = active,
+  // #board-body-nonrecent = Non-Recent, under the divider). Sorting works
+  // within each block; search filters both and hides the divider when no
+  // Non-Recent row matches.
+  var bodies = [document.getElementById('board-body'), document.getElementById('board-body-nonrecent')]
+    .filter(function(b) { return !!b; });
+  var groups = bodies.map(function(b) { return Array.prototype.slice.call(b.querySelectorAll('tr')); });
+  var divider = document.getElementById('board-divider');
+  var search = document.getElementById('search');
+  var emptyState = document.getElementById('empty-state');
+  var headers = document.querySelectorAll('#board thead th');
+  var sortState = { key: null, dir: 1 };
+
+  function cellText(row, colIndex) {
+    return row.children[colIndex].textContent.trim();
+  }
+
+  function cellSortValue(row, colIndex) {
+    var cell = row.children[colIndex];
+    var sortAttr = cell.getAttribute('data-sort');
+    return sortAttr !== null ? sortAttr : cell.textContent.trim().replace(/,/g, '');
+  }
+
+  function applyFilter() {
+    var q = search.value.trim().toLowerCase();
+    var visibleCount = 0;
+    groups.forEach(function(rows, gi) {
+      var groupVisible = 0;
+      rows.forEach(function(row) {
+        var match = cellText(row, 0).toLowerCase().indexOf(q) !== -1;
+        row.hidden = !match;
+        if (match) groupVisible++;
+      });
+      visibleCount += groupVisible;
+      if (gi === 1 && divider) divider.hidden = groupVisible === 0;
+    });
+    emptyState.hidden = visibleCount !== 0;
+  }
+
+  function applySort(colIndex, key, type) {
+    var dir = (sortState.key === key) ? -sortState.dir : 1;
+    sortState = { key: key, dir: dir };
+    headers.forEach(function(h) {
+      var arrow = h.querySelector('.arrow');
+      if (!arrow) return;
+      arrow.textContent = '';
+    });
+    var arrow = headers[colIndex].querySelector('.arrow');
+    if (arrow) arrow.textContent = dir === 1 ? '\\u25B2' : '\\u25BC';
+    groups.forEach(function(rows, gi) {
+      rows.sort(function(a, b) {
+        if (type === 'number') {
+          return (parseFloat(cellSortValue(a, colIndex)) - parseFloat(cellSortValue(b, colIndex))) * dir;
+        }
+        return cellText(a, colIndex).localeCompare(cellText(b, colIndex)) * dir;
+      });
+      rows.forEach(function(row) { bodies[gi].appendChild(row); });
+    });
+  }
+
+  search.addEventListener('input', applyFilter);
+  headers.forEach(function(h, idx) {
+    h.addEventListener('click', function() {
+      applySort(idx, h.getAttribute('data-key'), h.getAttribute('data-type'));
+    });
+  });
+})();
+"""
+
+DEMAND_ACTIVE_CSS = """  #board-divider td { background: var(--bg); padding: 14px 16px 10px; border-top: 1px solid var(--line);
+    border-bottom: 1px solid var(--line); }
+  #board-divider tr:hover { background: transparent; }
+  .nr-title { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink); }
+  .nr-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  #board-body tr:last-child td { border-bottom: 1px solid var(--line); border-radius: 0; }
+"""
+
+
 def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_key_email="admin",
-                 tenant_picker=False, edit_mode=False, person_id=None, account_email=None):
+                 tenant_picker=False, edit_mode=False, person_id=None, account_email=None, active_layout=False):
+    """Demand Board. Admin (edit_mode) always uses the active-buyers layout;
+    tenants only when active_layout is True (DEMAND_ACTIVE_FOR_TENANTS, or
+    an admin's view_as &preview_active=1). Otherwise the tenant page is
+    exactly the pre-active layout."""
+    active_mode = bool(edit_mode or active_layout)
     feature_box_html, feature_list_html = _feature_section_html(tenant_picker, anon_key_email, key=key,
                                                                    page="demand", edit_mode=edit_mode)
     tenant_picker_html = _tenant_picker_html() if tenant_picker else ""
@@ -17230,20 +17819,27 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     # back the admin-only tier legend/dot below.
     unknown_css_var = "    --unknown: #6b7280;\n" if edit_mode else ""
     dot_unknown_css = "  .dot.unknown { background: var(--unknown); }\n" if edit_mode else ""
+    active_rows, nonrecent_rows = [], []
+    if active_mode:
+        ranked = sorted(table, key=_demand_active_sort_key)
+        active_rows = [r for r in ranked if r.get("active", 0) > 0]
+        nonrecent_rows = [r for r in ranked if r.get("active", 0) <= 0]
     if edit_mode:
-        rows_html = "".join(
-            f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
-            f'{_esc(r["company"])}</a></td>'
-            f'<td class="num">{r["total"]}</td>'
-            f'<td class="num">{r["qp"]}</td>'
-            f'<td class="num">{r["accredited"]}</td>'
-            f'<td class="num">{r["unknown"]}</td>'
-            f'<td class="num">{r["sellers"]}</td></tr>'
-            for r in table
-        )
+        def _admin_row(r):
+            return (f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
+                    f'{_esc(r["company"])}</a></td>'
+                    f'<td class="num">{r.get("active", 0)}</td>'
+                    f'<td class="num">{r["total"]}</td>'
+                    f'<td class="num">{r["qp"]}</td>'
+                    f'<td class="num">{r["accredited"]}</td>'
+                    f'<td class="num">{r["unknown"]}</td>'
+                    f'<td class="num">{r["sellers"]}</td></tr>')
+        rows_html = "".join(_admin_row(r) for r in active_rows)
+        nonrecent_html = "".join(_admin_row(r) for r in nonrecent_rows)
         thead_html = """
         <tr>
           <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
+          <th class="num" data-key="active" data-type="number">Active (12 mo)<span class="arrow"></span></th>
           <th class="num" data-key="total" data-type="number">Total buyers<span class="arrow"></span></th>
           <th class="num" data-key="qp" data-type="number">QP<span class="arrow"></span></th>
           <th class="num" data-key="accredited" data-type="number">Accredited<span class="arrow"></span></th>
@@ -17255,6 +17851,29 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     <span><span class="dot accredited"></span>Accredited &mdash; IQF Status Yes / Unnecessary</span>
     <span><span class="dot unknown"></span>Unknown &mdash; unclassified</span>
   </div>"""
+    elif active_mode:
+        def _tenant_active_row(r):
+            link = (f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
+                    f'{_esc(r["company"])}</a></td>')
+            if r.get("active", 0) <= 0:
+                return (link + '<td class="num">0</td>'
+                        '<td class="num" data-sort="0">—</td><td class="num" data-sort="0">—</td>'
+                        '<td class="num" data-sort="0">—</td></tr>')
+            return (link + f'<td class="num">{r["active"]:,}</td>'
+                    f'<td class="num">{r["total"]:,}</td>'
+                    f'<td class="num">{r["qp"] + r["accredited"]:,}</td>'
+                    f'<td class="num" data-sort="{r["ticket_min_sum"]}">{_esc(_potential_demand_cell_html(r))}</td></tr>')
+        rows_html = "".join(_tenant_active_row(r) for r in active_rows)
+        nonrecent_html = "".join(_tenant_active_row(r) for r in nonrecent_rows)
+        thead_html = """
+        <tr>
+          <th data-key="company" data-type="string">Company<span class="arrow"></span></th>
+          <th class="num" data-key="active" data-type="number">Active buyers<span class="arrow"></span></th>
+          <th class="num" data-key="total" data-type="number">Total buyer interest<span class="arrow"></span></th>
+          <th class="num" data-key="qualified" data-type="number">Qualified buyers<span class="arrow"></span></th>
+          <th class="num" data-key="demand" data-type="number">Total Potential Demand<span class="arrow"></span></th>
+        </tr>"""
+        legend_html = ""
     else:
         rows_html = "".join(
             f'<tr><td class="company"><a href="{_company_href(r["company"], "demand", key, view_as)}">'
@@ -17278,6 +17897,23 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     # Tenant layout tightened to ~760px (4 lean columns) so it doesn't
     # float in whitespace; admin's wider 6-column table keeps 1000px.
     wrap_max_width = "1000px" if edit_mode else "760px"
+    # Active-buyers layout extras: every one is "" on the plain tenant
+    # layout, so that page stays byte-for-byte what it was.
+    active_css = board_tail_html = ""
+    sub_text = f"{len(table)} companies with interested buyers"
+    board_script = DEMAND_BOARD_SCRIPT
+    if active_mode:
+        ncols = 7 if edit_mode else 5
+        active_css = DEMAND_ACTIVE_CSS
+        board_script = DEMAND_BOARD_ACTIVE_SCRIPT
+        if nonrecent_rows:
+            board_tail_html = (
+                f'<tbody id="board-divider"><tr class="nonrecent-divider"><td colspan="{ncols}">'
+                '<div class="nr-title">Non-Recent</div>'
+                '<div class="nr-sub">No buyer activity in the past 12 months</div></td></tr></tbody>'
+                f'<tbody id="board-body-nonrecent">{nonrecent_html}</tbody>')
+        if not edit_mode:
+            sub_text = f"{len(active_rows)} companies with active buyer interest in the past 12 months"
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -17377,7 +18013,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
   .dot {{ width: 8px; height: 8px; border-radius: 50%; display: inline-block; }}
   .dot.qp {{ background: var(--qp); }}
   .dot.accredited {{ background: var(--accredited); }}
-{dot_unknown_css}  .empty {{ padding: 40px; text-align: center; color: var(--muted); }}
+{dot_unknown_css}{active_css}  .empty {{ padding: 40px; text-align: center; color: var(--muted); }}
   .ei-msg {{ display: inline-block; font-size: 11px; margin-left: 6px; color: var(--muted); }}
   .ei-msg.saving {{ color: var(--muted); }}
   .ei-msg.saved {{ color: var(--qp); }}
@@ -17407,7 +18043,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
     <div>
       <h1>Demand Board</h1>
       {raised_headline_html}
-      <p class="sub">{len(table)} companies with interested buyers</p>
+      <p class="sub">{sub_text}</p>
     </div>
   </div>
   {tenant_picker_html}
@@ -17420,7 +18056,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
       </thead>
       <tbody id="board-body">
         {rows_html}
-      </tbody>
+      </tbody>{board_tail_html}
     </table>
     <div class="empty" id="empty-state" hidden>No matching companies.</div>
   </div>
@@ -17431,69 +18067,7 @@ def render_page(table, viewer_name, key=None, view_as=None, cef_html="", anon_ke
   </div>
 </div>
 <script>
-(function() {{
-  var tbody = document.getElementById('board-body');
-  var rows = Array.prototype.slice.call(tbody.querySelectorAll('tr'));
-  var search = document.getElementById('search');
-  var emptyState = document.getElementById('empty-state');
-  var headers = document.querySelectorAll('#board thead th');
-  var sortState = {{ key: null, dir: 1 }};
-
-  function cellText(row, colIndex) {{
-    return row.children[colIndex].textContent.trim();
-  }}
-
-  function cellSortValue(row, colIndex) {{
-    var cell = row.children[colIndex];
-    var sortAttr = cell.getAttribute('data-sort');
-    return sortAttr !== null ? sortAttr : cell.textContent.trim();
-  }}
-
-  function applyFilter() {{
-    var q = search.value.trim().toLowerCase();
-    var visibleCount = 0;
-    rows.forEach(function(row) {{
-      var name = cellText(row, 0).toLowerCase();
-      var match = name.indexOf(q) !== -1;
-      row.hidden = !match;
-      if (match) visibleCount++;
-    }});
-    emptyState.hidden = visibleCount !== 0;
-  }}
-
-  function applySort(colIndex, key, type) {{
-    var dir = (sortState.key === key) ? -sortState.dir : 1;
-    sortState = {{ key: key, dir: dir }};
-    headers.forEach(function(h) {{
-      var arrow = h.querySelector('.arrow');
-      if (!arrow) return;
-      arrow.textContent = '';
-    }});
-    var activeHeader = headers[colIndex];
-    var arrow = activeHeader.querySelector('.arrow');
-    if (arrow) arrow.textContent = dir === 1 ? '\\u25B2' : '\\u25BC';
-
-    rows.sort(function(a, b) {{
-      if (type === 'number') {{
-        var av = cellSortValue(a, colIndex);
-        var bv = cellSortValue(b, colIndex);
-        return (parseFloat(av) - parseFloat(bv)) * dir;
-      }}
-      var av = cellText(a, colIndex);
-      var bv = cellText(b, colIndex);
-      return av.localeCompare(bv) * dir;
-    }});
-    rows.forEach(function(row) {{ tbody.appendChild(row); }});
-  }}
-
-  search.addEventListener('input', applyFilter);
-  headers.forEach(function(h, idx) {{
-    h.addEventListener('click', function() {{
-      applySort(idx, h.getAttribute('data-key'), h.getAttribute('data-type'));
-    }});
-  }});
-}})();
-</script>
+{board_script}</script>
 {_feature_toggle_script_html(key if edit_mode else None)}
 </body>
 </html>"""
@@ -23872,7 +24446,7 @@ def _perf_infer_page(query):
     return tab if tab in ("overview", "mydeals", "intros", "demand") else "mydeals"
 
 
-def _task_rebuild_slim():
+def _task_rebuild_slim(context=None):
     """Out-of-band {"task": "rebuild_slim"}: HEAD people.json; when its
     version differs from the source_version recorded in the slim file (or
     the slim file is missing/unreadable), rebuild and write the slim file.
@@ -23889,13 +24463,22 @@ def _task_rebuild_slim():
     except Exception:
         pass
     if recorded == source_version and recorded_schema == _people_slim_schema():
-        return {"task": "rebuild_slim", "rebuilt": False, "source_version": source_version}
-    _, built_from = _build_people_slim(s3)
-    print(f"people-slim rebuilt: {recorded} -> {built_from}")
-    return {"task": "rebuild_slim", "rebuilt": True, "source_version": built_from}
+        result = {"task": "rebuild_slim", "rebuilt": False, "source_version": source_version}
+    else:
+        _, built_from = _build_people_slim(s3)
+        print(f"people-slim rebuilt: {recorded} -> {built_from}")
+        result = {"task": "rebuild_slim", "rebuilt": True, "source_version": built_from}
+    # Whatever invokes rebuild_slim also refreshes the Demand Board's
+    # active-buyer files (best effort -- never fails rebuild_slim).
+    try:
+        result["interest_activity"] = _task_rebuild_interest_activity(context, summary=False)
+    except Exception as e:
+        print(f"rebuild_interest_activity (chained) failed: {e}")
+        result["interest_activity"] = {"ok": False, "error": type(e).__name__}
+    return result
 
 
-def _task_warm():
+def _task_warm(context=None):
     """Out-of-band {"task": "warm"}: load the slim people list, tenant
     index, deals and the other snapshot caches into this container's
     memory. Never renders a page."""
@@ -23912,7 +24495,8 @@ def _task_warm():
     return {"task": "warm", "loaded": loaded}
 
 
-OUT_OF_BAND_TASKS = {"rebuild_slim": _task_rebuild_slim, "warm": _task_warm}
+OUT_OF_BAND_TASKS = {"rebuild_slim": _task_rebuild_slim, "warm": _task_warm,
+                     "rebuild_interest_activity": _task_rebuild_interest_activity}
 
 
 def lambda_handler(event, context):
@@ -23926,7 +24510,7 @@ def lambda_handler(event, context):
     if task is not None:
         _perf_start(f"task_{event['task']}")
         try:
-            return task()
+            return task(context)
         finally:
             _perf_log()
     query = event.get("queryStringParameters") or {}
@@ -24357,10 +24941,14 @@ def _lambda_handler_impl(event, context):
 
     if tab == "demand":
         table = get_company_table()
+        # Tenant "Active buyers" layout: the module flag, or an admin's
+        # view_as preview (&preview_active=1 needs the valid admin key).
+        demand_active = DEMAND_ACTIVE_FOR_TENANTS or (is_admin_key and bool(view_as)
+                                                       and query.get("preview_active") == "1")
         body = render_page(table, viewer_name, key=nav_key, view_as=nav_view_as, cef_html=cef_html,
                             anon_key_email=anon_key_email, tenant_picker=(tenant is None), edit_mode=edit_mode,
                             person_id=(tenant.get("person_id") if tenant is not None else None),
-                            account_email=account_email)
+                            account_email=account_email, active_layout=demand_active)
     elif tab == "mydeals":
         if tenant is None:
             body = render_my_deals_page(viewer_name, tenant_picker=True,

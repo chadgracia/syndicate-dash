@@ -6556,15 +6556,16 @@ check("Tenant Demand Board: Gamma's Total Potential Demand is an em dash (zero t
 check("Tenant Demand Board: Gamma's row has no leftover latest-interest text",
       "Jan 2026" not in gamma_cell)
 
-# --- Admin layout: unchanged 6-column table + legend + 1000px wrap.
+# --- Admin layout: 6 original columns + "Active (12 mo)" after Company, legend, 1000px wrap.
 admin_demand_page = lf.render_page(ticket_table, "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",
                                     tenant_picker=True, edit_mode=True)
 admin_thead = admin_demand_page[admin_demand_page.find("<thead>"):admin_demand_page.find("</thead>")]
-check("Admin Demand Board: unchanged 6 <th> columns", admin_thead.count("<th ") == 6)
-check("Admin Demand Board: header order is Company/Total buyers/QP/Accredited/Unknown/Sellers",
-      [admin_thead.find(f">{h}<") for h in ["Company", "Total buyers", "QP", "Accredited", "Unknown", "Sellers"]]
+check("Admin Demand Board: 7 <th> columns (Active added)", admin_thead.count("<th ") == 7)
+check("Admin Demand Board: header order is Company/Active (12 mo)/Total buyers/QP/Accredited/Unknown/Sellers",
+      [admin_thead.find(f">{h}<") for h in ["Company", "Active (12 mo)", "Total buyers", "QP", "Accredited",
+                                             "Unknown", "Sellers"]]
       == sorted(admin_thead.find(f">{h}<")
-                for h in ["Company", "Total buyers", "QP", "Accredited", "Unknown", "Sellers"]))
+                for h in ["Company", "Active (12 mo)", "Total buyers", "QP", "Accredited", "Unknown", "Sellers"]))
 check("Admin Demand Board: legend still present with all three tiers",
       'class="legend"' in admin_demand_page and ">QP &mdash;" in admin_demand_page
       and ">Accredited &mdash;" in admin_demand_page and ">Unknown &mdash;" in admin_demand_page)
@@ -8751,7 +8752,9 @@ with contextlib.redirect_stdout(_pf_buf):
     _pf_rb = lf.lambda_handler({"task": "rebuild_slim"}, None)
 check("cold load: rebuild_slim rebuilds when people.json's version differs from the slim source_version, "
       "and returns without rendering",
-      _pf_rb == {"task": "rebuild_slim", "rebuilt": True, "source_version": _pf_lm[lf.PEOPLE_KEY].isoformat()}
+      {k: v for k, v in _pf_rb.items() if k != "interest_activity"}
+      == {"task": "rebuild_slim", "rebuilt": True, "source_version": _pf_lm[lf.PEOPLE_KEY].isoformat()}
+      and _pf_rb["interest_activity"]["task"] == "rebuild_interest_activity"
       and _pf_s3.objs[lf.PEOPLE_SLIM_KEY]["source_version"] == _pf_lm[lf.PEOPLE_KEY].isoformat()
       and "TIMING page=task_rebuild_slim" in _pf_buf.getvalue())
 with contextlib.redirect_stdout(io.StringIO()):
@@ -13848,6 +13851,349 @@ check("visibility fail-soft: lookup error -> VIS_ALL (no filtering), one log lin
       and _vis_buf.getvalue().count("visibility: lookup failed; no visibility filtering") == 1)
 _vis_reset()
 reset_caches()
+
+# ======================================================================
+# Active buyers (Demand Board): 12-month signals, rebuild_interest_activity
+# task (click summary + first-seen ledger), admin/tenant layouts.
+# ======================================================================
+_ab_now = datetime.now(timezone.utc)
+
+
+def _ab_pts(days_ago):
+    """Pipeline timestamp format, days_ago before now."""
+    return (_ab_now - timedelta(days=days_ago)).strftime("%Y/%m/%d %H:%M:%S +0000")
+
+
+def _ab_iso(days_ago):
+    return (_ab_now - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _ab_date(days_ago):
+    return (_ab_now - timedelta(days=days_ago)).date().isoformat()
+
+
+AB_SELLER = "ab-seller@example.com"
+_ab_old = _ab_pts(1200)
+_ab_people = {"people": [{"id": 9001, "full_name": "Abe Seller", "email": AB_SELLER, "company_id": 8001,
+                          "company_name": "Seller Firm", "custom_fields": {}, "created_at": _ab_old}]
+              + [{"id": pid, "full_name": f"Buyer {pid}", "email": f"b{pid}@example.org", "custom_fields": {},
+                  "created_at": _ab_old, "updated_at": _ab_pts(1)} for pid in
+                 (9101, 9102, 9103, 9104, 9105, 9107, 9108, 9109, 9110, 9111, 9112, 9113)
+                 + tuple(range(9120, 9130)) + tuple(range(9140, 9145))]
+              + [{"id": 9106, "full_name": "New Person", "email": "b9106@example.org", "custom_fields": {},
+                  "created_at": _ab_pts(20), "updated_at": _ab_pts(1)}]}
+_ab_people["people"][-2]["updated_at"] = _ab_pts(0)   # recent person updated_at alone is never a signal
+
+
+def _ab_buy(did, company, pid, created, extra=None, updated=None):
+    cf = {lf.DEAL_SIDE_FIELD: [lf.DEAL_SIDE_BUY_ID]}
+    cf.update(extra or {})
+    return {"id": did, "name": f"{company} buy {did}", "company": {"id": 7700, "name": company},
+            "deal_stage": {"id": lf.STAGE_INQUIRY}, "custom_fields": cf, "people": [{"id": pid}],
+            "primary_contact_id": pid, "created_at": created, "updated_at": updated or _ab_old}
+
+
+_ab_deals = {"deals": [
+    {"id": 8800, "name": "Seller Target sell", "company": {"id": 7701, "name": "Seller Target"},
+     "deal_stage": {"id": lf.STAGE_FIRM}, "custom_fields": cf_sell(), "people": [{"id": 9001}],
+     "primary_contact_id": 9001, "created_at": _ab_old, "updated_at": _ab_old},
+    _ab_buy(8801, "Alpha Active", 9101, _ab_pts(30)),                                        # a: created_at
+    _ab_buy(8802, "Alpha Active", 9102, _ab_old,
+            {lf.LAST_CONFIRMED_FIELD: (_ab_now - timedelta(days=10)).strftime("%Y/%m/%d")}),  # a: Last Confirmed
+    _ab_buy(8803, "Alpha Active", 9103, _ab_old, updated=_ab_pts(1)),                        # updated_at only
+    _ab_buy(8804, "Alpha Active", 9199, _ab_pts(5)),                                         # not an interest buyer
+    _ab_buy(8805, "Gamma Co", 9140, _ab_old),
+]}
+_ab_interest = {"buy": {
+    "Alpha Active": [9101, 9102, 9103, 9104, 9105, 9106, 9109, 9110],
+    "Gamma Co": list(range(9120, 9130)),
+    "Beta Co": [9111, 9112, 9113],
+    "Dead Co": [9107, 9108],
+    "Zed Dead": [9140, 9141, 9142, 9143, 9144],
+}}
+_ab_activity = {"clicks": {"Alpha Active": {"9104": _ab_iso(3), "9105": _ab_iso(500)},
+                           "Gamma Co": {"9120": _ab_iso(40)}, "beta co": {"9111": _ab_iso(100)}},
+                "processed_days": [], "earliest_day": None, "built_at": _ab_iso(0)}
+_ab_first_seen = {"pairs": {"Alpha Active": {"9109": _ab_date(5), "9110": None},
+                            "Dead Co": {"9107": _ab_date(400), "9108": None}}, "baseline_at": _ab_iso(600)}
+
+
+def _ab_fixture(with_files=True):
+    objs = {"people.json": json.loads(json.dumps(_ab_people)), "interest_people.json": json.loads(json.dumps(_ab_interest)),
+            "deals.json": json.loads(json.dumps(_ab_deals)), "companies.json": {"companies": []}}
+    if with_files:
+        objs[lf.INTEREST_ACTIVITY_KEY] = json.loads(json.dumps(_ab_activity))
+        objs[lf.INTEREST_FIRST_SEEN_KEY] = json.loads(json.dumps(_ab_first_seen))
+    s3, table = use_fixture(objs)
+    lf._data_cache.clear()
+    lf._people_cache.update({"version": None, "people": None, "by_id": None})
+    lf._s3_version_cache.clear()
+    lf._req_cache_reset()
+    return s3, table
+
+
+def _ab_rows():
+    lf._req_cache_reset()
+    lf._cache.update({"version": None, "table": None})
+    return {r["company"]: r for r in lf.get_company_table()}
+
+
+_ab_fixture()
+_ab_t = _ab_rows()
+check("active buyers: Alpha = 5 of 8 (deal created, Last Confirmed, click, person created, first-seen)",
+      (_ab_t["Alpha Active"]["active"], _ab_t["Alpha Active"]["total"]) == (5, 8))
+_ab_sig = lf._active_buyer_signals(lf._people_list(), lf.get_deals_list())
+check("active signal a: Buy deal created_at in window counts; Last Confirmed (YYYY/MM/DD) counts",
+      {"9101", "9102"} <= _ab_sig["deals"]["alpha active"])
+check("active signal a: deal updated_at is ignored (old created_at, no Last Confirmed)",
+      "9103" not in _ab_sig["deals"]["alpha active"] and "9140" not in _ab_sig["deals"].get("gamma co", set()))
+check("active signal b: recent human click counts, a 500-day-old click doesn't; company match is case-insensitive",
+      _ab_sig["clicks"]["alpha active"] == {"9104"} and _ab_sig["clicks"]["beta co"] == {"9111"})
+check("active signal c: person created_at in window counts; person updated_at alone never does",
+      "9106" in _ab_sig["created"] and "9144" not in _ab_sig["created"] and "9103" not in _ab_sig["created"])
+check("active signal d: recent first_seen counts; baseline null and 400-day-old dates never do",
+      _ab_sig["first_seen"]["alpha active"] == {"9109"} and "dead co" not in _ab_sig["first_seen"])
+check("active buyers: a recent Buy-deal person outside the interest list never counts (active <= total)",
+      all(r["active"] <= r["total"] for r in _ab_t.values()) and _ab_t["Gamma Co"]["active"] == 1
+      and _ab_t["Beta Co"]["active"] == 1 and _ab_t["Dead Co"]["active"] == 0 and _ab_t["Zed Dead"]["active"] == 0)
+check("active buyers: cache version tuple includes both activity files",
+      lf.INTEREST_ACTIVITY_KEY in lf._req_cache["object_version"]
+      and lf.INTEREST_FIRST_SEEN_KEY in lf._req_cache["object_version"])
+
+_ab_fixture(with_files=False)
+_ab_t2 = _ab_rows()
+check("active buyers: missing activity/first-seen files fail soft (signals b and d contribute nothing)",
+      (_ab_t2["Alpha Active"]["active"], _ab_t2["Beta Co"]["active"]) == (3, 0))
+
+# --- Admin layout
+_ab_fixture()
+_ab_table = lf.get_company_table()
+_ab_admin = lf.render_page(_ab_table, "Admin", key=ADMIN_KEY, view_as=None, anon_key_email="admin",
+                           tenant_picker=True, edit_mode=True)
+_ab_order = re.findall(r'<td class="company"><a [^>]*>([^<]+)</a>', _ab_admin)
+_ab_div = _ab_admin.find('id="board-divider"')
+check("admin Demand Board: 'Active (12 mo)' column directly after Company",
+      re.search(r'>Company<span class="arrow"></span></th>\s*<th class="num" data-key="active" '
+                r'data-type="number">Active \(12 mo\)<', _ab_admin) is not None)
+check("admin Demand Board: order active desc, then total desc, then name; Non-Recent block below the divider",
+      _ab_order == ["Alpha Active", "Gamma Co", "Beta Co", "Zed Dead", "Dead Co"]
+      and _ab_admin.find(">Beta Co<") < _ab_div < _ab_admin.find(">Zed Dead<"))
+check("admin Demand Board: divider labelled Non-Recent with the muted sub-line, spanning all 7 columns",
+      '<td colspan="7"><div class="nr-title">Non-Recent</div>'
+      '<div class="nr-sub">No buyer activity in the past 12 months</div>' in _ab_admin)
+check("admin Demand Board: Non-Recent rows keep their real totals",
+      re.search(r'>Zed Dead</a></td><td class="num">0</td><td class="num">5</td>', _ab_admin) is not None)
+check("admin Demand Board: sort/search script works per block (both tbodies, divider toggled)",
+      "board-body-nonrecent" in _ab_admin and "divider.hidden" in _ab_admin and "groups.forEach" in _ab_admin)
+
+# --- Tenant layout, flag off: identical to the pre-active layout
+check("tenant Active layout is OFF by default", lf.DEMAND_ACTIVE_FOR_TENANTS is False)
+_ab_plain_tbl = [{k: v for k, v in r.items() if k != "active"} for r in _ab_table]
+_ab_ten = lf.render_page(_ab_table, "Abe", anon_key_email=AB_SELLER)
+check("tenant Demand Board (flag off): output identical whether or not rows carry 'active'",
+      _ab_ten == lf.render_page(_ab_plain_tbl, "Abe", anon_key_email=AB_SELLER))
+check("tenant Demand Board (flag off): no Active column, no Non-Recent block, original sub line and order",
+      "Active buyers" not in _ab_ten and "Non-Recent" not in _ab_ten and "board-divider" not in _ab_ten
+      and "5 companies with interested buyers" in _ab_ten
+      and re.findall(r'<td class="company"><a [^>]*>([^<]+)</a>', _ab_ten)
+      == ["Gamma Co", "Alpha Active", "Zed Dead", "Beta Co", "Dead Co"]
+      and lf.DEMAND_BOARD_SCRIPT in _ab_ten)
+
+# --- Tenant layout, flag on
+_ab_on = lf.render_page(_ab_table, "Abe", anon_key_email=AB_SELLER, active_layout=True)
+check("tenant Active layout: 'Active buyers' directly after Company, original three columns kept",
+      re.search(r'>Company<span class="arrow"></span></th>\s*<th class="num" data-key="active" '
+                r'data-type="number">Active buyers<', _ab_on) is not None
+      and all(h in _ab_on for h in (">Total buyer interest<", ">Qualified buyers<", ">Total Potential Demand<")))
+check("tenant Active layout: sub-header counts companies with active > 0",
+      "3 companies with active buyer interest in the past 12 months" in _ab_on)
+check("tenant Active layout: active rows keep real totals; Non-Recent rows show 0 + em dashes (data-sort 0)",
+      re.search(r'>Alpha Active</a></td><td class="num">5</td><td class="num">8</td>', _ab_on) is not None
+      and '>Zed Dead</a></td><td class="num">0</td><td class="num" data-sort="0">—</td>'
+          '<td class="num" data-sort="0">—</td><td class="num" data-sort="0">—</td></tr>' in _ab_on
+      and '<td colspan="5"><div class="nr-title">Non-Recent</div>' in _ab_on
+      and _ab_on.find(">Beta Co<") < _ab_on.find('id="board-divider"') < _ab_on.find(">Zed Dead<"))
+check("tenant Active layout: no wording about clicks or tracking",
+      not re.search(r"click|track", _ab_on[_ab_on.find("<h1>"):_ab_on.find("</table>")], re.I)
+      and "click" not in lf.DEMAND_ACTIVE_CSS.lower())
+
+
+# --- Request path: preview_active needs the admin key + view_as
+def _ab_get(query, cookies=None):
+    lf._req_cache_reset()
+    lf._cache.update({"version": None, "table": None})
+    resp = lf.lambda_handler({"requestContext": {"http": {"method": "GET"}}, "rawPath": "/",
+                              "queryStringParameters": query, "cookies": cookies or []}, None)
+    return re.sub(r"sso=[A-Za-z0-9_\-]+", "sso=X", resp.get("body") or "")
+
+
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_t_plain = _ab_get({"tab": "demand"}, [tenant_cookie(AB_SELLER)])
+    _ab_t_prev = _ab_get({"tab": "demand", "preview_active": "1"}, [tenant_cookie(AB_SELLER)])
+    _ab_adm_prev = _ab_get({"tab": "demand", "key": ADMIN_KEY, "view_as": AB_SELLER, "preview_active": "1"})
+    _ab_adm_plain = _ab_get({"tab": "demand", "key": ADMIN_KEY, "view_as": AB_SELLER})
+    _ab_bad_prev = _ab_get({"tab": "demand", "key": "wrong-key", "view_as": AB_SELLER, "preview_active": "1"})
+check("tenant request: plain Demand Board renders (sanity)", "Demand Board" in _ab_t_plain
+      and "5 companies with interested buyers" in _ab_t_plain)
+check("tenant request: preview_active=1 is ignored for a non-admin (page identical)", _ab_t_prev == _ab_t_plain)
+check("admin view_as + preview_active=1 renders the tenant Active layout",
+      "Active buyers" in _ab_adm_prev and "Non-Recent" in _ab_adm_prev and "Active (12 mo)" not in _ab_adm_prev)
+check("admin view_as without preview_active keeps the plain tenant layout",
+      "Active buyers" not in _ab_adm_plain and "Non-Recent" not in _ab_adm_plain)
+check("preview_active with a wrong key never shows the Active layout", "Active buyers" not in _ab_bad_prev)
+lf.DEMAND_ACTIVE_FOR_TENANTS = True
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_t_on = _ab_get({"tab": "demand"}, [tenant_cookie(AB_SELLER)])
+lf.DEMAND_ACTIVE_FOR_TENANTS = False
+check("DEMAND_ACTIVE_FOR_TENANTS=True turns the Active layout on for tenants",
+      "Active buyers" in _ab_t_on and "3 companies with active buyer interest in the past 12 months" in _ab_t_on)
+
+
+# --- rebuild_interest_activity task
+class _AbMissing(Exception):
+    def __init__(self, key):
+        super().__init__(f"NoSuchKey: {key}")
+        self.response = {"Error": {"Code": "NoSuchKey"}}
+
+
+class FakeS3Clicks(FakeS3):
+    def __init__(self, objs):
+        super().__init__(objs)
+        self.gets = []
+        self.fail_keys = set()
+
+    def get_object(self, Bucket, Key):
+        self.gets.append(Key)
+        if Key in self.fail_keys:
+            raise RuntimeError("AccessDenied")
+        if Key not in self.objs:
+            raise _AbMissing(Key)
+        return super().get_object(Bucket, Key)
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None, Delimiter=None):
+        keys = sorted(k for k in self.objs if k.startswith(Prefix))
+        if Delimiter:
+            prefixes = sorted({Prefix + k[len(Prefix):].split(Delimiter, 1)[0] + Delimiter
+                               for k in keys if Delimiter in k[len(Prefix):]})
+            return {"CommonPrefixes": [{"Prefix": p} for p in prefixes], "IsTruncated": False}
+        return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
+
+
+class _AbCtx:
+    def __init__(self, ms):
+        self.ms = ms
+
+    def get_remaining_time_in_millis(self):
+        return self.ms
+
+
+_ab_today, _ab_yday, _ab_oldday = _ab_date(0), _ab_date(1), _ab_date(200)
+
+
+def _ab_click(day, n, pid, did, verdict, ts=None):
+    return (f"click-log/{day}/{n:06d}-{pid}.json",
+            {"ts": ts or f"{day}T12:00:{n % 60:02d}Z", "pid": pid, "did": did, "verdict": verdict, "reason": "r"})
+
+
+_ab_clicks = dict([
+    _ab_click(_ab_oldday, 1, 9112, 8801, "human"),        # Alpha (old day, still inside the window)
+    _ab_click(_ab_oldday, 2, 9113, 8801, "scanner"),      # scanner -> skipped
+    _ab_click(_ab_oldday, 3, 9112, 99999, "human"),       # unknown deal -> skipped
+    _ab_click(_ab_yday, 4, 9108, 8805, "Human"),           # Gamma
+    _ab_click(_ab_today, 5, 9112, 8801, "human"),          # later click, same pair -> latest kept
+    _ab_click(_ab_today, 6, 9107, 8801, "automated"),
+])
+
+
+def _ab_task_fixture(ledger=None):
+    objs = {"people.json": json.loads(json.dumps(_ab_people)), "interest_people.json": json.loads(json.dumps(_ab_interest)),
+            "deals.json": json.loads(json.dumps(_ab_deals)), "companies.json": {"companies": []}}
+    objs.update(json.loads(json.dumps(_ab_clicks)))
+    if ledger is not None:
+        objs[lf.INTEREST_FIRST_SEEN_KEY] = ledger
+    use_fixture(objs)
+    s3 = FakeS3Clicks(objs)
+    FakeBoto3.S3 = s3
+    reset_caches()
+    lf._data_cache.clear()
+    lf._s3_version_cache.clear()
+    return s3
+
+
+_ab_s3 = _ab_task_fixture()
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_r1 = lf.lambda_handler({"task": "rebuild_interest_activity"}, _AbCtx(60000))
+_ab_act = _ab_s3.objs[lf.INTEREST_ACTIVITY_KEY]
+check("interest task: returns without rendering a page", "statusCode" not in _ab_r1 and _ab_r1["task"] == "rebuild_interest_activity")
+check("interest task: only human clicks on known deals, latest click per pair, mapped via the combined deals list",
+      _ab_act["clicks"] == {"Alpha Active": {"9112": f"{_ab_today}T12:00:05Z"},
+                            "Gamma Co": {"9108": f"{_ab_yday}T12:00:04Z"}})
+check("interest task: processed_days cursor excludes today/yesterday; earliest_day + built_at recorded",
+      _ab_act["processed_days"] == [_ab_oldday] and _ab_act["earliest_day"] == _ab_oldday
+      and _ab_act["built_at"] and _ab_act["complete"] is True)
+check("interest task: verdict values seen are reported; human clicks counted",
+      sorted(_ab_r1["clicks"]["verdicts"]) == ["Human", "automated", "human", "scanner"]
+      and _ab_r1["clicks"]["human_clicks"] == 4 and _ab_r1["clicks"]["counted"] == 3
+      and _ab_r1["clicks"]["unknown_deal"] == 1 and _ab_r1["clicks"]["days_processed"] == 3)
+check("interest task: never writes or deletes click-log objects",
+      not any(c["Key"].startswith("click-log/") for c in _ab_s3.put_calls)
+      and all(k in _ab_s3.objs for k in _ab_clicks))
+check("interest task: summary counts active vs Non-Recent and lists the top companies",
+      _ab_r1["summary"]["active"] + _ab_r1["summary"]["non_recent"] == _ab_r1["summary"]["companies"]
+      and _ab_r1["summary"]["top"][0][0] == "Alpha Active")
+_ab_s3.gets.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_r2 = lf.lambda_handler({"task": "rebuild_interest_activity"}, _AbCtx(60000))
+check("interest task: idempotent re-run; processed days are not re-read, today + yesterday always are",
+      _ab_s3.objs[lf.INTEREST_ACTIVITY_KEY]["clicks"] == _ab_act["clicks"]
+      and not any(k.startswith(f"click-log/{_ab_oldday}/") for k in _ab_s3.gets)
+      and any(k.startswith(f"click-log/{_ab_today}/") for k in _ab_s3.gets)
+      and any(k.startswith(f"click-log/{_ab_yday}/") for k in _ab_s3.gets))
+
+# Time budget: an (almost) exhausted Lambda stops cleanly, saves, finishes next run.
+_ab_s3 = _ab_task_fixture()
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_r3 = lf.lambda_handler({"task": "rebuild_interest_activity"}, _AbCtx(1))
+_ab_act3 = _ab_s3.objs[lf.INTEREST_ACTIVITY_KEY]
+check("interest task: out of time -> stops cleanly, progress saved as incomplete",
+      _ab_act3["complete"] is False and _ab_act3["processed_days"] == [] and "summary" not in _ab_r3)
+with contextlib.redirect_stdout(io.StringIO()):
+    lf.lambda_handler({"task": "rebuild_interest_activity"}, _AbCtx(60000))
+check("interest task: the next run finishes the backlog",
+      _ab_s3.objs[lf.INTEREST_ACTIVITY_KEY]["complete"] is True
+      and _ab_s3.objs[lf.INTEREST_ACTIVITY_KEY]["processed_days"] == [_ab_oldday])
+
+# First-seen ledger
+_ab_led = _ab_s3.objs[lf.INTEREST_FIRST_SEEN_KEY]
+check("first-seen: first run records every current interest pair with null (baseline) + baseline_at",
+      _ab_led["baseline_at"] and _ab_led["pairs"]["Alpha Active"]["9101"] is None
+      and sum(len(v) for v in _ab_led["pairs"].values()) == 28
+      and all(v is None for p in _ab_led["pairs"].values() for v in p.values()))
+_ab_s3.objs["interest_people.json"]["buy"]["Alpha Active"] = [9101, 9113]   # 9113 new, others vanished
+_ab_s3.objs["interest_people.json"]["buy"]["New Co"] = [9111]
+lf._data_cache.clear()
+with contextlib.redirect_stdout(io.StringIO()):
+    _ab_r4 = lf.lambda_handler({"task": "rebuild_interest_activity"}, _AbCtx(60000))
+_ab_led2 = _ab_s3.objs[lf.INTEREST_FIRST_SEEN_KEY]
+check("first-seen: new pairs get today's UTC date; existing entries never overwritten; vanished pairs kept",
+      _ab_led2["pairs"]["Alpha Active"]["9113"] == _ab_today and _ab_led2["pairs"]["New Co"] == {"9111": _ab_today}
+      and _ab_led2["pairs"]["Alpha Active"]["9101"] is None and "9110" in _ab_led2["pairs"]["Alpha Active"]
+      and _ab_led2["baseline_at"] == _ab_led["baseline_at"] and _ab_r4["first_seen"]["added"] == 2)
+_ab_s3.fail_keys = {lf.INTEREST_FIRST_SEEN_KEY, lf.INTEREST_ACTIVITY_KEY}
+_ab_puts = len(_ab_s3.put_calls)
+_ab_buf = io.StringIO()
+with contextlib.redirect_stdout(_ab_buf):
+    _ab_r5 = lf.lambda_handler({"task": "rebuild_interest_activity"}, _AbCtx(60000))
+check("interest task: a failed read (not missing) writes nothing and logs one line per file",
+      len(_ab_s3.put_calls) == _ab_puts and _ab_r5["first_seen"]["ok"] is False and _ab_r5["clicks"]["ok"] is False
+      and "interest-first-seen: read failed" in _ab_buf.getvalue() and "interest-activity: read failed" in _ab_buf.getvalue())
+_ab_s3.fail_keys = set()
+check("interest task: also chained after rebuild_slim and registered as its own task",
+      "rebuild_interest_activity" in lf.OUT_OF_BAND_TASKS
+      and "_task_rebuild_interest_activity(context, summary=False)" in open(lf.__file__).read())
+reset_caches()
+lf._data_cache.clear()
+lf._s3_version_cache.clear()
 
 print(f"\n{passed} passed, {failed} failed")
 if failed:
