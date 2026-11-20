@@ -10863,7 +10863,9 @@ check("standing_json: referral note '1 confirmed'",
 check("standing_json: every item carries its key, in order",
       [i["key"] for i in _d["items"]] == ["id_forms", "qualification", "terms", "payments", "respond", "referral", "trades"])
 check("standing_json: trades include edited size and manual trade (4 trades)",
-      _d["items"][6] == {"key": "trades", "label": "Completed trades", "done": True, "note": "4 trades · $10.1M"})
+      _d["items"][6] == {"key": "trades", "label": "Completed trades", "done": True, "note": "4 trades · $10.1M",
+                         "volume_usd": _d["items"][6].get("volume_usd")}
+      and isinstance(_d["items"][6].get("volume_usd"), int) and 10_050_000 <= _d["items"][6]["volume_usd"] < 10_150_000)
 check("standing_json: no internal fields (history/notes/manual labels/repairs)",
       "ZZSECRETREASON" not in _r["body"] and "ZZINTERNALNOTE" not in _r["body"] and "ZZMANUALTRADE" not in _r["body"]
       and "repair" not in _r["body"] and "history" not in _r["body"] and "Rita" not in _r["body"])

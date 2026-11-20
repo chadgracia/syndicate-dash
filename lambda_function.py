@@ -19308,7 +19308,8 @@ def standing_json_payload(pid):
             ref_item["note"] = _standing_referral_note(cs["confirmed_referrals"], cs["pending_referrals"])
         items.append(ref_item)
         items.append({"key": "trades", "label": "Completed trades", "done": cs["trades"] >= 1,
-                      "note": f"{_plural(cs['trades'], 'trade')} · {_fmt_standing_musd(cs['volume'])}"})
+                      "note": f"{_plural(cs['trades'], 'trade')} · {_fmt_standing_musd(cs['volume'])}",
+                      "volume_usd": int(round(cs["volume"] or 0))})
         tier = cs["tier"]
         return {"visible": True, "share_with_sellers": cs["share_with_sellers"],
                 "roles": {"seller": bool(cs["roles"]["seller"]), "buyer": bool(cs["roles"]["buyer"])},
